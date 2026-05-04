@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-import certifi
 import httpx
 from dotenv import load_dotenv
 from fastapi import (APIRouter, Cookie, Depends, FastAPI, File, Form, Header,
@@ -44,14 +43,7 @@ EMERGENT_AUTH_SESSION_URL = (
     "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
 )
 
-client = AsyncIOMotorClient(
-    MONGO_URL,
-    tls=True,
-    tlsCAFile=certifi.where(),
-    serverSelectionTimeoutMS=30000,
-    connectTimeoutMS=20000,
-    socketTimeoutMS=20000,
-)
+client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
 app = FastAPI(title="EduHub Author Studio API")
@@ -245,12 +237,17 @@ async def auth_google(payload: dict, response: Response):
         path="/",
         max_age=7 * 24 * 60 * 60,
     )
+    # v8.1 — mobile Safari ITP drops 3rd-party cookies across cross-site
+    # redirects (vercel.app <-> onrender.com). We also return the token so
+    # the frontend can cache it in localStorage and fall back to
+    # `Authorization: Bearer` on devices where the cookie is blocked.
     return {
         "user_id": user_id,
         "email": email,
         "name": data.get("name") or "",
         "picture": data.get("picture") or "",
         "is_admin": is_admin,
+        "session_token": session_token,
     }
 
 
@@ -271,9 +268,15 @@ async def auth_me(user: User | None = Depends(current_user)):
 async def auth_logout(
     response: Response,
     session_token: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
 ):
-    if session_token:
-        await db.user_sessions.delete_one({"session_token": session_token})
+    # Accept token via cookie OR Authorization: Bearer — needed for
+    # mobile clients that use the localStorage fallback.
+    token = session_token
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if token:
+        await db.user_sessions.delete_one({"session_token": token})
     response.delete_cookie("session_token", path="/", samesite="none", secure=True)
     return {"ok": True}
 
@@ -502,18 +505,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    log.info("startup: admin emails=%s",
+    # Ensure useful indexes
+    await db.books.create_index([("slug", 1), ("revision", -1)])
+    await db.books.create_index("published")
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("user_id", unique=True)
+    await db.user_sessions.create_index("session_token", unique=True)
+    await db.user_sessions.create_index("expires_at")
+    log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
-    try:
-        await db.books.create_index([("slug", 1), ("revision", -1)])
-        await db.books.create_index("published")
-        await db.users.create_index("email", unique=True)
-        await db.users.create_index("user_id", unique=True)
-        await db.user_sessions.create_index("session_token", unique=True)
-        await db.user_sessions.create_index("expires_at")
-        log.info("startup: indexes ready")
-    except Exception as e:  # noqa: BLE001
-        log.warning("startup: DB unreachable at boot, will retry on first request: %s", e)
 
 
 @app.on_event("shutdown")
