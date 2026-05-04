@@ -502,15 +502,18 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    # Ensure useful indexes
-    await db.books.create_index([("slug", 1), ("revision", -1)])
-    await db.books.create_index("published")
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("user_id", unique=True)
-    await db.user_sessions.create_index("session_token", unique=True)
-    await db.user_sessions.create_index("expires_at")
-    log.info("startup: indexes ready | admin emails=%s",
+    log.info("startup: admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
+    try:
+        await db.books.create_index([("slug", 1), ("revision", -1)])
+        await db.books.create_index("published")
+        await db.users.create_index("email", unique=True)
+        await db.users.create_index("user_id", unique=True)
+        await db.user_sessions.create_index("session_token", unique=True)
+        await db.user_sessions.create_index("expires_at")
+        log.info("startup: indexes ready")
+    except Exception as e:  # noqa: BLE001
+        log.warning("startup: DB unreachable at boot, will retry on first request: %s", e)
 
 
 @app.on_event("shutdown")
