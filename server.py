@@ -808,6 +808,17 @@ async def push_send_studio(
     if payload.target == "group" and not payload.group:
         raise HTTPException(status_code=400, detail="group required when target=group")
 
+    # Surface VAPID misconfiguration so the UI never shows silent 0/0.
+    if not _VAPID_INSTANCE:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"VAPID key not loaded on the server. "
+                f"Boot error: {_VAPID_BOOT_ERROR or 'VAPID_PRIVATE_KEY missing'}. "
+                f"Visit /api/push/_diag for details."
+            ),
+        )
+
     query = _build_target_query(payload.target, payload.studentIds, payload.group)
     sent, failed = await _fan_out_push(query, payload.title, payload.body, payload.url or "/")
 
@@ -1113,6 +1124,33 @@ PATCH_FILES: dict[str, dict] = {
             "preserved byte-for-byte."
         ),
     },
+    "icon-192": {
+        "filename": "icon-192.png",
+        "ext": "png",
+        "title": "Asset — Push notification icon (192×192, 33 KB)",
+        "tab_label": "icon-192.png",
+        "target_path": "public/icons/icon-192.png",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/upload/master/public/icons",
+        "blurb": (
+            "EduHub logo resized + optimized to 192×192 PNG (33 KB, was 1.8 MB). "
+            "Drop into public/icons/ so push notification banners show your logo "
+            "instead of the browser default. Same icon used by sw.js and manifest."
+        ),
+        "binary": True,
+    },
+    "icon-512": {
+        "filename": "icon-512.png",
+        "ext": "png",
+        "title": "Asset — High-res app icon (512×512, 212 KB)",
+        "tab_label": "icon-512.png",
+        "target_path": "public/icons/icon-512.png",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/upload/master/public/icons",
+        "blurb": (
+            "Larger version for iOS Add-to-Home-Screen splash + Android adaptive "
+            "icons. Listed in manifest.json. Same logo, just bigger."
+        ),
+        "binary": True,
+    },
 }
 
 
@@ -1348,31 +1386,39 @@ function langFor(ext) {
 }
 
 function panelHTML(key, p) {
+  const isBinary = !!p.binary;
+  const previewBlock = isBinary
+    ? `<div class="code-wrap" style="display:flex;align-items:center;justify-content:center;padding:28px;background:repeating-conic-gradient(rgba(255,255,255,0.04) 0% 25%,transparent 0% 50%) 0 0/24px 24px,#1a1420">
+         <img src="/api/patch/${key}/raw" alt="${p.filename}"
+              style="max-width:240px;max-height:240px;border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,0.6);background:rgba(255,255,255,0.04)">
+       </div>`
+    : `<div class="code-wrap">
+         <div class="code-bar">
+           <span>${p.filename}</span>
+           <button class="copy-btn" data-copy="${key}">Copy</button>
+         </div>
+         <pre><code class="language-${langFor(p.ext)} hljs" id="code-${key}">Loading…</code></pre>
+       </div>`;
+
   return `
-    <section class="panel" id="panel-${key}" data-key="${key}">
+    <section class="panel" id="panel-${key}" data-key="${key}" data-binary="${isBinary}">
       <div class="panel-head">
         <div>
           <div class="title">${p.title}</div>
           <div class="target">${p.target_path}</div>
         </div>
         <div class="spacer"></div>
-        <a class="btn" href="/api/patch/${key}/raw" target="_blank">
+        <a class="btn" href="/api/patch/${key}/raw" target="_blank" download="${p.filename}">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          Raw
+          ${isBinary ? "Download" : "Raw"}
         </a>
         <a class="btn aurora" href="${p.github_edit}" target="_blank" rel="noopener">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
-          Open in GitHub
+          ${isBinary ? "Upload to GitHub" : "Open in GitHub"}
         </a>
       </div>
       <div class="blurb">${p.blurb}</div>
-      <div class="code-wrap">
-        <div class="code-bar">
-          <span>${p.filename}</span>
-          <button class="copy-btn" data-copy="${key}">Copy</button>
-        </div>
-        <pre><code class="language-${langFor(p.ext)} hljs" id="code-${key}">Loading…</code></pre>
-      </div>
+      ${previewBlock}
     </section>
   `;
 }
@@ -1400,7 +1446,11 @@ function activate(key) {
 const loaded = new Set();
 async function loadCode(key) {
   if (loaded.has(key)) return;
+  const panel = document.getElementById('panel-' + key);
+  // Skip code loading entirely for binary panels.
+  if (panel && panel.dataset.binary === 'true') { loaded.add(key); return; }
   const codeEl = document.getElementById('code-' + key);
+  if (!codeEl) { loaded.add(key); return; }
   try {
     const res = await fetch(`/api/patch/${key}/raw`);
     const txt = await res.text();
@@ -1479,9 +1529,25 @@ async def patch_raw(key: str):
     if key not in PATCH_FILES:
         raise HTTPException(status_code=404, detail="patch key not found")
     meta = PATCH_FILES[key]
-    text = _read_patch_file(meta["filename"])
-    media = "text/plain; charset=utf-8"
-    return Response(content=text, media_type=media)
+    p = (PATCHES_DIR / meta["filename"]).resolve()
+    if PATCHES_DIR.resolve() not in p.parents:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="file missing on disk")
+
+    # Binary assets (icons etc) — serve as-is with correct content-type.
+    if meta.get("binary"):
+        ext = meta["ext"].lower()
+        media = {
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
+            "svg": "image/svg+xml",
+        }.get(ext, "application/octet-stream")
+        return Response(content=p.read_bytes(), media_type=media)
+
+    # Text patches — return plain text.
+    return Response(content=p.read_text(encoding="utf-8"),
+                    media_type="text/plain; charset=utf-8")
 
 
 # --------------------------------------------------------------------------- #
