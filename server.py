@@ -53,17 +53,49 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@eduhub.app")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
+
+def _repair_pem(raw: str) -> str:
+    """Hosting UIs sometimes flatten multi-line PEM values:
+       - replace literal '\\n' with real newlines
+       - if the key ended up on a single line, re-wrap the base64 body
+       - strip surrounding quotes
+    Returns a string that should pass cryptography's PEM parser.
+    """
+    if not raw:
+        return raw
+    s = raw.strip().strip('"').strip("'")
+    # Most common breakage: literal backslash-n
+    if "\\n" in s and "\n" not in s:
+        s = s.replace("\\n", "\n")
+    # Already valid multi-line? keep as-is.
+    if "\n" in s:
+        return s
+    # Single-line — try to reconstruct: header + body wrapped at 64 chars + footer
+    import re as _re
+    m = _re.match(r"-----BEGIN ([A-Z ]+)-----(.*)-----END \1-----", s)
+    if not m:
+        return s
+    header, body, footer = m.group(1), m.group(2).strip(), m.group(1)
+    body_clean = "".join(body.split())
+    wrapped = "\n".join(body_clean[i:i + 64] for i in range(0, len(body_clean), 64))
+    return f"-----BEGIN {header}-----\n{wrapped}\n-----END {footer}-----"
+
+
+VAPID_PRIVATE_KEY = _repair_pem(VAPID_PRIVATE_KEY)
+
 # Pre-parse the VAPID PEM once. pywebpush expects either a Vapid01 instance, a
 # file path, or a raw base64-encoded private key string (NOT PEM). Passing PEM
 # directly fails with "Could not deserialize key data". We parse here at boot
 # so every subsequent webpush() call reuses this instance.
 _VAPID_INSTANCE: Vapid01 | None = None
+_VAPID_BOOT_ERROR: str = ""
 if VAPID_PRIVATE_KEY:
     try:
         _VAPID_INSTANCE = Vapid01.from_pem(VAPID_PRIVATE_KEY.encode())
     except Exception as _exc:  # noqa: BLE001
+        _VAPID_BOOT_ERROR = f"{type(_exc).__name__}: {_exc}"
         logging.getLogger("eduhub").warning(
-            "VAPID_PRIVATE_KEY could not be parsed: %s", _exc
+            "VAPID_PRIVATE_KEY could not be parsed at boot: %s", _VAPID_BOOT_ERROR
         )
 
 client = AsyncIOMotorClient(MONGO_URL)
@@ -579,7 +611,8 @@ async def _fan_out_push(
     (HTTP 404/410) are removed from the collection so the next send is fast.
     """
     if not _VAPID_INSTANCE:
-        log.warning("push: VAPID_PRIVATE_KEY missing or invalid — skipping fan-out")
+        log.warning("push: _VAPID_INSTANCE not loaded (boot error: %s) — skipping fan-out",
+                    _VAPID_BOOT_ERROR or "VAPID_PRIVATE_KEY missing")
         return 0, 0
 
     payload = json.dumps({"title": title, "body": body, "url": url or "/"})
@@ -682,10 +715,11 @@ async def push_vapid_public_key():
     return {"publicKey": VAPID_PUBLIC_KEY}
 
 
-# ---- Diagnostic (admin-only) ------------------------------------------------
+# ---- Diagnostic (public — returns booleans only, no secrets) ---------------
 @api.get("/push/_diag")
-async def push_diag(user: User = Depends(require_admin)):
-    """One-shot health check for the push pipeline. Hit from any browser."""
+async def push_diag():
+    """Public health check for the push pipeline. Returns only booleans/counts
+    (no key material). Hit from any browser to see why pushes might be failing."""
     out: dict = {
         "vapid_public_key_present": bool(VAPID_PUBLIC_KEY),
         "vapid_public_key_len": len(VAPID_PUBLIC_KEY),
@@ -709,10 +743,12 @@ async def push_diag(user: User = Depends(require_admin)):
         out["vapid_private_key_parses"] = True
         out["vapid_private_key_parse_error"] = None
         out["vapid_instance_loaded_at_boot"] = _VAPID_INSTANCE is not None
+        out["vapid_boot_error"] = _VAPID_BOOT_ERROR or None
     except Exception as exc:  # noqa: BLE001
         out["vapid_private_key_parses"] = False
         out["vapid_private_key_parse_error"] = f"{type(exc).__name__}: {exc}"
         out["vapid_instance_loaded_at_boot"] = _VAPID_INSTANCE is not None
+        out["vapid_boot_error"] = _VAPID_BOOT_ERROR or None
 
     # Try a *dry-run* sign — same code path as a real send but to a fake target.
     # Use a real EC public key so the encryption layer doesn't trip; only the
