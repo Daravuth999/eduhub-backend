@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, Field
 from pywebpush import WebPushException, webpush
+from py_vapid import Vapid01
 from starlette.middleware.cors import CORSMiddleware
 
 from content_parser import extract_docx, parse_content
@@ -51,6 +52,19 @@ VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@eduhub.app")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+# Pre-parse the VAPID PEM once. pywebpush expects either a Vapid01 instance, a
+# file path, or a raw base64-encoded private key string (NOT PEM). Passing PEM
+# directly fails with "Could not deserialize key data". We parse here at boot
+# so every subsequent webpush() call reuses this instance.
+_VAPID_INSTANCE: Vapid01 | None = None
+if VAPID_PRIVATE_KEY:
+    try:
+        _VAPID_INSTANCE = Vapid01.from_pem(VAPID_PRIVATE_KEY.encode())
+    except Exception as _exc:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "VAPID_PRIVATE_KEY could not be parsed: %s", _exc
+        )
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -564,8 +578,8 @@ async def _fan_out_push(
     Returns (sent, failed). Subscriptions whose endpoint is permanently gone
     (HTTP 404/410) are removed from the collection so the next send is fast.
     """
-    if not VAPID_PRIVATE_KEY:
-        log.warning("push: VAPID_PRIVATE_KEY missing — skipping fan-out")
+    if not _VAPID_INSTANCE:
+        log.warning("push: VAPID_PRIVATE_KEY missing or invalid — skipping fan-out")
         return 0, 0
 
     payload = json.dumps({"title": title, "body": body, "url": url or "/"})
@@ -584,7 +598,7 @@ async def _fan_out_push(
             webpush(
                 subscription_info={"endpoint": endpoint, "keys": keys},
                 data=payload,
-                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_private_key=_VAPID_INSTANCE,
                 vapid_claims={"sub": VAPID_CLAIM_EMAIL},
             )
             sent += 1
@@ -593,9 +607,14 @@ async def _fan_out_push(
             resp = getattr(exc, "response", None)
             if resp is not None and getattr(resp, "status_code", 0) in (404, 410):
                 dead_endpoints.append(endpoint)
+            else:
+                code = getattr(resp, "status_code", 0) if resp else 0
+                log.warning("push: webpush err endpoint=%s status=%s exc=%s",
+                            endpoint[:60], code, str(exc)[:200])
         except Exception as exc:  # noqa: BLE001
             failed += 1
-            log.warning("push: send error endpoint=%s err=%s", endpoint[:60], exc)
+            log.warning("push: send error endpoint=%s err=%s: %s",
+                        endpoint[:60], type(exc).__name__, str(exc)[:200])
 
     if dead_endpoints:
         await push_subscriptions.delete_many({"endpoint": {"$in": dead_endpoints}})
@@ -661,6 +680,85 @@ async def push_unsubscribe(payload: dict):
 @api.get("/push/vapid-public-key")
 async def push_vapid_public_key():
     return {"publicKey": VAPID_PUBLIC_KEY}
+
+
+# ---- Diagnostic (admin-only) ------------------------------------------------
+@api.get("/push/_diag")
+async def push_diag(user: User = Depends(require_admin)):
+    """One-shot health check for the push pipeline. Hit from any browser."""
+    out: dict = {
+        "vapid_public_key_present": bool(VAPID_PUBLIC_KEY),
+        "vapid_public_key_len": len(VAPID_PUBLIC_KEY),
+        "vapid_private_key_present": bool(VAPID_PRIVATE_KEY),
+        "vapid_private_key_len": len(VAPID_PRIVATE_KEY),
+        "vapid_private_key_starts_with_pem_header": VAPID_PRIVATE_KEY.startswith("-----BEGIN"),
+        "vapid_private_key_has_real_newlines": "\n" in VAPID_PRIVATE_KEY,
+        "vapid_private_key_has_literal_backslash_n": "\\n" in VAPID_PRIVATE_KEY and "\n" not in VAPID_PRIVATE_KEY,
+        "vapid_claim_email": VAPID_CLAIM_EMAIL,
+        "cron_secret_present": bool(CRON_SECRET),
+        "subscriptions_total": await push_subscriptions.count_documents({}),
+        "history_total": await push_history.count_documents({}),
+        "scheduled_pending": await push_scheduled.count_documents({"status": "pending"}),
+    }
+
+    # Try to parse the private key — uses the SAME code path as the live send.
+    try:
+        from py_vapid import Vapid01 as _V
+        v = _V.from_pem(VAPID_PRIVATE_KEY.encode())
+        _ = v.private_key
+        out["vapid_private_key_parses"] = True
+        out["vapid_private_key_parse_error"] = None
+        out["vapid_instance_loaded_at_boot"] = _VAPID_INSTANCE is not None
+    except Exception as exc:  # noqa: BLE001
+        out["vapid_private_key_parses"] = False
+        out["vapid_private_key_parse_error"] = f"{type(exc).__name__}: {exc}"
+        out["vapid_instance_loaded_at_boot"] = _VAPID_INSTANCE is not None
+
+    # Try a *dry-run* sign — same code path as a real send but to a fake target.
+    # Use a real EC public key so the encryption layer doesn't trip; only the
+    # endpoint is fake. A 0/4xx response means signing+encryption worked.
+    try:
+        import base64 as _b64
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography.hazmat.primitives.asymmetric import ec as _ec
+        _tmp = _ec.generate_private_key(_ec.SECP256R1())
+        _pub = _tmp.public_key().public_bytes(
+            _ser.Encoding.X962, _ser.PublicFormat.UncompressedPoint)
+        _p256dh = _b64.urlsafe_b64encode(_pub).rstrip(b"=").decode()
+        _auth = _b64.urlsafe_b64encode(b"\x01" * 16).rstrip(b"=").decode()
+        webpush(
+            subscription_info={
+                "endpoint": "https://fcm.googleapis.com/fcm/send/__diag_invalid__",
+                "keys": {"p256dh": _p256dh, "auth": _auth},
+            },
+            data="diag",
+            vapid_private_key=_VAPID_INSTANCE,
+            vapid_claims={"sub": VAPID_CLAIM_EMAIL},
+        )
+        out["dry_run_sign"] = "ok-signed-and-delivered (unexpected)"
+    except WebPushException as exc:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", 0) if resp else 0
+        out["dry_run_sign"] = (
+            f"ok-signed-but-endpoint-rejected-status-{code}"
+            if code in (0, 400, 404, 410)
+            else f"webpush-error-{code}: {exc}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        out["dry_run_sign"] = f"sign-failed: {type(exc).__name__}: {str(exc)[:200]}"
+
+    # Show the first subscription's endpoint host (if any) — helps spot
+    # whether subscriptions are FCM (Chrome/Edge) vs Apple (iOS Safari) vs Mozilla.
+    sample = await push_subscriptions.find_one({}, {"_id": 0, "endpoint": 1, "studentId": 1, "group": 1})
+    if sample:
+        ep = sample.get("endpoint", "")
+        host = ep.split("/", 3)[2] if ep.startswith("http") else "?"
+        out["sample_subscription"] = {
+            "studentId": sample.get("studentId"),
+            "group": sample.get("group"),
+            "endpoint_host": host,
+        }
+    return out
 
 
 # ---- Send (teacher or super-admin) -----------------------------------------
@@ -931,6 +1029,52 @@ PATCH_FILES: dict[str, dict] = {
             "student?.group || student?.batch || 'default'). AuthContext doesn't "
             "expose a group field today, so the call falls back to 'default' — "
             "Push Studio targeting by group still works on subsequent enrolments."
+        ),
+    },
+    "sw": {
+        "filename": "sw.js",
+        "ext": "js",
+        "title": "Frontend — Service Worker with Web Push handlers (v1.2)",
+        "tab_label": "sw.js",
+        "target_path": "public/sw.js",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/public/sw.js",
+        "blurb": (
+            "Two surgical edits on top of your existing SW: bumps SW_VERSION "
+            "from v1.1.0 → v1.2.0 (forces every browser to evict caches and "
+            "pick up the new code), and appends `push` + `notificationclick` "
+            "listeners at the very bottom. The browser needs the `push` "
+            "listener to actually render notifications — without it, "
+            "pywebpush delivers but nothing appears on screen. Restored the "
+            "missing `||` fallbacks that were lost in markdown formatting."
+        ),
+    },
+    "push-bell": {
+        "filename": "PushNotificationBell.jsx",
+        "ext": "jsx",
+        "title": "Frontend — Bell button to enable/disable notifications",
+        "tab_label": "PushNotificationBell.jsx",
+        "target_path": "src/eduhub/components/PushNotificationBell.jsx",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/eduhub/components",
+        "blurb": (
+            "NEW component. Self-contained bell button that calls the existing "
+            "usePushNotifications hook (default import, signature "
+            "(studentId, groupName)). Matches your committed backend payload "
+            "shape — no env var changes needed (VAPID key auto-fetched). "
+            "Styled to match your aurora header (cyan/violet/magenta accents)."
+        ),
+    },
+    "header": {
+        "filename": "Header.jsx",
+        "ext": "jsx",
+        "title": "Frontend — Header.jsx with bell wired in (2-line addition)",
+        "tab_label": "Header.jsx",
+        "target_path": "src/eduhub/components/Header.jsx",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/components/Header.jsx",
+        "blurb": (
+            "Surgical: 1 import line + 4 lines that render <PushNotificationBell> "
+            "inside the existing isAuthenticated block. ALL safe-area / iOS "
+            "notch logic, telegram link, student pill, sign-out button — "
+            "preserved byte-for-byte."
         ),
     },
 }
