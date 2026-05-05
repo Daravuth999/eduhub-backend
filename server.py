@@ -55,22 +55,38 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 
 def _repair_pem(raw: str) -> str:
-    """Hosting UIs sometimes flatten multi-line PEM values:
-       - replace literal '\\n' with real newlines
-       - if the key ended up on a single line, re-wrap the base64 body
-       - strip surrounding quotes
+    """Hosting UIs sometimes flatten or re-encode multi-line PEM values.
+    Repair the most common breakages so we get usable PEM:
+      - strip surrounding quotes/whitespace
+      - if value is base64-encoded PEM (starts with 'LS0t'), decode it
+      - replace literal '\\n' with real newlines
+      - if the key is on a single line, re-wrap the base64 body at 64 chars
     Returns a string that should pass cryptography's PEM parser.
     """
     if not raw:
         return raw
     s = raw.strip().strip('"').strip("'")
-    # Most common breakage: literal backslash-n
+
+    # Case A: the whole value is base64 of a PEM block.
+    # PEM headers begin with '-----BEGIN' which b64-encodes to start with 'LS0t'.
+    if s.startswith("LS0t") and "-----" not in s:
+        try:
+            import base64 as _b64
+            decoded = _b64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", errors="strict")
+            if "-----BEGIN" in decoded:
+                s = decoded.strip()
+        except Exception:  # noqa: BLE001
+            pass  # Fall through to other repair attempts.
+
+    # Case B: literal backslash-n
     if "\\n" in s and "\n" not in s:
         s = s.replace("\\n", "\n")
+
     # Already valid multi-line? keep as-is.
     if "\n" in s:
         return s
-    # Single-line — try to reconstruct: header + body wrapped at 64 chars + footer
+
+    # Case C: single-line — re-wrap body at 64 chars.
     import re as _re
     m = _re.match(r"-----BEGIN ([A-Z ]+)-----(.*)-----END \1-----", s)
     if not m:
@@ -1503,6 +1519,7 @@ async def patch_landing():
             "target_path": meta["target_path"],
             "github_edit": meta["github_edit"],
             "blurb": meta["blurb"],
+            "binary": bool(meta.get("binary")),
         }
     html = _LANDING_HTML.replace("__PATCHES_JSON__", json.dumps(payload))
     return Response(content=html, media_type="text/html; charset=utf-8")
