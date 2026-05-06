@@ -1571,10 +1571,29 @@ async def patch_raw(key: str):
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
 app.include_router(api)
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# IMPORTANT: browsers reject `Access-Control-Allow-Origin: *` combined with
+# `Access-Control-Allow-Credentials: true` (CORS spec §3.2).
+# When CORS_ORIGINS is set to explicit origins we can enable credentials safely.
+# When it is unset (dev / open deployment) we fall back to allow_origins=["*"]
+# but WITHOUT credentials so the public /api/books endpoint still works.
+_raw_origins = os.environ.get("CORS_ORIGINS", "").strip()
+if _raw_origins and _raw_origins != "*":
+    # Explicit allowlist — credentials safe (cookie auth works across origins).
+    _allow_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+    _allow_credentials = True
+else:
+    # Wildcard / unset — no credentials (public endpoints only).
+    # Studio auth uses the Bearer-header fallback (localStorage token) which
+    # does NOT require a credentialed CORS preflight, so nothing breaks.
+    _allow_origins = ["*"]
+    _allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=_allow_credentials,
+    allow_origins=_allow_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
