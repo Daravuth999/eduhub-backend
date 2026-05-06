@@ -176,6 +176,11 @@ class BookPayload(BaseModel):
     level: str = ""
     readingMinutes: int = 6
     price: int = 0
+    # v9.2 — Library tier classification. When empty, the frontend auto-derives
+    # from price using the band: free=0, standard=1-100, premium=101-500,
+    # limited=>500. Studio editors may set this explicitly to one of:
+    # "free" | "standard" | "premium" | "limited".
+    tier: str = ""
     published: bool = True
     newUntil: str = ""
     contentType: str = ""
@@ -363,7 +368,7 @@ async def auth_logout(
 CANONICAL_BOOK_FIELDS = {
     "slug", "title", "subtitle", "author", "section", "coverEmoji",
     "coverImage", "coverGradient", "accent", "badge", "level",
-    "readingMinutes", "price", "published", "newUntil", "contentType",
+    "readingMinutes", "price", "tier", "published", "newUntil", "contentType",
     "format", "chapters", "content", "revision", "_authoredAt", "_authoredBy",
 }
 
@@ -1167,6 +1172,115 @@ PATCH_FILES: dict[str, dict] = {
         ),
         "binary": True,
     },
+    # ─── v9.2 — Surgery Patch (treasury fix + reader page-flip + tier classification) ───
+    "v92-treasury": {
+        "filename": "purchaseService.js",
+        "ext": "js",
+        "title": "Surgery — Treasury wallet ID (stu001 → stu092)",
+        "tab_label": "purchaseService.js",
+        "target_path": "src/eduhub/pages/library/books/purchaseService.js",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/books/purchaseService.js",
+        "blurb": (
+            "Single-line constant change: `TREASURY_ID` fallback flipped from "
+            "`\"stu001\"` to `\"stu092\"`. The env-var override "
+            "REACT_APP_LIBRARY_TREASURY_ID is preserved. All sendPoints / "
+            "isUnlocked / SELF_TREASURY guard logic is byte-identical to the "
+            "previous build — only the default treasury wallet identifier "
+            "changes, so points spent on paid books now correctly credit "
+            "stu092 instead of the regular student wallet."
+        ),
+    },
+    "v92-tier-service": {
+        "filename": "booksService.js",
+        "ext": "js",
+        "title": "Surgery — Library tier classifier (free / standard / premium / limited)",
+        "tab_label": "booksService.js",
+        "target_path": "src/eduhub/pages/library/books/booksService.js",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/books/booksService.js",
+        "blurb": (
+            "Adds `normalizeTier(raw, price, badge)` plus exported "
+            "`TIER_PRICE_BANDS` / `TIER_ORDER`. `normalizeBook` now stamps "
+            "`b.tier` on every book using author override → badge LIMITED → "
+            "price band (free=0, standard=1-100, premium=101-500, "
+            "limited=501+). Sheet column aliases `[tier, edition, class, "
+            "category, plan]` and the multi-row PROMOTABLE list both honour "
+            "the new field. Existing book objects without a tier column light "
+            "up automatically — zero data migration."
+        ),
+    },
+    "v92-reader": {
+        "filename": "ReaderPage.jsx",
+        "ext": "jsx",
+        "title": "Surgery — Reader: media page-flip + transcript auto-flip",
+        "tab_label": "ReaderPage.jsx",
+        "target_path": "src/eduhub/pages/library/reader/ReaderPage.jsx",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/reader/ReaderPage.jsx",
+        "blurb": (
+            "Removes `audio` / `video` / `embed` / `transcript` from "
+            "NON_SPLITTABLE_TYPES so chapters with embedded media keep "
+            "page-flipping instead of collapsing into a tall scroll. Audio "
+            "playback already survives flips through the existing "
+            "BookAudioProvider mini-player. Adds `transcriptPageMap` + "
+            "`useBookAudio` subscription that auto-advances pages following "
+            "the audio cursor when transcript blocks declare start/end "
+            "timestamps — manual page-turn (`go` / `jumpTo`) stamps "
+            "userOverrideUntilRef for ~3 s so deliberate navigation always "
+            "wins. mcq / fillblank still cluster as one sub-page."
+        ),
+    },
+    "v92-library": {
+        "filename": "LibraryPage.jsx",
+        "ext": "jsx",
+        "title": "Surgery — Library tier filter chips (Free / Standard / Premium / Limited)",
+        "tab_label": "LibraryPage.jsx",
+        "target_path": "src/eduhub/pages/library/LibraryPage.jsx",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/LibraryPage.jsx",
+        "blurb": (
+            "Two surgical inserts: (1) appends Free / Standard / Premium / "
+            "Limited chips to the existing filter row (data-testids "
+            "library-filter-{free|standard|premium|limited}); (2) extends "
+            "the filter switch-case so activeFilter ∈ {free,standard,"
+            "premium,limited} narrows shelves by `it.tier`. All other shelf "
+            "logic, search, ContinueReading, purchase flow, sync button — "
+            "preserved byte-for-byte."
+        ),
+    },
+    "v92-card": {
+        "filename": "BookCard.jsx",
+        "ext": "jsx",
+        "title": "Surgery — BookCard tier ribbon",
+        "tab_label": "BookCard.jsx",
+        "target_path": "src/eduhub/pages/library/components/BookCard.jsx",
+        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/components/BookCard.jsx",
+        "blurb": (
+            "Adds the `TIER_META` palette (free=teal · standard=blue · "
+            "premium=gold · limited=platinum-pulse), a corner tier ribbon "
+            "(data-testid card-tier-{tier}), and a `data-tier` attribute on "
+            "the card root. Limited-tier cards get a 2.4 s pulsing halo. "
+            "Free-tier cards skip the ribbon since the price chip already "
+            "labels them. All existing parallax / sheen / NEW pill / "
+            "content-type chip / lock overlay / tap-burst behaviour "
+            "untouched."
+        ),
+    },
+    "v92-server": {
+        "filename": "server.py",
+        "ext": "py",
+        "title": "Surgery — server.py BookPayload.tier + CANONICAL_BOOK_FIELDS",
+        "tab_label": "server.py",
+        "target_path": "eduhub-backend-master/server.py",
+        "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/server.py",
+        "blurb": (
+            "Two surgical additions: (1) `BookPayload.tier: str = \"\"` so "
+            "Studio can persist explicit tiers in MongoDB; (2) "
+            "`CANONICAL_BOOK_FIELDS` whitelists `\"tier\"` so the cleaned "
+            "/api/books response includes it. Existing payloads without a "
+            "tier still validate (default empty); existing books without a "
+            "tier field still serialize cleanly (omitted from response). No "
+            "change to auth, push, patches, indexes, or any /api route "
+            "behaviour."
+        ),
+    },
 }
 
 
@@ -1530,15 +1644,60 @@ async def patch_index():
     return {"patches": PATCH_FILES}
 
 
-@api.get("/patch/{key}", include_in_schema=False)
-async def patch_view(key: str):
-    """Same landing page, opened on a specific tab via URL fragment redirect."""
+def _serve_patch_payload(key: str, force_attachment: bool = False) -> Response:
+    """Shared file-fetch helper used by `{key}.ext` and `{key}/download`.
+
+    `force_attachment=True` makes the browser save instead of inline-render.
+    """
     if key not in PATCH_FILES:
         raise HTTPException(status_code=404, detail="patch key not found")
-    return Response(
-        status_code=302,
-        headers={"Location": f"/api/patch#{key}"},
-    )
+    meta = PATCH_FILES[key]
+    p = (PATCHES_DIR / meta["filename"]).resolve()
+    if PATCHES_DIR.resolve() not in p.parents:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="file missing on disk")
+
+    ext = meta["ext"].lower()
+    if meta.get("binary"):
+        media = {
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
+            "svg": "image/svg+xml",
+        }.get(ext, "application/octet-stream")
+        body: Any = p.read_bytes()
+    else:
+        media = "text/plain; charset=utf-8"
+        body = p.read_text(encoding="utf-8")
+
+    headers: dict = {}
+    if force_attachment:
+        headers["Content-Disposition"] = f'attachment; filename="{meta["filename"]}"'
+    return Response(content=body, media_type=media, headers=headers)
+
+
+# Note: dotted + /download routes are registered BEFORE `/patch/{key}` so the
+# greedy str path-param doesn't swallow the dotted form.
+@api.get("/patch/{key}.{ext}", include_in_schema=False)
+async def patch_dotted(key: str, ext: str):
+    """Plain-text raw view at /api/patch/<key>.<ext> — convenient for iPhone
+    long-press copy and curl-friendly URLs (e.g. `purchaseService.js` looks
+    like a real file path)."""
+    if key not in PATCH_FILES:
+        raise HTTPException(status_code=404, detail="patch key not found")
+    meta = PATCH_FILES[key]
+    if str(meta.get("ext", "")).lower() != ext.lower():
+        # Allow generic aliases (txt) so `…/v92-server.txt` still works.
+        if ext.lower() not in {"txt", "raw"}:
+            raise HTTPException(status_code=404, detail="ext mismatch")
+    return _serve_patch_payload(key, force_attachment=False)
+
+
+@api.get("/patch/{key}/download", include_in_schema=False)
+async def patch_download(key: str):
+    """Forces a Save-As download with the original filename — handy on
+    desktop browsers and the GitHub mobile app file-upload picker."""
+    return _serve_patch_payload(key, force_attachment=True)
 
 
 @api.get("/patch/{key}/raw", include_in_schema=False)
@@ -1565,6 +1724,17 @@ async def patch_raw(key: str):
     # Text patches — return plain text.
     return Response(content=p.read_text(encoding="utf-8"),
                     media_type="text/plain; charset=utf-8")
+
+
+@api.get("/patch/{key}", include_in_schema=False)
+async def patch_view(key: str):
+    """Same landing page, opened on a specific tab via URL fragment redirect."""
+    if key not in PATCH_FILES:
+        raise HTTPException(status_code=404, detail="patch key not found")
+    return Response(
+        status_code=302,
+        headers={"Location": f"/api/patch#{key}"},
+    )
 
 
 # --------------------------------------------------------------------------- #
