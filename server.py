@@ -1011,6 +1011,463 @@ async def push_schedule_run_due(
 
 
 # --------------------------------------------------------------------------- #
+# Points-Credit Push (Option 3) — surgical add-on, no edits above this line.   #
+# --------------------------------------------------------------------------- #
+#
+# Purpose
+# -------
+# When a student credits another student via the existing P2P `sendPoints`
+# GAS flow, the recipient's phone never receives a push because the
+# `/api/push/send-studio` endpoint is teacher-gated. This module adds a
+# new sibling endpoint POST /api/push/notify-credit that:
+#
+#   1) Re-validates the SENDER's studentId+password against the GAS Points
+#      backend (`?action=login`) with a 60-second in-process LRU cache, so
+#      we never trust the client to identify itself and never hammer GAS.
+#   2) Enforces per-pair rate limiting (max 2 fires / 5 s) — protects the
+#      Points backend and the recipient from spam.
+#   3) Server-renders a fixed bilingual Khmer + English notification body
+#      using ONLY a validated `amount` int. Title/body are NEVER accepted
+#      from the client — that would let any caller send arbitrary copy.
+#   4) Reuses the EXISTING `_fan_out_push()` helper unchanged, targeting
+#      `{"studentId": recipientStudentId}` so every device the recipient
+#      is subscribed on lights up.
+#   5) Idempotency via a unique index on `transferId` in a NEW collection
+#      `push_credit_log` (TTL 24 h). Duplicate calls return
+#      {"ok": True, "duplicate": True} without fanning out again.
+#   6) Killswitch: PUSH_CREDIT_NOTIFY_ENABLED=false → 204 No Content. Read
+#      PER-REQUEST from `os.environ` so a Render env-var flip takes effect
+#      on the next request without code redeploy.
+#   7) Audit trail in `push_history` with extra fields {source, amount,
+#      recipientStudentId, senderStudentId, transferId, killswitch}.
+#      Existing field names + types are preserved byte-for-byte so the
+#      Author Studio history UI keeps rendering today's rows. New rows
+#      use `sentBy="credit-push:{senderId}"` so Studio's per-teacher
+#      filter (`sentBy == user.email`) silently excludes them — only
+#      super-admins see them in the Studio history view.
+#   8) Recipient-side dedupe: when `<PointsCreditPushBridge />` fires for
+#      a credit that the sender already pushed (P2P primary path), we
+#      detect the recent `credit-p2p` row for the same recipient+amount
+#      and short-circuit so the recipient's phone only buzzes ONCE per
+#      transfer. Without this, a single P2P transfer would surface two
+#      pushes (sender modal → primary; recipient bridge → fallback ~12 s
+#      later via usePoints poll → duplicate) because the legacy
+#      `myportal-latest-reward` storage shape never persisted the
+#      `from` field.
+#
+# Nothing above this line was modified. The /api/push/send-studio,
+# /api/push/_diag, _fan_out_push(), _build_target_query() helpers and
+# every other /api/push/* route, env var, and collection remain untouched.
+
+import asyncio
+import hashlib
+import re as _re_credit
+import time as _time_credit
+from collections import deque
+from datetime import timedelta as _credit_timedelta
+from typing import Deque
+
+push_credit_log = db["push_credit_log"]
+
+
+def _credit_killswitch_enabled() -> bool:
+    """Per-request killswitch read. Flipping PUSH_CREDIT_NOTIFY_ENABLED in
+    Render env vars takes effect on the next call (Render auto-restart
+    re-imports the module, but even within the same process this stays
+    fresh because we read os.environ on every call)."""
+    return (
+        os.environ.get("PUSH_CREDIT_NOTIFY_ENABLED", "true").strip().lower()
+        == "true"
+    )
+
+
+# GAS Points backend login endpoint. Falls back to the same URL the frontend
+# already exposes publicly via src/eduhub/pages/portal/lib/api.ts so a fresh
+# deploy works without operator intervention. Override in Render env vars
+# to point at a different deployment.
+GAS_POINTS_LOGIN_URL = os.environ.get(
+    "GAS_POINTS_LOGIN_URL",
+    "https://script.google.com/macros/s/AKfycbzRktKyql2I_FbPESNRpCrFDlse-qNd9_Opv9si-g-j2lcanOUPP49IzcyA59lFqVycdA/exec",
+)
+
+# In-process credential cache. Key: sha256(studentId + ":" + password).
+# Value: (expires_at_epoch_seconds, ok_bool). 60 s TTL.
+_CREDIT_CRED_CACHE: dict[str, tuple[float, bool]] = {}
+_CREDIT_CRED_TTL = 60.0
+_CREDIT_CRED_MAX = 1024  # bound the dict so it can't grow unbounded
+
+# In-process per-pair rate limiter. Key: (senderStudentId, recipientStudentId).
+# Value: deque of recent fire timestamps (epoch seconds).
+_CREDIT_RATE_BUCKETS: dict[tuple[str, str], Deque[float]] = {}
+_CREDIT_RATE_WINDOW_S = 5.0
+_CREDIT_RATE_MAX_PER_WINDOW = 2
+
+# Recipient-bridge dedupe window — see __doc__ above.
+_CREDIT_DEDUPE_WINDOW_S = 60
+
+# Last successful fire timestamp — surfaced via /_diag for ops visibility.
+_CREDIT_LAST_FIRE_AT: datetime | None = None
+
+# Lazy index creation — `asyncio.Lock()` is created on first use so the
+# module imports cleanly on Python versions where module-level Lock()
+# instantiation behaves differently (3.10+ is fine, but defensive coding
+# keeps boot strictly side-effect-free).
+_CREDIT_INDEXES_READY = False
+_CREDIT_INDEX_LOCK: asyncio.Lock | None = None
+
+_CREDIT_ID_RE = _re_credit.compile(r"^[A-Za-z0-9_-]+$")
+
+
+async def _ensure_credit_indexes() -> None:
+    """Create unique index on transferId + 24 h TTL on createdAt. Idempotent.
+    Lazy-init the asyncio Lock so module load has zero side effects."""
+    global _CREDIT_INDEXES_READY, _CREDIT_INDEX_LOCK
+    if _CREDIT_INDEXES_READY:
+        return
+    if _CREDIT_INDEX_LOCK is None:
+        # Tiny race window here is benign because create_index is idempotent.
+        _CREDIT_INDEX_LOCK = asyncio.Lock()
+    async with _CREDIT_INDEX_LOCK:
+        if _CREDIT_INDEXES_READY:
+            return
+        try:
+            await push_credit_log.create_index("transferId", unique=True)
+            await push_credit_log.create_index(
+                "createdAt", expireAfterSeconds=86400
+            )
+            _CREDIT_INDEXES_READY = True
+            log.info("credit-push: push_credit_log indexes ready")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("credit-push: index create failed: %s", str(exc)[:200])
+
+
+def _credit_cache_key(student_id: str, password: str) -> str:
+    return hashlib.sha256(
+        f"{student_id}:{password}".encode("utf-8")
+    ).hexdigest()
+
+
+def _credit_cache_get(key: str) -> bool | None:
+    rec = _CREDIT_CRED_CACHE.get(key)
+    if not rec:
+        return None
+    expires_at, ok = rec
+    if _time_credit.time() >= expires_at:
+        _CREDIT_CRED_CACHE.pop(key, None)
+        return None
+    return ok
+
+
+def _credit_cache_put(key: str, ok: bool) -> None:
+    if len(_CREDIT_CRED_CACHE) > _CREDIT_CRED_MAX:
+        # Cheap eviction — drop expired entries first.
+        now_ts = _time_credit.time()
+        stale = [k for k, (exp, _) in _CREDIT_CRED_CACHE.items() if exp <= now_ts]
+        for k in stale[:128]:
+            _CREDIT_CRED_CACHE.pop(k, None)
+    _CREDIT_CRED_CACHE[key] = (_time_credit.time() + _CREDIT_CRED_TTL, ok)
+
+
+def _credit_rate_check(sender_id: str, recipient_id: str) -> bool:
+    """Return True if the (sender, recipient) pair is within the rate budget."""
+    pair = (sender_id, recipient_id)
+    now_ts = _time_credit.time()
+    bucket = _CREDIT_RATE_BUCKETS.setdefault(pair, deque())
+    while bucket and (now_ts - bucket[0]) > _CREDIT_RATE_WINDOW_S:
+        bucket.popleft()
+    if len(bucket) >= _CREDIT_RATE_MAX_PER_WINDOW:
+        return False
+    bucket.append(now_ts)
+    if len(_CREDIT_RATE_BUCKETS) > 4096:
+        for k in list(_CREDIT_RATE_BUCKETS.keys())[:512]:
+            if not _CREDIT_RATE_BUCKETS[k]:
+                _CREDIT_RATE_BUCKETS.pop(k, None)
+    return True
+
+
+async def _credit_revalidate_with_gas(student_id: str, password: str) -> bool:
+    """Confirm (studentId, password) against GAS PointsBackend `?action=login`.
+
+    Mirrors the client's POST-then-GET fallback so we work against both the
+    secured and legacy GAS deployments. Returns True iff the response carries
+    `{"success": true}`. Never raises — callers translate False into 401.
+    """
+    cache_key = _credit_cache_key(student_id, password)
+    cached = _credit_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    if not GAS_POINTS_LOGIN_URL:
+        return False
+
+    ok = False
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=4.0),
+            follow_redirects=True,
+        ) as cli:
+            try:
+                r1 = await cli.post(
+                    GAS_POINTS_LOGIN_URL,
+                    data={"action": "login", "id": student_id, "password": password},
+                )
+                if r1.status_code == 200:
+                    try:
+                        j1 = r1.json()
+                        if isinstance(j1, dict) and j1.get("success") is True:
+                            ok = True
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+
+            if not ok:
+                try:
+                    r2 = await cli.get(
+                        GAS_POINTS_LOGIN_URL,
+                        params={
+                            "action": "login",
+                            "id": student_id,
+                            "password": password,
+                            "t": str(int(_time_credit.time() * 1000)),
+                        },
+                    )
+                    if r2.status_code == 200:
+                        try:
+                            j2 = r2.json()
+                            if isinstance(j2, dict) and j2.get("success") is True:
+                                ok = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "credit-push: GAS login revalidation error: %s",
+            str(exc)[:200],
+        )
+        ok = False
+
+    _credit_cache_put(cache_key, ok)
+    return ok
+
+
+async def _credit_recent_p2p_exists(recipient_id: str, amount: int) -> bool:
+    """Has a `credit-p2p` row landed in push_history for this (recipient, amount)
+    within the last _CREDIT_DEDUPE_WINDOW_S seconds? Used to suppress a
+    recipient-bridge fire when the sender's modal already pushed the same
+    credit. Looks at sentAt + recipientStudentId + amount + source — all
+    additive fields we own, so the query is fast and non-colliding."""
+    cutoff = datetime.now(timezone.utc) - _credit_timedelta(
+        seconds=_CREDIT_DEDUPE_WINDOW_S
+    )
+    try:
+        existing = await push_history.find_one(
+            {
+                "source": "credit-p2p",
+                "recipientStudentId": recipient_id,
+                "amount": amount,
+                "sentAt": {"$gte": cutoff},
+            },
+            {"_id": 1},
+        )
+        return existing is not None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("credit-push: dedupe lookup error: %s", str(exc)[:200])
+        return False
+
+
+class PushNotifyCreditPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    senderStudentId: str
+    senderPassword: str
+    recipientStudentId: str
+    amount: int
+    transferId: str | None = None
+
+
+def _credit_validate_id(value: str, label: str) -> str:
+    if not value or not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"{label} required")
+    v = value.strip()
+    if not v or len(v) > 64 or not _CREDIT_ID_RE.match(v):
+        raise HTTPException(status_code=400, detail=f"{label} invalid")
+    return v
+
+
+@api.post("/push/notify-credit")
+async def push_notify_credit(
+    payload: PushNotifyCreditPayload,
+    request: Request,
+):
+    """Fire a server-rendered Khmer+English credit notification to the
+    recipient's subscribed devices. Used by both the sender's client (P2P
+    primary path) and the recipient's <PointsCreditPushBridge /> fallback
+    for non-P2P credits. Killswitch + rate-limit + auth + dedupe + idempotency
+    + audit. See the module docstring above for the full design rationale."""
+    global _CREDIT_LAST_FIRE_AT
+
+    # ---- Killswitch (per-request) — bypasses every side effect below. ---
+    if not _credit_killswitch_enabled():
+        return Response(status_code=204)
+
+    if not GAS_POINTS_LOGIN_URL:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GAS_POINTS_LOGIN_URL not configured — set the env var to "
+                "the PointsBackend exec URL and redeploy."
+            ),
+        )
+
+    await _ensure_credit_indexes()
+
+    # ---- Validation -------------------------------------------------------
+    sender_id = _credit_validate_id(payload.senderStudentId, "senderStudentId")
+    recipient_id = _credit_validate_id(
+        payload.recipientStudentId, "recipientStudentId"
+    )
+    if not isinstance(payload.amount, int) or payload.amount < 1 or payload.amount > 100000:
+        raise HTTPException(status_code=400, detail="amount must be int in 1..100000")
+    pwd = (payload.senderPassword or "").strip()
+    if not pwd or len(pwd) > 128:
+        raise HTTPException(status_code=400, detail="senderPassword required")
+
+    transfer_id = (payload.transferId or "").strip()
+    if not transfer_id:
+        transfer_id = (
+            f"{sender_id}:{recipient_id}:{payload.amount}:{int(_time_credit.time())}"
+        )
+    if len(transfer_id) > 128:
+        raise HTTPException(status_code=400, detail="transferId too long")
+
+    is_self_detect = sender_id == recipient_id
+
+    # ---- Rate limit (per pair) -------------------------------------------
+    if not _credit_rate_check(sender_id, recipient_id):
+        raise HTTPException(status_code=429, detail="rate-limited")
+
+    # ---- Auth: revalidate sender against GAS (cached 60 s) ---------------
+    auth_ok = await _credit_revalidate_with_gas(sender_id, pwd)
+    if not auth_ok:
+        raise HTTPException(status_code=401, detail="sender auth failed")
+
+    # ---- Recipient-bridge dedupe -----------------------------------------
+    # Only the recipient-side fallback (sender == recipient) can collide
+    # with a sender-side P2P fire. Skip the fan-out + audit if a recent
+    # credit-p2p row already covered this recipient+amount.
+    if is_self_detect and await _credit_recent_p2p_exists(
+        recipient_id, payload.amount
+    ):
+        return {"sent": 0, "failed": 0, "duplicate": True, "deduped": "p2p-recent"}
+
+    # ---- Idempotency: insert log row first; duplicate → no fan-out -------
+    now_dt = datetime.now(timezone.utc)
+    try:
+        await push_credit_log.insert_one({
+            "transferId": transfer_id,
+            "senderStudentId": sender_id,
+            "recipientStudentId": recipient_id,
+            "amount": payload.amount,
+            "createdAt": now_dt,
+        })
+    except Exception as exc:  # noqa: BLE001
+        if "duplicate" in str(exc).lower() or "E11000" in str(exc):
+            return {"ok": True, "duplicate": True, "sent": 0, "failed": 0}
+        log.warning(
+            "credit-push: log insert error tid=%s err=%s",
+            transfer_id[:60], str(exc)[:200],
+        )
+        raise HTTPException(status_code=500, detail="log insert failed")
+
+    # ---- Server-rendered Khmer + English template ------------------------
+    title = f"\U0001F389 +{payload.amount} ពិន្ទុ"
+    body = (
+        f"+{payload.amount}ពិន្ទុ ត្រូវបានបញ្ចូលទៅក្នុងគណនីរបស់អ្នក។ "
+        f"ខិតខំប្រឹងប្រែងបន្តទៀត!\n"
+        f"+{payload.amount} Points added to your account. "
+        f"Keep learning and unlock more rewards!"
+    )
+    url_target = "/portal/me"
+
+    # ---- Fan out via the EXISTING helper (unchanged) ---------------------
+    sent, failed = await _fan_out_push(
+        {"studentId": recipient_id}, title, body, url_target,
+    )
+
+    # ---- Audit row in push_history (matches existing shape + extras) -----
+    source = "credit-detect" if is_self_detect else "credit-p2p"
+    history_doc = {
+        "title": title,
+        "body": body,
+        "url": url_target,
+        "target": "students",
+        "studentIds": [recipient_id],
+        "group": "",
+        "sentBy": f"credit-push:{sender_id}",
+        "sentAt": now_dt,
+        "sent": sent,
+        "failed": failed,
+        # Extra fields — additive, never collide with existing schema.
+        "source": source,
+        "amount": payload.amount,
+        "recipientStudentId": recipient_id,
+        "senderStudentId": sender_id,
+        "transferId": transfer_id,
+        "killswitch": False,
+    }
+    try:
+        await push_history.insert_one(history_doc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "credit-push: history insert error tid=%s err=%s",
+            transfer_id[:60], str(exc)[:200],
+        )
+
+    _CREDIT_LAST_FIRE_AT = now_dt
+    log.info(
+        "credit-push: sent=%d failed=%d source=%s amount=%d recipient=%s sender=%s",
+        sent, failed, source, payload.amount, recipient_id[:32], sender_id[:32],
+    )
+    return {"sent": sent, "failed": failed, "duplicate": False}
+
+
+@api.get("/push/notify-credit/_diag")
+async def push_notify_credit_diag():
+    """Public health probe — only counts/booleans, never secrets."""
+    await _ensure_credit_indexes()
+    try:
+        total = await push_credit_log.count_documents({})
+    except Exception:  # noqa: BLE001
+        total = -1
+    try:
+        history_p2p = await push_history.count_documents({"source": "credit-p2p"})
+    except Exception:  # noqa: BLE001
+        history_p2p = -1
+    try:
+        history_detect = await push_history.count_documents(
+            {"source": "credit-detect"}
+        )
+    except Exception:  # noqa: BLE001
+        history_detect = -1
+    return {
+        "enabled": _credit_killswitch_enabled(),
+        "credit_log_total": total,
+        "rate_limit_keys_in_memory": len(_CREDIT_RATE_BUCKETS),
+        "credential_cache_size": len(_CREDIT_CRED_CACHE),
+        "last_fire_at": (
+            _CREDIT_LAST_FIRE_AT.isoformat() if _CREDIT_LAST_FIRE_AT else None
+        ),
+        "history_credit_p2p_total": history_p2p,
+        "history_credit_detect_total": history_detect,
+        "gas_points_login_url_present": bool(GAS_POINTS_LOGIN_URL),
+        "indexes_ready": _CREDIT_INDEXES_READY,
+        "dedupe_window_seconds": _CREDIT_DEDUPE_WINDOW_S,
+    }
+
+
+
+
+# --------------------------------------------------------------------------- #
 # Patch landing page — serves the Push Studio deliverable files                #
 # --------------------------------------------------------------------------- #
 PATCHES_DIR = ROOT_DIR / "patches"
