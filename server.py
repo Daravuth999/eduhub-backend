@@ -477,6 +477,21 @@ async def studio_save_book(payload: BookPayload, admin: User = Depends(require_a
 @api.post("/studio/books/{slug}/publish")
 async def studio_publish(slug: str, admin: User = Depends(require_admin)):
     res = await db.books.update_many({"slug": slug}, {"$set": {"published": True}})
+
+    # ---- Feature 4: notify all subscribers when a new book is published ----
+    # Surgical addition: never blocks publish on push failure.
+    try:
+        if res.modified_count > 0:
+            book_title = slug.replace("-", " ").title()
+            await _fan_out_push(
+                {},  # everyone
+                title="New lesson available!",
+                body=f"{book_title} is now in your library. Start reading!",
+                url="/library",
+            )
+    except Exception:  # noqa: BLE001
+        pass  # push failure never blocks publish
+
     return {"success": True, "matched": res.matched_count, "modified": res.modified_count}
 
 
@@ -2192,6 +2207,145 @@ async def patch_view(key: str):
         status_code=302,
         headers={"Location": f"/api/patch#{key}"},
     )
+
+
+# --------------------------------------------------------------------------- #
+# Teacher-block push helpers (surgical additions, gated by require_admin       #
+# until require_teacher dependency arrives in the teacher block merge).        #
+#                                                                              #
+# These endpoints are NEW. They do not modify any existing route, do not       #
+# write to push_subscriptions, and only CALL the existing _fan_out_push        #
+# helper unchanged. They are designed so the future teacher block can call     #
+# them internally OR be merged cleanly without further changes here.           #
+# --------------------------------------------------------------------------- #
+class TeacherPushPointsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    delta: int
+
+
+class TeacherPushRestrictionPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    message: str | None = None
+
+
+class TeacherPushReminderPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    message: str | None = None
+
+
+class TeacherPushSpeakingPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    group: Literal["A", "B", "all"] = "all"
+
+
+# Feature 1 — Teacher Awards Points -> Auto Push
+@api.post("/teacher/students/{student_id}/push-points")
+async def teacher_push_points(
+    student_id: str,
+    payload: TeacherPushPointsPayload,
+    user: User = Depends(require_admin),
+):
+    """Fire push to a single student after their points were adjusted.
+    Wrapped in try/except — push failure must never break the points save flow."""
+    try:
+        if payload.delta > 0:
+            sent, failed = await _fan_out_push(
+                {"studentId": student_id},
+                title="Points credited!",
+                body=f"You received +{payload.delta} points. Keep it up!",
+                url="/portal",
+            )
+        else:
+            sent, failed = await _fan_out_push(
+                {"studentId": student_id},
+                title="Points updated",
+                body=f"Your points were adjusted by {payload.delta}.",
+                url="/portal",
+            )
+        return {"ok": True, "sent": sent, "failed": failed}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("teacher push-points failed for %s: %s", student_id, exc)
+        return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
+
+
+# Feature 2 — Restriction Warning Push
+@api.post("/teacher/students/{student_id}/push-restriction")
+async def teacher_push_restriction(
+    student_id: str,
+    payload: TeacherPushRestrictionPayload,
+    user: User = Depends(require_admin),
+):
+    """Fire push when a teacher sets a restriction on a student.
+    Wrapped in try/except — push failure must never break the scores save flow."""
+    try:
+        body_text = (payload.message or "").strip() or (
+            "Your account has been restricted. Contact your teacher."
+        )
+        sent, failed = await _fan_out_push(
+            {"studentId": student_id},
+            title="Account restricted",
+            body=body_text,
+            url="/portal",
+        )
+        return {"ok": True, "sent": sent, "failed": failed}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("teacher push-restriction failed for %s: %s", student_id, exc)
+        return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
+
+
+# Feature 3 — Tuition Reminder Button
+@api.post("/teacher/students/{student_id}/push-reminder")
+async def teacher_push_reminder(
+    student_id: str,
+    payload: TeacherPushReminderPayload,
+    user: User = Depends(require_admin),
+):
+    """Send a tuition reminder push to a single student. Used by:
+      - the teacher's StudentEditDrawer (Payment tab) when merged later
+      - the Quick Push tab in PushStudio for arbitrary student IDs (Feature 6)
+    """
+    try:
+        body_text = (payload.message or "").strip() or (
+            "Your tuition payment is overdue. Please settle today."
+        )
+        sent, failed = await _fan_out_push(
+            {"studentId": student_id},
+            title="Tuition reminder",
+            body=body_text,
+            url="/portal",
+        )
+        return {"ok": True, "sent": sent, "failed": failed}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("teacher push-reminder failed for %s: %s", student_id, exc)
+        return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
+
+
+# Feature 6 — Speaking Test Results Ready Push
+@api.post("/teacher/push/speaking-results")
+async def teacher_push_speaking_results(
+    payload: TeacherPushSpeakingPayload,
+    user: User = Depends(require_admin),
+):
+    """Fan-out a 'speaking test results are ready' push to a group of students.
+    group="A" -> {"group": "A"}, "B" -> {"group": "B"}, "all" -> {} (everyone).
+    """
+    try:
+        if payload.group == "A":
+            query: dict = {"group": "A"}
+        elif payload.group == "B":
+            query = {"group": "B"}
+        else:
+            query = {}
+        sent, failed = await _fan_out_push(
+            query,
+            title="Speaking test results are ready",
+            body="Your speaking test results are ready. Check your portal now!",
+            url="/portal",
+        )
+        return {"ok": True, "sent": sent, "failed": failed}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("teacher push speaking-results failed: %s", exc)
+        return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
 
 
 # --------------------------------------------------------------------------- #
