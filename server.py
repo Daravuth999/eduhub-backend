@@ -2351,6 +2351,8 @@ async def teacher_push_speaking_results(
 # --------------------------------------------------------------------------- #
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
+from restriction_realtime import build_router as _build_status_router
+app.include_router(_build_status_router(db, _fan_out_push, require_admin))
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
