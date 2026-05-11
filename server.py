@@ -629,7 +629,9 @@ def _build_target_query(target: str, studentIds: list[str], group: str | None) -
         ids = [s for s in (studentIds or []) if s]
         if not ids:
             return {"studentId": {"$in": []}}
-        return {"studentId": {"$in": ids}}
+        # Case-insensitive: teacher may type STU094 but subscription stores stu094.
+        import re as _re
+        return {"$or": [{"studentId": {"$regex": f"^{_re.escape(i)}$", "$options": "i"}} for i in ids]}
     if target == "group":
         return {"group": group or ""}
     return {}
