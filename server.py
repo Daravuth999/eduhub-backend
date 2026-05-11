@@ -622,16 +622,58 @@ class PushSchedulePayload(BaseModel):
 
 
 def _build_target_query(target: str, studentIds: list[str], group: str | None) -> dict:
-    """Translate target spec → MongoDB query for push_subscriptions."""
+    """Translate target spec → MongoDB query for push_subscriptions.
+
+    Surgical fix (Push Studio "By Student ID = 0 subscribers" bug):
+      * The teacher's textarea, the on-disk `studentId` field, and the
+        student's login `cleanId` are NOT guaranteed to share the same
+        casing or whitespace (AuthContext.jsx only `.trim()`s on login —
+        it never lowercases — so `push_subscriptions.studentId` may be
+        stored as `stu094`, `STU094`, `Stu094`, or even `" stu094 "`
+        depending on what was typed at first login).
+      * Previous attempt used a strict anchored regex `^stu094$/i` which
+        DID handle case differences but still missed any subscription
+        whose stored value had stray whitespace.
+      * `everyone` and `group` paths are intentionally left byte-identical
+        with the prior implementation — only the `students` branch is
+        touched.
+    """
     if target == "everyone":
         return {}
     if target == "students":
-        ids = [s for s in (studentIds or []) if s]
-        if not ids:
+        # Strip every typed ID, drop empties, then de-duplicate while
+        # preserving the original casing for logging clarity.
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in (studentIds or []):
+            if not isinstance(raw, str):
+                continue
+            s = raw.strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(s)
+        if not cleaned:
             return {"studentId": {"$in": []}}
-        # Case-insensitive: teacher may type STU094 but subscription stores stu094.
+        # Whitespace- AND case-insensitive match: allows the stored
+        # value to have leading / trailing whitespace AND any casing
+        # variant (the AuthContext login flow does not normalise case
+        # before subscribing).
         import re as _re
-        return {"$or": [{"studentId": {"$regex": f"^{_re.escape(i)}$", "$options": "i"}} for i in ids]}
+        return {
+            "$or": [
+                {
+                    "studentId": {
+                        "$regex": rf"^\s*{_re.escape(s)}\s*$",
+                        "$options": "i",
+                    }
+                }
+                for s in cleaned
+            ]
+        }
     if target == "group":
         return {"group": group or ""}
     return {}
