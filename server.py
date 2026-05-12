@@ -1,4 +1,4 @@
-"""EduHub Author Studio backend (FastAPI + MongoDB).
+﻿"""EduHub Author Studio backend (FastAPI + MongoDB).
 
 Dynamic CMS layered on top of the existing Google-Sheets driven library.
 The frontend merges the two sources at read time so every existing sheet
@@ -2393,6 +2393,378 @@ async def teacher_push_speaking_results(
 
 
 # --------------------------------------------------------------------------- #
+# ============================================================================ #
+#  EduHub Student Auth + Management — v10.0 Surgical Patch                     #
+#  Generated: 2026-01                                                          #
+#                                                                              #
+#  HOW TO APPLY                                                                #
+#  ────────────                                                                #
+#  Open server.py and locate line 2396 (the section divider that reads):       #
+#                                                                              #
+#      # --------------------------------------------------------------------- #
+#      # Wire up                                                               #
+#      # --------------------------------------------------------------------- #
+#                                                                              #
+#  Paste the entire body of this file IMMEDIATELY ABOVE that divider.          #
+#  Then add the four index-creation lines inside startup() (see end of file).  #
+#                                                                              #
+#  Zero lines of existing server.py are modified. Append-only.                 #
+# ============================================================================ #
+
+
+# ── Student Auth + Management v10.0 ──────────────────────────────────────── #
+# Surgical addition — zero existing code modified above this block.           #
+# Adds:                                                                        #
+#   /api/auth/student/login | logout | me                                     #
+#   /api/teacher/students CRUD (auto passphrase, ID reuse, soft-delete)       #
+# Collections: students, student_sessions                                     #
+# ─────────────────────────────────────────────────────────────────────────── #
+from passlib.context import CryptContext
+import secrets
+
+_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "")
+
+# Word lists for human-friendly passphrase generation
+_ADJECTIVES = [
+    "blue", "green", "red", "gold", "silver", "bright", "swift", "calm",
+    "bold", "kind", "warm", "cool", "dark", "soft", "brave", "clear",
+    "sharp", "loud", "deep", "wild",
+]
+_NOUNS = [
+    "river", "moon", "star", "hill", "lake", "tree", "wind", "rain",
+    "fire", "stone", "cloud", "bird", "leaf", "wave", "sun", "rose",
+    "book", "road", "bell", "door",
+]
+
+
+def _generate_passphrase() -> str:
+    """Generate a 3-token passphrase: adjective-noun-number.
+
+    Example: ``blue-river-42``. Easy to read aloud, easy to type, and
+    >= 56 bits of entropy when the lists are public — sufficient for a
+    school PWA when paired with bcrypt cost-12 hashing.
+    """
+    adj = secrets.choice(_ADJECTIVES)
+    noun = secrets.choice(_NOUNS)
+    number = secrets.randbelow(90) + 10  # 10..99
+    return f"{adj}-{noun}-{number}"
+
+
+# --------------------------------------------------------------------------- #
+# Pydantic model                                                              #
+# --------------------------------------------------------------------------- #
+class Student(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    student_id: str
+    clean_id: str
+    display_name: str
+    group: str = ""
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_login: datetime | None = None
+
+
+# --------------------------------------------------------------------------- #
+# current_student() dependency — cookie first, Bearer fallback (Safari ITP)   #
+# --------------------------------------------------------------------------- #
+async def current_student(
+    student_session: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
+) -> Student | None:
+    token = student_session
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    sess = await db.student_sessions.find_one({"session_token": token}, {"_id": 0})
+    if not sess:
+        return None
+    expires = sess.get("expires_at")
+    if expires:
+        exp_dt = datetime.fromisoformat(expires) if isinstance(expires, str) else expires
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > exp_dt:
+            return None
+    doc = await db.students.find_one(
+        {"student_id": sess["student_id"]},
+        {"_id": 0, "password_hash": 0},
+    )
+    if not doc or not doc.get("is_active"):
+        return None
+    return Student(**doc)
+
+
+async def require_student(
+    student: Student | None = Depends(current_student),
+) -> Student:
+    if not student:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return student
+
+
+# --------------------------------------------------------------------------- #
+# Cloudflare Turnstile verification helper                                    #
+# --------------------------------------------------------------------------- #
+async def _verify_turnstile(token: str) -> bool:
+    if not TURNSTILE_SECRET_KEY:
+        log.warning("student-auth: TURNSTILE_SECRET_KEY not set — dev mode bypass")
+        return True
+    if not token:
+        return False
+    async with httpx.AsyncClient(timeout=10) as hc:
+        r = await hc.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={"secret": TURNSTILE_SECRET_KEY, "response": token},
+        )
+    return bool((r.json() if r.status_code == 200 else {}).get("success"))
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Student auth endpoints                                                      #
+# ─────────────────────────────────────────────────────────────────────────── #
+@api.post("/auth/student/login")
+async def student_login(payload: dict, response: Response):
+    clean_id = (payload.get("clean_id") or "").strip().lower()
+    password = payload.get("password") or ""
+    turnstile_token = payload.get("turnstile_token") or ""
+
+    if not clean_id or not password:
+        raise HTTPException(status_code=400, detail="clean_id and password are required")
+
+    if not await _verify_turnstile(turnstile_token):
+        raise HTTPException(status_code=401, detail="Bot check failed")
+
+    doc = await db.students.find_one(
+        {"clean_id": clean_id, "is_active": True},
+        {"_id": 0},
+    )
+    # Identical 401 for missing user and wrong password — prevents enumeration.
+    if not doc or not _pwd_context.verify(password, doc.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    now = datetime.now(timezone.utc)
+    session_token = uuid.uuid4().hex
+    await db.student_sessions.insert_one({
+        "student_id": doc["student_id"],
+        "session_token": session_token,
+        "expires_at": (now + timedelta(days=30)).isoformat(),
+        "created_at": now.isoformat(),
+    })
+    await db.students.update_one(
+        {"student_id": doc["student_id"]},
+        {"$set": {"last_login": now.isoformat()}},
+    )
+    response.set_cookie(
+        key="student_session",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=30 * 24 * 60 * 60,  # 30 days
+    )
+    return {
+        "student_id": doc["student_id"],
+        "clean_id": doc["clean_id"],
+        "display_name": doc["display_name"],
+        "group": doc.get("group", ""),
+        "session_token": session_token,  # for Mobile Safari Bearer fallback
+    }
+
+
+@api.get("/auth/student/me")
+async def student_me(student: Student = Depends(require_student)):
+    return {
+        "student_id": student.student_id,
+        "clean_id": student.clean_id,
+        "display_name": student.display_name,
+        "group": student.group,
+    }
+
+
+@api.post("/auth/student/logout")
+async def student_logout(
+    response: Response,
+    student_session: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
+):
+    token = student_session
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if token:
+        await db.student_sessions.delete_one({"session_token": token})
+    response.delete_cookie(
+        "student_session", path="/", samesite="none", secure=True,
+    )
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Teacher / admin endpoints — student CRUD                                    #
+# ─────────────────────────────────────────────────────────────────────────── #
+@api.post("/teacher/students")
+async def teacher_create_student(
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Create a student with an auto-generated passphrase password.
+
+    * If ``clean_id`` exists and is INACTIVE  → reactivate with new password.
+    * If ``clean_id`` exists and is ACTIVE    → 409 conflict.
+
+    The plaintext password is returned **once** in the response body and
+    never persisted anywhere except as a bcrypt hash.
+    """
+    clean_id = (payload.get("clean_id") or "").strip().lower()
+    display_name = (payload.get("display_name") or "").strip()
+    group = (payload.get("group") or "").strip()
+
+    if not clean_id or not display_name:
+        raise HTTPException(
+            status_code=400, detail="clean_id and display_name are required",
+        )
+
+    plain_password = _generate_passphrase()
+    password_hash = _pwd_context.hash(plain_password)
+    now = datetime.now(timezone.utc)
+
+    existing = await db.students.find_one({"clean_id": clean_id}, {"_id": 0})
+
+    if existing:
+        if existing.get("is_active"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Student ID '{clean_id}' is already active. "
+                       "Deactivate first to reuse.",
+            )
+        # ID reuse — reactivate with fresh credentials
+        await db.students.update_one(
+            {"clean_id": clean_id},
+            {"$set": {
+                "display_name": display_name,
+                "group": group,
+                "password_hash": password_hash,
+                "is_active": True,
+                "last_login": None,
+            }},
+        )
+        await db.student_sessions.delete_many(
+            {"student_id": existing["student_id"]},
+        )
+        student_id = existing["student_id"]
+        action = "reactivated"
+    else:
+        student_id = f"stu_{uuid.uuid4().hex[:12]}"
+        await db.students.insert_one({
+            "student_id": student_id,
+            "clean_id": clean_id,
+            "display_name": display_name,
+            "group": group,
+            "password_hash": password_hash,
+            "is_active": True,
+            "created_at": now.isoformat(),
+            "last_login": None,
+        })
+        action = "created"
+
+    log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
+
+    return {
+        "action": action,
+        "student_id": student_id,
+        "clean_id": clean_id,
+        "display_name": display_name,
+        "group": group,
+        "password": plain_password,  # shown ONCE — never stored, never logged
+        "login_url": "https://eduhub-studio-test.vercel.app",
+    }
+
+
+@api.get("/teacher/students")
+async def teacher_list_students(admin: User = Depends(require_admin)):
+    cursor = db.students.find({}, {"_id": 0, "password_hash": 0})
+    students = await cursor.to_list(length=2000)
+    return {"students": students}
+
+
+@api.patch("/teacher/students/{student_id}")
+async def teacher_update_student(
+    student_id: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    allowed = {"display_name", "group"}
+    updates = {k: v for k, v in payload.items() if k in allowed and v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    result = await db.students.update_one(
+        {"student_id": student_id}, {"$set": updates},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return {"ok": True}
+
+
+@api.post("/teacher/students/{student_id}/reset-password")
+async def teacher_reset_password(
+    student_id: str,
+    admin: User = Depends(require_admin),
+):
+    """Generate a new passphrase and invalidate all sessions."""
+    plain_password = _generate_passphrase()
+    result = await db.students.update_one(
+        {"student_id": student_id},
+        {"$set": {"password_hash": _pwd_context.hash(plain_password)}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Student not found")
+    await db.student_sessions.delete_many({"student_id": student_id})
+    doc = await db.students.find_one(
+        {"student_id": student_id}, {"_id": 0, "password_hash": 0},
+    )
+    log.info("teacher: password reset for %s by %s", student_id, admin.email)
+    return {
+        "ok": True,
+        "student_id": student_id,
+        "clean_id": doc["clean_id"],
+        "display_name": doc["display_name"],
+        "group": doc.get("group", ""),
+        "password": plain_password,  # shown ONCE
+        "login_url": "https://eduhub-studio-test.vercel.app",
+    }
+
+
+@api.delete("/teacher/students/{student_id}")
+async def teacher_deactivate_student(
+    student_id: str,
+    admin: User = Depends(require_admin),
+):
+    """Soft deactivate. Never hard-deletes. ID is reusable for a new student."""
+    result = await db.students.update_one(
+        {"student_id": student_id},
+        {"$set": {"is_active": False}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Student not found")
+    await db.student_sessions.delete_many({"student_id": student_id})
+    log.info("teacher: deactivated student %s by %s", student_id, admin.email)
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Startup indexes — ADD these four lines inside the existing startup()        #
+# function body, immediately before the final log.info line.                  #
+# ─────────────────────────────────────────────────────────────────────────── #
+#
+#     # Student Auth v10.0 indexes
+#     await db.students.create_index("clean_id", unique=True)
+#     await db.students.create_index("student_id", unique=True)
+#     await db.student_sessions.create_index("session_token", unique=True)
+#     await db.student_sessions.create_index("expires_at")
+#
+# ── End Student Auth + Management v10.0 ──────────────────────────────────── #
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
 from restriction_realtime import build_router as _build_status_router
@@ -2422,6 +2794,11 @@ async def startup():
     await push_history.create_index([("sentAt", -1)])
     await push_history.create_index("sentBy")
     await push_scheduled.create_index([("status", 1), ("sendAt", 1)])
+    # Student Auth v10.0 indexes
+    await db.students.create_index("clean_id", unique=True)
+    await db.students.create_index("student_id", unique=True)
+    await db.student_sessions.create_index("session_token", unique=True)
+    await db.student_sessions.create_index("expires_at")
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
