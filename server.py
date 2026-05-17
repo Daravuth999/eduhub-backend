@@ -4065,17 +4065,19 @@ async def delete_coupon(code: str, admin: User = Depends(require_admin)):
 # ── Student endpoints ────────────────────────────────────────────────────
 
 @api.post("/coupons/validate")
-async def validate_coupon(payload: dict, student: "Student" = Depends(require_student)):
+async def validate_coupon(payload: dict):
     """
     Preview a coupon's discount without consuming it.
+    Accepts student_id from payload (GAS-authenticated students pass their clean_id).
     Returns { ok, original_price, discounted_price, discount_amount, coupon }.
     """
-    code      = (payload.get("code") or "").strip()
-    book_slug = (payload.get("book_slug") or "").strip()
-    original  = int(payload.get("original_price") or 0)
+    code       = (payload.get("code") or "").strip()
+    book_slug  = (payload.get("book_slug") or "").strip()
+    original   = int(payload.get("original_price") or 0)
+    student_id = (payload.get("student_id") or "").strip()
     if not code or not book_slug or original <= 0:
         raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
-    coupon = await _find_valid_coupon(code, student.clean_id, book_slug)
+    coupon = await _find_valid_coupon(code, student_id, book_slug)
     discounted = _calc_discount(original, coupon)
     return {
         "ok":               True,
@@ -4089,20 +4091,22 @@ async def validate_coupon(payload: dict, student: "Student" = Depends(require_st
 
 
 @api.post("/coupons/redeem")
-async def redeem_coupon(payload: dict, student: "Student" = Depends(require_student)):
+async def redeem_coupon(payload: dict):
     """
     Atomically redeem a coupon at purchase time.
+    Accepts student_id from payload (GAS-authenticated students pass their clean_id).
     Uses findOneAndUpdate with $lt guard to prevent concurrent over-use.
     Returns { ok, discounted_price }.
     """
-    code      = (payload.get("code") or "").strip()
-    book_slug = (payload.get("book_slug") or "").strip()
-    original  = int(payload.get("original_price") or 0)
+    code       = (payload.get("code") or "").strip()
+    book_slug  = (payload.get("book_slug") or "").strip()
+    original   = int(payload.get("original_price") or 0)
+    student_id = (payload.get("student_id") or "").strip()
     if not code or not book_slug or original <= 0:
         raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
 
     # Validate first (raises HTTPException on any failure)
-    coupon = await _find_valid_coupon(code, student.clean_id, book_slug)
+    coupon = await _find_valid_coupon(code, student_id, book_slug)
     discounted = _calc_discount(original, coupon)
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -4113,7 +4117,7 @@ async def redeem_coupon(payload: dict, student: "Student" = Depends(require_stud
         query["uses_count"] = {"$lt": max_uses}
 
     redemption_entry = {
-        "student_id":  student.clean_id,
+        "student_id":  student_id,
         "book_slug":   book_slug,
         "redeemed_at": now_iso,
         "original":    original,
@@ -4131,7 +4135,7 @@ async def redeem_coupon(payload: dict, student: "Student" = Depends(require_stud
         raise HTTPException(status_code=400, detail="Coupon is no longer available (usage limit reached).")
 
     log.info("coupon: redeemed %s by %s for book=%s saved=%dpts",
-             code, student.clean_id, book_slug, original - discounted)
+             code, student_id, book_slug, original - discounted)
     return {
         "ok":               True,
         "code":             code.upper(),
