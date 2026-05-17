@@ -3854,7 +3854,6 @@ register_lucky_draw_routes(
 )
 # ───────────────────────────────────────────────────────────────────────
 
-app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -4143,3 +4142,4 @@ async def redeem_coupon(payload: dict, student: "Student" = Depends(require_stud
 
 
 # ── END COUPON SYSTEM ──────────────────────────────────────────────────────
+app.include_router(api)
