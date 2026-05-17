@@ -1,14 +1,16 @@
-﻿"""EduHub Author Studio backend (FastAPI + MongoDB).
+"""EduHub Author Studio backend (FastAPI + MongoDB).
 
 Dynamic CMS layered on top of the existing Google-Sheets driven library.
 The frontend merges the two sources at read time so every existing sheet
-book keeps working unchanged — this backend only ADDS new capabilities.
+book keeps working unchanged   this backend only ADDS new capabilities.
 """
 from __future__ import annotations
 
 import logging
 import os
 import re
+import base64
+import io
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,12 +18,20 @@ from typing import Any, Literal
 
 import json
 import httpx
+
+# ── LUCKY DRAW SURGERY ─────────────────────────────────────────────────
+from lucky_draw import (
+    register_lucky_draw_routes,
+    generate_and_publish_lucky_code,
+    ensure_lucky_draw_indexes,
+)
+# ───────────────────────────────────────────────────────────────────────
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import (APIRouter, Cookie, Depends, FastAPI, File, Form, Header,
                      HTTPException, Request, Response, UploadFile, status)
-from fastapi.responses import JSONResponse
-from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi.responses import JSONResponse, StreamingResponse
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from pydantic import BaseModel, ConfigDict, Field
 from pywebpush import WebPushException, webpush
 from py_vapid import Vapid01
@@ -52,6 +62,25 @@ VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@eduhub.app")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+# ElevenLabs AI Voice (teacher-side TTS for chapter audio)
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+# Default voice falls back to "Rachel" (21m00Tcm4TlvDq8ikWAM) which is in
+# every ElevenLabs account's starter voice library. Override per-deploy via
+# the ELEVENLABS_DEFAULT_VOICE env var with any 20-char voice_id.
+ELEVENLABS_DEFAULT_VOICE = os.environ.get(
+    "ELEVENLABS_DEFAULT_VOICE", "21m00Tcm4TlvDq8ikWAM"
+)
+_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{20}$")
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_v3")
+
+# Public-facing backend URL — used to build absolute audio stream URLs
+# so both the student PWA (vercel.app) and Author Studio can play the audio.
+# Set in Render env vars as PUBLIC_BACKEND_URL.
+PUBLIC_BACKEND_URL = os.environ.get(
+    "PUBLIC_BACKEND_URL",
+    "https://eduhub-backend-td3a.onrender.com",
+).rstrip("/")
 
 
 def _repair_pem(raw: str) -> str:
@@ -86,7 +115,7 @@ def _repair_pem(raw: str) -> str:
     if "\n" in s:
         return s
 
-    # Case C: single-line — re-wrap body at 64 chars.
+    # Case C: single-line   re-wrap body at 64 chars.
     import re as _re
     m = _re.match(r"-----BEGIN ([A-Z ]+)-----(.*)-----END \1-----", s)
     if not m:
@@ -116,6 +145,9 @@ if VAPID_PRIVATE_KEY:
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+
+# GridFS bucket for ElevenLabs AI voice audio (avoids multi-MB inline base64)
+audio_bucket = None  # initialised in startup()
 
 # Collection references for the Push Studio module
 push_subscriptions = db["push_subscriptions"]
@@ -161,14 +193,14 @@ class Chapter(BaseModel):
 
 
 class BookPayload(BaseModel):
-    """Client → server book shape (studio save)."""
+    """Client ? server book shape (studio save)."""
     model_config = ConfigDict(extra="ignore")
     slug: str | None = None
     title: str
     subtitle: str = ""
     author: str = "Classroom Library"
     section: Section = "story"
-    coverEmoji: str = "📖"
+    coverEmoji: str = "??"
     coverImage: str = ""
     coverGradient: str = "linear-gradient(155deg, #2a2140 0%, #4a3a6a 100%)"
     accent: str = "#D4A843"
@@ -176,7 +208,7 @@ class BookPayload(BaseModel):
     level: str = ""
     readingMinutes: int = 6
     price: int = 0
-    # v9.2 — Library tier classification. When empty, the frontend auto-derives
+    # v9.2   Library tier classification. When empty, the frontend auto-derives
     # from price using the band: free=0, standard=1-100, premium=101-500,
     # limited=>500. Studio editors may set this explicitly to one of:
     # "free" | "standard" | "premium" | "limited".
@@ -249,6 +281,85 @@ async def require_admin(user: User = Depends(require_user)) -> User:
 
 
 # --------------------------------------------------------------------------- #
+# ElevenLabs AI Voice helper (teacher-side only, never called by students)    #
+# --------------------------------------------------------------------------- #
+async def _elevenlabs_generate(text: str, voice_id: str) -> dict:
+    """Call ElevenLabs text-to-speech with-timestamps endpoint.
+    Returns { audio_base64, word_timestamps } or raises HTTPException.
+    Never called by students — teacher-side only.
+    """
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL,
+        "output_format": "mp3_44100_128",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=10.0),
+        follow_redirects=True,
+    ) as cli:
+        r = await cli.post(url, headers=headers, json=body)
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ElevenLabs error {r.status_code}: {r.text[:200]}"
+            )
+        data = r.json()
+
+    # Convert character-level alignment to word-level timestamps
+    audio_base64 = data.get("audio_base64", "")
+    alignment = data.get("alignment", {})
+    chars = alignment.get("characters", [])
+    char_starts = alignment.get("character_start_times_seconds", [])
+    char_ends = alignment.get("character_end_times_seconds", [])
+
+    word_timestamps = []
+    current_word = ""
+    word_start = 0.0
+    word_end = 0.0
+
+    for i, ch in enumerate(chars):
+        char_str = ch if isinstance(ch, str) else str(ch)
+        t_start = char_starts[i] if i < len(char_starts) else 0.0
+        t_end = char_ends[i] if i < len(char_ends) else 0.0
+
+        if char_str == " " or char_str == "\n":
+            if current_word.strip():
+                word_timestamps.append({
+                    "word": current_word.strip(),
+                    "start": round(word_start, 3),
+                    "end": round(word_end, 3),
+                })
+            current_word = ""
+        else:
+            if not current_word:
+                word_start = t_start
+            current_word += char_str
+            word_end = t_end
+
+    # flush last word
+    if current_word.strip():
+        word_timestamps.append({
+            "word": current_word.strip(),
+            "start": round(word_start, 3),
+            "end": round(word_end, 3),
+        })
+
+    return {
+        "audio_base64": audio_base64,
+        "word_timestamps": word_timestamps,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Auth routes                                                                 #
 # --------------------------------------------------------------------------- #
 @api.post("/auth/google")
@@ -318,7 +429,7 @@ async def auth_google(payload: dict, response: Response):
         path="/",
         max_age=7 * 24 * 60 * 60,
     )
-    # v8.1 — mobile Safari ITP drops 3rd-party cookies across cross-site
+    # v8.1   mobile Safari ITP drops 3rd-party cookies across cross-site
     # redirects (vercel.app <-> onrender.com). We also return the token so
     # the frontend can cache it in localStorage and fall back to
     # `Authorization: Bearer` on devices where the cookie is blocked.
@@ -351,7 +462,7 @@ async def auth_logout(
     session_token: str | None = Cookie(default=None),
     authorization: str | None = Header(default=None),
 ):
-    # Accept token via cookie OR Authorization: Bearer — needed for
+    # Accept token via cookie OR Authorization: Bearer   needed for
     # mobile clients that use the localStorage fallback.
     token = session_token
     if not token and authorization and authorization.lower().startswith("bearer "):
@@ -363,13 +474,14 @@ async def auth_logout(
 
 
 # --------------------------------------------------------------------------- #
-# Books — public read                                                         #
+# Books   public read                                                         #
 # --------------------------------------------------------------------------- #
 CANONICAL_BOOK_FIELDS = {
     "slug", "title", "subtitle", "author", "section", "coverEmoji",
     "coverImage", "coverGradient", "accent", "badge", "level",
     "readingMinutes", "price", "tier", "published", "newUntil", "contentType",
     "format", "chapters", "content", "revision", "_authoredAt", "_authoredBy",
+    "ai_voice",
 }
 
 
@@ -423,7 +535,7 @@ async def get_book(slug: str):
 
 
 # --------------------------------------------------------------------------- #
-# Studio — admin CRUD                                                         #
+# Studio   admin CRUD                                                         #
 # --------------------------------------------------------------------------- #
 @api.get("/studio/books")
 async def studio_list_books(admin: User = Depends(require_admin)):
@@ -450,7 +562,7 @@ async def studio_get_book(slug: str, admin: User = Depends(require_admin)):
 
 @api.post("/studio/books")
 async def studio_save_book(payload: BookPayload, admin: User = Depends(require_admin)):
-    """Append-only save — writes a new revision document."""
+    """Append-only save   writes a new revision document."""
     slug = slugify(payload.slug or payload.title)
     # compute next revision
     latest = await db.books.find_one({"slug": slug}, {"_id": 0, "revision": 1},
@@ -501,6 +613,271 @@ async def studio_unpublish(slug: str, admin: User = Depends(require_admin)):
     return {"success": True, "matched": res.matched_count, "modified": res.modified_count}
 
 
+@api.get("/studio/voices")
+async def studio_list_voices(admin: User = Depends(require_admin)):
+    """List available ElevenLabs voices for the teacher voice picker.
+
+    Teacher-side only (require_admin). The xi-api-key never leaves the
+    server — the browser only receives sanitized {voice_id, name, ...}.
+    """
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(
+            status_code=503, detail="ELEVENLABS_API_KEY not configured."
+        )
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=10.0)
+    ) as cli:
+        r = await cli.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+        )
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ElevenLabs voices list error {r.status_code}: {r.text[:200]}",
+            )
+        data = r.json()
+
+    voices = []
+    for v in data.get("voices", []) or []:
+        labels = v.get("labels", {}) or {}
+        voices.append({
+            "voice_id": v.get("voice_id", ""),
+            "name": v.get("name", ""),
+            "category": v.get("category", ""),
+            "description": v.get("description", "") or "",
+            "preview_url": v.get("preview_url", "") or "",
+            "gender": labels.get("gender", "") or "",
+            "accent": labels.get("accent", "") or "",
+            "age": labels.get("age", "") or "",
+            "use_case": labels.get("use_case", "") or labels.get("use case", "") or "",
+        })
+
+    return {
+        "default_voice_id": ELEVENLABS_DEFAULT_VOICE,
+        "voices": voices,
+    }
+
+
+@api.get("/studio/audio/{audio_filename}")
+async def studio_audio_stream(audio_filename: str):
+    """Stream AI-generated audio from MongoDB GridFS.
+    Public — no auth required so student PWA can play it directly.
+    """
+    try:
+        stream = await audio_bucket.open_download_stream_by_name(audio_filename)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Audio not found.")
+
+    async def generate():
+        while True:
+            chunk = await stream.readchunk()
+            if not chunk:
+                break
+            yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+@api.post("/studio/books/{slug}/elevenlabs")
+async def studio_elevenlabs_generate(
+    slug: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Generate AI voice for one chapter using ElevenLabs.
+    Teacher-side only. Never called by students.
+    Injects audio_url + wordTimestamps into chapter blocks.
+    Saves a new book revision to MongoDB.
+    """
+    chapter_index = int(payload.get("chapterIndex", 0))
+    # Defensive: reject human-readable names like "Rachel" — ElevenLabs
+    # requires a 20-char alphanumeric voice_id. If the client somehow sends
+    # anything else (stale cached frontend, manual API caller, etc.), fall
+    # back to the configured default instead of 404-ing.
+    raw_voice = str(payload.get("voice") or "").strip()
+    if _VOICE_ID_RE.match(raw_voice):
+        voice_id = raw_voice
+    else:
+        if raw_voice:
+            log.warning(
+                "elevenlabs: rejected invalid voice value %r — using default %s",
+                raw_voice, ELEVENLABS_DEFAULT_VOICE,
+            )
+        voice_id = ELEVENLABS_DEFAULT_VOICE
+
+    # Define now early — used in GridFS metadata and ai_voice meta below
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Load current book (latest revision).
+    # The frontend passes the saved book directly in the payload after
+    # auto-saving, which avoids any MongoDB replication race condition.
+    # Fall back to find_one for backward compatibility.
+    import asyncio
+    book = payload.get("book") or None
+    if not book:
+        book = await db.books.find_one(
+            {"slug": slug},
+            {"_id": 0},
+            sort=[("revision", -1)],
+        )
+    if not book:
+        await asyncio.sleep(0.5)
+        book = await db.books.find_one(
+            {"slug": slug},
+            {"_id": 0},
+            sort=[("revision", -1)],
+        )
+    if not book:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Book '{slug}' not found. Please click Save Revision first, then Generate AI Voice."
+        )
+
+    chapters = book.get("chapters", [])
+    if chapter_index >= len(chapters):
+        raise HTTPException(status_code=400, detail="Chapter index out of range.")
+
+    chapter = chapters[chapter_index]
+    blocks = chapter.get("blocks", [])
+
+    # Collect all text from this chapter for ElevenLabs
+    full_text = " ".join(
+        b.get("text", "")
+        for b in blocks
+        if b.get("type", "paragraph") in (
+            "paragraph", "transcript", "text", "paragraphs", "heading", "quote"
+        )
+        and b.get("text", "").strip()
+    )
+
+    if not full_text.strip():
+        raise HTTPException(status_code=400, detail="Chapter has no readable text.")
+
+    # Call ElevenLabs
+    result = await _elevenlabs_generate(full_text, voice_id)
+    audio_b64 = result["audio_base64"]
+    word_timestamps = result["word_timestamps"]
+
+    # Upload MP3 to MongoDB GridFS — avoids storing multi-MB base64 inline
+    # which crashes the frontend when the book document is loaded.
+    # FIX v9.9: motor's GridFSBucket.upload_from_stream() requires a file-like
+    # object with a .read() method. Passing raw bytes raises
+    # AttributeError: 'bytes' object has no attribute 'read' — which manifests
+    # as a 500 (no CORS headers) and looks like a CORS error in the browser.
+    audio_bytes = base64.b64decode(audio_b64)
+    audio_id = str(uuid.uuid4())
+    try:
+        await audio_bucket.upload_from_stream(
+            f"{audio_id}.mp3",
+            io.BytesIO(audio_bytes),
+            metadata={
+                "slug": slug,
+                "chapter_index": chapter_index,
+                "voice": voice_id,
+                "created_at": now,
+                "created_by": admin.email,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("elevenlabs: GridFS upload failed for slug=%s", slug)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store generated audio: {type(exc).__name__}: {exc}",
+        ) from exc
+    # Build absolute URL so both Vercel frontend and student PWA can stream it
+    audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+
+    # Inject into blocks:
+    # 1. Remove any existing ElevenLabs audio block
+    blocks = [b for b in blocks if not b.get("_elevenlabs_audio")]
+
+    # 2. Append new audio block (after existing content so teacher MP3 stays primary)
+    blocks.append({
+        "type": "audio",
+        "text": audio_url,
+        "heading": f"AI Voice — {chapter.get('title', 'Chapter')}",
+        "_elevenlabs_audio": True,
+        "_audio_id": audio_id,
+    })
+
+    # 3. Distribute word timestamps across transcript blocks proportionally
+    transcript_blocks = [
+        (i, b) for i, b in enumerate(blocks)
+        if b.get("type") == "transcript" and b.get("text", "").strip()
+    ]
+
+    if transcript_blocks and word_timestamps:
+        total_chars = sum(
+            len(b.get("text", "")) for _, b in transcript_blocks
+        )
+        cursor = 0
+        for block_idx, block in transcript_blocks:
+            block_len = len(block.get("text", ""))
+            proportion = block_len / total_chars if total_chars > 0 else 0
+            slice_size = max(1, round(proportion * len(word_timestamps)))
+            block_words = word_timestamps[cursor: cursor + slice_size]
+            cursor += slice_size
+            if block_words:
+                blocks[block_idx] = {
+                    **block,
+                    "wordTimestamps": block_words,
+                    "start": block_words[0]["start"],
+                    "end": block_words[-1]["end"],
+                }
+
+    # Update chapter
+    chapters[chapter_index] = {**chapter, "blocks": blocks}
+
+    # Add ai_voice metadata to book
+    ai_voice_meta = book.get("ai_voice", {})
+    ai_voice_meta[str(chapter_index)] = {
+        "voice": voice_id,
+        "generated_at": now,
+        "word_count": len(word_timestamps),
+    }
+
+    # Save new revision (append-only — same as studio_save_book)
+    latest = await db.books.find_one(
+        {"slug": slug}, {"_id": 0, "revision": 1},
+        sort=[("revision", -1)]
+    )
+    next_rev = int((latest or {}).get("revision") or 0) + 1
+
+    updated_doc = {
+        **book,
+        "chapters": chapters,
+        "ai_voice": ai_voice_meta,
+        "revision": next_rev,
+        "_authoredAt": now,
+        "_authoredBy": admin.email,
+    }
+    updated_doc.pop("_id", None)
+
+    await db.books.insert_one(updated_doc)
+    log.info(
+        "elevenlabs: generated voice for slug=%s chapter=%s voice=%s words=%s rev=%s",
+        slug, chapter_index, voice_id, len(word_timestamps), next_rev,
+    )
+
+    return {
+        "success": True,
+        "slug": slug,
+        "chapterIndex": chapter_index,
+        "wordCount": len(word_timestamps),
+        "revision": next_rev,
+        "voice": voice_id,
+    }
+
+
 @api.delete("/studio/books/{slug}")
 async def studio_delete(slug: str, admin: User = Depends(require_admin)):
     res = await db.books.delete_many({"slug": slug})
@@ -508,11 +885,11 @@ async def studio_delete(slug: str, admin: User = Depends(require_admin)):
 
 
 # --------------------------------------------------------------------------- #
-# Studio — smart parse / upload                                               #
+# Studio   smart parse / upload                                               #
 # --------------------------------------------------------------------------- #
 @api.post("/studio/parse")
 async def studio_parse(payload: ParseRequest, admin: User = Depends(require_admin)):
-    """Raw text → structured chapters+blocks."""
+    """Raw text ? structured chapters+blocks."""
     return {"success": True, **parse_content(payload.text, payload.default_chapter)}
 
 
@@ -521,7 +898,7 @@ async def studio_upload(
     file: UploadFile = File(...),
     admin: User = Depends(require_admin),
 ):
-    """Upload .txt / .md / .docx → parsed chapters."""
+    """Upload .txt / .md / .docx ? parsed chapters."""
     raw = await file.read()
     name = (file.filename or "").lower()
     if name.endswith(".docx"):
@@ -587,7 +964,7 @@ async def get_status_checks():
 
 
 # --------------------------------------------------------------------------- #
-# Push Studio — subscriptions, send, schedule, history                         #
+# Push Studio   subscriptions, send, schedule, history                         #
 # --------------------------------------------------------------------------- #
 class PushSubscribePayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -622,20 +999,20 @@ class PushSchedulePayload(BaseModel):
 
 
 def _build_target_query(target: str, studentIds: list[str], group: str | None) -> dict:
-    """Translate target spec → MongoDB query for push_subscriptions.
+    """Translate target spec ? MongoDB query for push_subscriptions.
 
     Surgical fix (Push Studio "By Student ID = 0 subscribers" bug):
       * The teacher's textarea, the on-disk `studentId` field, and the
         student's login `cleanId` are NOT guaranteed to share the same
-        casing or whitespace (AuthContext.jsx only `.trim()`s on login —
-        it never lowercases — so `push_subscriptions.studentId` may be
+        casing or whitespace (AuthContext.jsx only `.trim()`s on login  
+        it never lowercases   so `push_subscriptions.studentId` may be
         stored as `stu094`, `STU094`, `Stu094`, or even `" stu094 "`
         depending on what was typed at first login).
       * Previous attempt used a strict anchored regex `^stu094$/i` which
         DID handle case differences but still missed any subscription
         whose stored value had stray whitespace.
       * `everyone` and `group` paths are intentionally left byte-identical
-        with the prior implementation — only the `students` branch is
+        with the prior implementation   only the `students` branch is
         touched.
     """
     if target == "everyone":
@@ -691,7 +1068,7 @@ async def _fan_out_push(
     (HTTP 404/410) are removed from the collection so the next send is fast.
     """
     if not _VAPID_INSTANCE:
-        log.warning("push: _VAPID_INSTANCE not loaded (boot error: %s) — skipping fan-out",
+        log.warning("push: _VAPID_INSTANCE not loaded (boot error: %s)   skipping fan-out",
                     _VAPID_BOOT_ERROR or "VAPID_PRIVATE_KEY missing")
         return 0, 0
 
@@ -795,7 +1172,7 @@ async def push_vapid_public_key():
     return {"publicKey": VAPID_PUBLIC_KEY}
 
 
-# ---- Diagnostic (public — returns booleans only, no secrets) ---------------
+# ---- Diagnostic (public   returns booleans only, no secrets) ---------------
 @api.get("/push/_diag")
 async def push_diag():
     """Public health check for the push pipeline. Returns only booleans/counts
@@ -815,7 +1192,7 @@ async def push_diag():
         "scheduled_pending": await push_scheduled.count_documents({"status": "pending"}),
     }
 
-    # Try to parse the private key — uses the SAME code path as the live send.
+    # Try to parse the private key   uses the SAME code path as the live send.
     try:
         from py_vapid import Vapid01 as _V
         v = _V.from_pem(VAPID_PRIVATE_KEY.encode())
@@ -830,7 +1207,7 @@ async def push_diag():
         out["vapid_instance_loaded_at_boot"] = _VAPID_INSTANCE is not None
         out["vapid_boot_error"] = _VAPID_BOOT_ERROR or None
 
-    # Try a *dry-run* sign — same code path as a real send but to a fake target.
+    # Try a *dry-run* sign   same code path as a real send but to a fake target.
     # Use a real EC public key so the encryption layer doesn't trip; only the
     # endpoint is fake. A 0/4xx response means signing+encryption worked.
     try:
@@ -863,7 +1240,7 @@ async def push_diag():
     except Exception as exc:  # noqa: BLE001
         out["dry_run_sign"] = f"sign-failed: {type(exc).__name__}: {str(exc)[:200]}"
 
-    # Show the first subscription's endpoint host (if any) — helps spot
+    # Show the first subscription's endpoint host (if any)   helps spot
     # whether subscriptions are FCM (Chrome/Edge) vs Apple (iOS Safari) vs Mozilla.
     sample = await push_subscriptions.find_one({}, {"_id": 0, "endpoint": 1, "studentId": 1, "group": 1})
     if sample:
@@ -1070,7 +1447,7 @@ async def push_schedule_run_due(
 
 
 # --------------------------------------------------------------------------- #
-# Points-Credit Push (Option 3) — surgical add-on, no edits above this line.   #
+# Points-Credit Push (Option 3)   surgical add-on, no edits above this line.   #
 # --------------------------------------------------------------------------- #
 #
 # Purpose
@@ -1083,18 +1460,18 @@ async def push_schedule_run_due(
 #   1) Re-validates the SENDER's studentId+password against the GAS Points
 #      backend (`?action=login`) with a 60-second in-process LRU cache, so
 #      we never trust the client to identify itself and never hammer GAS.
-#   2) Enforces per-pair rate limiting (max 2 fires / 5 s) — protects the
+#   2) Enforces per-pair rate limiting (max 2 fires / 5 s)   protects the
 #      Points backend and the recipient from spam.
 #   3) Server-renders a fixed bilingual Khmer + English notification body
 #      using ONLY a validated `amount` int. Title/body are NEVER accepted
-#      from the client — that would let any caller send arbitrary copy.
+#      from the client   that would let any caller send arbitrary copy.
 #   4) Reuses the EXISTING `_fan_out_push()` helper unchanged, targeting
 #      `{"studentId": recipientStudentId}` so every device the recipient
 #      is subscribed on lights up.
 #   5) Idempotency via a unique index on `transferId` in a NEW collection
 #      `push_credit_log` (TTL 24 h). Duplicate calls return
 #      {"ok": True, "duplicate": True} without fanning out again.
-#   6) Killswitch: PUSH_CREDIT_NOTIFY_ENABLED=false → 204 No Content. Read
+#   6) Killswitch: PUSH_CREDIT_NOTIFY_ENABLED=false ? 204 No Content. Read
 #      PER-REQUEST from `os.environ` so a Render env-var flip takes effect
 #      on the next request without code redeploy.
 #   7) Audit trail in `push_history` with extra fields {source, amount,
@@ -1102,15 +1479,15 @@ async def push_schedule_run_due(
 #      Existing field names + types are preserved byte-for-byte so the
 #      Author Studio history UI keeps rendering today's rows. New rows
 #      use `sentBy="credit-push:{senderId}"` so Studio's per-teacher
-#      filter (`sentBy == user.email`) silently excludes them — only
+#      filter (`sentBy == user.email`) silently excludes them   only
 #      super-admins see them in the Studio history view.
 #   8) Recipient-side dedupe: when `<PointsCreditPushBridge />` fires for
 #      a credit that the sender already pushed (P2P primary path), we
 #      detect the recent `credit-p2p` row for the same recipient+amount
 #      and short-circuit so the recipient's phone only buzzes ONCE per
 #      transfer. Without this, a single P2P transfer would surface two
-#      pushes (sender modal → primary; recipient bridge → fallback ~12 s
-#      later via usePoints poll → duplicate) because the legacy
+#      pushes (sender modal ? primary; recipient bridge ? fallback ~12 s
+#      later via usePoints poll ? duplicate) because the legacy
 #      `myportal-latest-reward` storage shape never persisted the
 #      `from` field.
 #
@@ -1149,6 +1526,30 @@ GAS_POINTS_LOGIN_URL = os.environ.get(
     "https://script.google.com/macros/s/AKfycbzRktKyql2I_FbPESNRpCrFDlse-qNd9_Opv9si-g-j2lcanOUPP49IzcyA59lFqVycdA/exec",
 )
 
+# Speaking Lab treasury credentials (env vars set in Render dashboard)
+SL_TREASURY_ID       = os.environ.get("SL_TREASURY_ID", "stu092")
+SL_TREASURY_PASSWORD = os.environ.get("SL_TREASURY_PASSWORD", "")
+
+
+# Portal GAS backend URL — used for server-to-server password sync after reset.
+# Set in Render env vars. Falls back to the same URL the frontend already uses.
+GAS_PORTAL_URL = os.environ.get(
+    "GAS_PORTAL_URL",
+    "https://script.google.com/macros/s/AKfycbw_hGdyYmWukTCzaZoxuKMv34mYpQMXd7JtSFzpMpRjGd947eM70u-a1xTUJYA894FwAQ/exec",
+)
+
+# Shared secret used to authenticate server-to-server GAS calls.
+# Set this in both Render env vars AND GAS Script Properties as GAS_ADMIN_SECRET.
+# Generate any long random string: python3 -c "import secrets; print(secrets.token_hex(32))"
+GAS_ADMIN_SECRET = os.environ.get("GAS_ADMIN_SECRET", "")
+
+# Evaluation GAS backend URL — used for archiving student evaluation rows
+# on deactivation. Set in Render env vars as GAS_EVAL_URL.
+GAS_EVAL_URL = os.environ.get(
+    "GAS_EVAL_URL",
+    "https://script.google.com/macros/s/AKfycbxqGH9JuGhVn9V5UuhYeOOyI-vk7E41jXm0hrVp9Pj-Ukuw_HcNcR0C8bflmFTPq1YRDA/exec",
+)
+
 # In-process credential cache. Key: sha256(studentId + ":" + password).
 # Value: (expires_at_epoch_seconds, ok_bool). 60 s TTL.
 _CREDIT_CRED_CACHE: dict[str, tuple[float, bool]] = {}
@@ -1161,13 +1562,13 @@ _CREDIT_RATE_BUCKETS: dict[tuple[str, str], Deque[float]] = {}
 _CREDIT_RATE_WINDOW_S = 5.0
 _CREDIT_RATE_MAX_PER_WINDOW = 2
 
-# Recipient-bridge dedupe window — see __doc__ above.
+# Recipient-bridge dedupe window   see __doc__ above.
 _CREDIT_DEDUPE_WINDOW_S = 60
 
-# Last successful fire timestamp — surfaced via /_diag for ops visibility.
+# Last successful fire timestamp   surfaced via /_diag for ops visibility.
 _CREDIT_LAST_FIRE_AT: datetime | None = None
 
-# Lazy index creation — `asyncio.Lock()` is created on first use so the
+# Lazy index creation   `asyncio.Lock()` is created on first use so the
 # module imports cleanly on Python versions where module-level Lock()
 # instantiation behaves differently (3.10+ is fine, but defensive coding
 # keeps boot strictly side-effect-free).
@@ -1219,7 +1620,7 @@ def _credit_cache_get(key: str) -> bool | None:
 
 def _credit_cache_put(key: str, ok: bool) -> None:
     if len(_CREDIT_CRED_CACHE) > _CREDIT_CRED_MAX:
-        # Cheap eviction — drop expired entries first.
+        # Cheap eviction   drop expired entries first.
         now_ts = _time_credit.time()
         stale = [k for k, (exp, _) in _CREDIT_CRED_CACHE.items() if exp <= now_ts]
         for k in stale[:128]:
@@ -1249,7 +1650,7 @@ async def _credit_revalidate_with_gas(student_id: str, password: str) -> bool:
 
     Mirrors the client's POST-then-GET fallback so we work against both the
     secured and legacy GAS deployments. Returns True iff the response carries
-    `{"success": true}`. Never raises — callers translate False into 401.
+    `{"success": true}`. Never raises   callers translate False into 401.
     """
     cache_key = _credit_cache_key(student_id, password)
     cached = _credit_cache_get(cache_key)
@@ -1314,7 +1715,7 @@ async def _credit_recent_p2p_exists(recipient_id: str, amount: int) -> bool:
     """Has a `credit-p2p` row landed in push_history for this (recipient, amount)
     within the last _CREDIT_DEDUPE_WINDOW_S seconds? Used to suppress a
     recipient-bridge fire when the sender's modal already pushed the same
-    credit. Looks at sentAt + recipientStudentId + amount + source — all
+    credit. Looks at sentAt + recipientStudentId + amount + source   all
     additive fields we own, so the query is fast and non-colliding."""
     cutoff = datetime.now(timezone.utc) - _credit_timedelta(
         seconds=_CREDIT_DEDUPE_WINDOW_S
@@ -1365,7 +1766,7 @@ async def push_notify_credit(
     + audit. See the module docstring above for the full design rationale."""
     global _CREDIT_LAST_FIRE_AT
 
-    # ---- Killswitch (per-request) — bypasses every side effect below. ---
+    # ---- Killswitch (per-request)   bypasses every side effect below. ---
     if not _credit_killswitch_enabled():
         return Response(status_code=204)
 
@@ -1373,7 +1774,7 @@ async def push_notify_credit(
         raise HTTPException(
             status_code=503,
             detail=(
-                "GAS_POINTS_LOGIN_URL not configured — set the env var to "
+                "GAS_POINTS_LOGIN_URL not configured   set the env var to "
                 "the PointsBackend exec URL and redeploy."
             ),
         )
@@ -1419,7 +1820,7 @@ async def push_notify_credit(
     ):
         return {"sent": 0, "failed": 0, "duplicate": True, "deduped": "p2p-recent"}
 
-    # ---- Idempotency: insert log row first; duplicate → no fan-out -------
+    # ---- Idempotency: insert log row first; duplicate ? no fan-out -------
     now_dt = datetime.now(timezone.utc)
     try:
         await push_credit_log.insert_one({
@@ -1439,12 +1840,11 @@ async def push_notify_credit(
         raise HTTPException(status_code=500, detail="log insert failed")
 
     # ---- Server-rendered Khmer + English template ------------------------
-    title = f"\U0001F389 +{payload.amount} ពិន្ទុ"
+    title = f"\U0001F389 +{payload.amount} ពិន្ទុ! / Points Credited!"
     body = (
-        f"+{payload.amount}ពិន្ទុ ត្រូវបានបញ្ចូលទៅក្នុងគណនីរបស់អ្នក។ "
-        f"ខិតខំប្រឹងប្រែងបន្តទៀត!\n"
-        f"+{payload.amount} Points added to your account. "
-        f"Keep learning and unlock more rewards!"
+        f"អ្នកបានទទួលពិន្ទុ +{payload.amount} ✨\n"
+        f"រៀនបន្ត ហើយដោះសោរង្វាន់!\n"
+        f"+{payload.amount} points added to your account. Keep learning!"
     )
     url_target = "/portal/me"
 
@@ -1466,7 +1866,7 @@ async def push_notify_credit(
         "sentAt": now_dt,
         "sent": sent,
         "failed": failed,
-        # Extra fields — additive, never collide with existing schema.
+        # Extra fields   additive, never collide with existing schema.
         "source": source,
         "amount": payload.amount,
         "recipientStudentId": recipient_id,
@@ -1487,12 +1887,24 @@ async def push_notify_credit(
         "credit-push: sent=%d failed=%d source=%s amount=%d recipient=%s sender=%s",
         sent, failed, source, payload.amount, recipient_id[:32], sender_id[:32],
     )
+
+    # ── Speaking Lab live roster hook ─────────────────────────────────────
+    # If this transfer goes to the treasury (stu092), check if the sender
+    # is paying an entry fee for an active session.  If so, their name
+    # appears on the teacher board automatically — no manual join needed.
+    TREASURY_ID = "stu092"
+    if recipient_id == TREASURY_ID and not is_self_detect:
+        asyncio.create_task(
+            _sl_try_auto_enter(sender_id, payload.amount)
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     return {"sent": sent, "failed": failed, "duplicate": False}
 
 
 @api.get("/push/notify-credit/_diag")
 async def push_notify_credit_diag():
-    """Public health probe — only counts/booleans, never secrets."""
+    """Public health probe   only counts/booleans, never secrets."""
     await _ensure_credit_indexes()
     try:
         total = await push_credit_log.count_documents({})
@@ -1527,7 +1939,7 @@ async def push_notify_credit_diag():
 
 
 # --------------------------------------------------------------------------- #
-# Patch landing page — serves the Push Studio deliverable files                #
+# Patch landing page   serves the Push Studio deliverable files                #
 # --------------------------------------------------------------------------- #
 PATCHES_DIR = ROOT_DIR / "patches"
 
@@ -1535,7 +1947,7 @@ PATCH_FILES: dict[str, dict] = {
     "server": {
         "filename": "server.py",
         "ext": "py",
-        "title": "Backend — Push Studio API routes",
+        "title": "Backend   Push Studio API routes",
         "tab_label": "server.py",
         "target_path": "eduhub-backend-master/server.py",
         "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/server.py",
@@ -1549,7 +1961,7 @@ PATCH_FILES: dict[str, dict] = {
     "requirements": {
         "filename": "requirements.txt",
         "ext": "txt",
-        "title": "Backend — requirements.txt (3-line addition)",
+        "title": "Backend   requirements.txt (3-line addition)",
         "tab_label": "requirements.txt",
         "target_path": "eduhub-backend-master/requirements.txt",
         "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/requirements.txt",
@@ -1562,21 +1974,21 @@ PATCH_FILES: dict[str, dict] = {
     "push-studio": {
         "filename": "PushStudio.jsx",
         "ext": "jsx",
-        "title": "Frontend — Push Studio page (Compose / Scheduled / History)",
+        "title": "Frontend   Push Studio page (Compose / Scheduled / History)",
         "tab_label": "PushStudio.jsx",
         "target_path": "src/studio/PushStudio.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/studio",
         "blurb": (
             "Self-contained Studio page with three tabs: Compose (title/body/url, "
             "audience selector, debounced subscriber count, live phone preview, "
-            "Send Now + Schedule), Scheduled (super-admin only — list, delete, "
+            "Send Now + Schedule), Scheduled (super-admin only   list, delete, "
             "Run-due button), and History (paginated, expandable rows, scoped per role)."
         ),
     },
     "studio-page": {
         "filename": "StudioPage.jsx",
         "ext": "jsx",
-        "title": "Frontend — StudioPage shell with the new Push tab",
+        "title": "Frontend   StudioPage shell with the new Push tab",
         "tab_label": "StudioPage.jsx",
         "target_path": "src/studio/StudioPage.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/studio/StudioPage.jsx",
@@ -1589,7 +2001,7 @@ PATCH_FILES: dict[str, dict] = {
     "use-push": {
         "filename": "usePushNotifications.js",
         "ext": "js",
-        "title": "Frontend — Web Push subscribe hook",
+        "title": "Frontend   Web Push subscribe hook",
         "tab_label": "usePushNotifications.js",
         "target_path": "src/eduhub/hooks/usePushNotifications.js",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/eduhub/hooks",
@@ -1604,30 +2016,30 @@ PATCH_FILES: dict[str, dict] = {
     "dashboard": {
         "filename": "Dashboard.jsx",
         "ext": "jsx",
-        "title": "Frontend — Dashboard wires up the Push hook",
+        "title": "Frontend   Dashboard wires up the Push hook",
         "tab_label": "Dashboard.jsx",
         "target_path": "src/eduhub/pages/Dashboard.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/Dashboard.jsx",
         "blurb": (
             "One-line addition: usePushNotifications(student?.studentId, "
             "student?.group || student?.batch || 'default'). AuthContext doesn't "
-            "expose a group field today, so the call falls back to 'default' — "
+            "expose a group field today, so the call falls back to 'default'   "
             "Push Studio targeting by group still works on subsequent enrolments."
         ),
     },
     "sw": {
         "filename": "sw.js",
         "ext": "js",
-        "title": "Frontend — Service Worker with Web Push handlers (v1.2)",
+        "title": "Frontend   Service Worker with Web Push handlers (v1.2)",
         "tab_label": "sw.js",
         "target_path": "public/sw.js",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/public/sw.js",
         "blurb": (
             "Two surgical edits on top of your existing SW: bumps SW_VERSION "
-            "from v1.1.0 → v1.2.0 (forces every browser to evict caches and "
+            "from v1.1.0 ? v1.2.0 (forces every browser to evict caches and "
             "pick up the new code), and appends `push` + `notificationclick` "
             "listeners at the very bottom. The browser needs the `push` "
-            "listener to actually render notifications — without it, "
+            "listener to actually render notifications   without it, "
             "pywebpush delivers but nothing appears on screen. Restored the "
             "missing `||` fallbacks that were lost in markdown formatting."
         ),
@@ -1635,7 +2047,7 @@ PATCH_FILES: dict[str, dict] = {
     "push-bell": {
         "filename": "PushNotificationBell.jsx",
         "ext": "jsx",
-        "title": "Frontend — Bell button to enable/disable notifications",
+        "title": "Frontend   Bell button to enable/disable notifications",
         "tab_label": "PushNotificationBell.jsx",
         "target_path": "src/eduhub/components/PushNotificationBell.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/eduhub/components",
@@ -1643,33 +2055,33 @@ PATCH_FILES: dict[str, dict] = {
             "NEW component. Self-contained bell button that calls the existing "
             "usePushNotifications hook (default import, signature "
             "(studentId, groupName)). Matches your committed backend payload "
-            "shape — no env var changes needed (VAPID key auto-fetched). "
+            "shape   no env var changes needed (VAPID key auto-fetched). "
             "Styled to match your aurora header (cyan/violet/magenta accents)."
         ),
     },
     "header": {
         "filename": "Header.jsx",
         "ext": "jsx",
-        "title": "Frontend — Header.jsx with bell wired in (2-line addition)",
+        "title": "Frontend   Header.jsx with bell wired in (2-line addition)",
         "tab_label": "Header.jsx",
         "target_path": "src/eduhub/components/Header.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/components/Header.jsx",
         "blurb": (
             "Surgical: 1 import line + 4 lines that render <PushNotificationBell> "
             "inside the existing isAuthenticated block. ALL safe-area / iOS "
-            "notch logic, telegram link, student pill, sign-out button — "
+            "notch logic, telegram link, student pill, sign-out button   "
             "preserved byte-for-byte."
         ),
     },
     "icon-192": {
         "filename": "icon-192.png",
         "ext": "png",
-        "title": "Asset — Push notification icon (192×192, 33 KB)",
+        "title": "Asset   Push notification icon (192 192, 33 KB)",
         "tab_label": "icon-192.png",
         "target_path": "public/icons/icon-192.png",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/upload/master/public/icons",
         "blurb": (
-            "EduHub logo resized + optimized to 192×192 PNG (33 KB, was 1.8 MB). "
+            "EduHub logo resized + optimized to 192 192 PNG (33 KB, was 1.8 MB). "
             "Drop into public/icons/ so push notification banners show your logo "
             "instead of the browser default. Same icon used by sw.js and manifest."
         ),
@@ -1678,7 +2090,7 @@ PATCH_FILES: dict[str, dict] = {
     "icon-512": {
         "filename": "icon-512.png",
         "ext": "png",
-        "title": "Asset — High-res app icon (512×512, 212 KB)",
+        "title": "Asset   High-res app icon (512 512, 212 KB)",
         "tab_label": "icon-512.png",
         "target_path": "public/icons/icon-512.png",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/upload/master/public/icons",
@@ -1688,11 +2100,11 @@ PATCH_FILES: dict[str, dict] = {
         ),
         "binary": True,
     },
-    # ─── v9.2 — Surgery Patch (treasury fix + reader page-flip + tier classification) ───
+    # --- v9.2   Surgery Patch (treasury fix + reader page-flip + tier classification) ---
     "v92-treasury": {
         "filename": "purchaseService.js",
         "ext": "js",
-        "title": "Surgery — Treasury wallet ID (stu001 → stu092)",
+        "title": "Surgery   Treasury wallet ID (stu001 ? stu092)",
         "tab_label": "purchaseService.js",
         "target_path": "src/eduhub/pages/library/books/purchaseService.js",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/books/purchaseService.js",
@@ -1701,7 +2113,7 @@ PATCH_FILES: dict[str, dict] = {
             "`\"stu001\"` to `\"stu092\"`. The env-var override "
             "REACT_APP_LIBRARY_TREASURY_ID is preserved. All sendPoints / "
             "isUnlocked / SELF_TREASURY guard logic is byte-identical to the "
-            "previous build — only the default treasury wallet identifier "
+            "previous build   only the default treasury wallet identifier "
             "changes, so points spent on paid books now correctly credit "
             "stu092 instead of the regular student wallet."
         ),
@@ -1709,25 +2121,25 @@ PATCH_FILES: dict[str, dict] = {
     "v92-tier-service": {
         "filename": "booksService.js",
         "ext": "js",
-        "title": "Surgery — Library tier classifier (free / standard / premium / limited)",
+        "title": "Surgery   Library tier classifier (free / standard / premium / limited)",
         "tab_label": "booksService.js",
         "target_path": "src/eduhub/pages/library/books/booksService.js",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/books/booksService.js",
         "blurb": (
             "Adds `normalizeTier(raw, price, badge)` plus exported "
             "`TIER_PRICE_BANDS` / `TIER_ORDER`. `normalizeBook` now stamps "
-            "`b.tier` on every book using author override → badge LIMITED → "
+            "`b.tier` on every book using author override ? badge LIMITED ? "
             "price band (free=0, standard=1-100, premium=101-500, "
             "limited=501+). Sheet column aliases `[tier, edition, class, "
             "category, plan]` and the multi-row PROMOTABLE list both honour "
             "the new field. Existing book objects without a tier column light "
-            "up automatically — zero data migration."
+            "up automatically   zero data migration."
         ),
     },
     "v92-reader": {
         "filename": "ReaderPage.jsx",
         "ext": "jsx",
-        "title": "Surgery — Reader: media page-flip + transcript auto-flip",
+        "title": "Surgery   Reader: media page-flip + transcript auto-flip",
         "tab_label": "ReaderPage.jsx",
         "target_path": "src/eduhub/pages/library/reader/ReaderPage.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/reader/ReaderPage.jsx",
@@ -1739,7 +2151,7 @@ PATCH_FILES: dict[str, dict] = {
             "BookAudioProvider mini-player. Adds `transcriptPageMap` + "
             "`useBookAudio` subscription that auto-advances pages following "
             "the audio cursor when transcript blocks declare start/end "
-            "timestamps — manual page-turn (`go` / `jumpTo`) stamps "
+            "timestamps   manual page-turn (`go` / `jumpTo`) stamps "
             "userOverrideUntilRef for ~3 s so deliberate navigation always "
             "wins. mcq / fillblank still cluster as one sub-page."
         ),
@@ -1747,7 +2159,7 @@ PATCH_FILES: dict[str, dict] = {
     "v92-library": {
         "filename": "LibraryPage.jsx",
         "ext": "jsx",
-        "title": "Surgery — Library tier filter chips (Free / Standard / Premium / Limited)",
+        "title": "Surgery   Library tier filter chips (Free / Standard / Premium / Limited)",
         "tab_label": "LibraryPage.jsx",
         "target_path": "src/eduhub/pages/library/LibraryPage.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/LibraryPage.jsx",
@@ -1755,22 +2167,22 @@ PATCH_FILES: dict[str, dict] = {
             "Two surgical inserts: (1) appends Free / Standard / Premium / "
             "Limited chips to the existing filter row (data-testids "
             "library-filter-{free|standard|premium|limited}); (2) extends "
-            "the filter switch-case so activeFilter ∈ {free,standard,"
+            "the filter switch-case so activeFilter ? {free,standard,"
             "premium,limited} narrows shelves by `it.tier`. All other shelf "
-            "logic, search, ContinueReading, purchase flow, sync button — "
+            "logic, search, ContinueReading, purchase flow, sync button   "
             "preserved byte-for-byte."
         ),
     },
     "v92-card": {
         "filename": "BookCard.jsx",
         "ext": "jsx",
-        "title": "Surgery — BookCard tier ribbon",
+        "title": "Surgery   BookCard tier ribbon",
         "tab_label": "BookCard.jsx",
         "target_path": "src/eduhub/pages/library/components/BookCard.jsx",
         "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/components/BookCard.jsx",
         "blurb": (
-            "Adds the `TIER_META` palette (free=teal · standard=blue · "
-            "premium=gold · limited=platinum-pulse), a corner tier ribbon "
+            "Adds the `TIER_META` palette (free=teal   standard=blue   "
+            "premium=gold   limited=platinum-pulse), a corner tier ribbon "
             "(data-testid card-tier-{tier}), and a `data-tier` attribute on "
             "the card root. Limited-tier cards get a 2.4 s pulsing halo. "
             "Free-tier cards skip the ribbon since the price chip already "
@@ -1782,7 +2194,7 @@ PATCH_FILES: dict[str, dict] = {
     "v92-server": {
         "filename": "server.py",
         "ext": "py",
-        "title": "Surgery — server.py BookPayload.tier + CANONICAL_BOOK_FIELDS",
+        "title": "Surgery   server.py BookPayload.tier + CANONICAL_BOOK_FIELDS",
         "tab_label": "server.py",
         "target_path": "eduhub-backend-master/server.py",
         "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/server.py",
@@ -1817,7 +2229,7 @@ _LANDING_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>EduHub Push Studio — Patch deliverables</title>
+  <title>EduHub Push Studio   Patch deliverables</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -2001,16 +2413,16 @@ _LANDING_HTML = """<!doctype html>
         </svg>
       </div>
       <div>
-        <h1>EduHub · Push Studio · Patch deliverables</h1>
-        <div class="sub">5 files — backend FastAPI + frontend React. Click a tab to view, copy or open in GitHub.</div>
+        <h1>EduHub   Push Studio   Patch deliverables</h1>
+        <div class="sub">5 files   backend FastAPI + frontend React. Click a tab to view, copy or open in GitHub.</div>
       </div>
     </header>
 
     <div class="meta-bar">
       <span class="pill aurora"><span class="swatch" style="background:#1a1420"></span> 5 files ready</span>
-      <span class="pill">Backend · 1</span>
-      <span class="pill">Frontend · 4</span>
-      <a class="pill" href="/api/patch/index.json">JSON index →</a>
+      <span class="pill">Backend   1</span>
+      <span class="pill">Frontend   4</span>
+      <a class="pill" href="/api/patch/index.json">JSON index ?</a>
     </div>
 
     <nav class="tabs" id="tabs"></nav>
@@ -2018,7 +2430,7 @@ _LANDING_HTML = """<!doctype html>
     <main id="panels"></main>
 
     <div class="footer">
-      <span>Generated by the EduHub agent · Plus Jakarta Sans + JetBrains Mono · highlight.js github-dark.</span>
+      <span>Generated by the EduHub agent   Plus Jakarta Sans + JetBrains Mono   highlight.js github-dark.</span>
     </div>
   </div>
 
@@ -2043,7 +2455,7 @@ function panelHTML(key, p) {
            <span>${p.filename}</span>
            <button class="copy-btn" data-copy="${key}">Copy</button>
          </div>
-         <pre><code class="language-${langFor(p.ext)} hljs" id="code-${key}">Loading…</code></pre>
+         <pre><code class="language-${langFor(p.ext)} hljs" id="code-${key}">Loading </code></pre>
        </div>`;
 
   return `
@@ -2117,7 +2529,7 @@ document.addEventListener('click', async (e) => {
     await navigator.clipboard.writeText(codeEl.textContent);
     b.classList.add('ok');
     const orig = b.textContent;
-    b.textContent = 'Copied ✓';
+    b.textContent = 'Copied ?';
     setTimeout(() => { b.classList.remove('ok'); b.textContent = orig; }, 1400);
   } catch { b.textContent = 'Copy failed'; }
 });
@@ -2196,14 +2608,14 @@ def _serve_patch_payload(key: str, force_attachment: bool = False) -> Response:
 # greedy str path-param doesn't swallow the dotted form.
 @api.get("/patch/{key}.{ext}", include_in_schema=False)
 async def patch_dotted(key: str, ext: str):
-    """Plain-text raw view at /api/patch/<key>.<ext> — convenient for iPhone
+    """Plain-text raw view at /api/patch/<key>.<ext>   convenient for iPhone
     long-press copy and curl-friendly URLs (e.g. `purchaseService.js` looks
     like a real file path)."""
     if key not in PATCH_FILES:
         raise HTTPException(status_code=404, detail="patch key not found")
     meta = PATCH_FILES[key]
     if str(meta.get("ext", "")).lower() != ext.lower():
-        # Allow generic aliases (txt) so `…/v92-server.txt` still works.
+        # Allow generic aliases (txt) so ` /v92-server.txt` still works.
         if ext.lower() not in {"txt", "raw"}:
             raise HTTPException(status_code=404, detail="ext mismatch")
     return _serve_patch_payload(key, force_attachment=False)
@@ -2211,7 +2623,7 @@ async def patch_dotted(key: str, ext: str):
 
 @api.get("/patch/{key}/download", include_in_schema=False)
 async def patch_download(key: str):
-    """Forces a Save-As download with the original filename — handy on
+    """Forces a Save-As download with the original filename   handy on
     desktop browsers and the GitHub mobile app file-upload picker."""
     return _serve_patch_payload(key, force_attachment=True)
 
@@ -2227,7 +2639,7 @@ async def patch_raw(key: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="file missing on disk")
 
-    # Binary assets (icons etc) — serve as-is with correct content-type.
+    # Binary assets (icons etc)   serve as-is with correct content-type.
     if meta.get("binary"):
         ext = meta["ext"].lower()
         media = {
@@ -2237,7 +2649,7 @@ async def patch_raw(key: str):
         }.get(ext, "application/octet-stream")
         return Response(content=p.read_bytes(), media_type=media)
 
-    # Text patches — return plain text.
+    # Text patches   return plain text.
     return Response(content=p.read_text(encoding="utf-8"),
                     media_type="text/plain; charset=utf-8")
 
@@ -2282,7 +2694,7 @@ class TeacherPushSpeakingPayload(BaseModel):
     group: Literal["A", "B", "all"] = "all"
 
 
-# Feature 1 — Teacher Awards Points -> Auto Push
+# Feature 1   Teacher Awards Points -> Auto Push
 @api.post("/teacher/students/{student_id}/push-points")
 async def teacher_push_points(
     student_id: str,
@@ -2290,13 +2702,16 @@ async def teacher_push_points(
     user: User = Depends(require_admin),
 ):
     """Fire push to a single student after their points were adjusted.
-    Wrapped in try/except — push failure must never break the points save flow."""
+    Wrapped in try/except   push failure must never break the points save flow."""
     try:
         if payload.delta > 0:
             sent, failed = await _fan_out_push(
                 {"studentId": student_id},
-                title="Points credited!",
-                body=f"You received +{payload.delta} points. Keep it up!",
+                title=f"\U0001F389 +{payload.delta} ពិន្ទុ! / Points!",
+                body=(
+                    f"អ្នកបានទទួលពិន្ទុ +{payload.delta} ✨\n"
+                    f"You received +{payload.delta} points. Keep it up!"
+                ),
                 url="/portal",
             )
         else:
@@ -2312,7 +2727,7 @@ async def teacher_push_points(
         return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
 
 
-# Feature 2 — Restriction Warning Push
+# Feature 2   Restriction Warning Push
 @api.post("/teacher/students/{student_id}/push-restriction")
 async def teacher_push_restriction(
     student_id: str,
@@ -2320,7 +2735,7 @@ async def teacher_push_restriction(
     user: User = Depends(require_admin),
 ):
     """Fire push when a teacher sets a restriction on a student.
-    Wrapped in try/except — push failure must never break the scores save flow."""
+    Wrapped in try/except   push failure must never break the scores save flow."""
     try:
         body_text = (payload.message or "").strip() or (
             "Your account has been restricted. Contact your teacher."
@@ -2337,7 +2752,7 @@ async def teacher_push_restriction(
         return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
 
 
-# Feature 3 — Tuition Reminder Button
+# Feature 3   Tuition Reminder Button
 @api.post("/teacher/students/{student_id}/push-reminder")
 async def teacher_push_reminder(
     student_id: str,
@@ -2364,7 +2779,7 @@ async def teacher_push_reminder(
         return {"ok": False, "sent": 0, "failed": 0, "error": str(exc)[:200]}
 
 
-# Feature 6 — Speaking Test Results Ready Push
+# Feature 6   Speaking Test Results Ready Push
 @api.post("/teacher/push/speaking-results")
 async def teacher_push_speaking_results(
     payload: TeacherPushSpeakingPayload,
@@ -2394,11 +2809,11 @@ async def teacher_push_speaking_results(
 
 # --------------------------------------------------------------------------- #
 # ============================================================================ #
-#  EduHub Student Auth + Management — v10.0 Surgical Patch                     #
+#  EduHub Student Auth + Management   v10.0 Surgical Patch                     #
 #  Generated: 2026-01                                                          #
 #                                                                              #
 #  HOW TO APPLY                                                                #
-#  ────────────                                                                #
+#  ------------                                                                #
 #  Open server.py and locate line 2396 (the section divider that reads):       #
 #                                                                              #
 #      # --------------------------------------------------------------------- #
@@ -2412,17 +2827,17 @@ async def teacher_push_speaking_results(
 # ============================================================================ #
 
 
-# ── Student Auth + Management v10.0 ──────────────────────────────────────── #
-# Surgical addition — zero existing code modified above this block.           #
+# -- Student Auth + Management v10.0 ---------------------------------------- #
+# Surgical addition   zero existing code modified above this block.           #
 # Adds:                                                                        #
 #   /api/auth/student/login | logout | me                                     #
 #   /api/teacher/students CRUD (auto passphrase, ID reuse, soft-delete)       #
 # Collections: students, student_sessions                                     #
-# ─────────────────────────────────────────────────────────────────────────── #
-from passlib.context import CryptContext
+# --------------------------------------------------------------------------- #
+import bcrypt as _bcrypt_lib
 import secrets
 
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+# passlib removed: using bcrypt directly
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "")
 
 # Word lists for human-friendly passphrase generation
@@ -2442,7 +2857,7 @@ def _generate_passphrase() -> str:
     """Generate a 3-token passphrase: adjective-noun-number.
 
     Example: ``blue-river-42``. Easy to read aloud, easy to type, and
-    >= 56 bits of entropy when the lists are public — sufficient for a
+    >= 56 bits of entropy when the lists are public   sufficient for a
     school PWA when paired with bcrypt cost-12 hashing.
     """
     adj = secrets.choice(_ADJECTIVES)
@@ -2466,7 +2881,7 @@ class Student(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# current_student() dependency — cookie first, Bearer fallback (Safari ITP)   #
+# current_student() dependency   cookie first, Bearer fallback (Safari ITP)   #
 # --------------------------------------------------------------------------- #
 async def current_student(
     student_session: str | None = Cookie(default=None),
@@ -2491,7 +2906,7 @@ async def current_student(
         {"student_id": sess["student_id"]},
         {"_id": 0, "password_hash": 0},
     )
-    if not doc or not doc.get("is_active"):
+    if not doc or doc.get("is_active") is False:
         return None
     return Student(**doc)
 
@@ -2509,7 +2924,7 @@ async def require_student(
 # --------------------------------------------------------------------------- #
 async def _verify_turnstile(token: str) -> bool:
     if not TURNSTILE_SECRET_KEY:
-        log.warning("student-auth: TURNSTILE_SECRET_KEY not set — dev mode bypass")
+        log.warning("student-auth: TURNSTILE_SECRET_KEY not set   dev mode bypass")
         return True
     if not token:
         return False
@@ -2521,9 +2936,9 @@ async def _verify_turnstile(token: str) -> bool:
     return bool((r.json() if r.status_code == 200 else {}).get("success"))
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
+# --------------------------------------------------------------------------- #
 # Student auth endpoints                                                      #
-# ─────────────────────────────────────────────────────────────────────────── #
+# --------------------------------------------------------------------------- #
 @api.post("/auth/student/login")
 async def student_login(payload: dict, response: Response):
     clean_id = (payload.get("clean_id") or "").strip().lower()
@@ -2537,11 +2952,11 @@ async def student_login(payload: dict, response: Response):
         raise HTTPException(status_code=401, detail="Bot check failed")
 
     doc = await db.students.find_one(
-        {"clean_id": clean_id, "is_active": True},
+        {"clean_id": clean_id, "is_active": {"$ne": False}},
         {"_id": 0},
     )
-    # Identical 401 for missing user and wrong password — prevents enumeration.
-    if not doc or not _pwd_context.verify(password, doc.get("password_hash", "")):
+    # Identical 401 for missing user and wrong password   prevents enumeration.
+    if not doc or not _bcrypt_lib.checkpw(password.encode("utf-8"), doc.get("password_hash", "").encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     now = datetime.now(timezone.utc)
@@ -2601,9 +3016,102 @@ async def student_logout(
     return {"ok": True}
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Teacher / admin endpoints — student CRUD                                    #
-# ─────────────────────────────────────────────────────────────────────────── #
+# --------------------------------------------------------------------------- #
+# Teacher / admin endpoints   student CRUD                                    #
+# --------------------------------------------------------------------------- #
+async def _archive_student_in_gas(clean_id: str) -> bool:
+    """Archive all month-sheet evaluation rows for this student to the Archive tab,
+    then blank those rows so the next student on this ID starts clean.
+    Never raises. Returns True on confirmed GAS success, False otherwise.
+    """
+    if not GAS_EVAL_URL or not GAS_ADMIN_SECRET:
+        log.warning(
+            "archive-student: GAS_EVAL_URL or GAS_ADMIN_SECRET not set "
+            "— rows NOT archived for %s.", clean_id,
+        )
+        return False
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_EVAL_URL,
+                data={
+                    "action": "archiveStudent",
+                    "studentId": clean_id,
+                    "adminSecret": GAS_ADMIN_SECRET,
+                },
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("ok") is True:
+                        log.info(
+                            "archive-student: archived %s month(s) for %s",
+                            j.get("archivedMonths", "?"), clean_id,
+                        )
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        log.warning("archive-student: GAS did not confirm for %s", clean_id)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("archive-student: GAS unreachable for %s — %s", clean_id, exc)
+        return False
+
+
+async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
+    """Push the new plaintext password to the GAS Portal Sheet Password column.
+
+    This keeps the Google Sheet credential in sync with MongoDB after a
+    teacher-initiated password reset.  The Sheet password is what GAS
+    PointsBackend / GameBackend / PortalBackend validate against — without
+    this sync, those backends keep accepting the OLD password forever, which
+    is fine for read-only data but breaks any write that re-authenticates
+    (sendPoints, library purchase, etc.) once the student changes their login.
+
+    Never raises — a GAS outage must never block or roll back the MongoDB
+    reset.  Returns True if the GAS confirmed success, False otherwise.
+    The caller logs the outcome; the student always gets their new password
+    regardless.
+    """
+    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+        log.warning(
+            "password-sync: GAS_PORTAL_URL or GAS_ADMIN_SECRET not set — "
+            "Sheet password NOT updated for %s. Set both env vars to enable sync.",
+            clean_id,
+        )
+        return False
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_PORTAL_URL,
+                data={
+                    "action": "syncPassword",
+                    "studentId": clean_id,
+                    "newPassword": plain_password,
+                    "adminSecret": GAS_ADMIN_SECRET,
+                },
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("ok") is True:
+                        log.info("password-sync: Sheet updated for %s", clean_id)
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        log.warning("password-sync: GAS did not confirm for %s", clean_id)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("password-sync: GAS unreachable for %s — %s", clean_id, exc)
+        return False
+
+
 @api.post("/teacher/students")
 async def teacher_create_student(
     payload: dict,
@@ -2611,8 +3119,8 @@ async def teacher_create_student(
 ):
     """Create a student with an auto-generated passphrase password.
 
-    * If ``clean_id`` exists and is INACTIVE  → reactivate with new password.
-    * If ``clean_id`` exists and is ACTIVE    → 409 conflict.
+    * If ``clean_id`` exists and is INACTIVE  ? reactivate with new password.
+    * If ``clean_id`` exists and is ACTIVE    ? 409 conflict.
 
     The plaintext password is returned **once** in the response body and
     never persisted anywhere except as a bcrypt hash.
@@ -2627,7 +3135,7 @@ async def teacher_create_student(
         )
 
     plain_password = _generate_passphrase()
-    password_hash = _pwd_context.hash(plain_password)
+    password_hash = _bcrypt_lib.hashpw(plain_password.encode("utf-8"), _bcrypt_lib.gensalt(rounds=12)).decode("utf-8")
     now = datetime.now(timezone.utc)
 
     existing = await db.students.find_one({"clean_id": clean_id}, {"_id": 0})
@@ -2639,7 +3147,7 @@ async def teacher_create_student(
                 detail=f"Student ID '{clean_id}' is already active. "
                        "Deactivate first to reuse.",
             )
-        # ID reuse — reactivate with fresh credentials
+        # ID reuse   reactivate with fresh credentials
         await db.students.update_one(
             {"clean_id": clean_id},
             {"$set": {
@@ -2647,6 +3155,7 @@ async def teacher_create_student(
                 "group": group,
                 "password_hash": password_hash,
                 "is_active": True,
+                "enrolled_at": now.isoformat(),
                 "last_login": None,
             }},
         )
@@ -2665,11 +3174,14 @@ async def teacher_create_student(
             "password_hash": password_hash,
             "is_active": True,
             "created_at": now.isoformat(),
+            "enrolled_at": now.isoformat(),
             "last_login": None,
         })
         action = "created"
 
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
+    # Sync new password to GAS Sheet so Points/Game/Portal backends stay in sync.
+    await _sync_password_to_gas(clean_id, plain_password)
 
     return {
         "action": action,
@@ -2677,15 +3189,75 @@ async def teacher_create_student(
         "clean_id": clean_id,
         "display_name": display_name,
         "group": group,
-        "password": plain_password,  # shown ONCE — never stored, never logged
+        "enrolled_at": now.isoformat(),
+        "password": plain_password,  # shown ONCE   never stored, never logged
         "login_url": "https://eduhub-studio-test.vercel.app",
     }
 
 
 @api.get("/teacher/students")
 async def teacher_list_students(admin: User = Depends(require_admin)):
-    cursor = db.students.find({}, {"_id": 0, "password_hash": 0})
+    # Primary source: MongoDB db.students (populated via teacher CRUD)
+    cursor = db.students.find({"is_active": {"$ne": False}}, {"_id": 0, "password_hash": 0})
     students = await cursor.to_list(length=2000)
+    for s in students:
+        if "enrolled_at" not in s:
+            s["enrolled_at"] = s.get("created_at", "")
+
+    # If db.students is empty, fall back to GAS_PORTAL_URL?action=getStudents
+    # This covers schools whose student roster lives entirely in Google Sheets.
+    if not students and GAS_PORTAL_URL:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(12.0, connect=6.0),
+                follow_redirects=True,
+            ) as cli:
+                r = await cli.get(
+                    GAS_PORTAL_URL,
+                    params={"action": "getStudents"},
+                )
+                if r.status_code == 200:
+                    try:
+                        gas_data = r.json()
+                        # GAS may return [{id, name, group, level, schedule, ...}]
+                        # or {students: [...]} — handle both
+                        raw = gas_data if isinstance(gas_data, list) else gas_data.get("students") or gas_data.get("data") or []
+                        for row in raw:
+                            if not isinstance(row, dict):
+                                continue
+                            sid = (
+                                row.get("student_id") or row.get("studentId") or
+                                row.get("id") or row.get("clean_id") or ""
+                            ).strip()
+                            name = (
+                                row.get("display_name") or row.get("name") or
+                                row.get("displayName") or sid
+                            ).strip()
+                            group = str(
+                                row.get("group") or row.get("schedule") or
+                                row.get("batch") or "A"
+                            ).strip()
+                            level = str(
+                                row.get("level") or row.get("Level") or "Beginner"
+                            ).strip()
+                            if not sid:
+                                continue
+                            students.append({
+                                "student_id": sid,
+                                "clean_id": sid,
+                                "display_name": name,
+                                "group": group,
+                                "level": level,
+                                "is_active": True,
+                                "source": "gas",
+                            })
+                        if students:
+                            log.info("teacher_list_students: loaded %d students from GAS fallback", len(students))
+                    except Exception as parse_exc:
+                        log.warning("teacher_list_students: GAS parse error: %s", str(parse_exc)[:200])
+        except Exception as gas_exc:
+            log.warning("teacher_list_students: GAS fetch error: %s", str(gas_exc)[:200])
+
     return {"students": students}
 
 
@@ -2716,7 +3288,7 @@ async def teacher_reset_password(
     plain_password = _generate_passphrase()
     result = await db.students.update_one(
         {"student_id": student_id},
-        {"$set": {"password_hash": _pwd_context.hash(plain_password)}},
+        {"$set": {"password_hash": _bcrypt_lib.hashpw(plain_password.encode("utf-8"), _bcrypt_lib.gensalt(rounds=12)).decode("utf-8")}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Student not found")
@@ -2725,6 +3297,9 @@ async def teacher_reset_password(
         {"student_id": student_id}, {"_id": 0, "password_hash": 0},
     )
     log.info("teacher: password reset for %s by %s", student_id, admin.email)
+    # Sync new password to GAS Sheet so Points/Game/Portal backends stay in sync.
+    await _sync_password_to_gas(doc["clean_id"], plain_password)
+
     return {
         "ok": True,
         "student_id": student_id,
@@ -2742,6 +3317,10 @@ async def teacher_deactivate_student(
     admin: User = Depends(require_admin),
 ):
     """Soft deactivate. Never hard-deletes. ID is reusable for a new student."""
+    doc = await db.students.find_one({"student_id": student_id}, {"_id": 0, "clean_id": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Student not found")
+
     result = await db.students.update_one(
         {"student_id": student_id},
         {"$set": {"is_active": False}},
@@ -2749,14 +3328,18 @@ async def teacher_deactivate_student(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Student not found")
     await db.student_sessions.delete_many({"student_id": student_id})
+
+    # Archive GAS evaluation rows — fire-and-forget, never blocks deactivation
+    await _archive_student_in_gas(doc["clean_id"])
+
     log.info("teacher: deactivated student %s by %s", student_id, admin.email)
     return {"ok": True}
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Startup indexes — ADD these four lines inside the existing startup()        #
+# --------------------------------------------------------------------------- #
+# Startup indexes   ADD these four lines inside the existing startup()        #
 # function body, immediately before the final log.info line.                  #
-# ─────────────────────────────────────────────────────────────────────────── #
+# --------------------------------------------------------------------------- #
 #
 #     # Student Auth v10.0 indexes
 #     await db.students.create_index("clean_id", unique=True)
@@ -2764,11 +3347,513 @@ async def teacher_deactivate_student(
 #     await db.student_sessions.create_index("session_token", unique=True)
 #     await db.student_sessions.create_index("expires_at")
 #
-# ── End Student Auth + Management v10.0 ──────────────────────────────────── #
+# -- End Student Auth + Management v10.0 ------------------------------------ #
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
 from restriction_realtime import build_router as _build_status_router
+@api.post("/studio/audio/migrate-inline")
+async def studio_audio_migrate_inline(admin: User = Depends(require_admin)):
+    """One-time migration: find all book blocks with inline base64 audio,
+    upload to GridFS, replace block.text with the stream URL.
+    Safe to run multiple times (idempotent).
+    """
+    fixed_books = 0
+    fixed_blocks = 0
+    cursor = db.books.find({}, {"_id": 0})
+    async for book in cursor:
+        changed = False
+        now = datetime.now(timezone.utc).isoformat()
+        for ch in book.get("chapters", []):
+            for block in ch.get("blocks", []):
+                txt = block.get("text", "")
+                if not isinstance(txt, str): continue
+                if not txt.startswith("data:audio/"): continue
+                # Extract base64 payload
+                try:
+                    header, b64data = txt.split(",", 1)
+                    audio_bytes = base64.b64decode(b64data)
+                except Exception:
+                    continue
+                audio_id = str(uuid.uuid4())
+                # FIX v9.9: wrap raw bytes in BytesIO (GridFS needs file-like)
+                await audio_bucket.upload_from_stream(
+                    f"{audio_id}.mp3", io.BytesIO(audio_bytes),
+                    metadata={"slug": book.get("slug",""), "migrated_at": now},
+                )
+                block["text"] = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+                block["_audio_id"] = audio_id
+                changed = True
+                fixed_blocks += 1
+        if changed:
+            # Save as new revision
+            latest = await db.books.find_one(
+                {"slug": book["slug"]}, {"_id": 0, "revision": 1},
+                sort=[("revision", -1)]
+            )
+            next_rev = int((latest or {}).get("revision") or 0) + 1
+            doc = {**book, "revision": next_rev, "_authoredAt": now,
+                   "_authoredBy": "migration"}
+            doc.pop("_id", None)
+            await db.books.insert_one(doc)
+            fixed_books += 1
+    log.info("audio-migration: fixed %s blocks in %s books", fixed_blocks, fixed_books)
+    return {"ok": True, "fixed_books": fixed_books, "fixed_blocks": fixed_blocks}
+
+
 app.include_router(_build_status_router(db, _fan_out_push, require_admin))
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
+    """Auto-enter a student into the active Speaking Lab session when they
+    pay the entry fee to stu092 via P2P.  Called as a fire-and-forget task
+    from push_notify_credit so it never blocks the credit response."""
+    try:
+        # 1. Look up sender's display name and schedule from db.students
+        #    GAS uses clean_id (e.g. "stu094") as the sender ID.
+        #    MongoDB stores both clean_id and student_id — try both.
+        student_doc = await db.students.find_one(
+            {"$or": [{"clean_id": sender_id}, {"student_id": sender_id}]},
+            {"display_name": 1, "name": 1, "group": 1, "schedule": 1, "clean_id": 1, "_id": 0},
+        )
+        if not student_doc:
+            log.info("sl.auto_enter: sender %s not in db.students", sender_id)
+            return
+
+        display_name = (
+            student_doc.get("display_name")
+            or student_doc.get("name")
+            or sender_id
+        )
+        schedule = (
+            student_doc.get("group")
+            or student_doc.get("schedule")
+            or ""
+        ).upper()
+
+        # 2. Find the most recent waiting/active session for this schedule
+        #    that has the matching entry_fee
+        session_doc = await SL_SESSIONS.find_one(
+            {
+                "schedule": schedule,
+                "entry_fee": amount,
+                "status": {"$in": ["waiting", "active"]},
+            },
+            sort=[("created_at", -1)],
+        )
+        if not session_doc:
+            # Try without schedule filter (any active session with matching fee)
+            session_doc = await SL_SESSIONS.find_one(
+                {
+                    "entry_fee": amount,
+                    "status": {"$in": ["waiting", "active"]},
+                },
+                sort=[("created_at", -1)],
+            )
+        if not session_doc:
+            log.info(
+                "sl.auto_enter: no active session fee=%d schedule=%s",
+                amount, schedule,
+            )
+            return
+
+        session_id = session_doc["session_id"]
+        display_name_key = display_name.lower()
+
+        # 3. Deduplicate — don't add the same student twice
+        existing = await SL_ENTRIES.find_one(
+            {"session_id": session_id, "display_name_key": display_name_key}
+        )
+        if existing:
+            log.info("sl.auto_enter: %s already in session %s", display_name, session_id)
+            return
+
+        # 4. Insert entry and publish to SSE stream
+        position = (await SL_ENTRIES.count_documents({"session_id": session_id})) + 1
+        entered_at = datetime.now(timezone.utc).isoformat()
+
+        await SL_ENTRIES.insert_one({
+            "session_id":       session_id,
+            "student_id":       sender_id,
+            "display_name":     display_name,
+            "display_name_key": display_name_key,
+            "position":         position,
+            "entered_at":       entered_at,
+        })
+
+        await _sl_publish(session_id, {
+            "type":         "entry",
+            "student_id":   sender_id,
+            "display_name": display_name,
+            "position":     position,
+            "entered_at":   entered_at,
+        })
+
+
+        # ── LUCKY DRAW SURGERY ─────────────────────────────────────────
+        # The same P2P payment that put the student on the roster also
+        # buys their lucky code. Fire-and-forget — never blocks /enter.
+        await generate_and_publish_lucky_code(
+            db, _sl_publish, session_id, sender_id, display_name,
+            amount=amount, log=log,
+        )
+        # ───────────────────────────────────────────────────────────────
+
+        log.info(
+            "sl.auto_enter: %s (pos=%d) entered session %s via P2P fee=%d",
+            display_name, position, session_id, amount,
+        )
+    except Exception as exc:
+        log.warning("sl.auto_enter error: %s", str(exc)[:200])
+
+# SPEAKING LAB — Live session, SSE roster, points grant
+# Added safely — no existing function modified.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Collection aliases
+SL_SESSIONS = db.speaking_lab_sessions
+SL_ENTRIES  = db.speaking_lab_entries
+
+# ── Pydantic models ───────────────────────────────────────────────────────
+
+class SLSessionCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    schedule: str
+    entry_fee: int = 0
+
+class SLEnterRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    session_code: str
+    student_name: str
+
+class SLPointsGrant(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    studentID: str
+    points: int
+    source: str | None = "speaking-lab"
+    description: str | None = ""
+
+class SLAttendancePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    schedule: str
+    date: str
+    present: list[str]
+
+# ── SSE pub/sub (in-process, single Render instance) ─────────────────────
+
+_sl_subs: dict[str, set[asyncio.Queue]] = {}
+_sl_lock = asyncio.Lock()
+
+async def _sl_publish(session_id: str, event: dict) -> None:
+    async with _sl_lock:
+        queues = list(_sl_subs.get(session_id, set()))
+    for q in queues:
+        try:
+            q.put_nowait(event)
+        except Exception:
+            pass
+
+def _sl_sse(event: dict) -> bytes:
+    return ("data: " + json.dumps(event) + chr(10) + chr(10)).encode()
+
+# ── Points grant ──────────────────────────────────────────────────────────
+
+@api.post("/points/grant")
+async def sl_grant_points(
+    payload: SLPointsGrant,
+    admin: User = Depends(require_admin),
+):
+    """Grant points from treasury (stu092) to student via GAS P2P.
+    Appears in student P2P statement as sent from treasury wallet.
+    """
+    if not 1 <= payload.points <= 1000:
+        raise HTTPException(status_code=400, detail="points out of range")
+
+    if not SL_TREASURY_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="SL_TREASURY_PASSWORD not set on Render — add it in Environment settings.",
+        )
+
+    # 1. Resolve student clean_id (push subscriptions use clean_id)
+    stu_doc = await db.students.find_one(
+        {"$or": [{"student_id": payload.studentID}, {"clean_id": payload.studentID}]},
+        {"clean_id": 1, "display_name": 1, "_id": 0},
+    )
+    student_clean_id = (stu_doc or {}).get("clean_id") or payload.studentID
+
+    # 2. Call GAS sendPoints — treasury → student (real balance transfer)
+    nonce = secrets.token_hex(12)
+    gas_payload = {
+        "action":     "sendPoints",
+        "id":         SL_TREASURY_ID,
+        "password":   SL_TREASURY_PASSWORD,
+        "receiverId": student_clean_id,
+        "amount":     str(payload.points),
+        "nonce":      nonce,
+    }
+    gas_ok = False
+    gas_error = "unknown"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=6.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_POINTS_LOGIN_URL,
+                data=gas_payload,
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("success") is True:
+                        gas_ok = True
+                    else:
+                        gas_error = str(j.get("message") or j.get("error") or j)[:200]
+                except Exception:
+                    gas_error = r.text[:200]
+            else:
+                gas_error = f"HTTP {r.status_code}"
+    except Exception as exc:
+        gas_error = str(exc)[:200]
+
+    if not gas_ok:
+        log.warning("sl.grant: GAS transfer failed: %s", gas_error)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Points transfer failed: {gas_error}",
+        )
+
+    # 3. Audit row in MongoDB points_history
+    now_str = datetime.now(timezone.utc).isoformat()
+    await db.points_history.insert_one({
+        "student_id":         student_clean_id,
+        "from":               SL_TREASURY_ID,
+        "to":                 student_clean_id,
+        "delta":              payload.points,
+        "source":             "speaking-lab-award",
+        "description":        payload.description or "Speaking Lab award",
+        "granted_by":         admin.email,
+        "created_at":         now_str,
+        "senderStudentId":    SL_TREASURY_ID,
+        "recipientStudentId": student_clean_id,
+        "amount":             payload.points,
+        "display_sender":     "Treasury",
+    })
+
+    # 4. Push notification to student device
+    asyncio.create_task(
+        _fan_out_push(
+            {"studentId": student_clean_id},
+            title=f"\U0001F389 +{payload.points} \u178F\u17B7\u1793\u17D0! / Points Credited!",
+            body=(
+                f"\u17A2\u17D2\u1793\u1780\u200b\u1794\u17B6\u1793\u200b\u1791\u1791\u1793\u200b\u178F\u17B7\u1793\u200b\u178E +{payload.points} \u2728\n"
+                f"+{payload.points} pts from Treasury \u00b7 {payload.description or 'Speaking Lab award'}"
+            ),
+            url="/portal",
+        )
+    )
+
+    log.info(
+        "sl.grant: treasury=%s sent %d pts to %s via GAS, by=%s",
+        SL_TREASURY_ID, payload.points, student_clean_id, admin.email,
+    )
+    return {
+        "success":    True,
+        "studentID":  payload.studentID,
+        "clean_id":   student_clean_id,
+        "points":     payload.points,
+        "via":        "GAS_treasury",
+    }
+
+
+@api.get("/speaking-lab/questions")
+async def sl_get_questions(admin: User = Depends(require_admin)):
+    doc = await db.speaking_lab_settings.find_one({"_id": "questions"}, {"_id": 0})
+    return doc or {"beginner": [], "intermediate": []}
+
+@api.put("/speaking-lab/questions")
+async def sl_save_questions(payload: dict, admin: User = Depends(require_admin)):
+    data = {k: v for k, v in payload.items() if k != "_id"}
+    await db.speaking_lab_settings.replace_one(
+        {"_id": "questions"},
+        {"_id": "questions", **data},
+        upsert=True,
+    )
+    return {"ok": True, **data}
+
+@api.delete("/speaking-lab/questions")
+async def sl_delete_questions(admin: User = Depends(require_admin)):
+    await db.speaking_lab_settings.delete_one({"_id": "questions"})
+    return {"ok": True, "reset": True}
+
+# ── Settings ──────────────────────────────────────────────────────────────
+
+@api.get("/speaking-lab/settings")
+async def sl_get_settings(admin: User = Depends(require_admin)):
+    doc = await db.speaking_lab_settings.find_one({"_id": "settings"}, {"_id": 0})
+    return doc or {}
+
+@api.put("/speaking-lab/settings")
+async def sl_save_settings(payload: dict, admin: User = Depends(require_admin)):
+    data = {k: v for k, v in payload.items() if k != "_id"}
+    await db.speaking_lab_settings.replace_one(
+        {"_id": "settings"},
+        {"_id": "settings", **data},
+        upsert=True,
+    )
+    return {"ok": True, **data}
+
+# ── Attendance ────────────────────────────────────────────────────────────
+
+@api.get("/speaking-lab/attendance")
+async def sl_get_attendance(
+    schedule: str, date: str,
+    admin: User = Depends(require_admin),
+):
+    doc = await db.speaking_lab_attendance.find_one(
+        {"schedule": schedule, "date": date}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="No attendance for that day")
+    return doc
+
+@api.put("/speaking-lab/attendance")
+async def sl_save_attendance(
+    payload: SLAttendancePayload,
+    admin: User = Depends(require_admin),
+):
+    await db.speaking_lab_attendance.replace_one(
+        {"schedule": payload.schedule, "date": payload.date},
+        {
+            "schedule":   payload.schedule,
+            "date":       payload.date,
+            "present":    list(payload.present),
+            "saved_by":   admin.email,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        upsert=True,
+    )
+    return {"ok": True}
+
+# ── Live sessions ─────────────────────────────────────────────────────────
+
+@api.post("/speaking-lab/sessions")
+async def sl_create_session(
+    payload: SLSessionCreate,
+    admin: User = Depends(require_admin),
+):
+    if not 0 <= payload.entry_fee <= 500:
+        raise HTTPException(status_code=400, detail="entry_fee out of range")
+    session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    await SL_SESSIONS.insert_one({
+        "session_id": session_id,
+        "schedule":   payload.schedule,
+        "entry_fee":  payload.entry_fee,
+        "treasury_id":"stu092",
+        "status":     "waiting",
+        "created_by": admin.email,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    log.info("sl.session.create: %s schedule=%s fee=%s", session_id, payload.schedule, payload.entry_fee)
+    return {"session_id": session_id, "schedule": payload.schedule, "entry_fee": payload.entry_fee}
+
+@api.post("/speaking-lab/sessions/{session_id}/enter")
+async def sl_enter_session(session_id: str, body: SLEnterRequest):
+    sess = await SL_SESSIONS.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    display_name = (body.student_name or "").strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="student_name is required")
+    display_name_key = display_name.lower()
+    existing = await SL_ENTRIES.find_one(
+        {"session_id": session_id, "display_name_key": display_name_key},
+        {"_id": 0},
+    )
+    if existing:
+        return {"ok": True, "position": existing.get("position", 0),
+                "display_name": display_name, "deduplicated": True}
+    position   = (await SL_ENTRIES.count_documents({"session_id": session_id})) + 1
+    entered_at = datetime.now(timezone.utc).isoformat()
+    student_id = f"sl-{uuid.uuid4().hex[:12]}"
+    await SL_ENTRIES.insert_one({
+        "session_id":       session_id,
+        "student_id":       student_id,
+        "display_name":     display_name,
+        "display_name_key": display_name_key,
+        "position":         position,
+        "entered_at":       entered_at,
+    })
+    await _sl_publish(session_id, {
+        "type":         "entry",
+        "student_id":   student_id,
+        "display_name": display_name,
+        "position":     position,
+        "entered_at":   entered_at,
+    })
+    log.info("sl.session.enter: %s pos=%s name=%s", session_id, position, display_name)
+    return {
+        "ok": True, "session_id": session_id, "student_id": student_id,
+        "display_name": display_name, "position": position,
+        "entered_at": entered_at, "deduplicated": False,
+    }
+
+@api.get("/speaking-lab/sessions/{session_id}/stream")
+async def sl_stream_session(
+    session_id: str,
+    admin: User = Depends(require_admin),
+):
+    sess = await SL_SESSIONS.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    async with _sl_lock:
+        _sl_subs.setdefault(session_id, set()).add(queue)
+
+    async def gen():
+        try:
+            async for row in SL_ENTRIES.find(
+                {"session_id": session_id}, {"_id": 0}
+            ).sort("position", 1):
+                yield _sl_sse({"type": "entry", **row})
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    yield _sl_sse(event)
+                except asyncio.TimeoutError:
+                    yield b': ping\n\n'
+        finally:
+            async with _sl_lock:
+                subs = _sl_subs.get(session_id)
+                if subs:
+                    subs.discard(queue)
+                    if not subs:
+                        _sl_subs.pop(session_id, None)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# END SPEAKING LAB
+
+# ── LUCKY DRAW SURGERY ─────────────────────────────────────────────────
+register_lucky_draw_routes(
+    api, db, _sl_publish,
+    gas_url=GAS_POINTS_LOGIN_URL,
+    treasury_id=SL_TREASURY_ID,
+    treasury_password=SL_TREASURY_PASSWORD,
+    log=log,
+    require_admin=require_admin,
+)
+# ───────────────────────────────────────────────────────────────────────
+
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
@@ -2779,8 +3864,13 @@ app.add_middleware(
 )
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+
 @app.on_event("startup")
 async def startup():
+    global audio_bucket
+    audio_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="studio_audio")
     # Ensure useful indexes
     await db.books.create_index([("slug", 1), ("revision", -1)])
     await db.books.create_index("published")
@@ -2799,6 +3889,19 @@ async def startup():
     await db.students.create_index("student_id", unique=True)
     await db.student_sessions.create_index("session_token", unique=True)
     await db.student_sessions.create_index("expires_at")
+        # Speaking Lab indexes
+    await db.points_history.create_index([("student_id", 1), ("created_at", -1)])
+    await db.speaking_lab_sessions.create_index("session_id", unique=True)
+    await db.speaking_lab_entries.create_index([("session_id", 1), ("display_name_key", 1)], unique=True)
+    await db.speaking_lab_settings.create_index("_id")
+    await db.speaking_lab_attendance.create_index([("schedule", 1), ("date", 1)], unique=True)
+    # ── LUCKY DRAW SURGERY ──
+    await ensure_lucky_draw_indexes(db)
+    # ────────────────────────
+    # Coupon system indexes
+    await db.coupons.create_index("code", unique=True)
+    await db.coupons.create_index("enabled")
+    await db.coupons.create_index("expires_at")
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
@@ -2806,3 +3909,237 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     client.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUPON SYSTEM — v1.0 (append-only, zero existing routes modified)
+# Collections: coupons
+# Endpoints: POST/GET/PATCH/DELETE /api/coupons  (admin)
+#            POST /api/coupons/validate           (student)
+#            POST /api/coupons/redeem             (student)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import secrets as _secrets_coupon
+import string  as _string_coupon
+
+
+def _generate_coupon_code(length: int = 8) -> str:
+    """Generate a random uppercase alphanumeric coupon code."""
+    alphabet = _string_coupon.ascii_uppercase + _string_coupon.digits
+    return "".join(_secrets_coupon.choice(alphabet) for _ in range(length))
+
+
+def _calc_discount(original_price: int, coupon: dict) -> int:
+    """Return the discounted price (never below 0)."""
+    if coupon.get("type") == "percent":
+        discount = round(original_price * coupon.get("value", 0) / 100)
+    else:  # fixed
+        discount = int(coupon.get("value", 0))
+    return max(0, original_price - discount)
+
+
+async def _find_valid_coupon(
+    code: str,
+    student_id: str,
+    book_slug: str,
+) -> dict | None:
+    """
+    Look up a coupon by code and verify all constraints.
+    Returns the coupon doc on success, raises HTTPException on failure.
+    """
+    doc = await db.coupons.find_one({"code": code.strip().upper()}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Coupon code not found.")
+    if not doc.get("enabled", True):
+        raise HTTPException(status_code=400, detail="This coupon has been disabled.")
+    now_iso = datetime.now(timezone.utc)
+    valid_from = doc.get("valid_from")
+    expires_at = doc.get("expires_at")
+    if valid_from:
+        vf = datetime.fromisoformat(valid_from) if isinstance(valid_from, str) else valid_from
+        if vf.tzinfo is None:
+            vf = vf.replace(tzinfo=timezone.utc)
+        if now_iso < vf:
+            raise HTTPException(status_code=400, detail="This coupon is not yet active.")
+    if expires_at:
+        ex = datetime.fromisoformat(expires_at) if isinstance(expires_at, str) else expires_at
+        if ex.tzinfo is None:
+            ex = ex.replace(tzinfo=timezone.utc)
+        if now_iso > ex:
+            raise HTTPException(status_code=400, detail="This coupon has expired.")
+    max_uses = doc.get("max_uses")
+    if max_uses is not None and doc.get("uses_count", 0) >= max_uses:
+        raise HTTPException(status_code=400, detail="This coupon has reached its usage limit.")
+    assigned_to = doc.get("assigned_to") or []
+    if assigned_to and student_id not in assigned_to:
+        raise HTTPException(status_code=403, detail="This coupon is not assigned to your account.")
+    book_slugs = doc.get("book_slugs") or []
+    if book_slugs and book_slug not in book_slugs:
+        raise HTTPException(status_code=400, detail="This coupon cannot be used for this book.")
+    # Check if student already redeemed this coupon for this book
+    already = any(
+        r.get("student_id") == student_id and r.get("book_slug") == book_slug
+        for r in (doc.get("redemptions") or [])
+    )
+    if already:
+        raise HTTPException(status_code=400, detail="You have already used this coupon for this book.")
+    return doc
+
+
+# ── Admin endpoints ──────────────────────────────────────────────────────
+
+@api.post("/coupons")
+async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
+    """Create a new coupon. Set code='' to auto-generate."""
+    code = (payload.get("code") or "").strip().upper() or _generate_coupon_code()
+    if await db.coupons.find_one({"code": code}):
+        raise HTTPException(status_code=409, detail=f"Coupon code '{code}' already exists.")
+    discount_type = payload.get("type", "percent")
+    if discount_type not in ("percent", "fixed"):
+        raise HTTPException(status_code=400, detail="type must be 'percent' or 'fixed'.")
+    value = float(payload.get("value", 0))
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="value must be > 0.")
+    if discount_type == "percent" and value > 100:
+        raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "code":        code,
+        "type":        discount_type,
+        "value":       value,
+        "max_uses":    payload.get("max_uses"),           # None = unlimited
+        "uses_count":  0,
+        "assigned_to": payload.get("assigned_to") or [],  # [] = public
+        "book_slugs":  payload.get("book_slugs") or [],   # [] = all books
+        "valid_from":  payload.get("valid_from") or now_iso,
+        "expires_at":  payload.get("expires_at"),         # None = never
+        "enabled":     True,
+        "created_by":  admin.email,
+        "created_at":  now_iso,
+        "redemptions": [],
+    }
+    await db.coupons.insert_one(doc)
+    doc.pop("_id", None)
+    log.info("coupon: created %s by %s", code, admin.email)
+    return {"ok": True, "coupon": doc}
+
+
+@api.get("/coupons")
+async def list_coupons(admin: User = Depends(require_admin)):
+    """List all coupons (admin only)."""
+    cursor = db.coupons.find({}, {"_id": 0}).sort("created_at", -1)
+    coupons = await cursor.to_list(length=500)
+    return {"ok": True, "coupons": coupons}
+
+
+@api.get("/coupons/{code}")
+async def get_coupon(code: str, admin: User = Depends(require_admin)):
+    doc = await db.coupons.find_one({"code": code.upper()}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Coupon not found.")
+    return {"ok": True, "coupon": doc}
+
+
+@api.patch("/coupons/{code}")
+async def update_coupon(code: str, payload: dict, admin: User = Depends(require_admin)):
+    """Update coupon fields. Supports: enabled, expires_at, max_uses, assigned_to, book_slugs, value."""
+    allowed = {"enabled", "expires_at", "max_uses", "assigned_to", "book_slugs", "value", "valid_from"}
+    updates = {k: v for k, v in payload.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+    res = await db.coupons.update_one({"code": code.upper()}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Coupon not found.")
+    log.info("coupon: updated %s by %s", code, admin.email)
+    return {"ok": True}
+
+
+@api.delete("/coupons/{code}")
+async def delete_coupon(code: str, admin: User = Depends(require_admin)):
+    res = await db.coupons.delete_one({"code": code.upper()})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Coupon not found.")
+    log.info("coupon: deleted %s by %s", code, admin.email)
+    return {"ok": True}
+
+
+# ── Student endpoints ────────────────────────────────────────────────────
+
+@api.post("/coupons/validate")
+async def validate_coupon(payload: dict, student: "Student" = Depends(require_student)):
+    """
+    Preview a coupon's discount without consuming it.
+    Returns { ok, original_price, discounted_price, discount_amount, coupon }.
+    """
+    code      = (payload.get("code") or "").strip()
+    book_slug = (payload.get("book_slug") or "").strip()
+    original  = int(payload.get("original_price") or 0)
+    if not code or not book_slug or original <= 0:
+        raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
+    coupon = await _find_valid_coupon(code, student.clean_id, book_slug)
+    discounted = _calc_discount(original, coupon)
+    return {
+        "ok":               True,
+        "original_price":   original,
+        "discounted_price": discounted,
+        "discount_amount":  original - discounted,
+        "coupon_type":      coupon["type"],
+        "coupon_value":     coupon["value"],
+        "code":             coupon["code"],
+    }
+
+
+@api.post("/coupons/redeem")
+async def redeem_coupon(payload: dict, student: "Student" = Depends(require_student)):
+    """
+    Atomically redeem a coupon at purchase time.
+    Uses findOneAndUpdate with $lt guard to prevent concurrent over-use.
+    Returns { ok, discounted_price }.
+    """
+    code      = (payload.get("code") or "").strip()
+    book_slug = (payload.get("book_slug") or "").strip()
+    original  = int(payload.get("original_price") or 0)
+    if not code or not book_slug or original <= 0:
+        raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
+
+    # Validate first (raises HTTPException on any failure)
+    coupon = await _find_valid_coupon(code, student.clean_id, book_slug)
+    discounted = _calc_discount(original, coupon)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Atomic increment with max_uses guard — prevents race conditions
+    max_uses = coupon.get("max_uses")
+    query: dict = {"code": code.upper()}
+    if max_uses is not None:
+        query["uses_count"] = {"$lt": max_uses}
+
+    redemption_entry = {
+        "student_id":  student.clean_id,
+        "book_slug":   book_slug,
+        "redeemed_at": now_iso,
+        "original":    original,
+        "discounted":  discounted,
+    }
+    result = await db.coupons.find_one_and_update(
+        query,
+        {
+            "$inc":  {"uses_count": 1},
+            "$push": {"redemptions": redemption_entry},
+        },
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=400, detail="Coupon is no longer available (usage limit reached).")
+
+    log.info("coupon: redeemed %s by %s for book=%s saved=%dpts",
+             code, student.clean_id, book_slug, original - discounted)
+    return {
+        "ok":               True,
+        "code":             code.upper(),
+        "original_price":   original,
+        "discounted_price": discounted,
+        "discount_amount":  original - discounted,
+    }
+
+
+# ── END COUPON SYSTEM ──────────────────────────────────────────────────────
