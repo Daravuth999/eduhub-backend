@@ -3858,8 +3858,21 @@ app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    # Explicit header list required when allow_credentials=True.
+    # Safari iOS (WebKit) rejects allow_headers=["*"] with credentials,
+    # causing POST /api/auth/google to fail on iPhone even though it works
+    # on desktop Chrome (which is lenient about the wildcard).
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Session-ID",
+        "X-Cron-Secret",
+        "Cookie",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
 )
 
 
