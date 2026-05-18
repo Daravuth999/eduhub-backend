@@ -2956,7 +2956,17 @@ async def student_login(payload: dict, response: Response):
         {"_id": 0},
     )
     # Identical 401 for missing user and wrong password   prevents enumeration.
-    if not doc or not _bcrypt_lib.checkpw(password.encode("utf-8"), doc.get("password_hash", "").encode("utf-8")):
+    _pw_ok = False
+    if doc:
+        _stored_hash = (doc.get("password_hash") or "").strip()
+        if _stored_hash:
+            try:
+                _pw_ok = _bcrypt_lib.checkpw(
+                    password.encode("utf-8"), _stored_hash.encode("utf-8")
+                )
+            except Exception:
+                _pw_ok = False
+    if not doc or not _pw_ok:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     now = datetime.now(timezone.utc)
@@ -3112,6 +3122,48 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
         return False
 
 
+async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
+    """Push the new display name to the GAS standalone Password Sync script.
+
+    Called on ID reactivation so the previous student's name is overwritten.
+    Without this, getStudentData returns the old occupant's name forever.
+    Never raises — a GAS outage must never block reactivation.
+    """
+    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+        log.warning(
+            "name-sync: GAS_PORTAL_URL or GAS_ADMIN_SECRET not set — "
+            "Sheet name NOT updated for %s.", clean_id,
+        )
+        return False
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_PORTAL_URL,
+                data={
+                    "action": "syncName",
+                    "studentId": clean_id,
+                    "newName": display_name,
+                    "adminSecret": GAS_ADMIN_SECRET,
+                },
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("ok") is True:
+                        log.info("name-sync: Sheet updated %s -> %s", clean_id, display_name)
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        log.warning("name-sync: GAS did not confirm for %s", clean_id)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("name-sync: GAS unreachable for %s — %s", clean_id, exc)
+        return False
+
+
 @api.post("/teacher/students")
 async def teacher_create_student(
     payload: dict,
@@ -3180,8 +3232,13 @@ async def teacher_create_student(
         action = "created"
 
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
-    # Sync new password to GAS Sheet so Points/Game/Portal backends stay in sync.
-    await _sync_password_to_gas(clean_id, plain_password)
+    # Fire-and-forget GAS syncs — never block the credential card response.
+    import asyncio as _asyncio_create
+    _asyncio_create.create_task(_sync_password_to_gas(clean_id, plain_password))
+    # On reactivation: also sync the new name so GAS returns the new student's
+    # identity, not the previous occupant's name.
+    if action == "reactivated":
+        _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
 
     return {
         "action": action,
@@ -3198,7 +3255,9 @@ async def teacher_create_student(
 @api.get("/teacher/students")
 async def teacher_list_students(admin: User = Depends(require_admin)):
     # Primary source: MongoDB db.students (populated via teacher CRUD)
-    cursor = db.students.find({"is_active": {"$ne": False}}, {"_id": 0, "password_hash": 0})
+    # Return ALL students so the frontend can show inactive ones with
+    # the Reuse ID button. The login endpoint still enforces is_active:True.
+    cursor = db.students.find({}, {"_id": 0, "password_hash": 0})
     students = await cursor.to_list(length=2000)
     for s in students:
         if "enrolled_at" not in s:
@@ -3297,8 +3356,9 @@ async def teacher_reset_password(
         {"student_id": student_id}, {"_id": 0, "password_hash": 0},
     )
     log.info("teacher: password reset for %s by %s", student_id, admin.email)
-    # Sync new password to GAS Sheet so Points/Game/Portal backends stay in sync.
-    await _sync_password_to_gas(doc["clean_id"], plain_password)
+    # Fire-and-forget — never delay the credential card response.
+    import asyncio as _asyncio_reset
+    _asyncio_reset.create_task(_sync_password_to_gas(doc["clean_id"], plain_password))
 
     return {
         "ok": True,
@@ -3329,8 +3389,10 @@ async def teacher_deactivate_student(
         raise HTTPException(status_code=404, detail="Student not found")
     await db.student_sessions.delete_many({"student_id": student_id})
 
-    # Archive GAS evaluation rows — fire-and-forget, never blocks deactivation
-    await _archive_student_in_gas(doc["clean_id"])
+    # Archive GAS evaluation rows — true fire-and-forget via create_task so the
+    # 15-second GAS timeout NEVER blocks this endpoint.
+    import asyncio as _asyncio_deact
+    _asyncio_deact.create_task(_archive_student_in_gas(doc["clean_id"]))
 
     log.info("teacher: deactivated student %s by %s", student_id, admin.email)
     return {"ok": True}
@@ -3854,13 +3916,25 @@ register_lucky_draw_routes(
 )
 # ───────────────────────────────────────────────────────────────────────
 
-app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    # Explicit header list required when allow_credentials=True.
+    # Safari iOS (WebKit) rejects allow_headers=["*"] with credentials,
+    # causing POST /api/auth/google to fail on iPhone even though it works
+    # on desktop Chrome (which is lenient about the wildcard).
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Session-ID",
+        "X-Cron-Secret",
+        "Cookie",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
 )
 
 
@@ -4066,17 +4140,19 @@ async def delete_coupon(code: str, admin: User = Depends(require_admin)):
 # ── Student endpoints ────────────────────────────────────────────────────
 
 @api.post("/coupons/validate")
-async def validate_coupon(payload: dict, student: "Student" = Depends(require_student)):
+async def validate_coupon(payload: dict):
     """
     Preview a coupon's discount without consuming it.
+    Accepts student_id from payload (GAS-authenticated students pass their clean_id).
     Returns { ok, original_price, discounted_price, discount_amount, coupon }.
     """
-    code      = (payload.get("code") or "").strip()
-    book_slug = (payload.get("book_slug") or "").strip()
-    original  = int(payload.get("original_price") or 0)
+    code       = (payload.get("code") or "").strip()
+    book_slug  = (payload.get("book_slug") or "").strip()
+    original   = int(payload.get("original_price") or 0)
+    student_id = (payload.get("student_id") or "").strip()
     if not code or not book_slug or original <= 0:
         raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
-    coupon = await _find_valid_coupon(code, student.clean_id, book_slug)
+    coupon = await _find_valid_coupon(code, student_id, book_slug)
     discounted = _calc_discount(original, coupon)
     return {
         "ok":               True,
@@ -4090,20 +4166,22 @@ async def validate_coupon(payload: dict, student: "Student" = Depends(require_st
 
 
 @api.post("/coupons/redeem")
-async def redeem_coupon(payload: dict, student: "Student" = Depends(require_student)):
+async def redeem_coupon(payload: dict):
     """
     Atomically redeem a coupon at purchase time.
+    Accepts student_id from payload (GAS-authenticated students pass their clean_id).
     Uses findOneAndUpdate with $lt guard to prevent concurrent over-use.
     Returns { ok, discounted_price }.
     """
-    code      = (payload.get("code") or "").strip()
-    book_slug = (payload.get("book_slug") or "").strip()
-    original  = int(payload.get("original_price") or 0)
+    code       = (payload.get("code") or "").strip()
+    book_slug  = (payload.get("book_slug") or "").strip()
+    original   = int(payload.get("original_price") or 0)
+    student_id = (payload.get("student_id") or "").strip()
     if not code or not book_slug or original <= 0:
         raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
 
     # Validate first (raises HTTPException on any failure)
-    coupon = await _find_valid_coupon(code, student.clean_id, book_slug)
+    coupon = await _find_valid_coupon(code, student_id, book_slug)
     discounted = _calc_discount(original, coupon)
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -4114,7 +4192,7 @@ async def redeem_coupon(payload: dict, student: "Student" = Depends(require_stud
         query["uses_count"] = {"$lt": max_uses}
 
     redemption_entry = {
-        "student_id":  student.clean_id,
+        "student_id":  student_id,
         "book_slug":   book_slug,
         "redeemed_at": now_iso,
         "original":    original,
@@ -4132,7 +4210,7 @@ async def redeem_coupon(payload: dict, student: "Student" = Depends(require_stud
         raise HTTPException(status_code=400, detail="Coupon is no longer available (usage limit reached).")
 
     log.info("coupon: redeemed %s by %s for book=%s saved=%dpts",
-             code, student.clean_id, book_slug, original - discounted)
+             code, student_id, book_slug, original - discounted)
     return {
         "ok":               True,
         "code":             code.upper(),
@@ -4143,396 +4221,4 @@ async def redeem_coupon(payload: dict, student: "Student" = Depends(require_stud
 
 
 # ── END COUPON SYSTEM ──────────────────────────────────────────────────────
-"""
-server_conversation_patch.py
-═══════════════════════════════════════════════════════════════════════════════
-INTEGRATION INSTRUCTIONS:
-  1. Open server.py
-  2. Find the line: `async def _elevenlabs_generate(text: str, voice_id: str)`
-     (around line 286)
-  3. After the closing of that function (around line 340), paste everything
-     below the "# ─── PASTE HERE ───" marker.
-  4. Add the new route alongside the existing /elevenlabs route (around line 690).
-  5. Add `pydub>=0.25.1` to requirements.txt
-
-EXISTING FUNCTION NOT MODIFIED — only new functions and one new endpoint added.
-═══════════════════════════════════════════════════════════════════════════════
-"""
-
-# ─── PASTE HERE (after _elevenlabs_generate function, before first @api route) ───
-
-# ─────────────────────────────────────────────────────────────────────────── #
-#  Conversation Voice Studio helpers — teacher-side only                       #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-EMOTION_ACTING_NOTES: dict = {
-    "neutral":   None,
-    "happy":     "enthusiastic and warm",
-    "excited":   "very excited and energetic",
-    "sad":       "sad and quietly dejected",
-    "scared":    "scared, voice trembling slightly",
-    "angry":     "frustrated and tense, clipped words",
-    "curious":   "curious and questioning, rising intonation",
-    "surprised": "surprised and astonished",
-    "calm":      "calm, slow, and reassuring",
-    "dramatic":  "dramatic and intense, measured pauses",
-    "whisper":   "whispering softly and quietly",
-}
-
-
-def _emotion_to_acting_note(emotion, custom_note):
-    """Merge emotion preset + teacher custom note into ElevenLabs acting prompt."""
-    base = EMOTION_ACTING_NOTES.get(emotion or "neutral")
-    if custom_note and custom_note.strip():
-        return f"{base}; {custom_note.strip()}" if base else custom_note.strip()
-    return base
-
-
-def _stitch_mp3_segments(segments):
-    """Concatenate MP3 byte segments.
-
-    Valid when all segments share the same codec parameters — guaranteed
-    when every clip comes from ElevenLabs mp3_44100_128 CBR output.
-    """
-    return b"".join(segments)
-
-
-def _generate_silence_bytes(duration_seconds):
-    """Return silent MP3 bytes for the requested duration.
-
-    Tries pydub + ffmpeg first; falls back to a pre-built silent MP3 frame
-    repeated to fill the time (works without ffmpeg on Render).
-    """
-    if duration_seconds <= 0:
-        return b""
-    try:
-        from pydub import AudioSegment  # noqa: PLC0415
-        silence = AudioSegment.silent(
-            duration=int(duration_seconds * 1000),
-            frame_rate=44100,
-        )
-        buf = io.BytesIO()
-        silence.export(buf, format="mp3", bitrate="128k")
-        return buf.getvalue()
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Fallback: repeat a minimal silent 128kbps MPEG-1 L3 frame.
-    # Frame holds 1152 samples at 44100 Hz → ~26.1 ms each.
-    # Header bytes: FF FB 90 00 (sync + 128kbps + 44100 + stereo + no padding)
-    SILENT_FRAME = b"\xff\xfb\x90\x00" + b"\x00" * 413  # 417 bytes total
-    FRAME_DURATION = 1152 / 44100  # ≈ 0.02613 s
-    n_frames = max(1, int(duration_seconds / FRAME_DURATION) + 1)
-    return SILENT_FRAME * n_frames
-
-
-async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_note=None):
-    """Generate audio + word timestamps for one dialogue line.
-
-    Extended variant of _elevenlabs_generate() that supports:
-      • voice_settings  dict  { stability, similarity_boost, style }
-      • acting_note     str   prepended as ElevenLabs emotion directive
-
-    Returns { audio_base64, word_timestamps, duration }.
-    """
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
-
-    # ElevenLabs v3 acting instruction: prefix in square brackets
-    tts_text = f"[{acting_note}] {text}" if acting_note else text
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    body = {
-        "text": tts_text,
-        "model_id": ELEVENLABS_MODEL,
-        "output_format": "mp3_44100_128",
-    }
-    if voice_settings:
-        vs = {}
-        for key in ("stability", "similarity_boost", "style"):
-            if key in voice_settings:
-                try:
-                    vs[key] = float(voice_settings[key])
-                except (TypeError, ValueError):
-                    pass
-        vs["use_speaker_boost"] = True
-        if vs:
-            body["voice_settings"] = vs
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(90.0, connect=10.0),
-        follow_redirects=True,
-    ) as cli:
-        r = await cli.post(url, headers=headers, json=body)
-        if r.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"ElevenLabs error {r.status_code}: {r.text[:200]}",
-            )
-        data = r.json()
-
-    audio_base64 = data.get("audio_base64", "")
-    alignment = data.get("alignment", {})
-    chars = alignment.get("characters", [])
-    char_starts = alignment.get("character_start_times_seconds", [])
-    char_ends = alignment.get("character_end_times_seconds", [])
-
-    word_timestamps = []
-    current_word = ""
-    word_start = 0.0
-    word_end = 0.0
-
-    for i, ch in enumerate(chars):
-        char_str = ch if isinstance(ch, str) else str(ch)
-        t_start = char_starts[i] if i < len(char_starts) else 0.0
-        t_end = char_ends[i] if i < len(char_ends) else 0.0
-
-        if char_str in (" ", "\n"):
-            if current_word.strip():
-                word_timestamps.append({
-                    "word": current_word.strip(),
-                    "start": round(word_start, 3),
-                    "end": round(word_end, 3),
-                })
-            current_word = ""
-        else:
-            if not current_word:
-                word_start = t_start
-            current_word += char_str
-            word_end = t_end
-
-    if current_word.strip():
-        word_timestamps.append({
-            "word": current_word.strip(),
-            "start": round(word_start, 3),
-            "end": round(word_end, 3),
-        })
-
-    duration = word_timestamps[-1]["end"] if word_timestamps else 0.0
-    return {
-        "audio_base64": audio_base64,
-        "word_timestamps": word_timestamps,
-        "duration": duration,
-    }
-
-
-# ─── PASTE NEW ROUTE alongside the existing /elevenlabs route ───────────── #
-
-@api.post("/studio/books/{slug}/conversation")
-async def studio_conversation_generate(
-    slug: str,
-    payload: dict,
-    admin: User = Depends(require_admin),
-):
-    """Generate multi-character emotional dialogue audio for a chapter.
-    Teacher-side only. Never called by students.
-
-    Per-line: calls ElevenLabs with per-speaker voice, emotion, acting notes,
-    and voice settings. Stitches all segments into one stable MP3. Stores
-    in GridFS. Updates dialog blocks with adjusted timestamps.
-
-    Payload:
-        chapterIndex: int
-        book: dict   (pre-saved, same pattern as /elevenlabs)
-        lines: [
-            {
-                lineIndex: int,
-                speaker: str,
-                text: str,
-                voiceId: str,
-                emotion: str,
-                actingNote: str,
-                voiceSettings: { stability, similarity_boost, style },
-                pauseAfter: float,
-            }
-        ]
-    """
-    import asyncio  # noqa: PLC0415
-
-    chapter_index = int(payload.get("chapterIndex", 0))
-    lines = payload.get("lines") or []
-    if not lines:
-        raise HTTPException(status_code=400, detail="No lines provided.")
-
-    # Load book (same pattern as /elevenlabs)
-    book = payload.get("book") or None
-    if not book:
-        book = await db.books.find_one(
-            {"slug": slug}, {"_id": 0}, sort=[("revision", -1)]
-        )
-    if not book:
-        await asyncio.sleep(0.5)
-        book = await db.books.find_one(
-            {"slug": slug}, {"_id": 0}, sort=[("revision", -1)]
-        )
-    if not book:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Book '{slug}' not found. Save first, then generate.",
-        )
-
-    chapters = book.get("chapters", [])
-    if chapter_index >= len(chapters):
-        raise HTTPException(status_code=400, detail="Chapter index out of range.")
-
-    chapter = chapters[chapter_index]
-    blocks = list(chapter.get("blocks", []))
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Validate voice IDs
-    for li, line in enumerate(lines):
-        raw_voice = str(line.get("voiceId") or "").strip()
-        if not _VOICE_ID_RE.match(raw_voice):
-            line["voiceId"] = ELEVENLABS_DEFAULT_VOICE
-            log.warning(
-                "conversation: line %d invalid voiceId %r → default", li, raw_voice
-            )
-
-    audio_segments = []
-    accumulated_time = 0.0
-    line_results = []
-
-    for li, line in enumerate(lines):
-        voice_id = line["voiceId"]
-        emotion = str(line.get("emotion") or "neutral")
-        acting_note = _emotion_to_acting_note(emotion, line.get("actingNote") or "")
-        voice_settings = line.get("voiceSettings") or None
-        pause_after = max(0.0, float(line.get("pauseAfter", 0.35)))
-
-        log.info(
-            "conversation: line %d/%d speaker=%s voice=%s emotion=%s",
-            li + 1, len(lines), line.get("speaker", "?"), voice_id, emotion,
-        )
-
-        try:
-            result = await _elevenlabs_generate_line(
-                text=line["text"],
-                voice_id=voice_id,
-                voice_settings=voice_settings,
-                acting_note=acting_note,
-            )
-        except HTTPException as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=f"Line {li + 1} ({line.get('speaker', '?')}): {exc.detail}",
-            ) from exc
-
-        audio_bytes = base64.b64decode(result["audio_base64"])
-        raw_wts = result["word_timestamps"]
-        line_duration = result["duration"]
-
-        # Shift timestamps by accumulated offset
-        shifted_wts = [
-            {
-                "word": w["word"],
-                "start": round(w["start"] + accumulated_time, 3),
-                "end": round(w["end"] + accumulated_time, 3),
-            }
-            for w in raw_wts
-        ]
-
-        line_start = accumulated_time
-        line_end = line_start + line_duration
-
-        audio_segments.append(audio_bytes)
-        line_results.append({
-            "lineIndex": line.get("lineIndex"),
-            "speaker": line.get("speaker", ""),
-            "start": round(line_start, 3),
-            "end": round(line_end, 3),
-            "wordTimestamps": shifted_wts,
-        })
-
-        accumulated_time = line_end + pause_after
-
-        if pause_after > 0:
-            silence = _generate_silence_bytes(pause_after)
-            if silence:
-                audio_segments.append(silence)
-
-    # Stitch all segments
-    stitched_bytes = _stitch_mp3_segments(audio_segments)
-
-    # Upload to GridFS
-    audio_id = str(uuid.uuid4())
-    try:
-        await audio_bucket.upload_from_stream(
-            f"{audio_id}.mp3",
-            io.BytesIO(stitched_bytes),
-            metadata={
-                "slug": slug,
-                "chapter_index": chapter_index,
-                "type": "conversation",
-                "speakers": list({lr["speaker"] for lr in line_results}),
-                "line_count": len(lines),
-                "created_at": now,
-                "created_by": admin.email,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.exception("conversation: GridFS upload failed for slug=%s", slug)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to store conversation audio: {type(exc).__name__}: {exc}",
-        ) from exc
-
-    audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
-
-    # Update dialog blocks with adjusted timestamps
-    for lr in line_results:
-        idx = lr.get("lineIndex")
-        if idx is None or not isinstance(idx, int) or idx >= len(blocks):
-            continue
-        if blocks[idx].get("type") == "dialog":
-            blocks[idx] = {
-                **blocks[idx],
-                "start": lr["start"],
-                "end": lr["end"],
-                "wordTimestamps": lr["wordTimestamps"],
-            }
-
-    # Remove any existing conversation audio block, inject new one
-    blocks = [b for b in blocks if not b.get("_conversation_audio")]
-    blocks.append({
-        "type": "audio",
-        "text": audio_url,
-        "heading": f"Conversation — {chapter.get('title', 'Chapter')}",
-        "_elevenlabs_audio": True,
-        "_conversation_audio": True,
-        "_audio_id": audio_id,
-    })
-
-    # Save new book revision
-    chapters[chapter_index] = {**chapter, "blocks": blocks}
-    latest = await db.books.find_one(
-        {"slug": slug}, {"_id": 0, "revision": 1}, sort=[("revision", -1)]
-    )
-    next_rev = int((latest or {}).get("revision") or 0) + 1
-
-    updated_doc = {
-        **book,
-        "chapters": chapters,
-        "revision": next_rev,
-        "_authoredAt": now,
-        "_authoredBy": admin.email,
-    }
-    updated_doc.pop("_id", None)
-    await db.books.insert_one(updated_doc)
-
-    log.info(
-        "conversation: done slug=%s chapter=%d lines=%d duration=%.1fs rev=%d",
-        slug, chapter_index, len(lines), accumulated_time, next_rev,
-    )
-
-    return {
-        "ok": True,
-        "audioUrl": audio_url,
-        "audioId": audio_id,
-        "totalDuration": round(accumulated_time, 3),
-        "lines": line_results,
-        "revision": next_rev,
-    }
+app.include_router(api)
