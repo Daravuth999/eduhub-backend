@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import base64
+import io
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,12 +18,20 @@ from typing import Any, Literal
 
 import json
 import httpx
+
+# ── LUCKY DRAW SURGERY ─────────────────────────────────────────────────
+from lucky_draw import (
+    register_lucky_draw_routes,
+    generate_and_publish_lucky_code,
+    ensure_lucky_draw_indexes,
+)
+# ───────────────────────────────────────────────────────────────────────
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import (APIRouter, Cookie, Depends, FastAPI, File, Form, Header,
                      HTTPException, Request, Response, UploadFile, status)
-from fastapi.responses import JSONResponse
-from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi.responses import JSONResponse, StreamingResponse
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from pydantic import BaseModel, ConfigDict, Field
 from pywebpush import WebPushException, webpush
 from py_vapid import Vapid01
@@ -52,6 +62,25 @@ VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@eduhub.app")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+# ElevenLabs AI Voice (teacher-side TTS for chapter audio)
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+# Default voice falls back to "Rachel" (21m00Tcm4TlvDq8ikWAM) which is in
+# every ElevenLabs account's starter voice library. Override per-deploy via
+# the ELEVENLABS_DEFAULT_VOICE env var with any 20-char voice_id.
+ELEVENLABS_DEFAULT_VOICE = os.environ.get(
+    "ELEVENLABS_DEFAULT_VOICE", "21m00Tcm4TlvDq8ikWAM"
+)
+_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{20}$")
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_v3")
+
+# Public-facing backend URL — used to build absolute audio stream URLs
+# so both the student PWA (vercel.app) and Author Studio can play the audio.
+# Set in Render env vars as PUBLIC_BACKEND_URL.
+PUBLIC_BACKEND_URL = os.environ.get(
+    "PUBLIC_BACKEND_URL",
+    "https://eduhub-backend-td3a.onrender.com",
+).rstrip("/")
 
 
 def _repair_pem(raw: str) -> str:
@@ -116,6 +145,9 @@ if VAPID_PRIVATE_KEY:
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+
+# GridFS bucket for ElevenLabs AI voice audio (avoids multi-MB inline base64)
+audio_bucket = None  # initialised in startup()
 
 # Collection references for the Push Studio module
 push_subscriptions = db["push_subscriptions"]
@@ -249,6 +281,85 @@ async def require_admin(user: User = Depends(require_user)) -> User:
 
 
 # --------------------------------------------------------------------------- #
+# ElevenLabs AI Voice helper (teacher-side only, never called by students)    #
+# --------------------------------------------------------------------------- #
+async def _elevenlabs_generate(text: str, voice_id: str) -> dict:
+    """Call ElevenLabs text-to-speech with-timestamps endpoint.
+    Returns { audio_base64, word_timestamps } or raises HTTPException.
+    Never called by students — teacher-side only.
+    """
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL,
+        "output_format": "mp3_44100_128",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=10.0),
+        follow_redirects=True,
+    ) as cli:
+        r = await cli.post(url, headers=headers, json=body)
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ElevenLabs error {r.status_code}: {r.text[:200]}"
+            )
+        data = r.json()
+
+    # Convert character-level alignment to word-level timestamps
+    audio_base64 = data.get("audio_base64", "")
+    alignment = data.get("alignment", {})
+    chars = alignment.get("characters", [])
+    char_starts = alignment.get("character_start_times_seconds", [])
+    char_ends = alignment.get("character_end_times_seconds", [])
+
+    word_timestamps = []
+    current_word = ""
+    word_start = 0.0
+    word_end = 0.0
+
+    for i, ch in enumerate(chars):
+        char_str = ch if isinstance(ch, str) else str(ch)
+        t_start = char_starts[i] if i < len(char_starts) else 0.0
+        t_end = char_ends[i] if i < len(char_ends) else 0.0
+
+        if char_str == " " or char_str == "\n":
+            if current_word.strip():
+                word_timestamps.append({
+                    "word": current_word.strip(),
+                    "start": round(word_start, 3),
+                    "end": round(word_end, 3),
+                })
+            current_word = ""
+        else:
+            if not current_word:
+                word_start = t_start
+            current_word += char_str
+            word_end = t_end
+
+    # flush last word
+    if current_word.strip():
+        word_timestamps.append({
+            "word": current_word.strip(),
+            "start": round(word_start, 3),
+            "end": round(word_end, 3),
+        })
+
+    return {
+        "audio_base64": audio_base64,
+        "word_timestamps": word_timestamps,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Auth routes                                                                 #
 # --------------------------------------------------------------------------- #
 @api.post("/auth/google")
@@ -370,6 +481,7 @@ CANONICAL_BOOK_FIELDS = {
     "coverImage", "coverGradient", "accent", "badge", "level",
     "readingMinutes", "price", "tier", "published", "newUntil", "contentType",
     "format", "chapters", "content", "revision", "_authoredAt", "_authoredBy",
+    "ai_voice",
 }
 
 
@@ -499,6 +611,271 @@ async def studio_publish(slug: str, admin: User = Depends(require_admin)):
 async def studio_unpublish(slug: str, admin: User = Depends(require_admin)):
     res = await db.books.update_many({"slug": slug}, {"$set": {"published": False}})
     return {"success": True, "matched": res.matched_count, "modified": res.modified_count}
+
+
+@api.get("/studio/voices")
+async def studio_list_voices(admin: User = Depends(require_admin)):
+    """List available ElevenLabs voices for the teacher voice picker.
+
+    Teacher-side only (require_admin). The xi-api-key never leaves the
+    server — the browser only receives sanitized {voice_id, name, ...}.
+    """
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(
+            status_code=503, detail="ELEVENLABS_API_KEY not configured."
+        )
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=10.0)
+    ) as cli:
+        r = await cli.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+        )
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ElevenLabs voices list error {r.status_code}: {r.text[:200]}",
+            )
+        data = r.json()
+
+    voices = []
+    for v in data.get("voices", []) or []:
+        labels = v.get("labels", {}) or {}
+        voices.append({
+            "voice_id": v.get("voice_id", ""),
+            "name": v.get("name", ""),
+            "category": v.get("category", ""),
+            "description": v.get("description", "") or "",
+            "preview_url": v.get("preview_url", "") or "",
+            "gender": labels.get("gender", "") or "",
+            "accent": labels.get("accent", "") or "",
+            "age": labels.get("age", "") or "",
+            "use_case": labels.get("use_case", "") or labels.get("use case", "") or "",
+        })
+
+    return {
+        "default_voice_id": ELEVENLABS_DEFAULT_VOICE,
+        "voices": voices,
+    }
+
+
+@api.get("/studio/audio/{audio_filename}")
+async def studio_audio_stream(audio_filename: str):
+    """Stream AI-generated audio from MongoDB GridFS.
+    Public — no auth required so student PWA can play it directly.
+    """
+    try:
+        stream = await audio_bucket.open_download_stream_by_name(audio_filename)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Audio not found.")
+
+    async def generate():
+        while True:
+            chunk = await stream.readchunk()
+            if not chunk:
+                break
+            yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+@api.post("/studio/books/{slug}/elevenlabs")
+async def studio_elevenlabs_generate(
+    slug: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Generate AI voice for one chapter using ElevenLabs.
+    Teacher-side only. Never called by students.
+    Injects audio_url + wordTimestamps into chapter blocks.
+    Saves a new book revision to MongoDB.
+    """
+    chapter_index = int(payload.get("chapterIndex", 0))
+    # Defensive: reject human-readable names like "Rachel" — ElevenLabs
+    # requires a 20-char alphanumeric voice_id. If the client somehow sends
+    # anything else (stale cached frontend, manual API caller, etc.), fall
+    # back to the configured default instead of 404-ing.
+    raw_voice = str(payload.get("voice") or "").strip()
+    if _VOICE_ID_RE.match(raw_voice):
+        voice_id = raw_voice
+    else:
+        if raw_voice:
+            log.warning(
+                "elevenlabs: rejected invalid voice value %r — using default %s",
+                raw_voice, ELEVENLABS_DEFAULT_VOICE,
+            )
+        voice_id = ELEVENLABS_DEFAULT_VOICE
+
+    # Define now early — used in GridFS metadata and ai_voice meta below
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Load current book (latest revision).
+    # The frontend passes the saved book directly in the payload after
+    # auto-saving, which avoids any MongoDB replication race condition.
+    # Fall back to find_one for backward compatibility.
+    import asyncio
+    book = payload.get("book") or None
+    if not book:
+        book = await db.books.find_one(
+            {"slug": slug},
+            {"_id": 0},
+            sort=[("revision", -1)],
+        )
+    if not book:
+        await asyncio.sleep(0.5)
+        book = await db.books.find_one(
+            {"slug": slug},
+            {"_id": 0},
+            sort=[("revision", -1)],
+        )
+    if not book:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Book '{slug}' not found. Please click Save Revision first, then Generate AI Voice."
+        )
+
+    chapters = book.get("chapters", [])
+    if chapter_index >= len(chapters):
+        raise HTTPException(status_code=400, detail="Chapter index out of range.")
+
+    chapter = chapters[chapter_index]
+    blocks = chapter.get("blocks", [])
+
+    # Collect all text from this chapter for ElevenLabs
+    full_text = " ".join(
+        b.get("text", "")
+        for b in blocks
+        if b.get("type", "paragraph") in (
+            "paragraph", "transcript", "text", "paragraphs", "heading", "quote"
+        )
+        and b.get("text", "").strip()
+    )
+
+    if not full_text.strip():
+        raise HTTPException(status_code=400, detail="Chapter has no readable text.")
+
+    # Call ElevenLabs
+    result = await _elevenlabs_generate(full_text, voice_id)
+    audio_b64 = result["audio_base64"]
+    word_timestamps = result["word_timestamps"]
+
+    # Upload MP3 to MongoDB GridFS — avoids storing multi-MB base64 inline
+    # which crashes the frontend when the book document is loaded.
+    # FIX v9.9: motor's GridFSBucket.upload_from_stream() requires a file-like
+    # object with a .read() method. Passing raw bytes raises
+    # AttributeError: 'bytes' object has no attribute 'read' — which manifests
+    # as a 500 (no CORS headers) and looks like a CORS error in the browser.
+    audio_bytes = base64.b64decode(audio_b64)
+    audio_id = str(uuid.uuid4())
+    try:
+        await audio_bucket.upload_from_stream(
+            f"{audio_id}.mp3",
+            io.BytesIO(audio_bytes),
+            metadata={
+                "slug": slug,
+                "chapter_index": chapter_index,
+                "voice": voice_id,
+                "created_at": now,
+                "created_by": admin.email,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("elevenlabs: GridFS upload failed for slug=%s", slug)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store generated audio: {type(exc).__name__}: {exc}",
+        ) from exc
+    # Build absolute URL so both Vercel frontend and student PWA can stream it
+    audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+
+    # Inject into blocks:
+    # 1. Remove any existing ElevenLabs audio block
+    blocks = [b for b in blocks if not b.get("_elevenlabs_audio")]
+
+    # 2. Append new audio block (after existing content so teacher MP3 stays primary)
+    blocks.append({
+        "type": "audio",
+        "text": audio_url,
+        "heading": f"AI Voice — {chapter.get('title', 'Chapter')}",
+        "_elevenlabs_audio": True,
+        "_audio_id": audio_id,
+    })
+
+    # 3. Distribute word timestamps across transcript blocks proportionally
+    transcript_blocks = [
+        (i, b) for i, b in enumerate(blocks)
+        if b.get("type") == "transcript" and b.get("text", "").strip()
+    ]
+
+    if transcript_blocks and word_timestamps:
+        total_chars = sum(
+            len(b.get("text", "")) for _, b in transcript_blocks
+        )
+        cursor = 0
+        for block_idx, block in transcript_blocks:
+            block_len = len(block.get("text", ""))
+            proportion = block_len / total_chars if total_chars > 0 else 0
+            slice_size = max(1, round(proportion * len(word_timestamps)))
+            block_words = word_timestamps[cursor: cursor + slice_size]
+            cursor += slice_size
+            if block_words:
+                blocks[block_idx] = {
+                    **block,
+                    "wordTimestamps": block_words,
+                    "start": block_words[0]["start"],
+                    "end": block_words[-1]["end"],
+                }
+
+    # Update chapter
+    chapters[chapter_index] = {**chapter, "blocks": blocks}
+
+    # Add ai_voice metadata to book
+    ai_voice_meta = book.get("ai_voice", {})
+    ai_voice_meta[str(chapter_index)] = {
+        "voice": voice_id,
+        "generated_at": now,
+        "word_count": len(word_timestamps),
+    }
+
+    # Save new revision (append-only — same as studio_save_book)
+    latest = await db.books.find_one(
+        {"slug": slug}, {"_id": 0, "revision": 1},
+        sort=[("revision", -1)]
+    )
+    next_rev = int((latest or {}).get("revision") or 0) + 1
+
+    updated_doc = {
+        **book,
+        "chapters": chapters,
+        "ai_voice": ai_voice_meta,
+        "revision": next_rev,
+        "_authoredAt": now,
+        "_authoredBy": admin.email,
+    }
+    updated_doc.pop("_id", None)
+
+    await db.books.insert_one(updated_doc)
+    log.info(
+        "elevenlabs: generated voice for slug=%s chapter=%s voice=%s words=%s rev=%s",
+        slug, chapter_index, voice_id, len(word_timestamps), next_rev,
+    )
+
+    return {
+        "success": True,
+        "slug": slug,
+        "chapterIndex": chapter_index,
+        "wordCount": len(word_timestamps),
+        "revision": next_rev,
+        "voice": voice_id,
+    }
 
 
 @api.delete("/studio/books/{slug}")
@@ -1149,6 +1526,11 @@ GAS_POINTS_LOGIN_URL = os.environ.get(
     "https://script.google.com/macros/s/AKfycbzRktKyql2I_FbPESNRpCrFDlse-qNd9_Opv9si-g-j2lcanOUPP49IzcyA59lFqVycdA/exec",
 )
 
+# Speaking Lab treasury credentials (env vars set in Render dashboard)
+SL_TREASURY_ID       = os.environ.get("SL_TREASURY_ID", "stu092")
+SL_TREASURY_PASSWORD = os.environ.get("SL_TREASURY_PASSWORD", "")
+
+
 # Portal GAS backend URL — used for server-to-server password sync after reset.
 # Set in Render env vars. Falls back to the same URL the frontend already uses.
 GAS_PORTAL_URL = os.environ.get(
@@ -1505,6 +1887,18 @@ async def push_notify_credit(
         "credit-push: sent=%d failed=%d source=%s amount=%d recipient=%s sender=%s",
         sent, failed, source, payload.amount, recipient_id[:32], sender_id[:32],
     )
+
+    # ── Speaking Lab live roster hook ─────────────────────────────────────
+    # If this transfer goes to the treasury (stu092), check if the sender
+    # is paying an entry fee for an active session.  If so, their name
+    # appears on the teacher board automatically — no manual join needed.
+    TREASURY_ID = "stu092"
+    if recipient_id == TREASURY_ID and not is_self_detect:
+        asyncio.create_task(
+            _sl_try_auto_enter(sender_id, payload.amount)
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     return {"sent": sent, "failed": failed, "duplicate": False}
 
 
@@ -2512,7 +2906,7 @@ async def current_student(
         {"student_id": sess["student_id"]},
         {"_id": 0, "password_hash": 0},
     )
-    if not doc or not doc.get("is_active"):
+    if not doc or doc.get("is_active") is False:
         return None
     return Student(**doc)
 
@@ -2558,13 +2952,10 @@ async def student_login(payload: dict, response: Response):
         raise HTTPException(status_code=401, detail="Bot check failed")
 
     doc = await db.students.find_one(
-        {"clean_id": clean_id, "is_active": True},
+        {"clean_id": clean_id, "is_active": {"$ne": False}},
         {"_id": 0},
     )
-    # Identical 401 for missing user and wrong password — prevents enumeration.
-    # Guard: bcrypt.checkpw raises ValueError on an empty or malformed hash
-    # (e.g. students whose password_hash was never written). Catch it and
-    # return the same 401 so a hash anomaly never produces an uncaught 500.
+    # Identical 401 for missing user and wrong password   prevents enumeration.
     _pw_ok = False
     if doc:
         _stored_hash = (doc.get("password_hash") or "").strip()
@@ -2731,6 +3122,48 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
         return False
 
 
+async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
+    """Push the new display name to the GAS standalone Password Sync script.
+
+    Called on ID reactivation so the previous student's name is overwritten.
+    Without this, getStudentData returns the old occupant's name forever.
+    Never raises — a GAS outage must never block reactivation.
+    """
+    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+        log.warning(
+            "name-sync: GAS_PORTAL_URL or GAS_ADMIN_SECRET not set — "
+            "Sheet name NOT updated for %s.", clean_id,
+        )
+        return False
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_PORTAL_URL,
+                data={
+                    "action": "syncName",
+                    "studentId": clean_id,
+                    "newName": display_name,
+                    "adminSecret": GAS_ADMIN_SECRET,
+                },
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("ok") is True:
+                        log.info("name-sync: Sheet updated %s -> %s", clean_id, display_name)
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        log.warning("name-sync: GAS did not confirm for %s", clean_id)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("name-sync: GAS unreachable for %s — %s", clean_id, exc)
+        return False
+
+
 @api.post("/teacher/students")
 async def teacher_create_student(
     payload: dict,
@@ -2799,11 +3232,13 @@ async def teacher_create_student(
         action = "created"
 
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
-    # Sync new password to GAS Sheet — fire-and-forget so the 10-second GAS
-    # timeout NEVER delays the credential card. MongoDB write is already committed;
-    # the student can log in immediately via bcrypt. GAS sync is best-effort.
+    # Fire-and-forget GAS syncs — never block the credential card response.
     import asyncio as _asyncio_create
     _asyncio_create.create_task(_sync_password_to_gas(clean_id, plain_password))
+    # On reactivation: also sync the new name so GAS returns the new student's
+    # identity, not the previous occupant's name.
+    if action == "reactivated":
+        _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
 
     return {
         "action": action,
@@ -2812,18 +3247,74 @@ async def teacher_create_student(
         "display_name": display_name,
         "group": group,
         "enrolled_at": now.isoformat(),
-        "password": plain_password,  # shown ONCE - never stored, never logged
+        "password": plain_password,  # shown ONCE   never stored, never logged
         "login_url": "https://eduhub-studio-test.vercel.app",
     }
 
 
 @api.get("/teacher/students")
 async def teacher_list_students(admin: User = Depends(require_admin)):
-    cursor = db.students.find({}, {"_id": 0, "password_hash": 0})
+    # Primary source: MongoDB db.students (populated via teacher CRUD)
+    cursor = db.students.find({"is_active": {"$ne": False}}, {"_id": 0, "password_hash": 0})
     students = await cursor.to_list(length=2000)
     for s in students:
         if "enrolled_at" not in s:
             s["enrolled_at"] = s.get("created_at", "")
+
+    # If db.students is empty, fall back to GAS_PORTAL_URL?action=getStudents
+    # This covers schools whose student roster lives entirely in Google Sheets.
+    if not students and GAS_PORTAL_URL:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(12.0, connect=6.0),
+                follow_redirects=True,
+            ) as cli:
+                r = await cli.get(
+                    GAS_PORTAL_URL,
+                    params={"action": "getStudents"},
+                )
+                if r.status_code == 200:
+                    try:
+                        gas_data = r.json()
+                        # GAS may return [{id, name, group, level, schedule, ...}]
+                        # or {students: [...]} — handle both
+                        raw = gas_data if isinstance(gas_data, list) else gas_data.get("students") or gas_data.get("data") or []
+                        for row in raw:
+                            if not isinstance(row, dict):
+                                continue
+                            sid = (
+                                row.get("student_id") or row.get("studentId") or
+                                row.get("id") or row.get("clean_id") or ""
+                            ).strip()
+                            name = (
+                                row.get("display_name") or row.get("name") or
+                                row.get("displayName") or sid
+                            ).strip()
+                            group = str(
+                                row.get("group") or row.get("schedule") or
+                                row.get("batch") or "A"
+                            ).strip()
+                            level = str(
+                                row.get("level") or row.get("Level") or "Beginner"
+                            ).strip()
+                            if not sid:
+                                continue
+                            students.append({
+                                "student_id": sid,
+                                "clean_id": sid,
+                                "display_name": name,
+                                "group": group,
+                                "level": level,
+                                "is_active": True,
+                                "source": "gas",
+                            })
+                        if students:
+                            log.info("teacher_list_students: loaded %d students from GAS fallback", len(students))
+                    except Exception as parse_exc:
+                        log.warning("teacher_list_students: GAS parse error: %s", str(parse_exc)[:200])
+        except Exception as gas_exc:
+            log.warning("teacher_list_students: GAS fetch error: %s", str(gas_exc)[:200])
+
     return {"students": students}
 
 
@@ -2863,9 +3354,7 @@ async def teacher_reset_password(
         {"student_id": student_id}, {"_id": 0, "password_hash": 0},
     )
     log.info("teacher: password reset for %s by %s", student_id, admin.email)
-    # Sync new password to GAS Sheet — fire-and-forget so the 10-second GAS
-    # timeout NEVER delays the credential card. MongoDB bcrypt hash is already
-    # committed; the student can log in immediately.
+    # Fire-and-forget — never delay the credential card response.
     import asyncio as _asyncio_reset
     _asyncio_reset.create_task(_sync_password_to_gas(doc["clean_id"], plain_password))
 
@@ -2899,10 +3388,9 @@ async def teacher_deactivate_student(
     await db.student_sessions.delete_many({"student_id": student_id})
 
     # Archive GAS evaluation rows — true fire-and-forget via create_task so the
-    # 15-second GAS timeout NEVER blocks this endpoint. The MongoDB write above
-    # is already committed; the GAS archive is best-effort bookkeeping only.
-    import asyncio as _asyncio
-    _asyncio.create_task(_archive_student_in_gas(doc["clean_id"]))
+    # 15-second GAS timeout NEVER blocks this endpoint.
+    import asyncio as _asyncio_deact
+    _asyncio_deact.create_task(_archive_student_in_gas(doc["clean_id"]))
 
     log.info("teacher: deactivated student %s by %s", student_id, admin.email)
     return {"ok": True}
@@ -2923,19 +3411,538 @@ async def teacher_deactivate_student(
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
 from restriction_realtime import build_router as _build_status_router
+@api.post("/studio/audio/migrate-inline")
+async def studio_audio_migrate_inline(admin: User = Depends(require_admin)):
+    """One-time migration: find all book blocks with inline base64 audio,
+    upload to GridFS, replace block.text with the stream URL.
+    Safe to run multiple times (idempotent).
+    """
+    fixed_books = 0
+    fixed_blocks = 0
+    cursor = db.books.find({}, {"_id": 0})
+    async for book in cursor:
+        changed = False
+        now = datetime.now(timezone.utc).isoformat()
+        for ch in book.get("chapters", []):
+            for block in ch.get("blocks", []):
+                txt = block.get("text", "")
+                if not isinstance(txt, str): continue
+                if not txt.startswith("data:audio/"): continue
+                # Extract base64 payload
+                try:
+                    header, b64data = txt.split(",", 1)
+                    audio_bytes = base64.b64decode(b64data)
+                except Exception:
+                    continue
+                audio_id = str(uuid.uuid4())
+                # FIX v9.9: wrap raw bytes in BytesIO (GridFS needs file-like)
+                await audio_bucket.upload_from_stream(
+                    f"{audio_id}.mp3", io.BytesIO(audio_bytes),
+                    metadata={"slug": book.get("slug",""), "migrated_at": now},
+                )
+                block["text"] = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+                block["_audio_id"] = audio_id
+                changed = True
+                fixed_blocks += 1
+        if changed:
+            # Save as new revision
+            latest = await db.books.find_one(
+                {"slug": book["slug"]}, {"_id": 0, "revision": 1},
+                sort=[("revision", -1)]
+            )
+            next_rev = int((latest or {}).get("revision") or 0) + 1
+            doc = {**book, "revision": next_rev, "_authoredAt": now,
+                   "_authoredBy": "migration"}
+            doc.pop("_id", None)
+            await db.books.insert_one(doc)
+            fixed_books += 1
+    log.info("audio-migration: fixed %s blocks in %s books", fixed_blocks, fixed_books)
+    return {"ok": True, "fixed_books": fixed_books, "fixed_blocks": fixed_blocks}
+
+
 app.include_router(_build_status_router(db, _fan_out_push, require_admin))
-app.include_router(api)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
+    """Auto-enter a student into the active Speaking Lab session when they
+    pay the entry fee to stu092 via P2P.  Called as a fire-and-forget task
+    from push_notify_credit so it never blocks the credit response."""
+    try:
+        # 1. Look up sender's display name and schedule from db.students
+        #    GAS uses clean_id (e.g. "stu094") as the sender ID.
+        #    MongoDB stores both clean_id and student_id — try both.
+        student_doc = await db.students.find_one(
+            {"$or": [{"clean_id": sender_id}, {"student_id": sender_id}]},
+            {"display_name": 1, "name": 1, "group": 1, "schedule": 1, "clean_id": 1, "_id": 0},
+        )
+        if not student_doc:
+            log.info("sl.auto_enter: sender %s not in db.students", sender_id)
+            return
+
+        display_name = (
+            student_doc.get("display_name")
+            or student_doc.get("name")
+            or sender_id
+        )
+        schedule = (
+            student_doc.get("group")
+            or student_doc.get("schedule")
+            or ""
+        ).upper()
+
+        # 2. Find the most recent waiting/active session for this schedule
+        #    that has the matching entry_fee
+        session_doc = await SL_SESSIONS.find_one(
+            {
+                "schedule": schedule,
+                "entry_fee": amount,
+                "status": {"$in": ["waiting", "active"]},
+            },
+            sort=[("created_at", -1)],
+        )
+        if not session_doc:
+            # Try without schedule filter (any active session with matching fee)
+            session_doc = await SL_SESSIONS.find_one(
+                {
+                    "entry_fee": amount,
+                    "status": {"$in": ["waiting", "active"]},
+                },
+                sort=[("created_at", -1)],
+            )
+        if not session_doc:
+            log.info(
+                "sl.auto_enter: no active session fee=%d schedule=%s",
+                amount, schedule,
+            )
+            return
+
+        session_id = session_doc["session_id"]
+        display_name_key = display_name.lower()
+
+        # 3. Deduplicate — don't add the same student twice
+        existing = await SL_ENTRIES.find_one(
+            {"session_id": session_id, "display_name_key": display_name_key}
+        )
+        if existing:
+            log.info("sl.auto_enter: %s already in session %s", display_name, session_id)
+            return
+
+        # 4. Insert entry and publish to SSE stream
+        position = (await SL_ENTRIES.count_documents({"session_id": session_id})) + 1
+        entered_at = datetime.now(timezone.utc).isoformat()
+
+        await SL_ENTRIES.insert_one({
+            "session_id":       session_id,
+            "student_id":       sender_id,
+            "display_name":     display_name,
+            "display_name_key": display_name_key,
+            "position":         position,
+            "entered_at":       entered_at,
+        })
+
+        await _sl_publish(session_id, {
+            "type":         "entry",
+            "student_id":   sender_id,
+            "display_name": display_name,
+            "position":     position,
+            "entered_at":   entered_at,
+        })
+
+
+        # ── LUCKY DRAW SURGERY ─────────────────────────────────────────
+        # The same P2P payment that put the student on the roster also
+        # buys their lucky code. Fire-and-forget — never blocks /enter.
+        await generate_and_publish_lucky_code(
+            db, _sl_publish, session_id, sender_id, display_name,
+            amount=amount, log=log,
+        )
+        # ───────────────────────────────────────────────────────────────
+
+        log.info(
+            "sl.auto_enter: %s (pos=%d) entered session %s via P2P fee=%d",
+            display_name, position, session_id, amount,
+        )
+    except Exception as exc:
+        log.warning("sl.auto_enter error: %s", str(exc)[:200])
+
+# SPEAKING LAB — Live session, SSE roster, points grant
+# Added safely — no existing function modified.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Collection aliases
+SL_SESSIONS = db.speaking_lab_sessions
+SL_ENTRIES  = db.speaking_lab_entries
+
+# ── Pydantic models ───────────────────────────────────────────────────────
+
+class SLSessionCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    schedule: str
+    entry_fee: int = 0
+
+class SLEnterRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    session_code: str
+    student_name: str
+
+class SLPointsGrant(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    studentID: str
+    points: int
+    source: str | None = "speaking-lab"
+    description: str | None = ""
+
+class SLAttendancePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    schedule: str
+    date: str
+    present: list[str]
+
+# ── SSE pub/sub (in-process, single Render instance) ─────────────────────
+
+_sl_subs: dict[str, set[asyncio.Queue]] = {}
+_sl_lock = asyncio.Lock()
+
+async def _sl_publish(session_id: str, event: dict) -> None:
+    async with _sl_lock:
+        queues = list(_sl_subs.get(session_id, set()))
+    for q in queues:
+        try:
+            q.put_nowait(event)
+        except Exception:
+            pass
+
+def _sl_sse(event: dict) -> bytes:
+    return ("data: " + json.dumps(event) + chr(10) + chr(10)).encode()
+
+# ── Points grant ──────────────────────────────────────────────────────────
+
+@api.post("/points/grant")
+async def sl_grant_points(
+    payload: SLPointsGrant,
+    admin: User = Depends(require_admin),
+):
+    """Grant points from treasury (stu092) to student via GAS P2P.
+    Appears in student P2P statement as sent from treasury wallet.
+    """
+    if not 1 <= payload.points <= 1000:
+        raise HTTPException(status_code=400, detail="points out of range")
+
+    if not SL_TREASURY_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="SL_TREASURY_PASSWORD not set on Render — add it in Environment settings.",
+        )
+
+    # 1. Resolve student clean_id (push subscriptions use clean_id)
+    stu_doc = await db.students.find_one(
+        {"$or": [{"student_id": payload.studentID}, {"clean_id": payload.studentID}]},
+        {"clean_id": 1, "display_name": 1, "_id": 0},
+    )
+    student_clean_id = (stu_doc or {}).get("clean_id") or payload.studentID
+
+    # 2. Call GAS sendPoints — treasury → student (real balance transfer)
+    nonce = secrets.token_hex(12)
+    gas_payload = {
+        "action":     "sendPoints",
+        "id":         SL_TREASURY_ID,
+        "password":   SL_TREASURY_PASSWORD,
+        "receiverId": student_clean_id,
+        "amount":     str(payload.points),
+        "nonce":      nonce,
+    }
+    gas_ok = False
+    gas_error = "unknown"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=6.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_POINTS_LOGIN_URL,
+                data=gas_payload,
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("success") is True:
+                        gas_ok = True
+                    else:
+                        gas_error = str(j.get("message") or j.get("error") or j)[:200]
+                except Exception:
+                    gas_error = r.text[:200]
+            else:
+                gas_error = f"HTTP {r.status_code}"
+    except Exception as exc:
+        gas_error = str(exc)[:200]
+
+    if not gas_ok:
+        log.warning("sl.grant: GAS transfer failed: %s", gas_error)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Points transfer failed: {gas_error}",
+        )
+
+    # 3. Audit row in MongoDB points_history
+    now_str = datetime.now(timezone.utc).isoformat()
+    await db.points_history.insert_one({
+        "student_id":         student_clean_id,
+        "from":               SL_TREASURY_ID,
+        "to":                 student_clean_id,
+        "delta":              payload.points,
+        "source":             "speaking-lab-award",
+        "description":        payload.description or "Speaking Lab award",
+        "granted_by":         admin.email,
+        "created_at":         now_str,
+        "senderStudentId":    SL_TREASURY_ID,
+        "recipientStudentId": student_clean_id,
+        "amount":             payload.points,
+        "display_sender":     "Treasury",
+    })
+
+    # 4. Push notification to student device
+    asyncio.create_task(
+        _fan_out_push(
+            {"studentId": student_clean_id},
+            title=f"\U0001F389 +{payload.points} \u178F\u17B7\u1793\u17D0! / Points Credited!",
+            body=(
+                f"\u17A2\u17D2\u1793\u1780\u200b\u1794\u17B6\u1793\u200b\u1791\u1791\u1793\u200b\u178F\u17B7\u1793\u200b\u178E +{payload.points} \u2728\n"
+                f"+{payload.points} pts from Treasury \u00b7 {payload.description or 'Speaking Lab award'}"
+            ),
+            url="/portal",
+        )
+    )
+
+    log.info(
+        "sl.grant: treasury=%s sent %d pts to %s via GAS, by=%s",
+        SL_TREASURY_ID, payload.points, student_clean_id, admin.email,
+    )
+    return {
+        "success":    True,
+        "studentID":  payload.studentID,
+        "clean_id":   student_clean_id,
+        "points":     payload.points,
+        "via":        "GAS_treasury",
+    }
+
+
+@api.get("/speaking-lab/questions")
+async def sl_get_questions(admin: User = Depends(require_admin)):
+    doc = await db.speaking_lab_settings.find_one({"_id": "questions"}, {"_id": 0})
+    return doc or {"beginner": [], "intermediate": []}
+
+@api.put("/speaking-lab/questions")
+async def sl_save_questions(payload: dict, admin: User = Depends(require_admin)):
+    data = {k: v for k, v in payload.items() if k != "_id"}
+    await db.speaking_lab_settings.replace_one(
+        {"_id": "questions"},
+        {"_id": "questions", **data},
+        upsert=True,
+    )
+    return {"ok": True, **data}
+
+@api.delete("/speaking-lab/questions")
+async def sl_delete_questions(admin: User = Depends(require_admin)):
+    await db.speaking_lab_settings.delete_one({"_id": "questions"})
+    return {"ok": True, "reset": True}
+
+# ── Settings ──────────────────────────────────────────────────────────────
+
+@api.get("/speaking-lab/settings")
+async def sl_get_settings(admin: User = Depends(require_admin)):
+    doc = await db.speaking_lab_settings.find_one({"_id": "settings"}, {"_id": 0})
+    return doc or {}
+
+@api.put("/speaking-lab/settings")
+async def sl_save_settings(payload: dict, admin: User = Depends(require_admin)):
+    data = {k: v for k, v in payload.items() if k != "_id"}
+    await db.speaking_lab_settings.replace_one(
+        {"_id": "settings"},
+        {"_id": "settings", **data},
+        upsert=True,
+    )
+    return {"ok": True, **data}
+
+# ── Attendance ────────────────────────────────────────────────────────────
+
+@api.get("/speaking-lab/attendance")
+async def sl_get_attendance(
+    schedule: str, date: str,
+    admin: User = Depends(require_admin),
+):
+    doc = await db.speaking_lab_attendance.find_one(
+        {"schedule": schedule, "date": date}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="No attendance for that day")
+    return doc
+
+@api.put("/speaking-lab/attendance")
+async def sl_save_attendance(
+    payload: SLAttendancePayload,
+    admin: User = Depends(require_admin),
+):
+    await db.speaking_lab_attendance.replace_one(
+        {"schedule": payload.schedule, "date": payload.date},
+        {
+            "schedule":   payload.schedule,
+            "date":       payload.date,
+            "present":    list(payload.present),
+            "saved_by":   admin.email,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        upsert=True,
+    )
+    return {"ok": True}
+
+# ── Live sessions ─────────────────────────────────────────────────────────
+
+@api.post("/speaking-lab/sessions")
+async def sl_create_session(
+    payload: SLSessionCreate,
+    admin: User = Depends(require_admin),
+):
+    if not 0 <= payload.entry_fee <= 500:
+        raise HTTPException(status_code=400, detail="entry_fee out of range")
+    session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    await SL_SESSIONS.insert_one({
+        "session_id": session_id,
+        "schedule":   payload.schedule,
+        "entry_fee":  payload.entry_fee,
+        "treasury_id":"stu092",
+        "status":     "waiting",
+        "created_by": admin.email,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    log.info("sl.session.create: %s schedule=%s fee=%s", session_id, payload.schedule, payload.entry_fee)
+    return {"session_id": session_id, "schedule": payload.schedule, "entry_fee": payload.entry_fee}
+
+@api.post("/speaking-lab/sessions/{session_id}/enter")
+async def sl_enter_session(session_id: str, body: SLEnterRequest):
+    sess = await SL_SESSIONS.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    display_name = (body.student_name or "").strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="student_name is required")
+    display_name_key = display_name.lower()
+    existing = await SL_ENTRIES.find_one(
+        {"session_id": session_id, "display_name_key": display_name_key},
+        {"_id": 0},
+    )
+    if existing:
+        return {"ok": True, "position": existing.get("position", 0),
+                "display_name": display_name, "deduplicated": True}
+    position   = (await SL_ENTRIES.count_documents({"session_id": session_id})) + 1
+    entered_at = datetime.now(timezone.utc).isoformat()
+    student_id = f"sl-{uuid.uuid4().hex[:12]}"
+    await SL_ENTRIES.insert_one({
+        "session_id":       session_id,
+        "student_id":       student_id,
+        "display_name":     display_name,
+        "display_name_key": display_name_key,
+        "position":         position,
+        "entered_at":       entered_at,
+    })
+    await _sl_publish(session_id, {
+        "type":         "entry",
+        "student_id":   student_id,
+        "display_name": display_name,
+        "position":     position,
+        "entered_at":   entered_at,
+    })
+    log.info("sl.session.enter: %s pos=%s name=%s", session_id, position, display_name)
+    return {
+        "ok": True, "session_id": session_id, "student_id": student_id,
+        "display_name": display_name, "position": position,
+        "entered_at": entered_at, "deduplicated": False,
+    }
+
+@api.get("/speaking-lab/sessions/{session_id}/stream")
+async def sl_stream_session(
+    session_id: str,
+    admin: User = Depends(require_admin),
+):
+    sess = await SL_SESSIONS.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    async with _sl_lock:
+        _sl_subs.setdefault(session_id, set()).add(queue)
+
+    async def gen():
+        try:
+            async for row in SL_ENTRIES.find(
+                {"session_id": session_id}, {"_id": 0}
+            ).sort("position", 1):
+                yield _sl_sse({"type": "entry", **row})
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    yield _sl_sse(event)
+                except asyncio.TimeoutError:
+                    yield b': ping\n\n'
+        finally:
+            async with _sl_lock:
+                subs = _sl_subs.get(session_id)
+                if subs:
+                    subs.discard(queue)
+                    if not subs:
+                        _sl_subs.pop(session_id, None)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# END SPEAKING LAB
+
+# ── LUCKY DRAW SURGERY ─────────────────────────────────────────────────
+register_lucky_draw_routes(
+    api, db, _sl_publish,
+    gas_url=GAS_POINTS_LOGIN_URL,
+    treasury_id=SL_TREASURY_ID,
+    treasury_password=SL_TREASURY_PASSWORD,
+    log=log,
+    require_admin=require_admin,
+)
+# ───────────────────────────────────────────────────────────────────────
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    # Explicit header list required when allow_credentials=True.
+    # Safari iOS (WebKit) rejects allow_headers=["*"] with credentials,
+    # causing POST /api/auth/google to fail on iPhone even though it works
+    # on desktop Chrome (which is lenient about the wildcard).
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Session-ID",
+        "X-Cron-Secret",
+        "Cookie",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
 )
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+
 @app.on_event("startup")
 async def startup():
+    global audio_bucket
+    audio_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="studio_audio")
     # Ensure useful indexes
     await db.books.create_index([("slug", 1), ("revision", -1)])
     await db.books.create_index("published")
@@ -2954,6 +3961,19 @@ async def startup():
     await db.students.create_index("student_id", unique=True)
     await db.student_sessions.create_index("session_token", unique=True)
     await db.student_sessions.create_index("expires_at")
+        # Speaking Lab indexes
+    await db.points_history.create_index([("student_id", 1), ("created_at", -1)])
+    await db.speaking_lab_sessions.create_index("session_id", unique=True)
+    await db.speaking_lab_entries.create_index([("session_id", 1), ("display_name_key", 1)], unique=True)
+    await db.speaking_lab_settings.create_index("_id")
+    await db.speaking_lab_attendance.create_index([("schedule", 1), ("date", 1)], unique=True)
+    # ── LUCKY DRAW SURGERY ──
+    await ensure_lucky_draw_indexes(db)
+    # ────────────────────────
+    # Coupon system indexes
+    await db.coupons.create_index("code", unique=True)
+    await db.coupons.create_index("enabled")
+    await db.coupons.create_index("expires_at")
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
@@ -2962,3 +3982,241 @@ async def startup():
 async def shutdown():
     client.close()
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COUPON SYSTEM — v1.0 (append-only, zero existing routes modified)
+# Collections: coupons
+# Endpoints: POST/GET/PATCH/DELETE /api/coupons  (admin)
+#            POST /api/coupons/validate           (student)
+#            POST /api/coupons/redeem             (student)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import secrets as _secrets_coupon
+import string  as _string_coupon
+
+
+def _generate_coupon_code(length: int = 8) -> str:
+    """Generate a random uppercase alphanumeric coupon code."""
+    alphabet = _string_coupon.ascii_uppercase + _string_coupon.digits
+    return "".join(_secrets_coupon.choice(alphabet) for _ in range(length))
+
+
+def _calc_discount(original_price: int, coupon: dict) -> int:
+    """Return the discounted price (never below 0)."""
+    if coupon.get("type") == "percent":
+        discount = round(original_price * coupon.get("value", 0) / 100)
+    else:  # fixed
+        discount = int(coupon.get("value", 0))
+    return max(0, original_price - discount)
+
+
+async def _find_valid_coupon(
+    code: str,
+    student_id: str,
+    book_slug: str,
+) -> dict | None:
+    """
+    Look up a coupon by code and verify all constraints.
+    Returns the coupon doc on success, raises HTTPException on failure.
+    """
+    doc = await db.coupons.find_one({"code": code.strip().upper()}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Coupon code not found.")
+    if not doc.get("enabled", True):
+        raise HTTPException(status_code=400, detail="This coupon has been disabled.")
+    now_iso = datetime.now(timezone.utc)
+    valid_from = doc.get("valid_from")
+    expires_at = doc.get("expires_at")
+    if valid_from:
+        vf = datetime.fromisoformat(valid_from) if isinstance(valid_from, str) else valid_from
+        if vf.tzinfo is None:
+            vf = vf.replace(tzinfo=timezone.utc)
+        if now_iso < vf:
+            raise HTTPException(status_code=400, detail="This coupon is not yet active.")
+    if expires_at:
+        ex = datetime.fromisoformat(expires_at) if isinstance(expires_at, str) else expires_at
+        if ex.tzinfo is None:
+            ex = ex.replace(tzinfo=timezone.utc)
+        if now_iso > ex:
+            raise HTTPException(status_code=400, detail="This coupon has expired.")
+    max_uses = doc.get("max_uses")
+    if max_uses is not None and doc.get("uses_count", 0) >= max_uses:
+        raise HTTPException(status_code=400, detail="This coupon has reached its usage limit.")
+    assigned_to = doc.get("assigned_to") or []
+    if assigned_to and student_id not in assigned_to:
+        raise HTTPException(status_code=403, detail="This coupon is not assigned to your account.")
+    book_slugs = doc.get("book_slugs") or []
+    if book_slugs and book_slug not in book_slugs:
+        raise HTTPException(status_code=400, detail="This coupon cannot be used for this book.")
+    # Check if student already redeemed this coupon for this book
+    already = any(
+        r.get("student_id") == student_id and r.get("book_slug") == book_slug
+        for r in (doc.get("redemptions") or [])
+    )
+    if already:
+        raise HTTPException(status_code=400, detail="You have already used this coupon for this book.")
+    return doc
+
+
+# ── Admin endpoints ──────────────────────────────────────────────────────
+
+@api.post("/coupons")
+async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
+    """Create a new coupon. Set code='' to auto-generate."""
+    code = (payload.get("code") or "").strip().upper() or _generate_coupon_code()
+    if await db.coupons.find_one({"code": code}):
+        raise HTTPException(status_code=409, detail=f"Coupon code '{code}' already exists.")
+    discount_type = payload.get("type", "percent")
+    if discount_type not in ("percent", "fixed"):
+        raise HTTPException(status_code=400, detail="type must be 'percent' or 'fixed'.")
+    value = float(payload.get("value", 0))
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="value must be > 0.")
+    if discount_type == "percent" and value > 100:
+        raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "code":        code,
+        "type":        discount_type,
+        "value":       value,
+        "max_uses":    payload.get("max_uses"),           # None = unlimited
+        "uses_count":  0,
+        "assigned_to": payload.get("assigned_to") or [],  # [] = public
+        "book_slugs":  payload.get("book_slugs") or [],   # [] = all books
+        "valid_from":  payload.get("valid_from") or now_iso,
+        "expires_at":  payload.get("expires_at"),         # None = never
+        "enabled":     True,
+        "created_by":  admin.email,
+        "created_at":  now_iso,
+        "redemptions": [],
+    }
+    await db.coupons.insert_one(doc)
+    doc.pop("_id", None)
+    log.info("coupon: created %s by %s", code, admin.email)
+    return {"ok": True, "coupon": doc}
+
+
+@api.get("/coupons")
+async def list_coupons(admin: User = Depends(require_admin)):
+    """List all coupons (admin only)."""
+    cursor = db.coupons.find({}, {"_id": 0}).sort("created_at", -1)
+    coupons = await cursor.to_list(length=500)
+    return {"ok": True, "coupons": coupons}
+
+
+@api.get("/coupons/{code}")
+async def get_coupon(code: str, admin: User = Depends(require_admin)):
+    doc = await db.coupons.find_one({"code": code.upper()}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Coupon not found.")
+    return {"ok": True, "coupon": doc}
+
+
+@api.patch("/coupons/{code}")
+async def update_coupon(code: str, payload: dict, admin: User = Depends(require_admin)):
+    """Update coupon fields. Supports: enabled, expires_at, max_uses, assigned_to, book_slugs, value."""
+    allowed = {"enabled", "expires_at", "max_uses", "assigned_to", "book_slugs", "value", "valid_from"}
+    updates = {k: v for k, v in payload.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+    res = await db.coupons.update_one({"code": code.upper()}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Coupon not found.")
+    log.info("coupon: updated %s by %s", code, admin.email)
+    return {"ok": True}
+
+
+@api.delete("/coupons/{code}")
+async def delete_coupon(code: str, admin: User = Depends(require_admin)):
+    res = await db.coupons.delete_one({"code": code.upper()})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Coupon not found.")
+    log.info("coupon: deleted %s by %s", code, admin.email)
+    return {"ok": True}
+
+
+# ── Student endpoints ────────────────────────────────────────────────────
+
+@api.post("/coupons/validate")
+async def validate_coupon(payload: dict):
+    """
+    Preview a coupon's discount without consuming it.
+    Accepts student_id from payload (GAS-authenticated students pass their clean_id).
+    Returns { ok, original_price, discounted_price, discount_amount, coupon }.
+    """
+    code       = (payload.get("code") or "").strip()
+    book_slug  = (payload.get("book_slug") or "").strip()
+    original   = int(payload.get("original_price") or 0)
+    student_id = (payload.get("student_id") or "").strip()
+    if not code or not book_slug or original <= 0:
+        raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
+    coupon = await _find_valid_coupon(code, student_id, book_slug)
+    discounted = _calc_discount(original, coupon)
+    return {
+        "ok":               True,
+        "original_price":   original,
+        "discounted_price": discounted,
+        "discount_amount":  original - discounted,
+        "coupon_type":      coupon["type"],
+        "coupon_value":     coupon["value"],
+        "code":             coupon["code"],
+    }
+
+
+@api.post("/coupons/redeem")
+async def redeem_coupon(payload: dict):
+    """
+    Atomically redeem a coupon at purchase time.
+    Accepts student_id from payload (GAS-authenticated students pass their clean_id).
+    Uses findOneAndUpdate with $lt guard to prevent concurrent over-use.
+    Returns { ok, discounted_price }.
+    """
+    code       = (payload.get("code") or "").strip()
+    book_slug  = (payload.get("book_slug") or "").strip()
+    original   = int(payload.get("original_price") or 0)
+    student_id = (payload.get("student_id") or "").strip()
+    if not code or not book_slug or original <= 0:
+        raise HTTPException(status_code=400, detail="code, book_slug, and original_price are required.")
+
+    # Validate first (raises HTTPException on any failure)
+    coupon = await _find_valid_coupon(code, student_id, book_slug)
+    discounted = _calc_discount(original, coupon)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Atomic increment with max_uses guard — prevents race conditions
+    max_uses = coupon.get("max_uses")
+    query: dict = {"code": code.upper()}
+    if max_uses is not None:
+        query["uses_count"] = {"$lt": max_uses}
+
+    redemption_entry = {
+        "student_id":  student_id,
+        "book_slug":   book_slug,
+        "redeemed_at": now_iso,
+        "original":    original,
+        "discounted":  discounted,
+    }
+    result = await db.coupons.find_one_and_update(
+        query,
+        {
+            "$inc":  {"uses_count": 1},
+            "$push": {"redemptions": redemption_entry},
+        },
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=400, detail="Coupon is no longer available (usage limit reached).")
+
+    log.info("coupon: redeemed %s by %s for book=%s saved=%dpts",
+             code, student_id, book_slug, original - discounted)
+    return {
+        "ok":               True,
+        "code":             code.upper(),
+        "original_price":   original,
+        "discounted_price": discounted,
+        "discount_amount":  original - discounted,
+    }
+
+
+# ── END COUPON SYSTEM ──────────────────────────────────────────────────────
+app.include_router(api)
