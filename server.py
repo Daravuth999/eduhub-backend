@@ -2731,6 +2731,50 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
         return False
 
 
+async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
+    """Push the new display name to the GAS Portal Sheet Name column.
+
+    Called on ID reactivation so the previous student's name is fully
+    overwritten. Without this, getStudentData returns the old occupant's
+    name forever, causing the portal to render the wrong identity.
+    Never raises — a GAS outage must never block reactivation.
+    """
+    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+        log.warning(
+            "name-sync: GAS_PORTAL_URL or GAS_ADMIN_SECRET not set — "
+            "Sheet name NOT updated for %s.",
+            clean_id,
+        )
+        return False
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(
+                GAS_PORTAL_URL,
+                data={
+                    "action": "syncName",
+                    "studentId": clean_id,
+                    "newName": display_name,
+                    "adminSecret": GAS_ADMIN_SECRET,
+                },
+            )
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("ok") is True:
+                        log.info("name-sync: Sheet updated %s -> %s", clean_id, display_name)
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+        log.warning("name-sync: GAS did not confirm for %s", clean_id)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("name-sync: GAS unreachable for %s — %s", clean_id, exc)
+        return False
+
+
 @api.post("/teacher/students")
 async def teacher_create_student(
     payload: dict,
@@ -2799,11 +2843,15 @@ async def teacher_create_student(
         action = "created"
 
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
-    # Sync new password to GAS Sheet — fire-and-forget so the 10-second GAS
-    # timeout NEVER delays the credential card. MongoDB write is already committed;
-    # the student can log in immediately via bcrypt. GAS sync is best-effort.
+    # Fire-and-forget GAS syncs — never block the credential card response.
+    # MongoDB is already committed; student can log in via bcrypt immediately.
     import asyncio as _asyncio_create
+    # Always sync the new password so GAS PointsBackend / GameBackend authenticate correctly.
     _asyncio_create.create_task(_sync_password_to_gas(clean_id, plain_password))
+    # On reactivation: also sync the new name so GAS getStudentData returns
+    # the NEW student's identity, not the previous occupant's name.
+    if action == "reactivated":
+        _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
 
     return {
         "action": action,
