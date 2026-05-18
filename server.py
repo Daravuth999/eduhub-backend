@@ -3255,7 +3255,9 @@ async def teacher_create_student(
 @api.get("/teacher/students")
 async def teacher_list_students(admin: User = Depends(require_admin)):
     # Primary source: MongoDB db.students (populated via teacher CRUD)
-    cursor = db.students.find({"is_active": {"$ne": False}}, {"_id": 0, "password_hash": 0})
+    # Return ALL students so the frontend can show inactive ones with
+    # the Reuse ID button. The login endpoint still enforces is_active:True.
+    cursor = db.students.find({}, {"_id": 0, "password_hash": 0})
     students = await cursor.to_list(length=2000)
     for s in students:
         if "enrolled_at" not in s:
