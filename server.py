@@ -4320,9 +4320,7 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
         raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
 
     # ElevenLabs v3 acting instruction: prefix in square brackets
-    # Only add acting note for texts longer than 10 chars to avoid API errors
-    use_acting = acting_note and len(text.strip()) > 10
-    tts_text = f"[{acting_note}] {text}" if use_acting else text
+    tts_text = f"[{acting_note}] {text}" if acting_note else text
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
     headers = {
@@ -4498,46 +4496,13 @@ async def studio_conversation_generate(
                 voice_settings=voice_settings,
                 acting_note=acting_note,
             )
-        except Exception as exc:
-            # Log and skip this line rather than aborting the whole generation.
-            # This ensures other lines still generate even if one fails.
-            log.warning(
-                "conversation: line %d (%s) failed: %s — skipping",
-                li + 1, line.get("speaker", "?"), exc,
-            )
-            line_results.append({
-                "lineIndex": line.get("lineIndex"),
-                "speaker": line.get("speaker", ""),
-                "start": round(accumulated_time, 3),
-                "end": round(accumulated_time + 0.5, 3),
-                "wordTimestamps": [],
-                "error": str(exc),
-            })
-            accumulated_time += pause_after
-            continue
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"Line {li + 1} ({line.get('speaker', '?')}): {exc.detail}",
+            ) from exc
 
-        raw_audio_b64 = result.get("audio_base64") or ""
-        if not raw_audio_b64:
-            log.warning("conversation: line %d (%s) returned empty audio — skipping",
-                        li + 1, line.get("speaker", "?"))
-            line_results.append({
-                "lineIndex": line.get("lineIndex"),
-                "speaker": line.get("speaker", ""),
-                "start": round(accumulated_time, 3),
-                "end": round(accumulated_time + 0.5, 3),
-                "wordTimestamps": [],
-                "error": "empty audio",
-            })
-            accumulated_time += pause_after
-            continue
-
-        try:
-            audio_bytes = base64.b64decode(raw_audio_b64)
-        except Exception as exc:
-            log.warning("conversation: line %d b64decode failed: %s — skipping", li + 1, exc)
-            accumulated_time += pause_after
-            continue
-
+        audio_bytes = base64.b64decode(result["audio_base64"])
         raw_wts = result["word_timestamps"]
         line_duration = result["duration"]
 
@@ -4563,17 +4528,12 @@ async def studio_conversation_generate(
             "wordTimestamps": shifted_wts,
         })
 
-        # Note: silence between lines removed — raw MP3 concatenation
-        # is cleaner than injecting synthetic frames. ElevenLabs clips
-        # already have natural trailing silence.
         accumulated_time = line_end + pause_after
 
-    # Abort if no lines generated successfully
-    if not audio_segments:
-        raise HTTPException(
-            status_code=502,
-            detail="No audio was generated. Check voice IDs and ElevenLabs API key.",
-        )
+        if pause_after > 0:
+            silence = _generate_silence_bytes(pause_after)
+            if silence:
+                audio_segments.append(silence)
 
     # Stitch all segments
     stitched_bytes = _stitch_mp3_segments(audio_segments)
@@ -4606,7 +4566,7 @@ async def studio_conversation_generate(
     # Update dialog blocks with adjusted timestamps
     for lr in line_results:
         idx = lr.get("lineIndex")
-        if idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(blocks):
+        if idx is None or not isinstance(idx, int) or idx >= len(blocks):
             continue
         if blocks[idx].get("type") == "dialog":
             blocks[idx] = {
