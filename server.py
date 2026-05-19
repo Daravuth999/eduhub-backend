@@ -4563,12 +4563,10 @@ async def studio_conversation_generate(
             "wordTimestamps": shifted_wts,
         })
 
+        # Note: silence between lines removed — raw MP3 concatenation
+        # is cleaner than injecting synthetic frames. ElevenLabs clips
+        # already have natural trailing silence.
         accumulated_time = line_end + pause_after
-
-        if pause_after > 0:
-            silence = _generate_silence_bytes(pause_after)
-            if silence:
-                audio_segments.append(silence)
 
     # Abort if no lines generated successfully
     if not audio_segments:
