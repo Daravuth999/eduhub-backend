@@ -4320,7 +4320,9 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
         raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
 
     # ElevenLabs v3 acting instruction: prefix in square brackets
-    tts_text = f"[{acting_note}] {text}" if acting_note else text
+    # Only add acting note for texts longer than 10 chars to avoid API errors
+    use_acting = acting_note and len(text.strip()) > 10
+    tts_text = f"[{acting_note}] {text}" if use_acting else text
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
     headers = {
@@ -4496,13 +4498,46 @@ async def studio_conversation_generate(
                 voice_settings=voice_settings,
                 acting_note=acting_note,
             )
-        except HTTPException as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=f"Line {li + 1} ({line.get('speaker', '?')}): {exc.detail}",
-            ) from exc
+        except Exception as exc:
+            # Log and skip this line rather than aborting the whole generation.
+            # This ensures other lines still generate even if one fails.
+            log.warning(
+                "conversation: line %d (%s) failed: %s — skipping",
+                li + 1, line.get("speaker", "?"), exc,
+            )
+            line_results.append({
+                "lineIndex": line.get("lineIndex"),
+                "speaker": line.get("speaker", ""),
+                "start": round(accumulated_time, 3),
+                "end": round(accumulated_time + 0.5, 3),
+                "wordTimestamps": [],
+                "error": str(exc),
+            })
+            accumulated_time += pause_after
+            continue
 
-        audio_bytes = base64.b64decode(result["audio_base64"])
+        raw_audio_b64 = result.get("audio_base64") or ""
+        if not raw_audio_b64:
+            log.warning("conversation: line %d (%s) returned empty audio — skipping",
+                        li + 1, line.get("speaker", "?"))
+            line_results.append({
+                "lineIndex": line.get("lineIndex"),
+                "speaker": line.get("speaker", ""),
+                "start": round(accumulated_time, 3),
+                "end": round(accumulated_time + 0.5, 3),
+                "wordTimestamps": [],
+                "error": "empty audio",
+            })
+            accumulated_time += pause_after
+            continue
+
+        try:
+            audio_bytes = base64.b64decode(raw_audio_b64)
+        except Exception as exc:
+            log.warning("conversation: line %d b64decode failed: %s — skipping", li + 1, exc)
+            accumulated_time += pause_after
+            continue
+
         raw_wts = result["word_timestamps"]
         line_duration = result["duration"]
 
@@ -4535,6 +4570,13 @@ async def studio_conversation_generate(
             if silence:
                 audio_segments.append(silence)
 
+    # Abort if no lines generated successfully
+    if not audio_segments:
+        raise HTTPException(
+            status_code=502,
+            detail="No audio was generated. Check voice IDs and ElevenLabs API key.",
+        )
+
     # Stitch all segments
     stitched_bytes = _stitch_mp3_segments(audio_segments)
 
@@ -4566,7 +4608,7 @@ async def studio_conversation_generate(
     # Update dialog blocks with adjusted timestamps
     for lr in line_results:
         idx = lr.get("lineIndex")
-        if idx is None or not isinstance(idx, int) or idx >= len(blocks):
+        if idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(blocks):
             continue
         if blocks[idx].get("type") == "dialog":
             blocks[idx] = {
@@ -4623,396 +4665,3 @@ async def studio_conversation_generate(
 # MUST be the last include_router(api) call so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
 app.include_router(api)
-"""
-server_conversation_patch.py
-═══════════════════════════════════════════════════════════════════════════════
-INTEGRATION INSTRUCTIONS:
-  1. Open server.py
-  2. Find the line: `async def _elevenlabs_generate(text: str, voice_id: str)`
-     (around line 286)
-  3. After the closing of that function (around line 340), paste everything
-     below the "# ─── PASTE HERE ───" marker.
-  4. Add the new route alongside the existing /elevenlabs route (around line 690).
-  5. Add `pydub>=0.25.1` to requirements.txt
-
-EXISTING FUNCTION NOT MODIFIED — only new functions and one new endpoint added.
-═══════════════════════════════════════════════════════════════════════════════
-"""
-
-# ─── PASTE HERE (after _elevenlabs_generate function, before first @api route) ───
-
-# ─────────────────────────────────────────────────────────────────────────── #
-#  Conversation Voice Studio helpers — teacher-side only                       #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-EMOTION_ACTING_NOTES: dict = {
-    "neutral":   None,
-    "happy":     "enthusiastic and warm",
-    "excited":   "very excited and energetic",
-    "sad":       "sad and quietly dejected",
-    "scared":    "scared, voice trembling slightly",
-    "angry":     "frustrated and tense, clipped words",
-    "curious":   "curious and questioning, rising intonation",
-    "surprised": "surprised and astonished",
-    "calm":      "calm, slow, and reassuring",
-    "dramatic":  "dramatic and intense, measured pauses",
-    "whisper":   "whispering softly and quietly",
-}
-
-
-def _emotion_to_acting_note(emotion, custom_note):
-    """Merge emotion preset + teacher custom note into ElevenLabs acting prompt."""
-    base = EMOTION_ACTING_NOTES.get(emotion or "neutral")
-    if custom_note and custom_note.strip():
-        return f"{base}; {custom_note.strip()}" if base else custom_note.strip()
-    return base
-
-
-def _stitch_mp3_segments(segments):
-    """Concatenate MP3 byte segments.
-
-    Valid when all segments share the same codec parameters — guaranteed
-    when every clip comes from ElevenLabs mp3_44100_128 CBR output.
-    """
-    return b"".join(segments)
-
-
-def _generate_silence_bytes(duration_seconds):
-    """Return silent MP3 bytes for the requested duration.
-
-    Tries pydub + ffmpeg first; falls back to a pre-built silent MP3 frame
-    repeated to fill the time (works without ffmpeg on Render).
-    """
-    if duration_seconds <= 0:
-        return b""
-    try:
-        from pydub import AudioSegment  # noqa: PLC0415
-        silence = AudioSegment.silent(
-            duration=int(duration_seconds * 1000),
-            frame_rate=44100,
-        )
-        buf = io.BytesIO()
-        silence.export(buf, format="mp3", bitrate="128k")
-        return buf.getvalue()
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Fallback: repeat a minimal silent 128kbps MPEG-1 L3 frame.
-    # Frame holds 1152 samples at 44100 Hz → ~26.1 ms each.
-    # Header bytes: FF FB 90 00 (sync + 128kbps + 44100 + stereo + no padding)
-    SILENT_FRAME = b"\xff\xfb\x90\x00" + b"\x00" * 413  # 417 bytes total
-    FRAME_DURATION = 1152 / 44100  # ≈ 0.02613 s
-    n_frames = max(1, int(duration_seconds / FRAME_DURATION) + 1)
-    return SILENT_FRAME * n_frames
-
-
-async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_note=None):
-    """Generate audio + word timestamps for one dialogue line.
-
-    Extended variant of _elevenlabs_generate() that supports:
-      • voice_settings  dict  { stability, similarity_boost, style }
-      • acting_note     str   prepended as ElevenLabs emotion directive
-
-    Returns { audio_base64, word_timestamps, duration }.
-    """
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
-
-    # ElevenLabs v3 acting instruction: prefix in square brackets
-    tts_text = f"[{acting_note}] {text}" if acting_note else text
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    body = {
-        "text": tts_text,
-        "model_id": ELEVENLABS_MODEL,
-        "output_format": "mp3_44100_128",
-    }
-    if voice_settings:
-        vs = {}
-        for key in ("stability", "similarity_boost", "style"):
-            if key in voice_settings:
-                try:
-                    vs[key] = float(voice_settings[key])
-                except (TypeError, ValueError):
-                    pass
-        vs["use_speaker_boost"] = True
-        if vs:
-            body["voice_settings"] = vs
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(90.0, connect=10.0),
-        follow_redirects=True,
-    ) as cli:
-        r = await cli.post(url, headers=headers, json=body)
-        if r.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"ElevenLabs error {r.status_code}: {r.text[:200]}",
-            )
-        data = r.json()
-
-    audio_base64 = data.get("audio_base64", "")
-    alignment = data.get("alignment", {})
-    chars = alignment.get("characters", [])
-    char_starts = alignment.get("character_start_times_seconds", [])
-    char_ends = alignment.get("character_end_times_seconds", [])
-
-    word_timestamps = []
-    current_word = ""
-    word_start = 0.0
-    word_end = 0.0
-
-    for i, ch in enumerate(chars):
-        char_str = ch if isinstance(ch, str) else str(ch)
-        t_start = char_starts[i] if i < len(char_starts) else 0.0
-        t_end = char_ends[i] if i < len(char_ends) else 0.0
-
-        if char_str in (" ", "\n"):
-            if current_word.strip():
-                word_timestamps.append({
-                    "word": current_word.strip(),
-                    "start": round(word_start, 3),
-                    "end": round(word_end, 3),
-                })
-            current_word = ""
-        else:
-            if not current_word:
-                word_start = t_start
-            current_word += char_str
-            word_end = t_end
-
-    if current_word.strip():
-        word_timestamps.append({
-            "word": current_word.strip(),
-            "start": round(word_start, 3),
-            "end": round(word_end, 3),
-        })
-
-    duration = word_timestamps[-1]["end"] if word_timestamps else 0.0
-    return {
-        "audio_base64": audio_base64,
-        "word_timestamps": word_timestamps,
-        "duration": duration,
-    }
-
-
-# ─── PASTE NEW ROUTE alongside the existing /elevenlabs route ───────────── #
-
-@api.post("/studio/books/{slug}/conversation")
-async def studio_conversation_generate(
-    slug: str,
-    payload: dict,
-    admin: User = Depends(require_admin),
-):
-    """Generate multi-character emotional dialogue audio for a chapter.
-    Teacher-side only. Never called by students.
-
-    Per-line: calls ElevenLabs with per-speaker voice, emotion, acting notes,
-    and voice settings. Stitches all segments into one stable MP3. Stores
-    in GridFS. Updates dialog blocks with adjusted timestamps.
-
-    Payload:
-        chapterIndex: int
-        book: dict   (pre-saved, same pattern as /elevenlabs)
-        lines: [
-            {
-                lineIndex: int,
-                speaker: str,
-                text: str,
-                voiceId: str,
-                emotion: str,
-                actingNote: str,
-                voiceSettings: { stability, similarity_boost, style },
-                pauseAfter: float,
-            }
-        ]
-    """
-    import asyncio  # noqa: PLC0415
-
-    chapter_index = int(payload.get("chapterIndex", 0))
-    lines = payload.get("lines") or []
-    if not lines:
-        raise HTTPException(status_code=400, detail="No lines provided.")
-
-    # Load book (same pattern as /elevenlabs)
-    book = payload.get("book") or None
-    if not book:
-        book = await db.books.find_one(
-            {"slug": slug}, {"_id": 0}, sort=[("revision", -1)]
-        )
-    if not book:
-        await asyncio.sleep(0.5)
-        book = await db.books.find_one(
-            {"slug": slug}, {"_id": 0}, sort=[("revision", -1)]
-        )
-    if not book:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Book '{slug}' not found. Save first, then generate.",
-        )
-
-    chapters = book.get("chapters", [])
-    if chapter_index >= len(chapters):
-        raise HTTPException(status_code=400, detail="Chapter index out of range.")
-
-    chapter = chapters[chapter_index]
-    blocks = list(chapter.get("blocks", []))
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Validate voice IDs
-    for li, line in enumerate(lines):
-        raw_voice = str(line.get("voiceId") or "").strip()
-        if not _VOICE_ID_RE.match(raw_voice):
-            line["voiceId"] = ELEVENLABS_DEFAULT_VOICE
-            log.warning(
-                "conversation: line %d invalid voiceId %r → default", li, raw_voice
-            )
-
-    audio_segments = []
-    accumulated_time = 0.0
-    line_results = []
-
-    for li, line in enumerate(lines):
-        voice_id = line["voiceId"]
-        emotion = str(line.get("emotion") or "neutral")
-        acting_note = _emotion_to_acting_note(emotion, line.get("actingNote") or "")
-        voice_settings = line.get("voiceSettings") or None
-        pause_after = max(0.0, float(line.get("pauseAfter", 0.35)))
-
-        log.info(
-            "conversation: line %d/%d speaker=%s voice=%s emotion=%s",
-            li + 1, len(lines), line.get("speaker", "?"), voice_id, emotion,
-        )
-
-        try:
-            result = await _elevenlabs_generate_line(
-                text=line["text"],
-                voice_id=voice_id,
-                voice_settings=voice_settings,
-                acting_note=acting_note,
-            )
-        except HTTPException as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=f"Line {li + 1} ({line.get('speaker', '?')}): {exc.detail}",
-            ) from exc
-
-        audio_bytes = base64.b64decode(result["audio_base64"])
-        raw_wts = result["word_timestamps"]
-        line_duration = result["duration"]
-
-        # Shift timestamps by accumulated offset
-        shifted_wts = [
-            {
-                "word": w["word"],
-                "start": round(w["start"] + accumulated_time, 3),
-                "end": round(w["end"] + accumulated_time, 3),
-            }
-            for w in raw_wts
-        ]
-
-        line_start = accumulated_time
-        line_end = line_start + line_duration
-
-        audio_segments.append(audio_bytes)
-        line_results.append({
-            "lineIndex": line.get("lineIndex"),
-            "speaker": line.get("speaker", ""),
-            "start": round(line_start, 3),
-            "end": round(line_end, 3),
-            "wordTimestamps": shifted_wts,
-        })
-
-        accumulated_time = line_end + pause_after
-
-        if pause_after > 0:
-            silence = _generate_silence_bytes(pause_after)
-            if silence:
-                audio_segments.append(silence)
-
-    # Stitch all segments
-    stitched_bytes = _stitch_mp3_segments(audio_segments)
-
-    # Upload to GridFS
-    audio_id = str(uuid.uuid4())
-    try:
-        await audio_bucket.upload_from_stream(
-            f"{audio_id}.mp3",
-            io.BytesIO(stitched_bytes),
-            metadata={
-                "slug": slug,
-                "chapter_index": chapter_index,
-                "type": "conversation",
-                "speakers": list({lr["speaker"] for lr in line_results}),
-                "line_count": len(lines),
-                "created_at": now,
-                "created_by": admin.email,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.exception("conversation: GridFS upload failed for slug=%s", slug)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to store conversation audio: {type(exc).__name__}: {exc}",
-        ) from exc
-
-    audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
-
-    # Update dialog blocks with adjusted timestamps
-    for lr in line_results:
-        idx = lr.get("lineIndex")
-        if idx is None or not isinstance(idx, int) or idx >= len(blocks):
-            continue
-        if blocks[idx].get("type") == "dialog":
-            blocks[idx] = {
-                **blocks[idx],
-                "start": lr["start"],
-                "end": lr["end"],
-                "wordTimestamps": lr["wordTimestamps"],
-            }
-
-    # Remove any existing conversation audio block, inject new one
-    blocks = [b for b in blocks if not b.get("_conversation_audio")]
-    blocks.append({
-        "type": "audio",
-        "text": audio_url,
-        "heading": f"Conversation — {chapter.get('title', 'Chapter')}",
-        "_elevenlabs_audio": True,
-        "_conversation_audio": True,
-        "_audio_id": audio_id,
-    })
-
-    # Save new book revision
-    chapters[chapter_index] = {**chapter, "blocks": blocks}
-    latest = await db.books.find_one(
-        {"slug": slug}, {"_id": 0, "revision": 1}, sort=[("revision", -1)]
-    )
-    next_rev = int((latest or {}).get("revision") or 0) + 1
-
-    updated_doc = {
-        **book,
-        "chapters": chapters,
-        "revision": next_rev,
-        "_authoredAt": now,
-        "_authoredBy": admin.email,
-    }
-    updated_doc.pop("_id", None)
-    await db.books.insert_one(updated_doc)
-
-    log.info(
-        "conversation: done slug=%s chapter=%d lines=%d duration=%.1fs rev=%d",
-        slug, chapter_index, len(lines), accumulated_time, next_rev,
-    )
-
-    return {
-        "ok": True,
-        "audioUrl": audio_url,
-        "audioId": audio_id,
-        "totalDuration": round(accumulated_time, 3),
-        "lines": line_results,
-        "revision": next_rev,
-    }
