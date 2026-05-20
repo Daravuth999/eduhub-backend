@@ -661,28 +661,120 @@ async def studio_list_voices(admin: User = Depends(require_admin)):
 
 
 @api.get("/studio/audio/{audio_filename}")
-async def studio_audio_stream(audio_filename: str):
-    """Stream AI-generated audio from MongoDB GridFS.
+async def studio_audio_stream(audio_filename: str, request: Request):
+    """Stream AI-generated audio from MongoDB GridFS with proper Range
+    support.
+
     Public — no auth required so student PWA can play it directly.
+
+    v10 (2026-05) surgical audio fix:
+      Previously this endpoint advertised `Accept-Ranges: bytes` but
+      IGNORED the actual `Range:` request header and always streamed the
+      entire file from byte 0. iOS Safari (and any HTML5 <audio> after a
+      pause/seek/network blip) sends `Range: bytes=<pos>-` to resume —
+      the old code answered every such request with the full file from
+      offset 0, which made resume / seek / scrub appear to "restart"
+      audio for the student. Combined with the ID3 stitcher bug above,
+      this produced the visible "audio cuts off after 1–2 minutes" bug.
+
+      Now: parse Range, seek into the GridFS stream, and return either a
+      proper 206 Partial Content or a 200 with Content-Length. Other
+      callers, headers, caching semantics are unchanged.
     """
     try:
-        stream = await audio_bucket.open_download_stream_by_name(audio_filename)
+        gridout = await audio_bucket.open_download_stream_by_name(audio_filename)
     except Exception:
         raise HTTPException(status_code=404, detail="Audio not found.")
 
-    async def generate():
-        while True:
-            chunk = await stream.readchunk()
-            if not chunk:
+    total_size = int(getattr(gridout, "length", 0) or 0)
+    range_header = request.headers.get("range") or request.headers.get("Range")
+
+    # Helper: stream bytes [start, end] inclusive from GridFS.
+    async def _range_iter(start: int, end: int):
+        # GridOut.seek + read works on motor's AsyncIOMotorGridOut.
+        try:
+            await gridout.seek(start)
+        except Exception:
+            # Older motor builds may expose .seek synchronously; try that too.
+            try:
+                gridout.seek(start)
+            except Exception:
+                pass
+        remaining = end - start + 1
+        # 64 KiB chunks — small enough for low-memory iOS PWA, big enough
+        # to keep the wire warm.
+        chunk_size = 64 * 1024
+        while remaining > 0:
+            data = await gridout.read(min(chunk_size, remaining))
+            if not data:
                 break
-            yield chunk
+            yield data
+            remaining -= len(data)
+
+    # No Range header → standard 200 with Content-Length when known.
+    if not range_header or total_size <= 0:
+        async def _full_iter():
+            chunk_size = 64 * 1024
+            while True:
+                data = await gridout.read(chunk_size)
+                if not data:
+                    break
+                yield data
+
+        headers = {
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Accept-Ranges": "bytes",
+        }
+        if total_size > 0:
+            headers["Content-Length"] = str(total_size)
+        return StreamingResponse(
+            _full_iter(),
+            media_type="audio/mpeg",
+            headers=headers,
+        )
+
+    # Parse "bytes=START-END" / "bytes=START-" / "bytes=-SUFFIX".
+    m = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", range_header, re.IGNORECASE)
+    if not m:
+        # Unparseable Range — respond with the full file as a fallback.
+        return StreamingResponse(
+            _range_iter(0, total_size - 1),
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(total_size),
+            },
+        )
+
+    start_s, end_s = m.group(1), m.group(2)
+    if start_s == "" and end_s == "":
+        # "bytes=-" with both sides empty is invalid → 416
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+    if start_s == "":
+        # Suffix range: last N bytes.
+        suffix = int(end_s)
+        if suffix <= 0:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+        start = max(0, total_size - suffix)
+        end = total_size - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else total_size - 1
+    if start >= total_size or start < 0 or end < start:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+    end = min(end, total_size - 1)
+    length = end - start + 1
 
     return StreamingResponse(
-        generate(),
+        _range_iter(start, end),
+        status_code=206,
         media_type="audio/mpeg",
         headers={
             "Cache-Control": "public, max-age=31536000, immutable",
             "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {start}-{end}/{total_size}",
+            "Content-Length": str(length),
         },
     )
 
@@ -4269,13 +4361,70 @@ def _emotion_to_acting_note(emotion, custom_note):
     return base
 
 
+def _strip_id3_tags(buf: bytes) -> bytes:
+    """Remove an ID3v2 header (front) and/or ID3v1 trailer (last 128 bytes)
+    from a single MP3 segment, returning only the raw MPEG frame run.
+
+    v10 (2026-05) surgical audio fix:
+      ElevenLabs returns each TTS segment as a self-contained .mp3 file
+      with its own ID3v2 header and (sometimes) an ID3v1 trailer. Naively
+      byte-concatenating those segments produces a file with MULTIPLE
+      embedded ID3 headers — iOS AVFoundation reads only the first
+      header's reported duration (== duration of segment 1) and stops
+      playback once currentTime crosses that value. Result: conversation
+      audio mysteriously cuts off after 1–2 minutes on every iPhone /
+      iPad / Mac-Safari client. Chromium-family browsers are lenient and
+      keep decoding past the bogus duration, which is why the bug never
+      reproduced on desktop QA.
+
+      Stripping ID3 tags from every segment AFTER the first leaves us
+      with one header at the very front and an uninterrupted run of
+      MPEG-1 Layer III frames, which every decoder handles correctly.
+
+    Header layout reference:
+      ID3v2: starts with b"ID3", followed by 3 bytes of version/flags,
+             then a 4-byte synchsafe size (each byte uses only 7 LSBs).
+             Total tag length = 10 + synchsafe(size).
+      ID3v1: fixed 128-byte trailer starting with b"TAG".
+    """
+    if not buf or len(buf) < 10:
+        return buf
+    out = buf
+    # Strip ID3v2 header at the front, if present.
+    if out[:3] == b"ID3":
+        # synchsafe size: 4 bytes, top bit of each is zero
+        b0, b1, b2, b3 = out[6], out[7], out[8], out[9]
+        size = (b0 << 21) | (b1 << 14) | (b2 << 7) | b3
+        tag_end = 10 + size
+        if 10 < tag_end < len(out):
+            out = out[tag_end:]
+    # Strip ID3v1 trailer at the back, if present.
+    if len(out) >= 128 and out[-128:-125] == b"TAG":
+        out = out[:-128]
+    return out
+
+
 def _stitch_mp3_segments(segments):
-    """Concatenate MP3 byte segments.
+    """Concatenate MP3 byte segments into one continuous decodable file.
+
+    v10 (2026-05) surgical audio fix — see _strip_id3_tags() docstring
+    for the full root-cause analysis.
+
+    Strategy:
+      • Keep the FIRST segment intact (its ID3v2 header — if any — becomes
+        the single header for the stitched file).
+      • For every subsequent segment, strip both the ID3v2 header and the
+        ID3v1 trailer so we emit only raw MPEG frames.
 
     Valid when all segments share the same codec parameters — guaranteed
     when every clip comes from ElevenLabs mp3_44100_128 CBR output.
     """
-    return b"".join(segments)
+    if not segments:
+        return b""
+    parts = [segments[0]]
+    for seg in segments[1:]:
+        parts.append(_strip_id3_tags(seg))
+    return b"".join(parts)
 
 
 def _generate_silence_bytes(duration_seconds):
