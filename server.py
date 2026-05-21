@@ -1654,8 +1654,6 @@ GAS_SYNC_URL = os.environ.get(
 # LastPaymentDate, NextDueDate columns in Sheet 2 (1oATjsiZio).
 # This is where updateTuition must be added and called.
 # Set in Render env vars as GAS_TUITION_URL.
-# Points to PasswordSync.gs which handles updateTuition writing to the
-# Evaluation / Control sheet (1oATjsiZio) — separate from syncPassword/syncName.
 GAS_TUITION_URL = os.environ.get(
     "GAS_TUITION_URL",
     "https://script.google.com/macros/s/AKfycbx1GGyX0Nfz6SYVvkeY_99g4lAKaDmPgeF2EwQFNgX82RjpNWgYJlxMyu2R3lQtCuG4Wg/exec",
@@ -3197,9 +3195,9 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
     The caller logs the outcome; the student always gets their new password
     regardless.
     """
-    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+    if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         log.warning(
-            "password-sync: GAS_PORTAL_URL or GAS_ADMIN_SECRET not set — "
+            "password-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set — "
             "Sheet password NOT updated for %s. Set both env vars to enable sync.",
             clean_id,
         )
@@ -3210,7 +3208,7 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
             follow_redirects=True,
         ) as cli:
             r = await cli.post(
-                GAS_PORTAL_URL,
+                GAS_SYNC_URL,
                 data={
                     "action": "syncPassword",
                     "studentId": clean_id,
@@ -3240,9 +3238,9 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
     Without this, getStudentData returns the old occupant's name forever.
     Never raises — a GAS outage must never block reactivation.
     """
-    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+    if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         log.warning(
-            "name-sync: GAS_PORTAL_URL or GAS_ADMIN_SECRET not set — "
+            "name-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set — "
             "Sheet name NOT updated for %s.", clean_id,
         )
         return False
@@ -3252,7 +3250,7 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
             follow_redirects=True,
         ) as cli:
             r = await cli.post(
-                GAS_PORTAL_URL,
+                GAS_SYNC_URL,
                 data={
                     "action": "syncName",
                     "studentId": clean_id,
