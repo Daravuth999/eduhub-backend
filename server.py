@@ -1642,12 +1642,21 @@ GAS_EVAL_URL = os.environ.get(
     "https://script.google.com/macros/s/AKfycbxqGH9JuGhVn9V5UuhYeOOyI-vk7E41jXm0hrVp9Pj-Ukuw_HcNcR0C8bflmFTPq1YRDA/exec",
 )
 
-# PasswordSync GAS URL — standalone script that handles syncPassword, syncName,
-# and updateTuition. Separate from GAS_PORTAL_URL (which is the Portal/auth script).
+# PasswordSync GAS URL — standalone script that handles syncPassword, syncName.
+# Writes to Sheet 1 (16L90CI5j - Main Database): Password, Name columns only.
 # Set in Render env vars as GAS_SYNC_URL.
 GAS_SYNC_URL = os.environ.get(
     "GAS_SYNC_URL",
     "https://script.google.com/macros/s/AKfycbx1GGyX0Nfz6SYVvkeY_99g4lAKaDmPgeF2EwQFNgX82RjpNWgYJlxMyu2R3lQtCuG4Wg/exec",
+)
+
+# Tuition GAS URL — Evaluation sheet GAS script that owns TuitionStatus,
+# LastPaymentDate, NextDueDate columns in Sheet 2 (1oATjsiZio).
+# This is where updateTuition must be added and called.
+# Set in Render env vars as GAS_TUITION_URL.
+GAS_TUITION_URL = os.environ.get(
+    "GAS_TUITION_URL",
+    "https://script.google.com/macros/s/AKfycbzC4EvzLo618tFUx8Gi2-h3oHAmjzT3yBw8PAYS_pdTQr9xr2a-HOOdYb_mThjIR8GMtw/exec",
 )
 
 # In-process credential cache. Key: sha256(studentId + ":" + password).
@@ -3510,9 +3519,9 @@ async def _update_tuition_in_gas(
     Raises RuntimeError with a human-readable message on any failure — the
     caller MUST surface this; never fake success.
     """
-    if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
+    if not GAS_TUITION_URL or not GAS_ADMIN_SECRET:
         raise RuntimeError(
-            "updateTuition: GAS_SYNC_URL or GAS_ADMIN_SECRET not configured "
+            "updateTuition: GAS_TUITION_URL or GAS_ADMIN_SECRET not configured "
             "— set both Render env vars to enable tuition management."
         )
     payload: dict = {
@@ -3534,7 +3543,7 @@ async def _update_tuition_in_gas(
             timeout=httpx.Timeout(15.0, connect=5.0),
             follow_redirects=True,
         ) as cli:
-            r = await cli.post(GAS_SYNC_URL, data=payload)
+            r = await cli.post(GAS_TUITION_URL, data=payload)
         if r.status_code == 200:
             try:
                 j = r.json()
