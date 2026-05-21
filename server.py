@@ -1642,6 +1642,14 @@ GAS_EVAL_URL = os.environ.get(
     "https://script.google.com/macros/s/AKfycbxqGH9JuGhVn9V5UuhYeOOyI-vk7E41jXm0hrVp9Pj-Ukuw_HcNcR0C8bflmFTPq1YRDA/exec",
 )
 
+# PasswordSync GAS URL — standalone script that handles syncPassword, syncName,
+# and updateTuition. Separate from GAS_PORTAL_URL (which is the Portal/auth script).
+# Set in Render env vars as GAS_SYNC_URL.
+GAS_SYNC_URL = os.environ.get(
+    "GAS_SYNC_URL",
+    "https://script.google.com/macros/s/AKfycbx1GGyX0Nfz6SYVvkeY_99g4lAKaDmPgeF2EwQFNgX82RjpNWgYJlxMyu2R3lQtCuG4Wg/exec",
+)
+
 # In-process credential cache. Key: sha256(studentId + ":" + password).
 # Value: (expires_at_epoch_seconds, ok_bool). 60 s TTL.
 _CREDIT_CRED_CACHE: dict[str, tuple[float, bool]] = {}
@@ -3502,9 +3510,9 @@ async def _update_tuition_in_gas(
     Raises RuntimeError with a human-readable message on any failure — the
     caller MUST surface this; never fake success.
     """
-    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+    if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         raise RuntimeError(
-            "updateTuition: GAS_PORTAL_URL or GAS_ADMIN_SECRET not configured "
+            "updateTuition: GAS_SYNC_URL or GAS_ADMIN_SECRET not configured "
             "— set both Render env vars to enable tuition management."
         )
     payload: dict = {
@@ -3526,7 +3534,7 @@ async def _update_tuition_in_gas(
             timeout=httpx.Timeout(15.0, connect=5.0),
             follow_redirects=True,
         ) as cli:
-            r = await cli.post(GAS_PORTAL_URL, data=payload)
+            r = await cli.post(GAS_SYNC_URL, data=payload)
         if r.status_code == 200:
             try:
                 j = r.json()
@@ -3536,7 +3544,7 @@ async def _update_tuition_in_gas(
                         clean_id, tuition_status, next_due_date,
                     )
                     return j
-                err_msg = j.get("error") or j.get("detail") or "GAS returned ok:false"
+                err_msg = j.get("message") or j.get("error") or j.get("detail") or "GAS returned ok:false"
                 raise RuntimeError(f"GAS update failed: {err_msg}")
             except (ValueError, AttributeError):
                 raise RuntimeError("GAS returned non-JSON response — update may not have applied")
@@ -3588,8 +3596,8 @@ async def teacher_update_tuition(
         raise HTTPException(status_code=404, detail="Student not found")
     clean_id: str = doc["clean_id"]
 
-    # Helper: parse YYYY-MM-DD strings robustly
-    _ISO = _re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+    # Helper: parse YYYY-MM-DD or YYYY.MM.DD (both formats exist in the sheet)
+    _ISO = _re.compile(r"^(\d{4})[.\-](\d{2})[.\-](\d{2})$")
 
     def _parse_iso(s: str | None) -> _date | None:
         if not s:
