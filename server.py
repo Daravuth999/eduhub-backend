@@ -3596,8 +3596,8 @@ async def teacher_update_tuition(
         raise HTTPException(status_code=404, detail="Student not found")
     clean_id: str = doc["clean_id"]
 
-    # Helper: parse YYYY-MM-DD or YYYY.MM.DD (both formats exist in the sheet)
-    _ISO = _re.compile(r"^(\d{4})[.\-](\d{2})[.\-](\d{2})$")
+    # Helper: parse YYYY.MM.DD, YYYY-MM-DD, or full ISO timestamp (2026-05-31T17:00:00.000Z)
+    _ISO = _re.compile(r"^(\d{4})[.\-](\d{2})[.\-](\d{2})")
 
     def _parse_iso(s: str | None) -> _date | None:
         if not s:
@@ -3611,7 +3611,7 @@ async def teacher_update_tuition(
             return None
 
     def _fmt(d: _date) -> str:
-        return d.strftime("%Y-%m-%d")
+        return d.strftime("%Y.%m.%d")  # matches sheet format: 2026.05.28
 
     def _add_one_month(d: _date) -> _date:
         """Add exactly one calendar month, clamping to month-end on overflow."""
