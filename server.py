@@ -3256,6 +3256,7 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
         return False
 
 
+
 @api.post("/teacher/students")
 async def teacher_create_student(
     payload: dict,
@@ -3327,10 +3328,10 @@ async def teacher_create_student(
     # Fire-and-forget GAS syncs — never block the credential card response.
     import asyncio as _asyncio_create
     _asyncio_create.create_task(_sync_password_to_gas(clean_id, plain_password))
-    # On reactivation: also sync the new name so GAS returns the new student's
-    # identity, not the previous occupant's name.
-    if action == "reactivated":
-        _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
+    # Always sync the name to GAS — on reactivation this overwrites the previous
+    # occupant's stale name; on brand-new creation this ensures the GAS sheet row
+    # (which may exist from a pre-MongoDB migration) shows the correct new name.
+    _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
 
     return {
         "action": action,
@@ -3422,11 +3423,31 @@ async def teacher_update_student(
     updates = {k: v for k, v in payload.items() if k in allowed and v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    # Fetch the doc BEFORE updating so we have clean_id for the GAS sync.
+    # clean_id is the Google Sheets student row key — student_id is the internal
+    # MongoDB UUID and is NOT what GAS stores.
+    doc = await db.students.find_one(
+        {"student_id": student_id}, {"_id": 0, "clean_id": 1},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Student not found")
+
     result = await db.students.update_one(
         {"student_id": student_id}, {"$set": updates},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Student not found")
+
+    # If display_name was updated, mirror it to Google Sheets so that GAS
+    # getStudentData, Tuition Reminder, and the Portal all see the new name.
+    # Fire-and-forget — a GAS outage must never block or roll back the update.
+    if "display_name" in updates:
+        import asyncio as _asyncio_patch
+        _asyncio_patch.create_task(
+            _sync_name_to_gas(doc["clean_id"], updates["display_name"])
+        )
+
     return {"ok": True}
 
 
