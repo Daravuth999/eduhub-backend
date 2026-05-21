@@ -1654,9 +1654,11 @@ GAS_SYNC_URL = os.environ.get(
 # LastPaymentDate, NextDueDate columns in Sheet 2 (1oATjsiZio).
 # This is where updateTuition must be added and called.
 # Set in Render env vars as GAS_TUITION_URL.
+# Points to PasswordSync.gs which handles updateTuition writing to the
+# Evaluation / Control sheet (1oATjsiZio) — separate from syncPassword/syncName.
 GAS_TUITION_URL = os.environ.get(
     "GAS_TUITION_URL",
-    "https://script.google.com/macros/s/AKfycbzC4EvzLo618tFUx8Gi2-h3oHAmjzT3yBw8PAYS_pdTQr9xr2a-HOOdYb_mThjIR8GMtw/exec",
+    "https://script.google.com/macros/s/AKfycbx1GGyX0Nfz6SYVvkeY_99g4lAKaDmPgeF2EwQFNgX82RjpNWgYJlxMyu2R3lQtCuG4Wg/exec",
 )
 
 # In-process credential cache. Key: sha256(studentId + ":" + password).
