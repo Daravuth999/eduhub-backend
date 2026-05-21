@@ -3484,6 +3484,211 @@ async def teacher_reset_password(
     }
 
 
+async def _update_tuition_in_gas(
+    clean_id: str,
+    tuition_status: str | None,
+    last_payment_date: str | None,
+    next_due_date: str | None,
+    payment_amount: str | None,
+) -> dict:
+    """Write TuitionStatus / LastPaymentDate / NextDueDate (and optionally
+    PaymentAmount) to the Students tab in GAS.
+
+    SAFE COLUMNS ONLY — never touches StudentID, Name, Password, restriction,
+    evaluation scores, month tabs, Archive tab, Comments, Coupons, Redemptions,
+    Strength / Weakness / Improvement.
+
+    Returns {"ok": True} on confirmed GAS success.
+    Raises RuntimeError with a human-readable message on any failure — the
+    caller MUST surface this; never fake success.
+    """
+    if not GAS_PORTAL_URL or not GAS_ADMIN_SECRET:
+        raise RuntimeError(
+            "updateTuition: GAS_PORTAL_URL or GAS_ADMIN_SECRET not configured "
+            "— set both Render env vars to enable tuition management."
+        )
+    payload: dict = {
+        "action": "updateTuition",
+        "studentId": clean_id,
+        "adminSecret": GAS_ADMIN_SECRET,
+    }
+    if tuition_status is not None:
+        payload["tuitionStatus"] = tuition_status
+    if last_payment_date is not None:
+        payload["lastPaymentDate"] = last_payment_date
+    if next_due_date is not None:
+        payload["nextDueDate"] = next_due_date
+    if payment_amount is not None:
+        payload["paymentAmount"] = payment_amount
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            r = await cli.post(GAS_PORTAL_URL, data=payload)
+        if r.status_code == 200:
+            try:
+                j = r.json()
+                if isinstance(j, dict) and j.get("ok") is True:
+                    log.info(
+                        "updateTuition: GAS confirmed for %s status=%s next=%s",
+                        clean_id, tuition_status, next_due_date,
+                    )
+                    return j
+                err_msg = j.get("error") or j.get("detail") or "GAS returned ok:false"
+                raise RuntimeError(f"GAS update failed: {err_msg}")
+            except (ValueError, AttributeError):
+                raise RuntimeError("GAS returned non-JSON response — update may not have applied")
+        raise RuntimeError(f"GAS HTTP {r.status_code} — update not applied")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"GAS unreachable: {exc}") from exc
+
+
+@api.patch("/teacher/students/{student_id}/tuition")
+async def teacher_update_tuition(
+    student_id: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Controlled tuition update — teacher clicks Mark Paid / Mark Unpaid /
+    Extend 1 Month / Set Custom Due Date.
+
+    Accepted actions:
+        mark_paid          — sets Paid, today as LastPaymentDate, safe NextDueDate
+        mark_unpaid        — sets Unpaid, clears LastPaymentDate
+        extend_one_month   — adds 1 month to NextDueDate (today if overdue/missing)
+        set_custom_due_date — sets NextDueDate to caller-provided YYYY-MM-DD
+
+    NEVER writes: StudentID, Name, Password, restriction, evaluation scores,
+    month tabs, Archive, Comments, Coupons, Redemptions, Strength/Weakness/Improvement.
+
+    On any GAS failure: returns HTTP 502 with the GAS error message.
+    Never fakes success.
+    """
+    import re as _re
+    import calendar as _cal
+    from datetime import date as _date
+
+    action = (payload.get("action") or "").strip()
+    if action not in {"mark_paid", "mark_unpaid", "extend_one_month", "set_custom_due_date"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid action '{action}'. Accepted: mark_paid, mark_unpaid, "
+                   "extend_one_month, set_custom_due_date",
+        )
+
+    doc = await db.students.find_one(
+        {"student_id": student_id},
+        {"_id": 0, "clean_id": 1, "display_name": 1},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Student not found")
+    clean_id: str = doc["clean_id"]
+
+    # Helper: parse YYYY-MM-DD strings robustly
+    _ISO = _re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+    def _parse_iso(s: str | None) -> _date | None:
+        if not s:
+            return None
+        m = _ISO.match(str(s).strip())
+        if not m:
+            return None
+        try:
+            return _date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            return None
+
+    def _fmt(d: _date) -> str:
+        return d.strftime("%Y-%m-%d")
+
+    def _add_one_month(d: _date) -> _date:
+        """Add exactly one calendar month, clamping to month-end on overflow."""
+        month = d.month % 12 + 1
+        year  = d.year + (1 if d.month == 12 else 0)
+        day   = min(d.day, _cal.monthrange(year, month)[1])
+        return _date(year, month, day)
+
+    today = _date.today()
+
+    tuition_status:    str | None = None
+    last_payment_date: str | None = None
+    next_due_date:     str | None = None
+    payment_amount:    str | None = None
+
+    if action == "mark_paid":
+        tuition_status    = "Paid"
+        last_payment_date = _fmt(today)
+        # Retrieve current NextDueDate from GAS for safe advancement
+        current_ndd_str: str | None = payload.get("currentNextDueDate")
+        current_ndd = _parse_iso(current_ndd_str)
+        if current_ndd and current_ndd >= today:
+            # Advance from the existing future/today due date
+            next_due_date = _fmt(_add_one_month(current_ndd))
+        else:
+            # Overdue or missing — advance from today
+            next_due_date = _fmt(_add_one_month(today))
+        # Optional: carry explicit PaymentAmount if provided
+        if payload.get("paymentAmount") is not None:
+            payment_amount = str(payload["paymentAmount"])
+
+    elif action == "mark_unpaid":
+        tuition_status    = "Unpaid"
+        last_payment_date = ""   # clears the cell
+
+    elif action == "extend_one_month":
+        current_ndd_str = payload.get("currentNextDueDate")
+        current_ndd = _parse_iso(current_ndd_str)
+        if current_ndd and current_ndd >= today:
+            next_due_date = _fmt(_add_one_month(current_ndd))
+        else:
+            next_due_date = _fmt(_add_one_month(today))
+
+    elif action == "set_custom_due_date":
+        raw = (payload.get("customDueDate") or "").strip()
+        custom = _parse_iso(raw)
+        if not custom:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid customDueDate '{raw}'. Must be YYYY-MM-DD.",
+            )
+        next_due_date = _fmt(custom)
+
+    # Call GAS — surface any failure as 502
+    try:
+        gas_result = await _update_tuition_in_gas(
+            clean_id=clean_id,
+            tuition_status=tuition_status,
+            last_payment_date=last_payment_date,
+            next_due_date=next_due_date,
+            payment_amount=payment_amount,
+        )
+    except RuntimeError as gas_err:
+        log.error(
+            "teacher_update_tuition: GAS error for student %s (%s): %s",
+            student_id, clean_id, gas_err,
+        )
+        raise HTTPException(status_code=502, detail=str(gas_err))
+
+    log.info(
+        "teacher_update_tuition: %s action=%s clean_id=%s by %s",
+        student_id, action, clean_id, admin.email,
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "clean_id": clean_id,
+        "tuitionStatus":    tuition_status,
+        "lastPaymentDate":  last_payment_date,
+        "nextDueDate":      next_due_date,
+        "paymentAmount":    payment_amount,
+        "gas": gas_result,
+    }
+
+
 @api.delete("/teacher/students/{student_id}")
 async def teacher_deactivate_student(
     student_id: str,
