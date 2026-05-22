@@ -185,7 +185,8 @@ from pydantic import BaseModel as _PM
 class PaymentIntentCreate(_PM):
     type:       str           # "tuition" | "points"
     student_id: str
-    amount:     float         # USD amount expected
+    amount:     float         # amount (KHR or USD)
+    amount_khr: int | None = None  # explicit KHR amount for matching
     currency:   str = "USD"
     pkg_id:     str | None = None   # for points purchase: package id
 
