@@ -122,6 +122,7 @@ async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
         txn_amount = float(txn.get("amount", 0))
         # Also check KHR amount stored directly
         intent_khr = float(intent.get("amount_khr", 0))
+        log.info("match_debug: intent_id=%s intent_amount=%s intent_khr=%s txn_amount=%s", str(intent.get("_id")), intent_amount, intent_khr, txn_amount)
         txn_matches = (intent_amount > 0 and abs(intent_amount - txn_amount) < 0.01) or \
                       (intent_khr > 0 and abs(intent_khr - txn_amount) < 1)
         if txn_matches:
