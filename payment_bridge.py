@@ -48,22 +48,16 @@ from bson import ObjectId
 # ------ Telegram message parser ---------------------------------------------------------------------------------------------------------------------------------------------
 
 _TRX_PATTERN = _pay_re.compile(
-    r"[\$\u17DB]?([\d,]+(?:\.\d+)?)\s*(?:USD|KHR)?\s*(?:paid|transferred)\s+by\s+"
-    r"([^\(]+?)\s*(?:\(([^\)]*)\))?\s+on\s+"
-    r"([A-Za-z]+ \d+,?\s*\d{1,2}:\d{2}\s*[APap][Mm])\s+"
-    r"via\s+([^\s]+(?:\s+[^\s]+)*?)\s+at\s+([^.]+?)\."
-    r"\s*Trx\.\s*ID:\s*(\d+),?\s*APV:\s*(\d+)",
+    r"([\d,]+(?:\.\d+)?)\s*(?:USD|KHR)?\s*paid\s+by\s+"
+    r"([^\(]+?)(?:\s*\([^\)]*\))?\s+on\s+"
+    r"([A-Za-z]+\s+\d+,?\s*\d{1,2}:\d{2}\s*[APap][Mm])\s+"
+    r"via\s+(.+?)\s+at\s+(.+?)\.\s*Trx\.\s*ID:\s*(\d+),?\s*APV:\s*(\d+)",
     _pay_re.IGNORECASE | _pay_re.DOTALL,
 )
 
-_KHR_PATTERN = _pay_re.compile(
-    r"([\d,]+(?:\.\d+)?)\s*[---KHR]+\s*(?:paid|transferred)\s+by\s+"
-    r"([^\(]+?)\s*(?:\(([^\)]*)\))?\s+on\s+"
-    r"([A-Za-z]+ \d+,?\s*\d{1,2}:\d{2}\s*[APap][Mm])\s+"
-    r"via\s+([^\s]+(?:\s+[^\s]+)*?)\s+at\s+([^.]+?)\."
-    r"\s*Trx\.\s*ID:\s*(\d+),?\s*APV:\s*(\d+)",
-    _pay_re.IGNORECASE | _pay_re.DOTALL,
-)
+_KHR_PATTERN = _TRX_PATTERN
+
+_KHR_PATTERN = _TRX_PATTERN
 
 
 def _parse_payway_message(text: str) -> dict | None:
@@ -82,12 +76,12 @@ def _parse_payway_message(text: str) -> dict | None:
                 "amount":         float(amount_str),
                 "currency":       currency,
                 "payer_name":     m.group(2).strip(),
-                "payer_account":  (m.group(3) or "").strip(),
-                "paid_at_raw":    m.group(4).strip(),
-                "payment_method": m.group(5).strip() if m.lastindex >= 5 else "ABA PAY",
-                "merchant":       m.group(6).strip(),
-                "transaction_id": m.group(7).strip(),
-                "apv":            m.group(8).strip(),
+                "payer_account":  "",
+                "paid_at_raw":    m.group(3).strip(),
+                "payment_method": m.group(4).strip() if m.lastindex >= 5 else "ABA PAY",
+                "merchant":       m.group(5).strip(),
+                "transaction_id": m.group(6).strip(),
+                "apv":            m.group(7).strip(),
                 "raw_message":    text,
             }
     return None
