@@ -97,7 +97,7 @@ async def _forward_to_backend(message_text: str, attempt: int = 1) -> bool:
     if WEBHOOK_SECRET:
         headers["X-Payment-Secret"] = WEBHOOK_SECRET
 
-    payload = {"message": message_text}
+    payload = {"message": message_text, "secret": os.environ.get("PAYMENT_WEBHOOK_SECRET", "")}
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:

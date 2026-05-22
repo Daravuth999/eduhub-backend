@@ -66,6 +66,16 @@ def _parse_payway_message(text: str) -> dict | None:
     Handles both USD ($1.00) and KHR (5000---) formats.
     Returns a dict of extracted fields or None if message doesn't match.
     """
+
+    # Detect currency from raw message before regex parsing
+    raw_text = (text or "").strip()
+    raw_upper = raw_text.upper()
+    if "KHR" in raw_upper:
+        detected_currency = "KHR"
+    elif "$" in raw_text or "USD" in raw_upper:
+        detected_currency = "USD"
+    else:
+        detected_currency = "KHR"
     text = (text or "").strip()
 
     for pattern, currency in [(_TRX_PATTERN, "USD"), (_KHR_PATTERN, "KHR")]:
@@ -74,7 +84,7 @@ def _parse_payway_message(text: str) -> dict | None:
             amount_str = m.group(1).replace(",", "")
             return {
                 "amount":         float(amount_str),
-                "currency":       currency,
+                "currency":       detected_currency,
                 "payer_name":     m.group(2).strip(),
                 "payer_account":  "",
                 "paid_at_raw":    m.group(3).strip(),
@@ -181,6 +191,7 @@ class PaymentIntentCreate(_PM):
 
 class TelegramWebhookPayload(_PM):
     message: str              # raw Telegram message text
+    secret: str | None = None  # X-Payment-Secret forwarded by listener
 
 class ManualParsePayload(_PM):
     message: str              # admin pastes the notification
@@ -340,7 +351,7 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
         asyncio.create_task(
             _fan_out_push(
                 {"studentId": clean_id},
-                title=f"---- +{points_to_credit} Points Credited!",
+                title=f"+{points_to_credit} Points Credited!",
                 body=(
                     f"Your payment of ${txn.get('amount', 0):.2f} was received. "
                     f"{points_to_credit} points have been added to your account."
@@ -463,6 +474,7 @@ async def create_payment_intent(
         "type":           payload.type,
         "student_id":     payload.student_id,
         "amount":         payload.amount,
+        "amount_khr":     payload.amount_khr or int(payload.amount),
         "currency":       payload.currency,
         "pkg_id":         payload.pkg_id,
         "reference_code": ref_code,
@@ -518,9 +530,11 @@ async def receive_telegram_webhook(payload: TelegramWebhookPayload):
     without a session cookie.
     """
     webhook_secret = os.environ.get("PAYMENT_WEBHOOK_SECRET", "")
-    # Security: if a webhook secret is configured, validate it
-    # (The forwarder should send it as X-Payment-Secret header)
-    # We keep this soft --- missing header is only a warning if secret not configured
+    if webhook_secret:
+        provided = payload.secret or ""
+        if not _pay_secrets.compare_digest(provided, webhook_secret):
+            log.warning("payment_bridge: webhook rejected - bad secret")
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
     parsed = _parse_payway_message(payload.message)
     if not parsed:
         raise HTTPException(
