@@ -4572,7 +4572,7 @@ async def redeem_coupon(payload: dict):
 exec(open(Path(__file__).parent / "payment_bridge.py").read())
 # -----------------------------------------------------------------------------
 
-app.include_router(api) has been moved to the END of this file
+# app.include_router(api) has been moved to the END of this file
 # so that ALL @api.* route decorators (including the conversation route below)
 # are registered before the router is attached to the app.
 """
