@@ -19,13 +19,13 @@ from typing import Any, Literal
 import json
 import httpx
 
-# â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ LUCKY DRAW SURGERY Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 from lucky_draw import (
     register_lucky_draw_routes,
     generate_and_publish_lucky_code,
     ensure_lucky_draw_indexes,
 )
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import (APIRouter, Cookie, Depends, FastAPI, File, Form, Header,
@@ -74,7 +74,7 @@ ELEVENLABS_DEFAULT_VOICE = os.environ.get(
 _VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{20}$")
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_v3")
 
-# Public-facing backend URL â€” used to build absolute audio stream URLs
+# Public-facing backend URL Ã¢â¬â used to build absolute audio stream URLs
 # so both the student PWA (vercel.app) and Author Studio can play the audio.
 # Set in Render env vars as PUBLIC_BACKEND_URL.
 PUBLIC_BACKEND_URL = os.environ.get(
@@ -286,7 +286,7 @@ async def require_admin(user: User = Depends(require_user)) -> User:
 async def _elevenlabs_generate(text: str, voice_id: str) -> dict:
     """Call ElevenLabs text-to-speech with-timestamps endpoint.
     Returns { audio_base64, word_timestamps } or raises HTTPException.
-    Never called by students â€” teacher-side only.
+    Never called by students Ã¢â¬â teacher-side only.
     """
     if not ELEVENLABS_API_KEY:
         raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
@@ -618,7 +618,7 @@ async def studio_list_voices(admin: User = Depends(require_admin)):
     """List available ElevenLabs voices for the teacher voice picker.
 
     Teacher-side only (require_admin). The xi-api-key never leaves the
-    server â€” the browser only receives sanitized {voice_id, name, ...}.
+    server Ã¢â¬â the browser only receives sanitized {voice_id, name, ...}.
     """
     if not ELEVENLABS_API_KEY:
         raise HTTPException(
@@ -665,17 +665,17 @@ async def studio_audio_stream(audio_filename: str, request: Request):
     """Stream AI-generated audio from MongoDB GridFS with proper Range
     support.
 
-    Public â€” no auth required so student PWA can play it directly.
+    Public Ã¢â¬â no auth required so student PWA can play it directly.
 
     v10 (2026-05) surgical audio fix:
       Previously this endpoint advertised `Accept-Ranges: bytes` but
       IGNORED the actual `Range:` request header and always streamed the
       entire file from byte 0. iOS Safari (and any HTML5 <audio> after a
-      pause/seek/network blip) sends `Range: bytes=<pos>-` to resume â€”
+      pause/seek/network blip) sends `Range: bytes=<pos>-` to resume Ã¢â¬â
       the old code answered every such request with the full file from
       offset 0, which made resume / seek / scrub appear to "restart"
       audio for the student. Combined with the ID3 stitcher bug above,
-      this produced the visible "audio cuts off after 1â€“2 minutes" bug.
+      this produced the visible "audio cuts off after 1Ã¢â¬â2 minutes" bug.
 
       Now: parse Range, seek into the GridFS stream, and return either a
       proper 206 Partial Content or a 200 with Content-Length. Other
@@ -701,7 +701,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
             except Exception:
                 pass
         remaining = end - start + 1
-        # 64 KiB chunks â€” small enough for low-memory iOS PWA, big enough
+        # 64 KiB chunks Ã¢â¬â small enough for low-memory iOS PWA, big enough
         # to keep the wire warm.
         chunk_size = 64 * 1024
         while remaining > 0:
@@ -711,7 +711,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
             yield data
             remaining -= len(data)
 
-    # No Range header â†’ standard 200 with Content-Length when known.
+    # No Range header Ã¢â â standard 200 with Content-Length when known.
     if not range_header or total_size <= 0:
         async def _full_iter():
             chunk_size = 64 * 1024
@@ -736,7 +736,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
     # Parse "bytes=START-END" / "bytes=START-" / "bytes=-SUFFIX".
     m = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", range_header, re.IGNORECASE)
     if not m:
-        # Unparseable Range â€” respond with the full file as a fallback.
+        # Unparseable Range Ã¢â¬â respond with the full file as a fallback.
         return StreamingResponse(
             _range_iter(0, total_size - 1),
             media_type="audio/mpeg",
@@ -749,7 +749,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
 
     start_s, end_s = m.group(1), m.group(2)
     if start_s == "" and end_s == "":
-        # "bytes=-" with both sides empty is invalid â†’ 416
+        # "bytes=-" with both sides empty is invalid Ã¢â â 416
         return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
     if start_s == "":
         # Suffix range: last N bytes.
@@ -791,7 +791,7 @@ async def studio_elevenlabs_generate(
     Saves a new book revision to MongoDB.
     """
     chapter_index = int(payload.get("chapterIndex", 0))
-    # Defensive: reject human-readable names like "Rachel" â€” ElevenLabs
+    # Defensive: reject human-readable names like "Rachel" Ã¢â¬â ElevenLabs
     # requires a 20-char alphanumeric voice_id. If the client somehow sends
     # anything else (stale cached frontend, manual API caller, etc.), fall
     # back to the configured default instead of 404-ing.
@@ -801,12 +801,12 @@ async def studio_elevenlabs_generate(
     else:
         if raw_voice:
             log.warning(
-                "elevenlabs: rejected invalid voice value %r â€” using default %s",
+                "elevenlabs: rejected invalid voice value %r Ã¢â¬â using default %s",
                 raw_voice, ELEVENLABS_DEFAULT_VOICE,
             )
         voice_id = ELEVENLABS_DEFAULT_VOICE
 
-    # Define now early â€” used in GridFS metadata and ai_voice meta below
+    # Define now early Ã¢â¬â used in GridFS metadata and ai_voice meta below
     now = datetime.now(timezone.utc).isoformat()
 
     # Load current book (latest revision).
@@ -859,11 +859,11 @@ async def studio_elevenlabs_generate(
     audio_b64 = result["audio_base64"]
     word_timestamps = result["word_timestamps"]
 
-    # Upload MP3 to MongoDB GridFS â€” avoids storing multi-MB base64 inline
+    # Upload MP3 to MongoDB GridFS Ã¢â¬â avoids storing multi-MB base64 inline
     # which crashes the frontend when the book document is loaded.
     # FIX v9.9: motor's GridFSBucket.upload_from_stream() requires a file-like
     # object with a .read() method. Passing raw bytes raises
-    # AttributeError: 'bytes' object has no attribute 'read' â€” which manifests
+    # AttributeError: 'bytes' object has no attribute 'read' Ã¢â¬â which manifests
     # as a 500 (no CORS headers) and looks like a CORS error in the browser.
     audio_bytes = base64.b64decode(audio_b64)
     audio_id = str(uuid.uuid4())
@@ -896,7 +896,7 @@ async def studio_elevenlabs_generate(
     blocks.append({
         "type": "audio",
         "text": audio_url,
-        "heading": f"AI Voice â€” {chapter.get('title', 'Chapter')}",
+        "heading": f"AI Voice Ã¢â¬â {chapter.get('title', 'Chapter')}",
         "_elevenlabs_audio": True,
         "_audio_id": audio_id,
     })
@@ -937,7 +937,7 @@ async def studio_elevenlabs_generate(
         "word_count": len(word_timestamps),
     }
 
-    # Save new revision (append-only â€” same as studio_save_book)
+    # Save new revision (append-only Ã¢â¬â same as studio_save_book)
     latest = await db.books.find_one(
         {"slug": slug}, {"_id": 0, "revision": 1},
         sort=[("revision", -1)]
@@ -1623,7 +1623,7 @@ SL_TREASURY_ID       = os.environ.get("SL_TREASURY_ID", "stu092")
 SL_TREASURY_PASSWORD = os.environ.get("SL_TREASURY_PASSWORD", "")
 
 
-# Portal GAS backend URL â€” used for server-to-server password sync after reset.
+# Portal GAS backend URL Ã¢â¬â used for server-to-server password sync after reset.
 # Set in Render env vars. Falls back to the same URL the frontend already uses.
 GAS_PORTAL_URL = os.environ.get(
     "GAS_PORTAL_URL",
@@ -1635,14 +1635,14 @@ GAS_PORTAL_URL = os.environ.get(
 # Generate any long random string: python3 -c "import secrets; print(secrets.token_hex(32))"
 GAS_ADMIN_SECRET = os.environ.get("GAS_ADMIN_SECRET", "")
 
-# Evaluation GAS backend URL â€” used for archiving student evaluation rows
+# Evaluation GAS backend URL Ã¢â¬â used for archiving student evaluation rows
 # on deactivation. Set in Render env vars as GAS_EVAL_URL.
 GAS_EVAL_URL = os.environ.get(
     "GAS_EVAL_URL",
     "https://script.google.com/macros/s/AKfycbxqGH9JuGhVn9V5UuhYeOOyI-vk7E41jXm0hrVp9Pj-Ukuw_HcNcR0C8bflmFTPq1YRDA/exec",
 )
 
-# PasswordSync GAS URL â€” standalone script that handles syncPassword, syncName.
+# PasswordSync GAS URL Ã¢â¬â standalone script that handles syncPassword, syncName.
 # Writes to Sheet 1 (16L90CI5j - Main Database): Password, Name columns only.
 # Set in Render env vars as GAS_SYNC_URL.
 GAS_SYNC_URL = os.environ.get(
@@ -1650,7 +1650,7 @@ GAS_SYNC_URL = os.environ.get(
     "https://script.google.com/macros/s/AKfycbx1GGyX0Nfz6SYVvkeY_99g4lAKaDmPgeF2EwQFNgX82RjpNWgYJlxMyu2R3lQtCuG4Wg/exec",
 )
 
-# Tuition GAS URL â€” Evaluation sheet GAS script that owns TuitionStatus,
+# Tuition GAS URL Ã¢â¬â Evaluation sheet GAS script that owns TuitionStatus,
 # LastPaymentDate, NextDueDate columns in Sheet 2 (1oATjsiZio).
 # This is where updateTuition must be added and called.
 # Set in Render env vars as GAS_TUITION_URL.
@@ -1949,883 +1949,9 @@ async def push_notify_credit(
         raise HTTPException(status_code=500, detail="log insert failed")
 
     # ---- Server-rendered Khmer + English template ------------------------
-    title = f"\U0001F389 +{payload.amount} áž–áž·áž“áŸ’áž‘áž»! / Points Credited!"
-    body = (
-        f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.amount} âœ¨\n"
-        f"ážšáŸ€áž“áž”áž“áŸ’áž áž áž¾áž™ážŠáŸ„áŸ‡ážŸáŸ„ážšáž„áŸ’ážœáž¶áž“áŸ‹!\n"
-        f"+{payload.amount} points added to your account. Keep learning!"
-    )
-    url_target = "/portal/me"
-
-    # ---- Fan out via the EXISTING helper (unchanged) ---------------------
-    sent, failed = await _fan_out_push(
-        {"studentId": recipient_id}, title, body, url_target,
-    )
-
-    # ---- Audit row in push_history (matches existing shape + extras) -----
-    source = "credit-detect" if is_self_detect else "credit-p2p"
-    history_doc = {
-        "title": title,
-        "body": body,
-        "url": url_target,
-        "target": "students",
-        "studentIds": [recipient_id],
-        "group": "",
-        "sentBy": f"credit-push:{sender_id}",
-        "sentAt": now_dt,
-        "sent": sent,
-        "failed": failed,
-        # Extra fields   additive, never collide with existing schema.
-        "source": source,
-        "amount": payload.amount,
-        "recipientStudentId": recipient_id,
-        "senderStudentId": sender_id,
-        "transferId": transfer_id,
-        "killswitch": False,
-    }
-    try:
-        await push_history.insert_one(history_doc)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "credit-push: history insert error tid=%s err=%s",
-            transfer_id[:60], str(exc)[:200],
-        )
-
-    _CREDIT_LAST_FIRE_AT = now_dt
-    log.info(
-        "credit-push: sent=%d failed=%d source=%s amount=%d recipient=%s sender=%s",
-        sent, failed, source, payload.amount, recipient_id[:32], sender_id[:32],
-    )
-
-    # â”€â”€ Speaking Lab live roster hook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # If this transfer goes to the treasury (stu092), check if the sender
-    # is paying an entry fee for an active session.  If so, their name
-    # appears on the teacher board automatically â€” no manual join needed.
-    TREASURY_ID = "stu092"
-    if recipient_id == TREASURY_ID and not is_self_detect:
-        asyncio.create_task(
-            _sl_try_auto_enter(sender_id, payload.amount)
-        )
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    return {"sent": sent, "failed": failed, "duplicate": False}
-
-
-@api.get("/push/notify-credit/_diag")
-async def push_notify_credit_diag():
-    """Public health probe   only counts/booleans, never secrets."""
-    await _ensure_credit_indexes()
-    try:
-        total = await push_credit_log.count_documents({})
-    except Exception:  # noqa: BLE001
-        total = -1
-    try:
-        history_p2p = await push_history.count_documents({"source": "credit-p2p"})
-    except Exception:  # noqa: BLE001
-        history_p2p = -1
-    try:
-        history_detect = await push_history.count_documents(
-            {"source": "credit-detect"}
-        )
-    except Exception:  # noqa: BLE001
-        history_detect = -1
-    return {
-        "enabled": _credit_killswitch_enabled(),
-        "credit_log_total": total,
-        "rate_limit_keys_in_memory": len(_CREDIT_RATE_BUCKETS),
-        "credential_cache_size": len(_CREDIT_CRED_CACHE),
-        "last_fire_at": (
-            _CREDIT_LAST_FIRE_AT.isoformat() if _CREDIT_LAST_FIRE_AT else None
-        ),
-        "history_credit_p2p_total": history_p2p,
-        "history_credit_detect_total": history_detect,
-        "gas_points_login_url_present": bool(GAS_POINTS_LOGIN_URL),
-        "indexes_ready": _CREDIT_INDEXES_READY,
-        "dedupe_window_seconds": _CREDIT_DEDUPE_WINDOW_S,
-    }
-
-
-
-
-# --------------------------------------------------------------------------- #
-# Patch landing page   serves the Push Studio deliverable files                #
-# --------------------------------------------------------------------------- #
-PATCHES_DIR = ROOT_DIR / "patches"
-
-PATCH_FILES: dict[str, dict] = {
-    "server": {
-        "filename": "server.py",
-        "ext": "py",
-        "title": "Backend   Push Studio API routes",
-        "tab_label": "server.py",
-        "target_path": "eduhub-backend-master/server.py",
-        "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/server.py",
-        "blurb": (
-            "FastAPI server with the new /api/push/* routes (send-studio, schedule, "
-            "scheduled, history, subscribers/count, run-due) plus the baseline "
-            "subscribe / vapid-public-key endpoints. Adds three Mongo collections: "
-            "push_subscriptions, push_history, push_scheduled."
-        ),
-    },
-    "requirements": {
-        "filename": "requirements.txt",
-        "ext": "txt",
-        "title": "Backend   requirements.txt (3-line addition)",
-        "tab_label": "requirements.txt",
-        "target_path": "eduhub-backend-master/requirements.txt",
-        "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/requirements.txt",
-        "blurb": (
-            "Adds three deps required by the Push Studio backend: pywebpush "
-            "(fan-out), py-vapid (key generation), cryptography (transitive). "
-            "Original 11 unpinned entries are preserved verbatim."
-        ),
-    },
-    "push-studio": {
-        "filename": "PushStudio.jsx",
-        "ext": "jsx",
-        "title": "Frontend   Push Studio page (Compose / Scheduled / History)",
-        "tab_label": "PushStudio.jsx",
-        "target_path": "src/studio/PushStudio.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/studio",
-        "blurb": (
-            "Self-contained Studio page with three tabs: Compose (title/body/url, "
-            "audience selector, debounced subscriber count, live phone preview, "
-            "Send Now + Schedule), Scheduled (super-admin only   list, delete, "
-            "Run-due button), and History (paginated, expandable rows, scoped per role)."
-        ),
-    },
-    "studio-page": {
-        "filename": "StudioPage.jsx",
-        "ext": "jsx",
-        "title": "Frontend   StudioPage shell with the new Push tab",
-        "tab_label": "StudioPage.jsx",
-        "target_path": "src/studio/StudioPage.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/studio/StudioPage.jsx",
-        "blurb": (
-            "Three surgical changes: import PushStudio, add Bell to the lucide-react "
-            "imports, append { key:'push', label:'Push', Icon:Bell } to TABS, and "
-            "render <PushStudio /> inside the existing view-switcher when tab==='push'."
-        ),
-    },
-    "use-push": {
-        "filename": "usePushNotifications.js",
-        "ext": "js",
-        "title": "Frontend   Web Push subscribe hook",
-        "tab_label": "usePushNotifications.js",
-        "target_path": "src/eduhub/hooks/usePushNotifications.js",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/eduhub/hooks",
-        "blurb": (
-            "New baseline hook the spec asked us to MODIFY (it didn't yet exist). "
-            "Accepts (studentId, groupName), registers/uses the existing service "
-            "worker, fetches the VAPID public key, subscribes via PushManager, and "
-            "POSTs { studentId, endpoint, keys, userAgent, group } to "
-            "/api/push/subscribe."
-        ),
-    },
-    "dashboard": {
-        "filename": "Dashboard.jsx",
-        "ext": "jsx",
-        "title": "Frontend   Dashboard wires up the Push hook",
-        "tab_label": "Dashboard.jsx",
-        "target_path": "src/eduhub/pages/Dashboard.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/Dashboard.jsx",
-        "blurb": (
-            "One-line addition: usePushNotifications(student?.studentId, "
-            "student?.group || student?.batch || 'default'). AuthContext doesn't "
-            "expose a group field today, so the call falls back to 'default'   "
-            "Push Studio targeting by group still works on subsequent enrolments."
-        ),
-    },
-    "sw": {
-        "filename": "sw.js",
-        "ext": "js",
-        "title": "Frontend   Service Worker with Web Push handlers (v1.2)",
-        "tab_label": "sw.js",
-        "target_path": "public/sw.js",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/public/sw.js",
-        "blurb": (
-            "Two surgical edits on top of your existing SW: bumps SW_VERSION "
-            "from v1.1.0 ? v1.2.0 (forces every browser to evict caches and "
-            "pick up the new code), and appends `push` + `notificationclick` "
-            "listeners at the very bottom. The browser needs the `push` "
-            "listener to actually render notifications   without it, "
-            "pywebpush delivers but nothing appears on screen. Restored the "
-            "missing `||` fallbacks that were lost in markdown formatting."
-        ),
-    },
-    "push-bell": {
-        "filename": "PushNotificationBell.jsx",
-        "ext": "jsx",
-        "title": "Frontend   Bell button to enable/disable notifications",
-        "tab_label": "PushNotificationBell.jsx",
-        "target_path": "src/eduhub/components/PushNotificationBell.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/new/master/src/eduhub/components",
-        "blurb": (
-            "NEW component. Self-contained bell button that calls the existing "
-            "usePushNotifications hook (default import, signature "
-            "(studentId, groupName)). Matches your committed backend payload "
-            "shape   no env var changes needed (VAPID key auto-fetched). "
-            "Styled to match your aurora header (cyan/violet/magenta accents)."
-        ),
-    },
-    "header": {
-        "filename": "Header.jsx",
-        "ext": "jsx",
-        "title": "Frontend   Header.jsx with bell wired in (2-line addition)",
-        "tab_label": "Header.jsx",
-        "target_path": "src/eduhub/components/Header.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/components/Header.jsx",
-        "blurb": (
-            "Surgical: 1 import line + 4 lines that render <PushNotificationBell> "
-            "inside the existing isAuthenticated block. ALL safe-area / iOS "
-            "notch logic, telegram link, student pill, sign-out button   "
-            "preserved byte-for-byte."
-        ),
-    },
-    "icon-192": {
-        "filename": "icon-192.png",
-        "ext": "png",
-        "title": "Asset   Push notification icon (192 192, 33 KB)",
-        "tab_label": "icon-192.png",
-        "target_path": "public/icons/icon-192.png",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/upload/master/public/icons",
-        "blurb": (
-            "EduHub logo resized + optimized to 192 192 PNG (33 KB, was 1.8 MB). "
-            "Drop into public/icons/ so push notification banners show your logo "
-            "instead of the browser default. Same icon used by sw.js and manifest."
-        ),
-        "binary": True,
-    },
-    "icon-512": {
-        "filename": "icon-512.png",
-        "ext": "png",
-        "title": "Asset   High-res app icon (512 512, 212 KB)",
-        "tab_label": "icon-512.png",
-        "target_path": "public/icons/icon-512.png",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/upload/master/public/icons",
-        "blurb": (
-            "Larger version for iOS Add-to-Home-Screen splash + Android adaptive "
-            "icons. Listed in manifest.json. Same logo, just bigger."
-        ),
-        "binary": True,
-    },
-    # --- v9.2   Surgery Patch (treasury fix + reader page-flip + tier classification) ---
-    "v92-treasury": {
-        "filename": "purchaseService.js",
-        "ext": "js",
-        "title": "Surgery   Treasury wallet ID (stu001 ? stu092)",
-        "tab_label": "purchaseService.js",
-        "target_path": "src/eduhub/pages/library/books/purchaseService.js",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/books/purchaseService.js",
-        "blurb": (
-            "Single-line constant change: `TREASURY_ID` fallback flipped from "
-            "`\"stu001\"` to `\"stu092\"`. The env-var override "
-            "REACT_APP_LIBRARY_TREASURY_ID is preserved. All sendPoints / "
-            "isUnlocked / SELF_TREASURY guard logic is byte-identical to the "
-            "previous build   only the default treasury wallet identifier "
-            "changes, so points spent on paid books now correctly credit "
-            "stu092 instead of the regular student wallet."
-        ),
-    },
-    "v92-tier-service": {
-        "filename": "booksService.js",
-        "ext": "js",
-        "title": "Surgery   Library tier classifier (free / standard / premium / limited)",
-        "tab_label": "booksService.js",
-        "target_path": "src/eduhub/pages/library/books/booksService.js",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/books/booksService.js",
-        "blurb": (
-            "Adds `normalizeTier(raw, price, badge)` plus exported "
-            "`TIER_PRICE_BANDS` / `TIER_ORDER`. `normalizeBook` now stamps "
-            "`b.tier` on every book using author override ? badge LIMITED ? "
-            "price band (free=0, standard=1-100, premium=101-500, "
-            "limited=501+). Sheet column aliases `[tier, edition, class, "
-            "category, plan]` and the multi-row PROMOTABLE list both honour "
-            "the new field. Existing book objects without a tier column light "
-            "up automatically   zero data migration."
-        ),
-    },
-    "v92-reader": {
-        "filename": "ReaderPage.jsx",
-        "ext": "jsx",
-        "title": "Surgery   Reader: media page-flip + transcript auto-flip",
-        "tab_label": "ReaderPage.jsx",
-        "target_path": "src/eduhub/pages/library/reader/ReaderPage.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/reader/ReaderPage.jsx",
-        "blurb": (
-            "Removes `audio` / `video` / `embed` / `transcript` from "
-            "NON_SPLITTABLE_TYPES so chapters with embedded media keep "
-            "page-flipping instead of collapsing into a tall scroll. Audio "
-            "playback already survives flips through the existing "
-            "BookAudioProvider mini-player. Adds `transcriptPageMap` + "
-            "`useBookAudio` subscription that auto-advances pages following "
-            "the audio cursor when transcript blocks declare start/end "
-            "timestamps   manual page-turn (`go` / `jumpTo`) stamps "
-            "userOverrideUntilRef for ~3 s so deliberate navigation always "
-            "wins. mcq / fillblank still cluster as one sub-page."
-        ),
-    },
-    "v92-library": {
-        "filename": "LibraryPage.jsx",
-        "ext": "jsx",
-        "title": "Surgery   Library tier filter chips (Free / Standard / Premium / Limited)",
-        "tab_label": "LibraryPage.jsx",
-        "target_path": "src/eduhub/pages/library/LibraryPage.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/LibraryPage.jsx",
-        "blurb": (
-            "Two surgical inserts: (1) appends Free / Standard / Premium / "
-            "Limited chips to the existing filter row (data-testids "
-            "library-filter-{free|standard|premium|limited}); (2) extends "
-            "the filter switch-case so activeFilter ? {free,standard,"
-            "premium,limited} narrows shelves by `it.tier`. All other shelf "
-            "logic, search, ContinueReading, purchase flow, sync button   "
-            "preserved byte-for-byte."
-        ),
-    },
-    "v92-card": {
-        "filename": "BookCard.jsx",
-        "ext": "jsx",
-        "title": "Surgery   BookCard tier ribbon",
-        "tab_label": "BookCard.jsx",
-        "target_path": "src/eduhub/pages/library/components/BookCard.jsx",
-        "github_edit": "https://github.com/Daravuth999/eduhub-studio-test/edit/master/src/eduhub/pages/library/components/BookCard.jsx",
-        "blurb": (
-            "Adds the `TIER_META` palette (free=teal   standard=blue   "
-            "premium=gold   limited=platinum-pulse), a corner tier ribbon "
-            "(data-testid card-tier-{tier}), and a `data-tier` attribute on "
-            "the card root. Limited-tier cards get a 2.4 s pulsing halo. "
-            "Free-tier cards skip the ribbon since the price chip already "
-            "labels them. All existing parallax / sheen / NEW pill / "
-            "content-type chip / lock overlay / tap-burst behaviour "
-            "untouched."
-        ),
-    },
-    "v92-server": {
-        "filename": "server.py",
-        "ext": "py",
-        "title": "Surgery   server.py BookPayload.tier + CANONICAL_BOOK_FIELDS",
-        "tab_label": "server.py",
-        "target_path": "eduhub-backend-master/server.py",
-        "github_edit": "https://github.com/Daravuth999/eduhub-backend/edit/master/server.py",
-        "blurb": (
-            "Two surgical additions: (1) `BookPayload.tier: str = \"\"` so "
-            "Studio can persist explicit tiers in MongoDB; (2) "
-            "`CANONICAL_BOOK_FIELDS` whitelists `\"tier\"` so the cleaned "
-            "/api/books response includes it. Existing payloads without a "
-            "tier still validate (default empty); existing books without a "
-            "tier field still serialize cleanly (omitted from response). No "
-            "change to auth, push, patches, indexes, or any /api route "
-            "behaviour."
-        ),
-    },
-}
-
-
-def _read_patch_file(filename: str) -> str:
-    p = (PATCHES_DIR / filename).resolve()
-    if PATCHES_DIR.resolve() not in p.parents and p != PATCHES_DIR.resolve():
-        raise HTTPException(status_code=400, detail="invalid path")
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="patch file not found")
-    return p.read_text(encoding="utf-8")
-
-
-_LANG_BY_EXT = {"py": "python", "jsx": "jsx", "js": "javascript", "ts": "typescript",
-                "tsx": "tsx", "css": "css", "json": "json", "md": "markdown", "html": "html"}
-
-_LANDING_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>EduHub Push Studio   Patch deliverables</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github-dark.min.css" />
-  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
-  <style>
-    :root {
-      --bg: #0a0a0f;
-      --card: rgba(255,255,255,0.04);
-      --card-strong: rgba(255,255,255,0.06);
-      --border: rgba(255,255,255,0.08);
-      --border-strong: rgba(255,255,255,0.16);
-      --text: #F4E5C1;
-      --text-muted: rgba(244,229,193,0.55);
-      --gold: #D4A843;
-      --aurora: linear-gradient(135deg, #FFE19A 0%, #D4A843 50%, #9C7A2C 100%);
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; }
-    body {
-      background: radial-gradient(circle at 20% 0%, #2D1F3E 0%, #0d0a16 70%);
-      color: var(--text);
-      font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-      min-height: 100vh;
-      padding: 32px 24px 64px;
-    }
-    .wrap { max-width: 1100px; margin: 0 auto; }
-    header { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
-    .logo {
-      width: 40px; height: 40px; border-radius: 12px;
-      background: rgba(212,168,67,0.12);
-      border: 1px solid rgba(212,168,67,0.4);
-      display: grid; place-items: center;
-    }
-    h1 {
-      font-size: 22px; font-weight: 700; letter-spacing: -0.01em;
-      margin: 0; line-height: 1.2;
-    }
-    .sub {
-      color: var(--text-muted);
-      font-size: 13px; margin: 4px 0 24px;
-    }
-    .meta-bar {
-      display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px;
-    }
-    .pill {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 6px 12px; border-radius: 999px;
-      background: var(--card); border: 1px solid var(--border);
-      color: var(--text); font-size: 11px; text-transform: uppercase;
-      letter-spacing: 0.18em; font-weight: 700;
-      text-decoration: none;
-    }
-    .pill.aurora {
-      background: var(--aurora); color: #1a1420;
-      border: 1px solid rgba(255,225,154,0.6);
-    }
-    nav.tabs {
-      display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px;
-    }
-    .tab {
-      padding: 9px 14px; border-radius: 999px;
-      background: var(--card); border: 1px solid var(--border);
-      color: var(--text); font-size: 11px; font-weight: 700;
-      text-transform: uppercase; letter-spacing: 0.16em;
-      cursor: pointer; transition: all 0.15s;
-      display: inline-flex; align-items: center; gap: 6px;
-    }
-    .tab:hover { background: var(--card-strong); border-color: var(--border-strong); }
-    .tab.active {
-      background: var(--aurora); color: #1a1420;
-      border: 1px solid rgba(255,225,154,0.6);
-    }
-    .tab .ext {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 9.5px; letter-spacing: 0;
-      padding: 1px 5px; border-radius: 4px;
-      background: rgba(0,0,0,0.18);
-      color: rgba(255,255,255,0.55);
-    }
-    .tab.active .ext { background: rgba(0,0,0,0.18); color: rgba(0,0,0,0.55); }
-
-    .panel {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: 18px; overflow: hidden;
-    }
-    .panel-head {
-      padding: 18px 22px; border-bottom: 1px solid var(--border);
-      display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
-    }
-    .panel-head .title {
-      font-size: 15px; font-weight: 700; letter-spacing: -0.005em;
-    }
-    .panel-head .target {
-      font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
-      color: var(--text-muted);
-    }
-    .panel-head .spacer { flex: 1; }
-    .btn {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 7px 13px; border-radius: 999px;
-      font-size: 10.5px; font-weight: 700;
-      text-transform: uppercase; letter-spacing: 0.16em;
-      text-decoration: none; cursor: pointer;
-      transition: all 0.15s;
-      border: 1px solid var(--border-strong);
-      background: var(--card-strong); color: var(--text);
-    }
-    .btn:hover { background: rgba(255,255,255,0.10); }
-    .btn.aurora {
-      background: var(--aurora); color: #1a1420;
-      border: 1px solid rgba(255,225,154,0.6);
-    }
-    .btn.aurora:hover { filter: brightness(1.05); }
-
-    .blurb {
-      padding: 14px 22px 0;
-      font-size: 13px; line-height: 1.55;
-      color: rgba(244,229,193,0.78);
-      max-width: 820px;
-    }
-
-    .code-wrap {
-      position: relative;
-      margin: 14px 22px 22px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: rgba(0,0,0,0.35);
-      overflow: hidden;
-    }
-    .code-bar {
-      display: flex; align-items: center; gap: 8px;
-      padding: 8px 14px;
-      border-bottom: 1px solid var(--border);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11.5px;
-      color: var(--text-muted);
-    }
-    .copy-btn {
-      margin-left: auto;
-      padding: 4px 10px; border-radius: 6px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid var(--border);
-      color: var(--text); cursor: pointer;
-      font-size: 10.5px; font-weight: 600;
-      text-transform: uppercase; letter-spacing: 0.12em;
-      transition: all 0.15s;
-    }
-    .copy-btn:hover { background: rgba(255,255,255,0.12); }
-    .copy-btn.ok { background: rgba(34,197,94,0.18); border-color: rgba(34,197,94,0.4); color: #bbf7d0; }
-    pre { margin: 0; max-height: 560px; overflow: auto; }
-    pre code.hljs {
-      padding: 16px 18px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12.5px; line-height: 1.55;
-      background: transparent !important;
-    }
-    .footer {
-      margin-top: 26px;
-      color: var(--text-muted);
-      font-size: 11.5px;
-      display: flex; flex-wrap: wrap; gap: 18px; align-items: center;
-    }
-    .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #22c55e; }
-    [hidden] { display: none !important; }
-    .icon { width: 14px; height: 14px; }
-    @media (max-width: 640px) {
-      body { padding: 22px 14px 48px; }
-      .panel-head { padding: 14px 16px; }
-      .blurb, .code-wrap { margin-left: 16px; margin-right: 16px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <header>
-      <div class="logo">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#D4A843" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>
-          <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>
-        </svg>
-      </div>
-      <div>
-        <h1>EduHub   Push Studio   Patch deliverables</h1>
-        <div class="sub">5 files   backend FastAPI + frontend React. Click a tab to view, copy or open in GitHub.</div>
-      </div>
-    </header>
-
-    <div class="meta-bar">
-      <span class="pill aurora"><span class="swatch" style="background:#1a1420"></span> 5 files ready</span>
-      <span class="pill">Backend   1</span>
-      <span class="pill">Frontend   4</span>
-      <a class="pill" href="/api/patch/index.json">JSON index ?</a>
-    </div>
-
-    <nav class="tabs" id="tabs"></nav>
-
-    <main id="panels"></main>
-
-    <div class="footer">
-      <span>Generated by the EduHub agent   Plus Jakarta Sans + JetBrains Mono   highlight.js github-dark.</span>
-    </div>
-  </div>
-
-<script>
-const PATCHES = __PATCHES_JSON__;
-const tabsEl = document.getElementById('tabs');
-const panelsEl = document.getElementById('panels');
-
-function langFor(ext) {
-  return ({ py:'python', jsx:'jsx', js:'javascript', ts:'typescript', tsx:'tsx', css:'css', json:'json' }[ext] || 'plaintext');
-}
-
-function panelHTML(key, p) {
-  const isBinary = !!p.binary;
-  const previewBlock = isBinary
-    ? `<div class="code-wrap" style="display:flex;align-items:center;justify-content:center;padding:28px;background:repeating-conic-gradient(rgba(255,255,255,0.04) 0% 25%,transparent 0% 50%) 0 0/24px 24px,#1a1420">
-         <img src="/api/patch/${key}/raw" alt="${p.filename}"
-              style="max-width:240px;max-height:240px;border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,0.6);background:rgba(255,255,255,0.04)">
-       </div>`
-    : `<div class="code-wrap">
-         <div class="code-bar">
-           <span>${p.filename}</span>
-           <button class="copy-btn" data-copy="${key}">Copy</button>
-         </div>
-         <pre><code class="language-${langFor(p.ext)} hljs" id="code-${key}">Loading </code></pre>
-       </div>`;
-
-  return `
-    <section class="panel" id="panel-${key}" data-key="${key}" data-binary="${isBinary}">
-      <div class="panel-head">
-        <div>
-          <div class="title">${p.title}</div>
-          <div class="target">${p.target_path}</div>
-        </div>
-        <div class="spacer"></div>
-        <a class="btn" href="/api/patch/${key}/raw" target="_blank" download="${p.filename}">
-          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          ${isBinary ? "Download" : "Raw"}
-        </a>
-        <a class="btn aurora" href="${p.github_edit}" target="_blank" rel="noopener">
-          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
-          ${isBinary ? "Upload to GitHub" : "Open in GitHub"}
-        </a>
-      </div>
-      <div class="blurb">${p.blurb}</div>
-      ${previewBlock}
-    </section>
-  `;
-}
-
-const order = Object.keys(PATCHES);
-order.forEach((key, i) => {
-  const p = PATCHES[key];
-  const tab = document.createElement('button');
-  tab.className = 'tab' + (i === 0 ? ' active' : '');
-  tab.dataset.key = key;
-  tab.innerHTML = `<span>${p.tab_label}</span><span class="ext">${p.ext}</span>`;
-  tab.onclick = () => activate(key);
-  tabsEl.appendChild(tab);
-  panelsEl.insertAdjacentHTML('beforeend', panelHTML(key, p));
-  if (i !== 0) document.getElementById('panel-' + key).hidden = true;
-});
-
-function activate(key) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.key === key));
-  document.querySelectorAll('.panel').forEach(p => { p.hidden = (p.dataset.key !== key); });
-  loadCode(key);
-  history.replaceState(null, '', '#' + key);
-}
-
-const loaded = new Set();
-async function loadCode(key) {
-  if (loaded.has(key)) return;
-  const panel = document.getElementById('panel-' + key);
-  // Skip code loading entirely for binary panels.
-  if (panel && panel.dataset.binary === 'true') { loaded.add(key); return; }
-  const codeEl = document.getElementById('code-' + key);
-  if (!codeEl) { loaded.add(key); return; }
-  try {
-    const res = await fetch(`/api/patch/${key}/raw`);
-    const txt = await res.text();
-    codeEl.textContent = txt;
-    if (window.hljs) hljs.highlightElement(codeEl);
-    loaded.add(key);
-  } catch (e) {
-    codeEl.textContent = 'Failed to load: ' + e;
-  }
-}
-
-document.addEventListener('click', async (e) => {
-  const b = e.target.closest('.copy-btn');
-  if (!b) return;
-  const key = b.dataset.copy;
-  const codeEl = document.getElementById('code-' + key);
-  try {
-    await navigator.clipboard.writeText(codeEl.textContent);
-    b.classList.add('ok');
-    const orig = b.textContent;
-    b.textContent = 'Copied ?';
-    setTimeout(() => { b.classList.remove('ok'); b.textContent = orig; }, 1400);
-  } catch { b.textContent = 'Copy failed'; }
-});
-
-// Activate from hash if present, else first
-const hashKey = (location.hash || '').replace('#','');
-activate(order.includes(hashKey) ? hashKey : order[0]);
-window.addEventListener('load', () => {
-  // Pre-load the first tab's code
-  loadCode(order[0]);
-});
-</script>
-</body>
-</html>
-"""
-
-
-@api.get("/patch", include_in_schema=False)
-@api.get("/patch/", include_in_schema=False)
-async def patch_landing():
-    """Landing page listing every deliverable file."""
-    payload: dict = {}
-    for key, meta in PATCH_FILES.items():
-        payload[key] = {
-            "filename": meta["filename"],
-            "ext": meta["ext"],
-            "title": meta["title"],
-            "tab_label": meta["tab_label"],
-            "target_path": meta["target_path"],
-            "github_edit": meta["github_edit"],
-            "blurb": meta["blurb"],
-            "binary": bool(meta.get("binary")),
-        }
-    html = _LANDING_HTML.replace("__PATCHES_JSON__", json.dumps(payload))
-    return Response(content=html, media_type="text/html; charset=utf-8")
-
-
-@api.get("/patch/index.json", include_in_schema=False)
-async def patch_index():
-    return {"patches": PATCH_FILES}
-
-
-def _serve_patch_payload(key: str, force_attachment: bool = False) -> Response:
-    """Shared file-fetch helper used by `{key}.ext` and `{key}/download`.
-
-    `force_attachment=True` makes the browser save instead of inline-render.
-    """
-    if key not in PATCH_FILES:
-        raise HTTPException(status_code=404, detail="patch key not found")
-    meta = PATCH_FILES[key]
-    p = (PATCHES_DIR / meta["filename"]).resolve()
-    if PATCHES_DIR.resolve() not in p.parents:
-        raise HTTPException(status_code=400, detail="invalid path")
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="file missing on disk")
-
-    ext = meta["ext"].lower()
-    if meta.get("binary"):
-        media = {
-            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
-            "svg": "image/svg+xml",
-        }.get(ext, "application/octet-stream")
-        body: Any = p.read_bytes()
-    else:
-        media = "text/plain; charset=utf-8"
-        body = p.read_text(encoding="utf-8")
-
-    headers: dict = {}
-    if force_attachment:
-        headers["Content-Disposition"] = f'attachment; filename="{meta["filename"]}"'
-    return Response(content=body, media_type=media, headers=headers)
-
-
-# Note: dotted + /download routes are registered BEFORE `/patch/{key}` so the
-# greedy str path-param doesn't swallow the dotted form.
-@api.get("/patch/{key}.{ext}", include_in_schema=False)
-async def patch_dotted(key: str, ext: str):
-    """Plain-text raw view at /api/patch/<key>.<ext>   convenient for iPhone
-    long-press copy and curl-friendly URLs (e.g. `purchaseService.js` looks
-    like a real file path)."""
-    if key not in PATCH_FILES:
-        raise HTTPException(status_code=404, detail="patch key not found")
-    meta = PATCH_FILES[key]
-    if str(meta.get("ext", "")).lower() != ext.lower():
-        # Allow generic aliases (txt) so ` /v92-server.txt` still works.
-        if ext.lower() not in {"txt", "raw"}:
-            raise HTTPException(status_code=404, detail="ext mismatch")
-    return _serve_patch_payload(key, force_attachment=False)
-
-
-@api.get("/patch/{key}/download", include_in_schema=False)
-async def patch_download(key: str):
-    """Forces a Save-As download with the original filename   handy on
-    desktop browsers and the GitHub mobile app file-upload picker."""
-    return _serve_patch_payload(key, force_attachment=True)
-
-
-@api.get("/patch/{key}/raw", include_in_schema=False)
-async def patch_raw(key: str):
-    if key not in PATCH_FILES:
-        raise HTTPException(status_code=404, detail="patch key not found")
-    meta = PATCH_FILES[key]
-    p = (PATCHES_DIR / meta["filename"]).resolve()
-    if PATCHES_DIR.resolve() not in p.parents:
-        raise HTTPException(status_code=400, detail="invalid path")
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="file missing on disk")
-
-    # Binary assets (icons etc)   serve as-is with correct content-type.
-    if meta.get("binary"):
-        ext = meta["ext"].lower()
-        media = {
-            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
-            "svg": "image/svg+xml",
-        }.get(ext, "application/octet-stream")
-        return Response(content=p.read_bytes(), media_type=media)
-
-    # Text patches   return plain text.
-    return Response(content=p.read_text(encoding="utf-8"),
-                    media_type="text/plain; charset=utf-8")
-
-
-@api.get("/patch/{key}", include_in_schema=False)
-async def patch_view(key: str):
-    """Same landing page, opened on a specific tab via URL fragment redirect."""
-    if key not in PATCH_FILES:
-        raise HTTPException(status_code=404, detail="patch key not found")
-    return Response(
-        status_code=302,
-        headers={"Location": f"/api/patch#{key}"},
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Teacher-block push helpers (surgical additions, gated by require_admin       #
-# until require_teacher dependency arrives in the teacher block merge).        #
-#                                                                              #
-# These endpoints are NEW. They do not modify any existing route, do not       #
-# write to push_subscriptions, and only CALL the existing _fan_out_push        #
-# helper unchanged. They are designed so the future teacher block can call     #
-# them internally OR be merged cleanly without further changes here.           #
-# --------------------------------------------------------------------------- #
-class TeacherPushPointsPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    delta: int
-
-
-class TeacherPushRestrictionPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    message: str | None = None
-
-
-class TeacherPushReminderPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    message: str | None = None
-
-
-class TeacherPushSpeakingPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    group: Literal["A", "B", "all"] = "all"
-
-
-# Feature 1   Teacher Awards Points -> Auto Push
-@api.post("/teacher/students/{student_id}/push-points")
-async def teacher_push_points(
-    student_id: str,
-    payload: TeacherPushPointsPayload,
-    user: User = Depends(require_admin),
-):
-    """Fire push to a single student after their points were adjusted.
-    Wrapped in try/except   push failure must never break the points save flow."""
-    try:
-        if payload.delta > 0:
-            sent, failed = await _fan_out_push(
-                {"studentId": student_id},
-                title=f"\U0001F389 +{payload.delta} áž–áž·áž“áŸ’áž‘áž»! / Points!",
-                body=(
-                    f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.delta} âœ¨\n"
-                    f"You received +{payload.delta} points. Keep it up!"
-                ),
-                url="/portal",
-            )
-        else:
-            sent, failed = await _fan_out_push(
-                {"studentId": student_id},
+    title = f"\U0001F389 +{payload.amount} Ã¡Å¾âÃ¡Å¾Â·Ã¡Å¾âÃ¡Å¸âÃ¡Å¾âÃ¡Å¾Â»! / Points Credited!",
+    body = f"+{payload.amount} points have been added to your account.",
+    url = "/portal/me"       {"studentId": student_id},
                 title="Points updated",
                 body=f"Your points were adjusted by {payload.delta}.",
                 url="/portal",
@@ -3146,7 +2272,7 @@ async def _archive_student_in_gas(clean_id: str) -> bool:
     if not GAS_EVAL_URL or not GAS_ADMIN_SECRET:
         log.warning(
             "archive-student: GAS_EVAL_URL or GAS_ADMIN_SECRET not set "
-            "â€” rows NOT archived for %s.", clean_id,
+            "Ã¢â¬â rows NOT archived for %s.", clean_id,
         )
         return False
     try:
@@ -3176,7 +2302,7 @@ async def _archive_student_in_gas(clean_id: str) -> bool:
         log.warning("archive-student: GAS did not confirm for %s", clean_id)
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("archive-student: GAS unreachable for %s â€” %s", clean_id, exc)
+        log.warning("archive-student: GAS unreachable for %s Ã¢â¬â %s", clean_id, exc)
         return False
 
 
@@ -3185,19 +2311,19 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
 
     This keeps the Google Sheet credential in sync with MongoDB after a
     teacher-initiated password reset.  The Sheet password is what GAS
-    PointsBackend / GameBackend / PortalBackend validate against â€” without
+    PointsBackend / GameBackend / PortalBackend validate against Ã¢â¬â without
     this sync, those backends keep accepting the OLD password forever, which
     is fine for read-only data but breaks any write that re-authenticates
     (sendPoints, library purchase, etc.) once the student changes their login.
 
-    Never raises â€” a GAS outage must never block or roll back the MongoDB
+    Never raises Ã¢â¬â a GAS outage must never block or roll back the MongoDB
     reset.  Returns True if the GAS confirmed success, False otherwise.
     The caller logs the outcome; the student always gets their new password
     regardless.
     """
     if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         log.warning(
-            "password-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set â€” "
+            "password-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set Ã¢â¬â "
             "Sheet password NOT updated for %s. Set both env vars to enable sync.",
             clean_id,
         )
@@ -3227,7 +2353,7 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
         log.warning("password-sync: GAS did not confirm for %s", clean_id)
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("password-sync: GAS unreachable for %s â€” %s", clean_id, exc)
+        log.warning("password-sync: GAS unreachable for %s Ã¢â¬â %s", clean_id, exc)
         return False
 
 
@@ -3236,11 +2362,11 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
 
     Called on ID reactivation so the previous student's name is overwritten.
     Without this, getStudentData returns the old occupant's name forever.
-    Never raises â€” a GAS outage must never block reactivation.
+    Never raises Ã¢â¬â a GAS outage must never block reactivation.
     """
     if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         log.warning(
-            "name-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set â€” "
+            "name-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set Ã¢â¬â "
             "Sheet name NOT updated for %s.", clean_id,
         )
         return False
@@ -3269,7 +2395,7 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
         log.warning("name-sync: GAS did not confirm for %s", clean_id)
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("name-sync: GAS unreachable for %s â€” %s", clean_id, exc)
+        log.warning("name-sync: GAS unreachable for %s Ã¢â¬â %s", clean_id, exc)
         return False
 
 
@@ -3342,10 +2468,10 @@ async def teacher_create_student(
         action = "created"
 
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
-    # Fire-and-forget GAS syncs â€” never block the credential card response.
+    # Fire-and-forget GAS syncs Ã¢â¬â never block the credential card response.
     import asyncio as _asyncio_create
     _asyncio_create.create_task(_sync_password_to_gas(clean_id, plain_password))
-    # Always sync the name to GAS â€” on reactivation this overwrites the previous
+    # Always sync the name to GAS Ã¢â¬â on reactivation this overwrites the previous
     # occupant's stale name; on brand-new creation this ensures the GAS sheet row
     # (which may exist from a pre-MongoDB migration) shows the correct new name.
     _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
@@ -3389,7 +2515,7 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                     try:
                         gas_data = r.json()
                         # GAS may return [{id, name, group, level, schedule, ...}]
-                        # or {students: [...]} â€” handle both
+                        # or {students: [...]} Ã¢â¬â handle both
                         raw = gas_data if isinstance(gas_data, list) else gas_data.get("students") or gas_data.get("data") or []
                         for row in raw:
                             if not isinstance(row, dict):
@@ -3442,7 +2568,7 @@ async def teacher_update_student(
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     # Fetch the doc BEFORE updating so we have clean_id for the GAS sync.
-    # clean_id is the Google Sheets student row key â€” student_id is the internal
+    # clean_id is the Google Sheets student row key Ã¢â¬â student_id is the internal
     # MongoDB UUID and is NOT what GAS stores.
     doc = await db.students.find_one(
         {"student_id": student_id}, {"_id": 0, "clean_id": 1},
@@ -3458,7 +2584,7 @@ async def teacher_update_student(
 
     # If display_name was updated, mirror it to Google Sheets so that GAS
     # getStudentData, Tuition Reminder, and the Portal all see the new name.
-    # Fire-and-forget â€” a GAS outage must never block or roll back the update.
+    # Fire-and-forget Ã¢â¬â a GAS outage must never block or roll back the update.
     if "display_name" in updates:
         import asyncio as _asyncio_patch
         _asyncio_patch.create_task(
@@ -3486,7 +2612,7 @@ async def teacher_reset_password(
         {"student_id": student_id}, {"_id": 0, "password_hash": 0},
     )
     log.info("teacher: password reset for %s by %s", student_id, admin.email)
-    # Fire-and-forget â€” never delay the credential card response.
+    # Fire-and-forget Ã¢â¬â never delay the credential card response.
     import asyncio as _asyncio_reset
     _asyncio_reset.create_task(_sync_password_to_gas(doc["clean_id"], plain_password))
 
@@ -3511,18 +2637,18 @@ async def _update_tuition_in_gas(
     """Write TuitionStatus / LastPaymentDate / NextDueDate (and optionally
     PaymentAmount) to the Students tab in GAS.
 
-    SAFE COLUMNS ONLY â€” never touches StudentID, Name, Password, restriction,
+    SAFE COLUMNS ONLY Ã¢â¬â never touches StudentID, Name, Password, restriction,
     evaluation scores, month tabs, Archive tab, Comments, Coupons, Redemptions,
     Strength / Weakness / Improvement.
 
     Returns {"ok": True} on confirmed GAS success.
-    Raises RuntimeError with a human-readable message on any failure â€” the
+    Raises RuntimeError with a human-readable message on any failure Ã¢â¬â the
     caller MUST surface this; never fake success.
     """
     if not GAS_TUITION_URL or not GAS_ADMIN_SECRET:
         raise RuntimeError(
             "updateTuition: GAS_TUITION_URL or GAS_ADMIN_SECRET not configured "
-            "â€” set both Render env vars to enable tuition management."
+            "Ã¢â¬â set both Render env vars to enable tuition management."
         )
     payload: dict = {
         "action": "updateTuition",
@@ -3556,8 +2682,8 @@ async def _update_tuition_in_gas(
                 err_msg = j.get("message") or j.get("error") or j.get("detail") or "GAS returned ok:false"
                 raise RuntimeError(f"GAS update failed: {err_msg}")
             except (ValueError, AttributeError):
-                raise RuntimeError("GAS returned non-JSON response â€” update may not have applied")
-        raise RuntimeError(f"GAS HTTP {r.status_code} â€” update not applied")
+                raise RuntimeError("GAS returned non-JSON response Ã¢â¬â update may not have applied")
+        raise RuntimeError(f"GAS HTTP {r.status_code} Ã¢â¬â update not applied")
     except RuntimeError:
         raise
     except Exception as exc:
@@ -3570,14 +2696,14 @@ async def teacher_update_tuition(
     payload: dict,
     admin: User = Depends(require_admin),
 ):
-    """Controlled tuition update â€” teacher clicks Mark Paid / Mark Unpaid /
+    """Controlled tuition update Ã¢â¬â teacher clicks Mark Paid / Mark Unpaid /
     Extend 1 Month / Set Custom Due Date.
 
     Accepted actions:
-        mark_paid          â€” sets Paid, today as LastPaymentDate, safe NextDueDate
-        mark_unpaid        â€” sets Unpaid, clears LastPaymentDate
-        extend_one_month   â€” adds 1 month to NextDueDate (today if overdue/missing)
-        set_custom_due_date â€” sets NextDueDate to caller-provided YYYY-MM-DD
+        mark_paid          Ã¢â¬â sets Paid, today as LastPaymentDate, safe NextDueDate
+        mark_unpaid        Ã¢â¬â sets Unpaid, clears LastPaymentDate
+        extend_one_month   Ã¢â¬â adds 1 month to NextDueDate (today if overdue/missing)
+        set_custom_due_date Ã¢â¬â sets NextDueDate to caller-provided YYYY-MM-DD
 
     NEVER writes: StudentID, Name, Password, restriction, evaluation scores,
     month tabs, Archive, Comments, Coupons, Redemptions, Strength/Weakness/Improvement.
@@ -3646,7 +2772,7 @@ async def teacher_update_tuition(
             # Advance from the existing future/today due date
             next_due_date = _fmt(_add_one_month(current_ndd))
         else:
-            # Overdue or missing â€” advance from today
+            # Overdue or missing Ã¢â¬â advance from today
             next_due_date = _fmt(_add_one_month(today))
         # Optional: carry explicit PaymentAmount if provided
         if payload.get("paymentAmount") is not None:
@@ -3674,7 +2800,7 @@ async def teacher_update_tuition(
             )
         next_due_date = _fmt(custom)
 
-    # Call GAS â€” surface any failure as 502
+    # Call GAS Ã¢â¬â surface any failure as 502
     try:
         gas_result = await _update_tuition_in_gas(
             clean_id=clean_id,
@@ -3724,7 +2850,7 @@ async def teacher_deactivate_student(
         raise HTTPException(status_code=404, detail="Student not found")
     await db.student_sessions.delete_many({"student_id": student_id})
 
-    # Archive GAS evaluation rows â€” true fire-and-forget via create_task so the
+    # Archive GAS evaluation rows Ã¢â¬â true fire-and-forget via create_task so the
     # 15-second GAS timeout NEVER blocks this endpoint.
     import asyncio as _asyncio_deact
     _asyncio_deact.create_task(_archive_student_in_gas(doc["clean_id"]))
@@ -3798,7 +2924,7 @@ async def studio_audio_migrate_inline(admin: User = Depends(require_admin)):
 
 
 app.include_router(_build_status_router(db, _fan_out_push, require_admin))
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 
 async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
     """Auto-enter a student into the active Speaking Lab session when they
@@ -3807,7 +2933,7 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
     try:
         # 1. Look up sender's display name and schedule from db.students
         #    GAS uses clean_id (e.g. "stu094") as the sender ID.
-        #    MongoDB stores both clean_id and student_id â€” try both.
+        #    MongoDB stores both clean_id and student_id Ã¢â¬â try both.
         student_doc = await db.students.find_one(
             {"$or": [{"clean_id": sender_id}, {"student_id": sender_id}]},
             {"display_name": 1, "name": 1, "group": 1, "schedule": 1, "clean_id": 1, "_id": 0},
@@ -3856,7 +2982,7 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
         session_id = session_doc["session_id"]
         display_name_key = display_name.lower()
 
-        # 3. Deduplicate â€” don't add the same student twice
+        # 3. Deduplicate Ã¢â¬â don't add the same student twice
         existing = await SL_ENTRIES.find_one(
             {"session_id": session_id, "display_name_key": display_name_key}
         )
@@ -3886,14 +3012,14 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
         })
 
 
-        # â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢ââ¬Ã¢ââ¬ LUCKY DRAW SURGERY Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
         # The same P2P payment that put the student on the roster also
-        # buys their lucky code. Fire-and-forget â€” never blocks /enter.
+        # buys their lucky code. Fire-and-forget Ã¢â¬â never blocks /enter.
         await generate_and_publish_lucky_code(
             db, _sl_publish, session_id, sender_id, display_name,
             amount=amount, log=log,
         )
-        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
         log.info(
             "sl.auto_enter: %s (pos=%d) entered session %s via P2P fee=%d",
@@ -3902,15 +3028,15 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
     except Exception as exc:
         log.warning("sl.auto_enter error: %s", str(exc)[:200])
 
-# SPEAKING LAB â€” Live session, SSE roster, points grant
-# Added safely â€” no existing function modified.
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SPEAKING LAB Ã¢â¬â Live session, SSE roster, points grant
+# Added safely Ã¢â¬â no existing function modified.
+# Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 
 # Collection aliases
 SL_SESSIONS = db.speaking_lab_sessions
 SL_ENTRIES  = db.speaking_lab_entries
 
-# â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Pydantic models Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 class SLSessionCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -3935,7 +3061,7 @@ class SLAttendancePayload(BaseModel):
     date: str
     present: list[str]
 
-# â”€â”€ SSE pub/sub (in-process, single Render instance) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ SSE pub/sub (in-process, single Render instance) Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 _sl_subs: dict[str, set[asyncio.Queue]] = {}
 _sl_lock = asyncio.Lock()
@@ -3952,7 +3078,7 @@ async def _sl_publish(session_id: str, event: dict) -> None:
 def _sl_sse(event: dict) -> bytes:
     return ("data: " + json.dumps(event) + chr(10) + chr(10)).encode()
 
-# â”€â”€ Points grant â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Points grant Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 @api.post("/points/grant")
 async def sl_grant_points(
@@ -3968,7 +3094,7 @@ async def sl_grant_points(
     if not SL_TREASURY_PASSWORD:
         raise HTTPException(
             status_code=503,
-            detail="SL_TREASURY_PASSWORD not set on Render â€” add it in Environment settings.",
+            detail="SL_TREASURY_PASSWORD not set on Render Ã¢â¬â add it in Environment settings.",
         )
 
     # 1. Resolve student clean_id (push subscriptions use clean_id)
@@ -3978,7 +3104,7 @@ async def sl_grant_points(
     )
     student_clean_id = (stu_doc or {}).get("clean_id") or payload.studentID
 
-    # 2. Call GAS sendPoints â€” treasury â†’ student (real balance transfer)
+    # 2. Call GAS sendPoints Ã¢â¬â treasury Ã¢â â student (real balance transfer)
     nonce = secrets.token_hex(12)
     gas_payload = {
         "action":     "sendPoints",
@@ -4083,7 +3209,7 @@ async def sl_delete_questions(admin: User = Depends(require_admin)):
     await db.speaking_lab_settings.delete_one({"_id": "questions"})
     return {"ok": True, "reset": True}
 
-# â”€â”€ Settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Settings Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 @api.get("/speaking-lab/settings")
 async def sl_get_settings(admin: User = Depends(require_admin)):
@@ -4100,7 +3226,7 @@ async def sl_save_settings(payload: dict, admin: User = Depends(require_admin)):
     )
     return {"ok": True, **data}
 
-# â”€â”€ Attendance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Attendance Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 @api.get("/speaking-lab/attendance")
 async def sl_get_attendance(
@@ -4132,7 +3258,7 @@ async def sl_save_attendance(
     )
     return {"ok": True}
 
-# â”€â”€ Live sessions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Live sessions Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 @api.post("/speaking-lab/sessions")
 async def sl_create_session(
@@ -4237,10 +3363,10 @@ async def sl_stream_session(
         },
     )
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 # END SPEAKING LAB
 
-# â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ LUCKY DRAW SURGERY Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 register_lucky_draw_routes(
     api, db, _sl_publish,
     gas_url=GAS_POINTS_LOGIN_URL,
@@ -4249,7 +3375,7 @@ register_lucky_draw_routes(
     log=log,
     require_admin=require_admin,
 )
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 app.add_middleware(
     CORSMiddleware,
@@ -4274,7 +3400,7 @@ app.add_middleware(
 
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 
 @app.on_event("startup")
 async def startup():
@@ -4304,9 +3430,9 @@ async def startup():
     await db.speaking_lab_entries.create_index([("session_id", 1), ("display_name_key", 1)], unique=True)
     await db.speaking_lab_settings.create_index("_id")
     await db.speaking_lab_attendance.create_index([("schedule", 1), ("date", 1)], unique=True)
-    # â”€â”€ LUCKY DRAW SURGERY â”€â”€
+    # Ã¢ââ¬Ã¢ââ¬ LUCKY DRAW SURGERY Ã¢ââ¬Ã¢ââ¬
     await ensure_lucky_draw_indexes(db)
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
     # Coupon system indexes
     await db.coupons.create_index("code", unique=True)
     await db.coupons.create_index("enabled")
@@ -4326,13 +3452,13 @@ async def shutdown():
     client.close()
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# COUPON SYSTEM â€” v1.0 (append-only, zero existing routes modified)
+# Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
+# COUPON SYSTEM Ã¢â¬â v1.0 (append-only, zero existing routes modified)
 # Collections: coupons
 # Endpoints: POST/GET/PATCH/DELETE /api/coupons  (admin)
 #            POST /api/coupons/validate           (student)
 #            POST /api/coupons/redeem             (student)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 
 import secrets as _secrets_coupon
 import string  as _string_coupon
@@ -4401,7 +3527,7 @@ async def _find_valid_coupon(
     return doc
 
 
-# â”€â”€ Admin endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Admin endpoints Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 @api.post("/coupons")
 async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
@@ -4478,7 +3604,7 @@ async def delete_coupon(code: str, admin: User = Depends(require_admin)):
     return {"ok": True}
 
 
-# â”€â”€ Student endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ Student endpoints Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
 @api.post("/coupons/validate")
 async def validate_coupon(payload: dict):
@@ -4526,7 +3652,7 @@ async def redeem_coupon(payload: dict):
     discounted = _calc_discount(original, coupon)
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Atomic increment with max_uses guard â€” prevents race conditions
+    # Atomic increment with max_uses guard Ã¢â¬â prevents race conditions
     max_uses = coupon.get("max_uses")
     query: dict = {"code": code.upper()}
     if max_uses is not None:
@@ -4561,31 +3687,31 @@ async def redeem_coupon(payload: dict):
     }
 
 
-# â”€â”€ END COUPON SYSTEM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬ END COUPON SYSTEM Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 # NOTE: app.include_router(api) has been moved to the END of this file
 # so that ALL @api.* route decorators (including the conversation route below)
 # are registered before the router is attached to the app.
 """
 server_conversation_patch.py
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 INTEGRATION INSTRUCTIONS:
   1. Open server.py
   2. Find the line: `async def _elevenlabs_generate(text: str, voice_id: str)`
      (around line 286)
   3. After the closing of that function (around line 340), paste everything
-     below the "# â”€â”€â”€ PASTE HERE â”€â”€â”€" marker.
+     below the "# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬ PASTE HERE Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬" marker.
   4. Add the new route alongside the existing /elevenlabs route (around line 690).
   5. Add `pydub>=0.25.1` to requirements.txt
 
-EXISTING FUNCTION NOT MODIFIED â€” only new functions and one new endpoint added.
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+EXISTING FUNCTION NOT MODIFIED Ã¢â¬â only new functions and one new endpoint added.
+Ã¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢ÂÃ¢â¢Â
 """
 
-# â”€â”€â”€ PASTE HERE (after _elevenlabs_generate function, before first @api route) â”€â”€â”€
+# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬ PASTE HERE (after _elevenlabs_generate function, before first @api route) Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
-#  Conversation Voice Studio helpers â€” teacher-side only                       #
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
+# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬ #
+#  Conversation Voice Studio helpers Ã¢â¬â teacher-side only                       #
+# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬ #
 
 EMOTION_ACTING_NOTES: dict = {
     "neutral":   None,
@@ -4618,10 +3744,10 @@ def _strip_id3_tags(buf: bytes) -> bytes:
       ElevenLabs returns each TTS segment as a self-contained .mp3 file
       with its own ID3v2 header and (sometimes) an ID3v1 trailer. Naively
       byte-concatenating those segments produces a file with MULTIPLE
-      embedded ID3 headers â€” iOS AVFoundation reads only the first
+      embedded ID3 headers Ã¢â¬â iOS AVFoundation reads only the first
       header's reported duration (== duration of segment 1) and stops
       playback once currentTime crosses that value. Result: conversation
-      audio mysteriously cuts off after 1â€“2 minutes on every iPhone /
+      audio mysteriously cuts off after 1Ã¢â¬â2 minutes on every iPhone /
       iPad / Mac-Safari client. Chromium-family browsers are lenient and
       keep decoding past the bogus duration, which is why the bug never
       reproduced on desktop QA.
@@ -4656,16 +3782,16 @@ def _strip_id3_tags(buf: bytes) -> bytes:
 def _stitch_mp3_segments(segments):
     """Concatenate MP3 byte segments into one continuous decodable file.
 
-    v10 (2026-05) surgical audio fix â€” see _strip_id3_tags() docstring
+    v10 (2026-05) surgical audio fix Ã¢â¬â see _strip_id3_tags() docstring
     for the full root-cause analysis.
 
     Strategy:
-      â€¢ Keep the FIRST segment intact (its ID3v2 header â€” if any â€” becomes
+      Ã¢â¬Â¢ Keep the FIRST segment intact (its ID3v2 header Ã¢â¬â if any Ã¢â¬â becomes
         the single header for the stitched file).
-      â€¢ For every subsequent segment, strip both the ID3v2 header and the
+      Ã¢â¬Â¢ For every subsequent segment, strip both the ID3v2 header and the
         ID3v1 trailer so we emit only raw MPEG frames.
 
-    Valid when all segments share the same codec parameters â€” guaranteed
+    Valid when all segments share the same codec parameters Ã¢â¬â guaranteed
     when every clip comes from ElevenLabs mp3_44100_128 CBR output.
     """
     if not segments:
@@ -4697,10 +3823,10 @@ def _generate_silence_bytes(duration_seconds):
         pass
 
     # Fallback: repeat a minimal silent 128kbps MPEG-1 L3 frame.
-    # Frame holds 1152 samples at 44100 Hz â†’ ~26.1 ms each.
+    # Frame holds 1152 samples at 44100 Hz Ã¢â â ~26.1 ms each.
     # Header bytes: FF FB 90 00 (sync + 128kbps + 44100 + stereo + no padding)
     SILENT_FRAME = b"\xff\xfb\x90\x00" + b"\x00" * 413  # 417 bytes total
-    FRAME_DURATION = 1152 / 44100  # â‰ˆ 0.02613 s
+    FRAME_DURATION = 1152 / 44100  # Ã¢â°Ë 0.02613 s
     n_frames = max(1, int(duration_seconds / FRAME_DURATION) + 1)
     return SILENT_FRAME * n_frames
 
@@ -4709,8 +3835,8 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
     """Generate audio + word timestamps for one dialogue line.
 
     Extended variant of _elevenlabs_generate() that supports:
-      â€¢ voice_settings  dict  { stability, similarity_boost, style }
-      â€¢ acting_note     str   prepended as ElevenLabs emotion directive
+      Ã¢â¬Â¢ voice_settings  dict  { stability, similarity_boost, style }
+      Ã¢â¬Â¢ acting_note     str   prepended as ElevenLabs emotion directive
 
     Returns { audio_base64, word_timestamps, duration }.
     """
@@ -4801,7 +3927,7 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
     }
 
 
-# â”€â”€â”€ PASTE NEW ROUTE alongside the existing /elevenlabs route â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
+# Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬ PASTE NEW ROUTE alongside the existing /elevenlabs route Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬ #
 
 @api.post("/studio/books/{slug}/conversation")
 async def studio_conversation_generate(
@@ -4870,7 +3996,7 @@ async def studio_conversation_generate(
         if not _VOICE_ID_RE.match(raw_voice):
             line["voiceId"] = ELEVENLABS_DEFAULT_VOICE
             log.warning(
-                "conversation: line %d invalid voiceId %r â†’ default", li, raw_voice
+                "conversation: line %d invalid voiceId %r Ã¢â â default", li, raw_voice
             )
 
     audio_segments = []
@@ -4900,7 +4026,7 @@ async def studio_conversation_generate(
             # Log and skip this line rather than aborting the whole generation.
             # This ensures other lines still generate even if one fails.
             log.warning(
-                "conversation: line %d (%s) failed: %s â€” skipping",
+                "conversation: line %d (%s) failed: %s Ã¢â¬â skipping",
                 li + 1, line.get("speaker", "?"), exc,
             )
             line_results.append({
@@ -4916,7 +4042,7 @@ async def studio_conversation_generate(
 
         raw_audio_b64 = result.get("audio_base64") or ""
         if not raw_audio_b64:
-            log.warning("conversation: line %d (%s) returned empty audio â€” skipping",
+            log.warning("conversation: line %d (%s) returned empty audio Ã¢â¬â skipping",
                         li + 1, line.get("speaker", "?"))
             line_results.append({
                 "lineIndex": line.get("lineIndex"),
@@ -4932,7 +4058,7 @@ async def studio_conversation_generate(
         try:
             audio_bytes = base64.b64decode(raw_audio_b64)
         except Exception as exc:
-            log.warning("conversation: line %d b64decode failed: %s â€” skipping", li + 1, exc)
+            log.warning("conversation: line %d b64decode failed: %s Ã¢â¬â skipping", li + 1, exc)
             accumulated_time += pause_after
             continue
 
@@ -4961,7 +4087,7 @@ async def studio_conversation_generate(
             "wordTimestamps": shifted_wts,
         })
 
-        # Note: silence between lines removed â€” raw MP3 concatenation
+        # Note: silence between lines removed Ã¢â¬â raw MP3 concatenation
         # is cleaner than injecting synthetic frames. ElevenLabs clips
         # already have natural trailing silence.
         accumulated_time = line_end + pause_after
@@ -5019,7 +4145,7 @@ async def studio_conversation_generate(
     blocks.append({
         "type": "audio",
         "text": audio_url,
-        "heading": f"Conversation â€” {chapter.get('title', 'Chapter')}",
+        "heading": f"Conversation Ã¢â¬â {chapter.get('title', 'Chapter')}",
         "_elevenlabs_audio": True,
         "_conversation_audio": True,
         "_audio_id": audio_id,
@@ -5057,8 +4183,8 @@ async def studio_conversation_generate(
     }
 
 
-# â”€â”€ Register all api routes with the app â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# MUST be the last include_router(api) call — v2 so every @api.* route defined
+# Ã¢ââ¬Ã¢ââ¬ Register all api routes with the app Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬Ã¢ââ¬
+# MUST be the last include_router(api) call â v2 so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
 exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").read())
 app.include_router(api)

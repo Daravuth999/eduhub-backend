@@ -343,11 +343,8 @@ async def _complete_tuition_payment(db, student_id: str, txn: dict) -> dict:
         asyncio.create_task(
             _fan_out_push(
                 {"studentId": clean_id},
-                title="--- Tuition Payment Confirmed",
-                body=(
-                    f"Your payment of ${txn.get('amount', 0):.2f} was received. "
-                    "Tuition status updated to Paid."
-                ),
+                title="Tuition Payment Confirmed",
+                body=f"Payment of {int(txn.get('amount', 0)):,} KHR received. Tuition status updated to Paid.",
                 url="/portal/me",
             )
         )
@@ -422,11 +419,8 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
         asyncio.create_task(
             _fan_out_push(
                 {"studentId": clean_id},
-                title=f"+{points_to_credit} Points Credited!",
-                body=(
-                    f"Your {pkg.get('label', 'Top-Up')} payment of {int(txn.get('amount', 0)):,}{chr(0x17DB) if txn.get('currency','KHR')=='KHR' else ' USD'} was received. "
-                    f"+{points_to_credit} PTS credited to your account."
-                ),
+                title=f"+{points_to_credit} PTS Added!",
+                body=f"Payment of {int(txn.get('amount', 0)):,} KHR received. +{points_to_credit} points added to your account.",
                 url="/portal/me",
             )
         )
