@@ -120,10 +120,14 @@ async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
         # Amount match (most important --- 50 pts)
         intent_amount = float(intent.get("amount", 0))
         txn_amount = float(txn.get("amount", 0))
-        if intent_amount > 0 and abs(intent_amount - txn_amount) < 0.01:
+        # Also check KHR amount stored directly
+        intent_khr = float(intent.get("amount_khr", 0))
+        txn_matches = (intent_amount > 0 and abs(intent_amount - txn_amount) < 0.01) or \
+                      (intent_khr > 0 and abs(intent_khr - txn_amount) < 1)
+        if txn_matches:
             score += 50
             reasons.append("amount_exact")
-        elif intent_amount > 0 and abs(intent_amount - txn_amount) / intent_amount < 0.02:
+        elif intent_amount > 0 and abs(intent_amount - txn_amount) / max(intent_amount,1) < 0.5:
             score += 35
             reasons.append("amount_near")
 
@@ -642,7 +646,7 @@ async def approve_transaction(
         result = await _complete_tuition_payment(db, student_id, doc)
     elif intent_type == "points":
         # For manual approve, find the package by amount
-        amount_khr = int(doc.get("amount", 0) * 4100) if doc.get("currency") == "USD" else int(doc.get("amount", 0))
+        amount_khr = int(doc.get("amount", 0))  # amount stored as raw KHR
         pkg = await db.payment_settings.find_one({"amount_khr": amount_khr, "active": True})
         result = await _complete_points_payment(db, student_id, doc, pkg)
     else:
