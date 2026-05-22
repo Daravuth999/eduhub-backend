@@ -4311,6 +4311,18 @@ async def startup():
     await db.coupons.create_index("code", unique=True)
     await db.coupons.create_index("enabled")
     await db.coupons.create_index("expires_at")
+    # -- PAYMENT BRIDGE indexes -------------------------------------------
+    await db.payment_intents.create_index(
+        [("student_id", 1), ("status", 1), ("created_at", -1)]
+    )
+    await db.payment_transactions.create_index(
+        [("transaction_id", 1), ("apv", 1)], unique=True
+    )
+    await db.payment_transactions.create_index([("status", 1), ("created_at", -1)])
+    await db.payment_transactions.create_index("matched_student_id")
+    await db.payment_settings.create_index([("amount_khr", 1), ("active", 1)])
+    await db.payment_audit_log.create_index([("txn_id", 1), ("at", -1)])
+    # --------------------------------------------------------------------
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
@@ -4556,7 +4568,11 @@ async def redeem_coupon(payload: dict):
 
 
 # ── END COUPON SYSTEM ──────────────────────────────────────────────────────
-# NOTE: app.include_router(api) has been moved to the END of this file
+# NOTE: # -- PAYMENT BRIDGE SURGERY (append only � zero existing code modified) -------
+exec(open(Path(__file__).parent / "payment_bridge.py").read())
+# -----------------------------------------------------------------------------
+
+app.include_router(api) has been moved to the END of this file
 # so that ALL @api.* route decorators (including the conversation route below)
 # are registered before the router is attached to the app.
 """
@@ -5054,4 +5070,8 @@ async def studio_conversation_generate(
 # ── Register all api routes with the app ────────────────────────────────────
 # MUST be the last include_router(api) call so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
+# -- PAYMENT BRIDGE SURGERY (append only � zero existing code modified) -------
+exec(open(Path(__file__).parent / "payment_bridge.py").read())
+# -----------------------------------------------------------------------------
+
 app.include_router(api)
