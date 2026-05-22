@@ -1,4 +1,4 @@
-﻿"""EduHub Author Studio backend (FastAPI + MongoDB).
+""EduHub Author Studio backend (FastAPI + MongoDB).
 
 Dynamic CMS layered on top of the existing Google-Sheets driven library.
 The frontend merges the two sources at read time so every existing sheet
