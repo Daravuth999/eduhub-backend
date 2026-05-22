@@ -202,6 +202,7 @@ class PointsPackageCreate(_PM):
     max_purchase:   int = 0
     active:         bool = True
     notes:          str | None = None
+    payment_link:   str | None = None
 
 class PointsPackagePatch(_PM):
     label:          str | None = None
@@ -212,6 +213,7 @@ class PointsPackagePatch(_PM):
     max_purchase:   int | None = None
     active:         bool | None = None
     notes:          str | None = None
+    payment_link:   str | None = None
 
 
 # ------ Internal helpers ------------------------------------------------------------------------------------------------------------------------------------------------------------------
