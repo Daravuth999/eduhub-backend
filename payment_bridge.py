@@ -140,6 +140,23 @@ async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
         if intent_khr > 0 and abs(intent_khr - txn_amount) < 1:
             unexpired_matches.append(intent)
 
+    # Auto-expire any pending intents that are past their expires_at
+    # This cleans up stale sessions from previous logins/refreshes
+    for intent in all_pending:
+        exp_str = intent.get("expires_at", "")
+        if exp_str:
+            try:
+                exp = datetime.fromisoformat(exp_str)
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if exp < now:
+                    await db.payment_intents.update_one(
+                        {"_id": intent["_id"], "status": "pending"},
+                        {"$set": {"status": "expired", "expired_reason": "session_timeout"}}
+                    )
+            except Exception:
+                pass
+
     log.info("match_strict: txn_amount=%.0f unexpired_exact_matches=%d",
              txn_amount, len(unexpired_matches))
 
@@ -407,8 +424,8 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
                 {"studentId": clean_id},
                 title=f"+{points_to_credit} Points Credited!",
                 body=(
-                    f"Your payment of ${txn.get('amount', 0):.2f} was received. "
-                    f"{points_to_credit} points have been added to your account."
+                    f"Your {pkg.get('label', 'Top-Up')} payment of {int(txn.get('amount', 0)):,}{chr(0x17DB) if txn.get('currency','KHR')=='KHR' else ' USD'} was received. "
+                    f"+{points_to_credit} PTS credited to your account."
                 ),
                 url="/portal/me",
             )
@@ -448,6 +465,7 @@ async def _process_transaction(db, txn_id: str) -> dict:
         "match_reason":     reason,
         "matched_intent_id": str(intent["_id"]) if intent else None,
         "matched_student_id": intent.get("student_id") if intent else None,
+        "matched_intent_type": intent.get("type", "points") if intent else None,
         "status":           new_status,
         "updated_at":       datetime.now(timezone.utc).isoformat(),
     }
@@ -723,7 +741,20 @@ async def approve_transaction(
         raise HTTPException(status_code=409, detail="Transaction already completed")
 
     student_id   = payload.student_id or doc.get("matched_student_id", "")
-    intent_type  = payload.intent_type or "tuition"
+    # Default to "points" for payment bridge transactions; admin can override
+    matched_intent_id = doc.get("matched_intent_id")
+    default_type = "tuition"
+    if matched_intent_id:
+        try:
+            from bson import ObjectId as _OID
+            mi = await db.payment_intents.find_one({"_id": _OID(matched_intent_id)})
+            if mi:
+                default_type = mi.get("type", "tuition")
+                if not payload.student_id:
+                    student_id = mi.get("student_id", student_id)
+        except Exception:
+            pass
+    intent_type  = payload.intent_type or default_type
 
     if not student_id:
         raise HTTPException(status_code=400, detail="student_id required for manual approval")
