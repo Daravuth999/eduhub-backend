@@ -1949,9 +1949,9 @@ async def push_notify_credit(
         raise HTTPException(status_code=500, detail="log insert failed")
 
     # ---- Server-rendered Khmer + English template ------------------------
-    title = f"\U0001F389 +{payload.amount} áž–áž·áž“áŸ’áž‘áž»! / Points Credited!"
+    title = f"\U0001F389 +{payload.amount} áž-áž·áž“áŸ’áž‘áž»! / Points Credited!"
     body = (
-        f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.amount} âœ¨\n"
+        f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž-áž·áž“áŸ’áž‘áž» +{payload.amount} âœ¨\n"
         f"ážšáŸ€áž“áž”áž“áŸ’áž áž áž¾áž™ážŠáŸ„áŸ‡ážŸáŸ„ážšáž„áŸ’ážœáž¶áž“áŸ‹!\n"
         f"+{payload.amount} points added to your account. Keep learning!"
     )
@@ -2816,9 +2816,9 @@ async def teacher_push_points(
         if payload.delta > 0:
             sent, failed = await _fan_out_push(
                 {"studentId": student_id},
-                title=f"\U0001F389 +{payload.delta} áž–áž·áž“áŸ’áž‘áž»! / Points!",
+                title=f"\U0001F389 +{payload.delta} áž-áž·áž“áŸ’áž‘áž»! / Points!",
                 body=(
-                    f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.delta} âœ¨\n"
+                    f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž-áž·áž“áŸ’áž‘áž» +{payload.delta} âœ¨\n"
                     f"You received +{payload.delta} points. Keep it up!"
                 ),
                 url="/portal",
@@ -5070,7 +5070,7 @@ async def studio_conversation_generate(
 # â”€â”€ Register all api routes with the app â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # MUST be the last include_router(api) call so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
-# -- PAYMENT BRIDGE SURGERY (append only — zero existing code modified) -------
+# -- PAYMENT BRIDGE SURGERY (append only - zero existing code modified) -------
 exec(open(Path(__file__).parent / "payment_bridge.py").read())
 # -----------------------------------------------------------------------------
 
