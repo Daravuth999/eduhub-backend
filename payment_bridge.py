@@ -478,6 +478,18 @@ async def create_payment_intent(
     }
 
 
+@api.get("/payments/intents/{intent_id}/status")
+async def get_payment_intent_status(intent_id: str):
+    """Public - student polls this to check if their payment was confirmed."""
+    try:
+        doc = await db.payment_intents.find_one({"_id": ObjectId(intent_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid intent_id")
+    if not doc:
+        raise HTTPException(status_code=404, detail="Intent not found")
+    return {"ok": True, "status": doc.get("status", "pending"), "intent_id": intent_id}
+
+
 @api.get("/payments/intents/{intent_id}")
 async def get_payment_intent(intent_id: str, admin: User = Depends(require_admin)):
     """Get a payment intent by ID (admin only)."""
