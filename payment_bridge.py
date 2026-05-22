@@ -100,14 +100,67 @@ def _parse_payway_message(text: str) -> dict | None:
 # ------ Matching logic ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
-    """Find the best matching open payment intent for a transaction.
+    """Find the safest matching payment intent for a transaction.
+
+    PRODUCTION-SAFE STRICT SINGLE-MATCH ALGORITHM:
+    - Only match unexpired pending intents (expires_at > now)
+    - Match by exact KHR amount
+    - AUTO-CREDIT only if exactly ONE unexpired intent matches
+    - If ZERO matches: unmatched -> needs_review
+    - If MULTIPLE matches: ambiguous -> needs_review (never guess)
+    - This prevents cross-student mis-credit when 2 students pay same amount simultaneously
 
     Returns (intent_doc, confidence_score, match_reason).
-    confidence_score:
-        --- 80 --- HIGH   --- auto-complete
-        40-79 --- MEDIUM --- needs_review
-        < 40  --- LOW   --- unmatched
     """
+    now = datetime.now(timezone.utc)
+    txn_amount = float(txn.get("amount", 0))
+
+    # Query ONLY unexpired pending intents
+    all_pending = await db.payment_intents.find(
+        {"status": "pending"}
+    ).sort("created_at", 1).to_list(500)
+
+    # Filter: must be unexpired AND exact amount match
+    unexpired_matches = []
+    for intent in all_pending:
+        # Check not expired
+        expires_at_str = intent.get("expires_at", "")
+        if expires_at_str:
+            try:
+                exp = datetime.fromisoformat(expires_at_str)
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if exp < now:
+                    continue  # expired - skip
+            except Exception:
+                pass
+
+        # Check exact KHR amount match
+        intent_khr = float(intent.get("amount_khr", 0) or intent.get("amount", 0))
+        if intent_khr > 0 and abs(intent_khr - txn_amount) < 1:
+            unexpired_matches.append(intent)
+
+    log.info("match_strict: txn_amount=%.0f unexpired_exact_matches=%d",
+             txn_amount, len(unexpired_matches))
+
+    if len(unexpired_matches) == 0:
+        return None, 0, "no_unexpired_intent_for_amount"
+
+    if len(unexpired_matches) == 1:
+        # SAFE: exactly one student waiting for this exact amount
+        intent = unexpired_matches[0]
+        log.info("match_strict: SAFE single match -> student=%s intent=%s",
+                 intent.get("student_id"), str(intent.get("_id")))
+        return intent, 80, "single_unexpired_exact_amount"
+
+    # UNSAFE: multiple students waiting for same amount - do not guess
+    log.warning("match_strict: AMBIGUOUS %d intents for amount=%.0f -> needs_review",
+                len(unexpired_matches), txn_amount)
+    # Return the oldest intent at low confidence -> needs_review
+    return unexpired_matches[0], 40, f"ambiguous_{len(unexpired_matches)}_intents_same_amount"
+
+async def _find_best_intent_UNUSED(db, txn: dict) -> tuple[dict | None, int, str]:
+    """DEPRECATED - kept for reference only"""
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=6)  # 6-hour window
 
@@ -468,8 +521,19 @@ async def create_payment_intent(
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="amount must be > 0")
 
-    ref_code = f"{payload.type.upper()[:3]}-{payload.student_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
-    now_str  = datetime.now(timezone.utc).isoformat()
+    ref_code = f"{payload.type.upper()[:3]}-{payload.student_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    now      = datetime.now(timezone.utc)
+    now_str  = now.isoformat()
+    expires  = now + timedelta(minutes=3)
+
+    # Lane lock: expire all previous PENDING top-up intents for this student
+    # This prevents the same student from having multiple active intents
+    if payload.type == "points":
+        await db.payment_intents.update_many(
+            {"student_id": payload.student_id, "type": "points", "status": "pending"},
+            {"$set": {"status": "expired", "expired_reason": "superseded_by_new_intent"}}
+        )
+        log.info("payment_bridge: expired old pending intents for student=%s", payload.student_id)
 
     doc = {
         "type":           payload.type,
@@ -481,14 +545,18 @@ async def create_payment_intent(
         "reference_code": ref_code,
         "status":         "pending",
         "created_at":     now_str,
-        "expires_at":     (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+        "expires_at":     expires.isoformat(),
+        "session_minutes": 3,
     }
     result = await db.payment_intents.insert_one(doc)
+    log.info("payment_bridge: intent created id=%s student=%s amount_khr=%s expires=%s",
+             str(result.inserted_id), payload.student_id, doc["amount_khr"], expires.isoformat())
     return {
         "ok":             True,
         "intent_id":      str(result.inserted_id),
         "reference_code": ref_code,
-        "expires_at":     doc["expires_at"],
+        "expires_at":     expires.isoformat(),
+        "session_seconds": 180,
     }
 
 
