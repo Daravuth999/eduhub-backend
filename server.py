@@ -4568,7 +4568,7 @@ async def redeem_coupon(payload: dict):
 
 
 # â”€â”€ END COUPON SYSTEM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# ── PAYMENT BRIDGE SURGERY (append only - zero existing code modified) ───────
+# -- PAYMENT BRIDGE SURGERY (append only - zero existing code modified) -------
 exec(open(Path(__file__).parent / "payment_bridge.py").read())
 # -----------------------------------------------------------------------------
 
