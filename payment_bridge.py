@@ -1,18 +1,18 @@
-# ═══════════════════════════════════════════════════════════════════════════
-# SMART PAYMENT BRIDGE — v1.0
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# SMART PAYMENT BRIDGE --- v1.0
 # Semi-automatic ABA PayWay Telegram notification processor.
 #
-# Collections added (NEW — never touches existing collections):
-#   payment_intents       — pending payment intents (tuition / points purchase)
-#   payment_transactions  — every raw Telegram notification received
-#   payment_settings      — points-rate packages (admin-configurable)
-#   payment_audit_log     — admin approve/reject/manual actions
+# Collections added (NEW --- never touches existing collections):
+#   payment_intents       --- pending payment intents (tuition / points purchase)
+#   payment_transactions  --- every raw Telegram notification received
+#   payment_settings      --- points-rate packages (admin-configurable)
+#   payment_audit_log     --- admin approve/reject/manual actions
 #
-# Endpoints (ALL NEW — zero existing routes touched):
+# Endpoints (ALL NEW --- zero existing routes touched):
 #   POST /api/payments/intents
 #   GET  /api/payments/intents/{intent_id}
 #   POST /api/payments/telegram-webhook
-#   POST /api/payments/parse-manual          ← fallback: admin pastes message
+#   POST /api/payments/parse-manual          --- fallback: admin pastes message
 #   GET  /api/payments/transactions
 #   POST /api/payments/transactions/{id}/approve
 #   POST /api/payments/transactions/{id}/reject
@@ -24,28 +24,28 @@
 #   GET  /api/students/{student_id}/payment-history
 #
 # Architecture:
-#   QR payment → Telegram bot notification → POST /telegram-webhook
+#   QR payment --- Telegram bot notification --- POST /telegram-webhook
 #   Backend parses amount, payer, trx_id, apv, timestamp
 #   Deduplication via (trx_id, apv) unique index
 #   Match against open payment_intents (student ID + amount + time window)
-#   High confidence  → auto-complete (update tuition OR credit points via GAS)
-#   Medium confidence → status "review"
-#   Low confidence   → status "unmatched"
+#   High confidence  --- auto-complete (update tuition OR credit points via GAS)
+#   Medium confidence --- status "review"
+#   Low confidence   --- status "unmatched"
 #   All transactions stored permanently; admin can approve/reject from Studio
 #
 # Matching algorithm:
-#   Score = (amount_match × 50) + (student_id_in_ref × 30) + (time_window × 20)
-#   ≥ 80  → HIGH  → auto-complete
-#   40-79 → MEDIUM → needs_review
-#   < 40  → LOW   → unmatched
-# ═══════════════════════════════════════════════════════════════════════════
+#   Score = (amount_match -- 50) + (student_id_in_ref -- 30) + (time_window -- 20)
+#   --- 80  --- HIGH  --- auto-complete
+#   40-79 --- MEDIUM --- needs_review
+#   < 40  --- LOW   --- unmatched
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 import re as _pay_re
 import secrets as _pay_secrets
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 
-# ── Telegram message parser ───────────────────────────────────────────────
+# ------ Telegram message parser ---------------------------------------------------------------------------------------------------------------------------------------------
 
 _TRX_PATTERN = _pay_re.compile(
     r"\$?([\d,]+(?:\.\d+)?)\s*(?:USD)?\s*(?:paid|transferred)\s+by\s+"
@@ -57,7 +57,7 @@ _TRX_PATTERN = _pay_re.compile(
 )
 
 _KHR_PATTERN = _pay_re.compile(
-    r"([\d,]+(?:\.\d+)?)\s*[៛KHR]+\s*(?:paid|transferred)\s+by\s+"
+    r"([\d,]+(?:\.\d+)?)\s*[---KHR]+\s*(?:paid|transferred)\s+by\s+"
     r"([^\(]+?)\s*(?:\(([^\)]*)\))?\s+on\s+"
     r"([A-Za-z]+ \d+,?\s*\d{1,2}:\d{2}\s*[APap][Mm])\s+"
     r"via\s+([^\s]+(?:\s+[^\s]+)*?)\s+at\s+([^.]+?)\."
@@ -69,7 +69,7 @@ _KHR_PATTERN = _pay_re.compile(
 def _parse_payway_message(text: str) -> dict | None:
     """Parse an ABA PayWay Telegram notification message.
 
-    Handles both USD ($1.00) and KHR (5000៛) formats.
+    Handles both USD ($1.00) and KHR (5000---) formats.
     Returns a dict of extracted fields or None if message doesn't match.
     """
     text = (text or "").strip()
@@ -93,16 +93,16 @@ def _parse_payway_message(text: str) -> dict | None:
     return None
 
 
-# ── Matching logic ────────────────────────────────────────────────────────
+# ------ Matching logic ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
     """Find the best matching open payment intent for a transaction.
 
     Returns (intent_doc, confidence_score, match_reason).
     confidence_score:
-        ≥ 80 → HIGH   → auto-complete
-        40-79 → MEDIUM → needs_review
-        < 40  → LOW   → unmatched
+        --- 80 --- HIGH   --- auto-complete
+        40-79 --- MEDIUM --- needs_review
+        < 40  --- LOW   --- unmatched
     """
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=6)  # 6-hour window
@@ -123,7 +123,7 @@ async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
         score = 0
         reasons = []
 
-        # Amount match (most important — 50 pts)
+        # Amount match (most important --- 50 pts)
         intent_amount = float(intent.get("amount", 0))
         txn_amount = float(txn.get("amount", 0))
         if intent_amount > 0 and abs(intent_amount - txn_amount) < 0.01:
@@ -147,7 +147,7 @@ async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
             score += 30
             reasons.append("ref_code_in_message")
 
-        # Time window match — intent created before payment (20 pts)
+        # Time window match --- intent created before payment (20 pts)
         intent_created = intent.get("created_at", "")
         if intent_created:
             try:
@@ -169,7 +169,7 @@ async def _find_best_intent(db, txn: dict) -> tuple[dict | None, int, str]:
     return best_intent, best_score, best_reason
 
 
-# ── Pydantic models for payments ──────────────────────────────────────────
+# ------ Pydantic models for payments ------------------------------------------------------------------------------------------------------------------------------
 
 from pydantic import BaseModel as _PM
 
@@ -215,10 +215,10 @@ class PointsPackagePatch(_PM):
     notes:          str | None = None
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────
+# ------ Internal helpers ------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 async def _complete_tuition_payment(db, student_id: str, txn: dict) -> dict:
-    """Auto-complete a tuition payment — reuses the same GAS call as teacher_update_tuition."""
+    """Auto-complete a tuition payment --- reuses the same GAS call as teacher_update_tuition."""
     import calendar as _cal
     from datetime import date as _date
 
@@ -260,7 +260,7 @@ async def _complete_tuition_payment(db, student_id: str, txn: dict) -> dict:
         asyncio.create_task(
             _fan_out_push(
                 {"studentId": clean_id},
-                title="✅ Tuition Payment Confirmed",
+                title="--- Tuition Payment Confirmed",
                 body=(
                     f"Your payment of ${txn.get('amount', 0):.2f} was received. "
                     "Tuition status updated to Paid."
@@ -278,7 +278,7 @@ async def _complete_tuition_payment(db, student_id: str, txn: dict) -> dict:
 
 
 async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | None) -> dict:
-    """Auto-complete a points purchase — reuses the GAS sendPoints flow (treasury → student)."""
+    """Auto-complete a points purchase --- reuses the GAS sendPoints flow (treasury --- student)."""
     if not pkg:
         return {"ok": False, "error": "No points package found for this transaction"}
 
@@ -331,7 +331,7 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
             "to":          clean_id,
             "delta":       points_to_credit,
             "source":      "payment-bridge-points-purchase",
-            "description": f"Points purchase — {pkg.get('label', '')} via ABA PayWay",
+            "description": f"Points purchase --- {pkg.get('label', '')} via ABA PayWay",
             "granted_by":  "payment_bridge",
             "created_at":  datetime.now(timezone.utc).isoformat(),
         })
@@ -339,7 +339,7 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
         asyncio.create_task(
             _fan_out_push(
                 {"studentId": clean_id},
-                title=f"🎉 +{points_to_credit} Points Credited!",
+                title=f"---- +{points_to_credit} Points Credited!",
                 body=(
                     f"Your payment of ${txn.get('amount', 0):.2f} was received. "
                     f"{points_to_credit} points have been added to your account."
@@ -405,7 +405,7 @@ async def _process_transaction(db, txn_id: str) -> dict:
                 # Fall back: find active package matching amount
                 khr_amount = txn_doc.get("amount", 0)
                 if txn_doc.get("currency") == "USD":
-                    # approximate USD → KHR for package lookup
+                    # approximate USD --- KHR for package lookup
                     khr_amount = int(float(txn_doc.get("amount", 0)) * 4100)
                 pkg = await db.payment_settings.find_one({"amount_khr": khr_amount, "active": True})
             result = await _complete_points_payment(db, student_id, txn_doc, pkg)
@@ -432,7 +432,7 @@ async def _process_transaction(db, txn_id: str) -> dict:
     return {"status": new_status, "score": score}
 
 
-# ── Routes ────────────────────────────────────────────────────────────────
+# ------ Routes ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 # --- Payment Intents ---
 
@@ -446,7 +446,7 @@ async def create_payment_intent(
     Called by the PWA before the student scans the QR code.
     Returns a unique reference code to show to the student.
     Works for both enrolled students (tuition) and app users (points purchase).
-    Does NOT require admin auth — any authenticated student can create an intent.
+    Does NOT require admin auth --- any authenticated student can create an intent.
     """
     if payload.type not in ("tuition", "points"):
         raise HTTPException(status_code=400, detail="type must be 'tuition' or 'points'")
@@ -507,7 +507,7 @@ async def receive_telegram_webhook(payload: TelegramWebhookPayload):
     webhook_secret = os.environ.get("PAYMENT_WEBHOOK_SECRET", "")
     # Security: if a webhook secret is configured, validate it
     # (The forwarder should send it as X-Payment-Secret header)
-    # We keep this soft — missing header is only a warning if secret not configured
+    # We keep this soft --- missing header is only a warning if secret not configured
     parsed = _parse_payway_message(payload.message)
     if not parsed:
         raise HTTPException(
@@ -525,7 +525,7 @@ async def parse_manual_notification(
     payload: ManualParsePayload,
     admin: User = Depends(require_admin),
 ):
-    """Admin pastes a PayWay notification message → parse and store.
+    """Admin pastes a PayWay notification message --- parse and store.
 
     This is the fallback when Telegram automation is unavailable.
     """
@@ -712,7 +712,7 @@ async def reject_transaction(
 
 @api.get("/payments/packages/public")
 async def list_points_packages_public():
-    """Public read-only endpoint � returns active packages only. No auth required."""
+    """Public read-only endpoint - returns active packages only. No auth required."""
     docs = await db.payment_settings.find({"active": True}).sort("amount_khr", 1).to_list(100)
     for d in docs:
         d["_id"] = str(d["_id"])
