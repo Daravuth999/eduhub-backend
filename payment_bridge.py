@@ -424,14 +424,14 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
             "granted_by":  "payment_bridge",
             "created_at":  datetime.now(timezone.utc).isoformat(),
         })
-        # Push notification
-        asyncio.create_task(
-            _fan_out_push(
-                {"studentId": clean_id},
-                title=f"+{points_to_credit} PTS Added!",
-                body=f"Payment of {int(txn.get('amount', 0)):,} KHR received. +{points_to_credit} points added to your account.",
-                url="/portal/me",
-            )
+        # Idempotent Top-Up push (guards against webhook retries / double-process)
+        await _send_topup_push_once(
+            txn=txn,
+            student_id=clean_id,
+            amount_khr=int(txn.get("amount", 0)),
+            points_credited=points_to_credit,
+            package_label=(pkg.get("label") if pkg else "Top-Up") or "Top-Up",
+            trigger="auto",
         )
         log.info("payment_bridge: points auto-credited %d pts to %s (trx=%s)",
                  points_to_credit, clean_id, txn.get("transaction_id"))
@@ -439,6 +439,102 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
     else:
         log.warning("payment_bridge: GAS points transfer failed for %s: %s", clean_id, gas_error)
         return {"ok": False, "error": gas_error}
+
+
+async def _send_topup_push_once(
+    *,
+    txn: dict,
+    student_id: str,
+    amount_khr: int,
+    points_credited: int,
+    package_label: str = "Top-Up",
+    trigger: str = "auto",
+) -> bool:
+    """Idempotently fire the ✅ Top-Up Successful Web Push exactly once per
+    payment_transactions row.
+
+    Guarantees:
+        * Only sends when student_id and points_credited > 0.
+        * Skips silently if the txn already has `push_sent_at` set (so
+          duplicate Telegram webhooks / manual approvals after auto-credit /
+          retries can never trigger a second buzz on the user's phone).
+        * Writes `push_sent_at`, `push_status`, `push_trigger`,
+          `credited_points` on the transaction row so the audit trail and
+          dashboard stay correct.
+        * NEVER raises   push failure is logged and stamped, the payment is
+          NOT reversed and points credit is NOT undone.
+    """
+    if not student_id or points_credited <= 0:
+        return False
+
+    txn_oid = txn.get("_id") if isinstance(txn, dict) else None
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    # Idempotency check against the live row (not the stale dict argument)
+    if txn_oid is not None:
+        fresh = await db.payment_transactions.find_one(
+            {"_id": txn_oid}, {"push_sent_at": 1, "push_status": 1}
+        )
+        if fresh and fresh.get("push_sent_at"):
+            log.info(
+                "topup_push: SKIPPED already-sent txn=%s student=%s trigger=%s",
+                str(txn_oid), student_id, trigger,
+            )
+            return False
+
+    title_en = "✅ Top-Up Successful"
+    body_en = (
+        f"Your {package_label} payment of {amount_khr:,}៛ was detected. "
+        f"+{points_credited} PTS has been credited to your account."
+    )
+
+    # Stamp BEFORE firing so concurrent retries cannot race to send twice.
+    push_status = "queued"
+    push_error: str | None = None
+    if txn_oid is not None:
+        await db.payment_transactions.update_one(
+            {"_id": txn_oid, "push_sent_at": {"$in": [None, ""]}},
+            {"$set": {
+                "push_sent_at":   now_str,
+                "push_status":    push_status,
+                "push_trigger":   trigger,
+                "credited_points": int(points_credited),
+                "updated_at":     now_str,
+            }},
+            upsert=False,
+        )
+
+    # Fire the push   never let push noise propagate.
+    try:
+        sent, failed = await _fan_out_push(
+            {"studentId": student_id},
+            title=title_en,
+            body=body_en,
+            url="/portal/me",
+        )
+        push_status = "sent" if sent and sent > 0 else "no_subscribers"
+        log.info(
+            "topup_push: trigger=%s student=%s sent=%s failed=%s txn=%s",
+            trigger, student_id, sent, failed, str(txn_oid) if txn_oid else "-",
+        )
+    except Exception as exc:
+        push_status = "failed"
+        push_error = str(exc)[:200]
+        log.warning(
+            "topup_push: FAILED student=%s trigger=%s err=%s   credit NOT reversed",
+            student_id, trigger, push_error,
+        )
+
+    if txn_oid is not None:
+        await db.payment_transactions.update_one(
+            {"_id": txn_oid},
+            {"$set": {
+                "push_status": push_status,
+                **({"push_error": push_error} if push_error else {}),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+    return push_status == "sent"
 
 
 async def _process_transaction(db, txn_id: str) -> dict:
@@ -508,11 +604,20 @@ async def _process_transaction(db, txn_id: str) -> dict:
                 "completed_at": datetime.now(timezone.utc).isoformat() if result.get("ok") else None,
             }},
         )
-        # Mark intent as completed
+        # Mark intent as completed (with rich audit fields so the student
+        # modal can auto-close on its next poll).
         if result.get("ok"):
+            now_iso = datetime.now(timezone.utc).isoformat()
             await db.payment_intents.update_one(
                 {"_id": intent["_id"]},
-                {"$set": {"status": "completed", "transaction_id": txn_id}},
+                {"$set": {
+                    "status":           "completed",
+                    "transaction_id":   txn_id,
+                    "matched_txn_id":   txn_id,
+                    "credited_points":  int(result.get("points_credited") or 0),
+                    "completed_at":     now_iso,
+                    "manual_approved":  False,
+                }},
             )
         return {"status": final_status, "result": result}
 
@@ -546,6 +651,47 @@ async def create_payment_intent(
     now      = datetime.now(timezone.utc)
     now_str  = now.isoformat()
     expires  = now + timedelta(minutes=3)
+
+    # ── Lane lock (cross-student safety) ─────────────────────────────────
+    # If a DIFFERENT student already holds a live pending points intent for
+    # the same KHR amount, refuse to open a second lane. This guarantees
+    # that when the Telegram notification arrives the strict single-match
+    # algorithm in _find_best_intent has exactly one candidate -> no chance
+    # of crediting the wrong student (the original stu094->stu093 bug).
+    if payload.type == "points":
+        intent_amount_khr = int(payload.amount_khr or int(payload.amount))
+        if intent_amount_khr > 0:
+            busy = await db.payment_intents.find_one({
+                "type":       "points",
+                "status":     "pending",
+                "amount_khr": intent_amount_khr,
+                "student_id": {"$ne": payload.student_id},
+                "expires_at": {"$gt": now_str},
+            })
+            if busy:
+                # Compute retry seconds from the busy intent's expires_at
+                retry_after = 60
+                try:
+                    busy_exp = datetime.fromisoformat(busy.get("expires_at", ""))
+                    if busy_exp.tzinfo is None:
+                        busy_exp = busy_exp.replace(tzinfo=timezone.utc)
+                    retry_after = max(5, int((busy_exp - now).total_seconds()))
+                except Exception:
+                    pass
+                log.warning(
+                    "payment_bridge: lane_busy student=%s amount_khr=%s held_by=%s retry=%ss",
+                    payload.student_id, intent_amount_khr,
+                    busy.get("student_id"), retry_after,
+                )
+                raise HTTPException(
+                    status_code=423,
+                    detail={
+                        "ok": False,
+                        "reason": "lane_busy",
+                        "message": "Payment session is currently preparing for another learner. Please try again in a moment.",
+                        "retry_after_seconds": retry_after,
+                    },
+                )
 
     # Lane lock: expire all previous PENDING top-up intents for this student
     # This prevents the same student from having multiple active intents
@@ -583,14 +729,145 @@ async def create_payment_intent(
 
 @api.get("/payments/intents/{intent_id}/status")
 async def get_payment_intent_status(intent_id: str):
-    """Public - student polls this to check if their payment was confirmed."""
+    """Public — student modal polls this every 3 seconds.
+
+    Returns a rich, terminal-aware payload so the frontend can:
+      * close automatically on `completed` / `completed_manual`
+      * show needs_review / expired states with a manual close button
+      * never poll forever
+    """
     try:
-        doc = await db.payment_intents.find_one({"_id": ObjectId(intent_id)})
+        oid = ObjectId(intent_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid intent_id")
+    doc = await db.payment_intents.find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Intent not found")
-    return {"ok": True, "status": doc.get("status", "pending"), "intent_id": intent_id}
+
+    now = datetime.now(timezone.utc)
+    status = doc.get("status") or "pending"
+
+    # Auto-promote pending -> expired if past expires_at (best-effort).
+    if status == "pending":
+        exp_str = doc.get("expires_at") or ""
+        if exp_str:
+            try:
+                exp = datetime.fromisoformat(exp_str)
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if exp < now:
+                    await db.payment_intents.update_one(
+                        {"_id": oid, "status": "pending"},
+                        {"$set": {"status": "expired",
+                                  "expired_reason": "session_timeout"}}
+                    )
+                    status = "expired"
+                    doc["status"] = "expired"
+            except Exception:
+                pass
+
+    # ── Try to surface a linked completed transaction even if the intent
+    # itself was never written by the auto-credit / manual-approval paths.
+    # This makes the student modal close after Author Studio manual approval
+    # whenever the related intent record was missed.
+    completed_at = doc.get("completed_at")
+    transaction_id = doc.get("transaction_id")
+    credited_points = doc.get("credited_points")
+    matched_student_id = doc.get("student_id")
+    manual_approved = bool(doc.get("manual_approved"))
+
+    intent_id_str = str(oid)
+    if status in ("pending", "expired"):
+        # 1) Look for a completed txn that already records this intent.
+        linked = await db.payment_transactions.find_one(
+            {
+                "$or": [
+                    {"matched_intent_id": intent_id_str},
+                    {"matched_intent_id": oid},
+                ],
+                "status": "completed",
+            }
+        )
+        # 2) Otherwise look for a manual-approved txn for the same
+        #    student + amount within a 10-minute window AND created
+        #    AFTER the intent itself (so an older completed txn from
+        #    a previous attempt cannot accidentally heal a fresh intent).
+        if not linked:
+            try:
+                window_start_dt = now - timedelta(minutes=10)
+                intent_created = doc.get("created_at") or ""
+                lower_bound = window_start_dt.isoformat()
+                if intent_created:
+                    # Use the later of (intent.created_at, now-10min).
+                    try:
+                        ic = datetime.fromisoformat(intent_created)
+                        if ic.tzinfo is None:
+                            ic = ic.replace(tzinfo=timezone.utc)
+                        if ic > window_start_dt:
+                            lower_bound = ic.isoformat()
+                    except Exception:
+                        pass
+                amount_khr = doc.get("amount_khr") or doc.get("amount") or 0
+                cand = await db.payment_transactions.find_one(
+                    {
+                        "matched_student_id": doc.get("student_id"),
+                        "status": "completed",
+                        "amount": amount_khr,
+                        "updated_at": {"$gte": lower_bound},
+                    },
+                    sort=[("updated_at", -1)],
+                )
+                if cand:
+                    linked = cand
+            except Exception:
+                pass
+
+        if linked:
+            # Heal the intent record so subsequent polls are O(1).
+            credited_points = (
+                (linked.get("completion_result") or {}).get("points_credited")
+                or doc.get("credited_points")
+                or 0
+            )
+            new_status = "completed_manual" if linked.get("manually_approved") else "completed"
+            update_payload = {
+                "status":            new_status,
+                "transaction_id":    str(linked.get("_id")),
+                "matched_txn_id":    str(linked.get("_id")),
+                "credited_points":   int(credited_points or 0),
+                "manual_approved":   bool(linked.get("manually_approved")),
+                "completed_at":      linked.get("completed_at") or now.isoformat(),
+            }
+            await db.payment_intents.update_one({"_id": oid}, {"$set": update_payload})
+            status = new_status
+            completed_at = update_payload["completed_at"]
+            transaction_id = update_payload["transaction_id"]
+            manual_approved = update_payload["manual_approved"]
+
+    # Friendly message per terminal state.
+    msg_map = {
+        "pending":          "Waiting for payment confirmation.",
+        "completed":        "Payment confirmed. Points credited.",
+        "completed_manual": "Payment confirmed by reviewer. Points credited.",
+        "needs_review":     "Payment is under review. If you already paid, points will be credited shortly.",
+        "expired":          "Payment session expired. If you already paid, it will be reviewed shortly.",
+    }
+
+    return {
+        "ok":                 True,
+        "intent_id":          intent_id_str,
+        "status":             status,
+        "credited_points":    int(credited_points or 0),
+        "transaction_id":     transaction_id,
+        "matched_student_id": matched_student_id,
+        "completed_at":       completed_at,
+        "manual_approved":    manual_approved,
+        "expires_at":         doc.get("expires_at"),
+        "amount_khr":         doc.get("amount_khr") or doc.get("amount"),
+        "currency":           doc.get("currency") or "KHR",
+        "reference_code":     doc.get("reference_code"),
+        "message":            msg_map.get(status, "Status updated."),
+    }
 
 
 @api.get("/payments/intents/{intent_id}")
@@ -609,19 +886,24 @@ async def get_payment_intent(intent_id: str, admin: User = Depends(require_admin
 # --- Telegram Webhook (automatic ingestion) ---
 
 @api.post("/payments/telegram-webhook")
-async def receive_telegram_webhook(payload: TelegramWebhookPayload):
+async def receive_telegram_webhook(payload: TelegramWebhookPayload, request: Request):
     """Receive a raw PayWay Telegram notification message.
 
     Intended to be called by a Telegram bot or forwarder automation.
-    Optionally protected via PAYMENT_WEBHOOK_SECRET header check if
-    PAYMENT_WEBHOOK_SECRET env var is set.
+    Optionally protected via PAYMENT_WEBHOOK_SECRET env var, accepted as
+    either the JSON body field `secret` OR the `X-Payment-Secret` header.
 
     Does NOT require admin auth so that the forwarder bot can call it
     without a session cookie.
     """
     webhook_secret = os.environ.get("PAYMENT_WEBHOOK_SECRET", "")
     if webhook_secret:
-        provided = payload.secret or ""
+        provided = (
+            payload.secret
+            or request.headers.get("x-payment-secret")
+            or request.headers.get("X-Payment-Secret")
+            or ""
+        )
         if not _pay_secrets.compare_digest(provided, webhook_secret):
             log.warning("payment_bridge: webhook rejected - bad secret")
             raise HTTPException(status_code=403, detail="Invalid webhook secret")
@@ -774,19 +1056,93 @@ async def approve_transaction(
 
     now_str = datetime.now(timezone.utc).isoformat()
     final_status = "completed" if result.get("ok") else "needs_review"
+    points_credited = int((result.get("points_credited") if isinstance(result, dict) else 0) or 0)
     await db.payment_transactions.update_one(
         {"_id": ObjectId(txn_id)},
         {"$set": {
             "status":            final_status,
             "matched_student_id": student_id,
+            "matched_intent_type": intent_type,
+            "credited_points":   points_credited,
             "manually_approved": True,
             "approved_by":       admin.email,
             "approved_at":       now_str,
             "completion_result": result,
             "admin_note":        payload.note,
+            "completed_at":      now_str if result.get("ok") else None,
             "updated_at":        now_str,
         }},
     )
+
+    # ── Sync the related payment_intent so the student's modal can close ──
+    # First try the intent already linked on the txn; if missing, find the
+    # newest pending/expired points intent for this student + amount within
+    # the last 10 minutes (the modal's window of interest).
+    intent_to_close = None
+    if matched_intent_id:
+        try:
+            intent_to_close = await db.payment_intents.find_one(
+                {"_id": ObjectId(matched_intent_id)}
+            )
+        except Exception:
+            intent_to_close = None
+    if intent_to_close is None and result.get("ok") and intent_type == "points":
+        try:
+            window_start = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            amount_khr = int(doc.get("amount", 0))
+            intent_to_close = await db.payment_intents.find_one(
+                {
+                    "student_id": student_id,
+                    "type":       "points",
+                    "amount_khr": amount_khr,
+                    "status":     {"$in": ["pending", "expired"]},
+                    "created_at": {"$gte": window_start},
+                },
+                sort=[("created_at", -1)],
+            )
+        except Exception:
+            intent_to_close = None
+    if intent_to_close is not None and result.get("ok"):
+        await db.payment_intents.update_one(
+            {"_id": intent_to_close["_id"]},
+            {"$set": {
+                "status":           "completed_manual",
+                "transaction_id":   txn_id,
+                "matched_txn_id":   txn_id,
+                "credited_points":  points_credited,
+                "manual_approved":  True,
+                "completed_at":     now_str,
+                "approved_by":      admin.email,
+            }},
+        )
+        log.info(
+            "payment_bridge: manual approval closed intent=%s student=%s pts=%d",
+            str(intent_to_close["_id"]), student_id, points_credited,
+        )
+
+    # ── Idempotent ✅ Top-Up Successful push (manual trigger) ──
+    if result.get("ok") and intent_type == "points":
+        # Re-fetch the txn so the helper sees the freshly stamped row.
+        txn_doc = await db.payment_transactions.find_one({"_id": ObjectId(txn_id)})
+        pkg_label = "Top-Up"
+        try:
+            amount_khr = int(doc.get("amount", 0))
+            pkg = await db.payment_settings.find_one(
+                {"amount_khr": amount_khr, "active": True}
+            )
+            if pkg and pkg.get("label"):
+                pkg_label = pkg.get("label")
+        except Exception:
+            pass
+        await _send_topup_push_once(
+            txn=txn_doc or doc,
+            student_id=student_id,
+            amount_khr=int(doc.get("amount", 0)),
+            points_credited=points_credited,
+            package_label=pkg_label,
+            trigger="manual",
+        )
+
     # Audit log
     await db.payment_audit_log.insert_one({
         "action":     "approve",
