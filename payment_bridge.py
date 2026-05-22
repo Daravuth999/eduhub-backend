@@ -710,6 +710,15 @@ async def reject_transaction(
 
 # --- Points packages (conversion rate settings) ---
 
+@api.get("/payments/packages/public")
+async def list_points_packages_public():
+    """Public read-only endpoint — returns active packages only. No auth required."""
+    docs = await db.payment_settings.find({"active": True}).sort("amount_khr", 1).to_list(100)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return {"ok": True, "packages": docs}
+
+
 @api.get("/payments/settings/points-packages")
 async def list_points_packages(admin: User = Depends(require_admin)):
     """List all points conversion packages."""
