@@ -907,7 +907,8 @@ async def update_points_package(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid pkg_id")
 
-    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    # Use exclude_unset to keep False/0 values but skip truly unset fields
+    updates = {k: v for k, v in payload.model_dump(exclude_unset=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
