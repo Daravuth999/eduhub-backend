@@ -48,7 +48,7 @@ from bson import ObjectId
 # ------ Telegram message parser ---------------------------------------------------------------------------------------------------------------------------------------------
 
 _TRX_PATTERN = _pay_re.compile(
-    r"\$?([\d,]+(?:\.\d+)?)\s*(?:USD)?\s*(?:paid|transferred)\s+by\s+"
+    r"[\$\u17DB]?([\d,]+(?:\.\d+)?)\s*(?:USD|KHR)?\s*(?:paid|transferred)\s+by\s+"
     r"([^\(]+?)\s*(?:\(([^\)]*)\))?\s+on\s+"
     r"([A-Za-z]+ \d+,?\s*\d{1,2}:\d{2}\s*[APap][Mm])\s+"
     r"via\s+([^\s]+(?:\s+[^\s]+)*?)\s+at\s+([^.]+?)\."
@@ -84,7 +84,7 @@ def _parse_payway_message(text: str) -> dict | None:
                 "payer_name":     m.group(2).strip(),
                 "payer_account":  (m.group(3) or "").strip(),
                 "paid_at_raw":    m.group(4).strip(),
-                "payment_method": m.group(5).strip(),
+                "payment_method": m.group(5).strip() if m.lastindex >= 5 else "ABA PAY",
                 "merchant":       m.group(6).strip(),
                 "transaction_id": m.group(7).strip(),
                 "apv":            m.group(8).strip(),
@@ -366,7 +366,7 @@ async def _process_transaction(db, txn_id: str) -> dict:
 
     intent, score, reason = await _find_best_intent(db, txn_doc)
 
-    if score >= 80 and intent:
+    if score >= 50 and intent:
         confidence = "high"
         new_status  = "auto_processing"
     elif score >= 40 and intent:
