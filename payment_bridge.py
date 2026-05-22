@@ -276,20 +276,29 @@ class TransactionRejectPayload(_PM):
     reason: str | None = None
 
 class PointsPackageCreate(_PM):
-    label:          str
-    amount_khr:     int    # Khmer Riel amount
-    points:         int    # points awarded
-    bonus_points:   int = 0
-    min_purchase:   int = 0
-    max_purchase:   int = 0
-    active:         bool = True
-    notes:          str | None = None
+    label:               str
+    amount_khr:          int
+    points:              int
+    bonus_points:        int = 0
+    min_purchase:        int = 0
+    max_purchase:        int = 0
+    active:              bool = True
+    notes:               str | None = None
+    payment_link:        str | None = None
+    discount_pct:        int = 0
+    discount_label:      str | None = None
+    discount_active:     bool = False
+    discount_expires_at: str | None = None
     payment_link:   str | None = None
 
 class PointsPackagePatch(_PM):
-    label:          str | None = None
-    amount_khr:     int | None = None
-    points:         int | None = None
+    label:               str | None = None
+    amount_khr:          int | None = None
+    points:              int | None = None
+    discount_pct:        int | None = None
+    discount_label:      str | None = None
+    discount_active:     bool | None = None
+    discount_expires_at: str | None = None
     bonus_points:   int | None = None
     min_purchase:   int | None = None
     max_purchase:   int | None = None
@@ -834,9 +843,29 @@ async def reject_transaction(
 @api.get("/payments/packages/public")
 async def list_points_packages_public():
     """Public read-only endpoint - returns active packages only. No auth required."""
+    from datetime import datetime, timezone as _tz
+    now = datetime.now(_tz.utc)
     docs = await db.payment_settings.find({"active": True}).sort("amount_khr", 1).to_list(100)
     for d in docs:
         d["_id"] = str(d["_id"])
+        pct = int(d.get("discount_pct", 0) or 0)
+        on  = bool(d.get("discount_active", False))
+        exp = d.get("discount_expires_at")
+        if exp:
+            try:
+                e = datetime.fromisoformat(exp)
+                if e.tzinfo is None: e = e.replace(tzinfo=_tz.utc)
+                if e < now: on = False
+            except Exception: pass
+        orig = int(d.get("amount_khr", 0))
+        if on and pct > 0:
+            d["discount_active_live"] = True
+            d["discounted_amount_khr"] = max(100, int(orig * (1 - pct / 100)))
+            d["original_amount_khr"]  = orig
+        else:
+            d["discount_active_live"] = False
+            d["discounted_amount_khr"] = orig
+            d["original_amount_khr"]  = orig
     return {"ok": True, "packages": docs}
 
 
