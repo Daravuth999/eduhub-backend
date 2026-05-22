@@ -1,4 +1,4 @@
-"""EduHub Author Studio backend (FastAPI + MongoDB).
+﻿"""EduHub Author Studio backend (FastAPI + MongoDB).
 
 Dynamic CMS layered on top of the existing Google-Sheets driven library.
 The frontend merges the two sources at read time so every existing sheet
@@ -19,13 +19,13 @@ from typing import Any, Literal
 import json
 import httpx
 
-# ── LUCKY DRAW SURGERY ─────────────────────────────────────────────────
+# â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from lucky_draw import (
     register_lucky_draw_routes,
     generate_and_publish_lucky_code,
     ensure_lucky_draw_indexes,
 )
-# ───────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import (APIRouter, Cookie, Depends, FastAPI, File, Form, Header,
@@ -74,7 +74,7 @@ ELEVENLABS_DEFAULT_VOICE = os.environ.get(
 _VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{20}$")
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_v3")
 
-# Public-facing backend URL — used to build absolute audio stream URLs
+# Public-facing backend URL â€” used to build absolute audio stream URLs
 # so both the student PWA (vercel.app) and Author Studio can play the audio.
 # Set in Render env vars as PUBLIC_BACKEND_URL.
 PUBLIC_BACKEND_URL = os.environ.get(
@@ -286,7 +286,7 @@ async def require_admin(user: User = Depends(require_user)) -> User:
 async def _elevenlabs_generate(text: str, voice_id: str) -> dict:
     """Call ElevenLabs text-to-speech with-timestamps endpoint.
     Returns { audio_base64, word_timestamps } or raises HTTPException.
-    Never called by students — teacher-side only.
+    Never called by students â€” teacher-side only.
     """
     if not ELEVENLABS_API_KEY:
         raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY not configured.")
@@ -618,7 +618,7 @@ async def studio_list_voices(admin: User = Depends(require_admin)):
     """List available ElevenLabs voices for the teacher voice picker.
 
     Teacher-side only (require_admin). The xi-api-key never leaves the
-    server — the browser only receives sanitized {voice_id, name, ...}.
+    server â€” the browser only receives sanitized {voice_id, name, ...}.
     """
     if not ELEVENLABS_API_KEY:
         raise HTTPException(
@@ -665,17 +665,17 @@ async def studio_audio_stream(audio_filename: str, request: Request):
     """Stream AI-generated audio from MongoDB GridFS with proper Range
     support.
 
-    Public — no auth required so student PWA can play it directly.
+    Public â€” no auth required so student PWA can play it directly.
 
     v10 (2026-05) surgical audio fix:
       Previously this endpoint advertised `Accept-Ranges: bytes` but
       IGNORED the actual `Range:` request header and always streamed the
       entire file from byte 0. iOS Safari (and any HTML5 <audio> after a
-      pause/seek/network blip) sends `Range: bytes=<pos>-` to resume —
+      pause/seek/network blip) sends `Range: bytes=<pos>-` to resume â€”
       the old code answered every such request with the full file from
       offset 0, which made resume / seek / scrub appear to "restart"
       audio for the student. Combined with the ID3 stitcher bug above,
-      this produced the visible "audio cuts off after 1–2 minutes" bug.
+      this produced the visible "audio cuts off after 1â€“2 minutes" bug.
 
       Now: parse Range, seek into the GridFS stream, and return either a
       proper 206 Partial Content or a 200 with Content-Length. Other
@@ -701,7 +701,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
             except Exception:
                 pass
         remaining = end - start + 1
-        # 64 KiB chunks — small enough for low-memory iOS PWA, big enough
+        # 64 KiB chunks â€” small enough for low-memory iOS PWA, big enough
         # to keep the wire warm.
         chunk_size = 64 * 1024
         while remaining > 0:
@@ -711,7 +711,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
             yield data
             remaining -= len(data)
 
-    # No Range header → standard 200 with Content-Length when known.
+    # No Range header â†’ standard 200 with Content-Length when known.
     if not range_header or total_size <= 0:
         async def _full_iter():
             chunk_size = 64 * 1024
@@ -736,7 +736,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
     # Parse "bytes=START-END" / "bytes=START-" / "bytes=-SUFFIX".
     m = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", range_header, re.IGNORECASE)
     if not m:
-        # Unparseable Range — respond with the full file as a fallback.
+        # Unparseable Range â€” respond with the full file as a fallback.
         return StreamingResponse(
             _range_iter(0, total_size - 1),
             media_type="audio/mpeg",
@@ -749,7 +749,7 @@ async def studio_audio_stream(audio_filename: str, request: Request):
 
     start_s, end_s = m.group(1), m.group(2)
     if start_s == "" and end_s == "":
-        # "bytes=-" with both sides empty is invalid → 416
+        # "bytes=-" with both sides empty is invalid â†’ 416
         return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
     if start_s == "":
         # Suffix range: last N bytes.
@@ -791,7 +791,7 @@ async def studio_elevenlabs_generate(
     Saves a new book revision to MongoDB.
     """
     chapter_index = int(payload.get("chapterIndex", 0))
-    # Defensive: reject human-readable names like "Rachel" — ElevenLabs
+    # Defensive: reject human-readable names like "Rachel" â€” ElevenLabs
     # requires a 20-char alphanumeric voice_id. If the client somehow sends
     # anything else (stale cached frontend, manual API caller, etc.), fall
     # back to the configured default instead of 404-ing.
@@ -801,12 +801,12 @@ async def studio_elevenlabs_generate(
     else:
         if raw_voice:
             log.warning(
-                "elevenlabs: rejected invalid voice value %r — using default %s",
+                "elevenlabs: rejected invalid voice value %r â€” using default %s",
                 raw_voice, ELEVENLABS_DEFAULT_VOICE,
             )
         voice_id = ELEVENLABS_DEFAULT_VOICE
 
-    # Define now early — used in GridFS metadata and ai_voice meta below
+    # Define now early â€” used in GridFS metadata and ai_voice meta below
     now = datetime.now(timezone.utc).isoformat()
 
     # Load current book (latest revision).
@@ -859,11 +859,11 @@ async def studio_elevenlabs_generate(
     audio_b64 = result["audio_base64"]
     word_timestamps = result["word_timestamps"]
 
-    # Upload MP3 to MongoDB GridFS — avoids storing multi-MB base64 inline
+    # Upload MP3 to MongoDB GridFS â€” avoids storing multi-MB base64 inline
     # which crashes the frontend when the book document is loaded.
     # FIX v9.9: motor's GridFSBucket.upload_from_stream() requires a file-like
     # object with a .read() method. Passing raw bytes raises
-    # AttributeError: 'bytes' object has no attribute 'read' — which manifests
+    # AttributeError: 'bytes' object has no attribute 'read' â€” which manifests
     # as a 500 (no CORS headers) and looks like a CORS error in the browser.
     audio_bytes = base64.b64decode(audio_b64)
     audio_id = str(uuid.uuid4())
@@ -896,7 +896,7 @@ async def studio_elevenlabs_generate(
     blocks.append({
         "type": "audio",
         "text": audio_url,
-        "heading": f"AI Voice — {chapter.get('title', 'Chapter')}",
+        "heading": f"AI Voice â€” {chapter.get('title', 'Chapter')}",
         "_elevenlabs_audio": True,
         "_audio_id": audio_id,
     })
@@ -937,7 +937,7 @@ async def studio_elevenlabs_generate(
         "word_count": len(word_timestamps),
     }
 
-    # Save new revision (append-only — same as studio_save_book)
+    # Save new revision (append-only â€” same as studio_save_book)
     latest = await db.books.find_one(
         {"slug": slug}, {"_id": 0, "revision": 1},
         sort=[("revision", -1)]
@@ -1623,7 +1623,7 @@ SL_TREASURY_ID       = os.environ.get("SL_TREASURY_ID", "stu092")
 SL_TREASURY_PASSWORD = os.environ.get("SL_TREASURY_PASSWORD", "")
 
 
-# Portal GAS backend URL — used for server-to-server password sync after reset.
+# Portal GAS backend URL â€” used for server-to-server password sync after reset.
 # Set in Render env vars. Falls back to the same URL the frontend already uses.
 GAS_PORTAL_URL = os.environ.get(
     "GAS_PORTAL_URL",
@@ -1635,14 +1635,14 @@ GAS_PORTAL_URL = os.environ.get(
 # Generate any long random string: python3 -c "import secrets; print(secrets.token_hex(32))"
 GAS_ADMIN_SECRET = os.environ.get("GAS_ADMIN_SECRET", "")
 
-# Evaluation GAS backend URL — used for archiving student evaluation rows
+# Evaluation GAS backend URL â€” used for archiving student evaluation rows
 # on deactivation. Set in Render env vars as GAS_EVAL_URL.
 GAS_EVAL_URL = os.environ.get(
     "GAS_EVAL_URL",
     "https://script.google.com/macros/s/AKfycbxqGH9JuGhVn9V5UuhYeOOyI-vk7E41jXm0hrVp9Pj-Ukuw_HcNcR0C8bflmFTPq1YRDA/exec",
 )
 
-# PasswordSync GAS URL — standalone script that handles syncPassword, syncName.
+# PasswordSync GAS URL â€” standalone script that handles syncPassword, syncName.
 # Writes to Sheet 1 (16L90CI5j - Main Database): Password, Name columns only.
 # Set in Render env vars as GAS_SYNC_URL.
 GAS_SYNC_URL = os.environ.get(
@@ -1650,7 +1650,7 @@ GAS_SYNC_URL = os.environ.get(
     "https://script.google.com/macros/s/AKfycbx1GGyX0Nfz6SYVvkeY_99g4lAKaDmPgeF2EwQFNgX82RjpNWgYJlxMyu2R3lQtCuG4Wg/exec",
 )
 
-# Tuition GAS URL — Evaluation sheet GAS script that owns TuitionStatus,
+# Tuition GAS URL â€” Evaluation sheet GAS script that owns TuitionStatus,
 # LastPaymentDate, NextDueDate columns in Sheet 2 (1oATjsiZio).
 # This is where updateTuition must be added and called.
 # Set in Render env vars as GAS_TUITION_URL.
@@ -1949,10 +1949,10 @@ async def push_notify_credit(
         raise HTTPException(status_code=500, detail="log insert failed")
 
     # ---- Server-rendered Khmer + English template ------------------------
-    title = f"\U0001F389 +{payload.amount} ពិន្ទុ! / Points Credited!"
+    title = f"\U0001F389 +{payload.amount} áž–áž·áž“áŸ’áž‘áž»! / Points Credited!"
     body = (
-        f"អ្នកបានទទួលពិន្ទុ +{payload.amount} ✨\n"
-        f"រៀនបន្ត ហើយដោះសោរង្វាន់!\n"
+        f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.amount} âœ¨\n"
+        f"ážšáŸ€áž“áž”áž“áŸ’áž áž áž¾áž™ážŠáŸ„áŸ‡ážŸáŸ„ážšáž„áŸ’ážœáž¶áž“áŸ‹!\n"
         f"+{payload.amount} points added to your account. Keep learning!"
     )
     url_target = "/portal/me"
@@ -1997,16 +1997,16 @@ async def push_notify_credit(
         sent, failed, source, payload.amount, recipient_id[:32], sender_id[:32],
     )
 
-    # ── Speaking Lab live roster hook ─────────────────────────────────────
+    # â”€â”€ Speaking Lab live roster hook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # If this transfer goes to the treasury (stu092), check if the sender
     # is paying an entry fee for an active session.  If so, their name
-    # appears on the teacher board automatically — no manual join needed.
+    # appears on the teacher board automatically â€” no manual join needed.
     TREASURY_ID = "stu092"
     if recipient_id == TREASURY_ID and not is_self_detect:
         asyncio.create_task(
             _sl_try_auto_enter(sender_id, payload.amount)
         )
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     return {"sent": sent, "failed": failed, "duplicate": False}
 
@@ -2816,9 +2816,9 @@ async def teacher_push_points(
         if payload.delta > 0:
             sent, failed = await _fan_out_push(
                 {"studentId": student_id},
-                title=f"\U0001F389 +{payload.delta} ពិន្ទុ! / Points!",
+                title=f"\U0001F389 +{payload.delta} áž–áž·áž“áŸ’áž‘áž»! / Points!",
                 body=(
-                    f"អ្នកបានទទួលពិន្ទុ +{payload.delta} ✨\n"
+                    f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.delta} âœ¨\n"
                     f"You received +{payload.delta} points. Keep it up!"
                 ),
                 url="/portal",
@@ -3146,7 +3146,7 @@ async def _archive_student_in_gas(clean_id: str) -> bool:
     if not GAS_EVAL_URL or not GAS_ADMIN_SECRET:
         log.warning(
             "archive-student: GAS_EVAL_URL or GAS_ADMIN_SECRET not set "
-            "— rows NOT archived for %s.", clean_id,
+            "â€” rows NOT archived for %s.", clean_id,
         )
         return False
     try:
@@ -3176,7 +3176,7 @@ async def _archive_student_in_gas(clean_id: str) -> bool:
         log.warning("archive-student: GAS did not confirm for %s", clean_id)
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("archive-student: GAS unreachable for %s — %s", clean_id, exc)
+        log.warning("archive-student: GAS unreachable for %s â€” %s", clean_id, exc)
         return False
 
 
@@ -3185,19 +3185,19 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
 
     This keeps the Google Sheet credential in sync with MongoDB after a
     teacher-initiated password reset.  The Sheet password is what GAS
-    PointsBackend / GameBackend / PortalBackend validate against — without
+    PointsBackend / GameBackend / PortalBackend validate against â€” without
     this sync, those backends keep accepting the OLD password forever, which
     is fine for read-only data but breaks any write that re-authenticates
     (sendPoints, library purchase, etc.) once the student changes their login.
 
-    Never raises — a GAS outage must never block or roll back the MongoDB
+    Never raises â€” a GAS outage must never block or roll back the MongoDB
     reset.  Returns True if the GAS confirmed success, False otherwise.
     The caller logs the outcome; the student always gets their new password
     regardless.
     """
     if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         log.warning(
-            "password-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set — "
+            "password-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set â€” "
             "Sheet password NOT updated for %s. Set both env vars to enable sync.",
             clean_id,
         )
@@ -3227,7 +3227,7 @@ async def _sync_password_to_gas(clean_id: str, plain_password: str) -> bool:
         log.warning("password-sync: GAS did not confirm for %s", clean_id)
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("password-sync: GAS unreachable for %s — %s", clean_id, exc)
+        log.warning("password-sync: GAS unreachable for %s â€” %s", clean_id, exc)
         return False
 
 
@@ -3236,11 +3236,11 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
 
     Called on ID reactivation so the previous student's name is overwritten.
     Without this, getStudentData returns the old occupant's name forever.
-    Never raises — a GAS outage must never block reactivation.
+    Never raises â€” a GAS outage must never block reactivation.
     """
     if not GAS_SYNC_URL or not GAS_ADMIN_SECRET:
         log.warning(
-            "name-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set — "
+            "name-sync: GAS_SYNC_URL or GAS_ADMIN_SECRET not set â€” "
             "Sheet name NOT updated for %s.", clean_id,
         )
         return False
@@ -3269,7 +3269,7 @@ async def _sync_name_to_gas(clean_id: str, display_name: str) -> bool:
         log.warning("name-sync: GAS did not confirm for %s", clean_id)
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("name-sync: GAS unreachable for %s — %s", clean_id, exc)
+        log.warning("name-sync: GAS unreachable for %s â€” %s", clean_id, exc)
         return False
 
 
@@ -3342,10 +3342,10 @@ async def teacher_create_student(
         action = "created"
 
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
-    # Fire-and-forget GAS syncs — never block the credential card response.
+    # Fire-and-forget GAS syncs â€” never block the credential card response.
     import asyncio as _asyncio_create
     _asyncio_create.create_task(_sync_password_to_gas(clean_id, plain_password))
-    # Always sync the name to GAS — on reactivation this overwrites the previous
+    # Always sync the name to GAS â€” on reactivation this overwrites the previous
     # occupant's stale name; on brand-new creation this ensures the GAS sheet row
     # (which may exist from a pre-MongoDB migration) shows the correct new name.
     _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
@@ -3389,7 +3389,7 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                     try:
                         gas_data = r.json()
                         # GAS may return [{id, name, group, level, schedule, ...}]
-                        # or {students: [...]} — handle both
+                        # or {students: [...]} â€” handle both
                         raw = gas_data if isinstance(gas_data, list) else gas_data.get("students") or gas_data.get("data") or []
                         for row in raw:
                             if not isinstance(row, dict):
@@ -3442,7 +3442,7 @@ async def teacher_update_student(
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     # Fetch the doc BEFORE updating so we have clean_id for the GAS sync.
-    # clean_id is the Google Sheets student row key — student_id is the internal
+    # clean_id is the Google Sheets student row key â€” student_id is the internal
     # MongoDB UUID and is NOT what GAS stores.
     doc = await db.students.find_one(
         {"student_id": student_id}, {"_id": 0, "clean_id": 1},
@@ -3458,7 +3458,7 @@ async def teacher_update_student(
 
     # If display_name was updated, mirror it to Google Sheets so that GAS
     # getStudentData, Tuition Reminder, and the Portal all see the new name.
-    # Fire-and-forget — a GAS outage must never block or roll back the update.
+    # Fire-and-forget â€” a GAS outage must never block or roll back the update.
     if "display_name" in updates:
         import asyncio as _asyncio_patch
         _asyncio_patch.create_task(
@@ -3486,7 +3486,7 @@ async def teacher_reset_password(
         {"student_id": student_id}, {"_id": 0, "password_hash": 0},
     )
     log.info("teacher: password reset for %s by %s", student_id, admin.email)
-    # Fire-and-forget — never delay the credential card response.
+    # Fire-and-forget â€” never delay the credential card response.
     import asyncio as _asyncio_reset
     _asyncio_reset.create_task(_sync_password_to_gas(doc["clean_id"], plain_password))
 
@@ -3511,18 +3511,18 @@ async def _update_tuition_in_gas(
     """Write TuitionStatus / LastPaymentDate / NextDueDate (and optionally
     PaymentAmount) to the Students tab in GAS.
 
-    SAFE COLUMNS ONLY — never touches StudentID, Name, Password, restriction,
+    SAFE COLUMNS ONLY â€” never touches StudentID, Name, Password, restriction,
     evaluation scores, month tabs, Archive tab, Comments, Coupons, Redemptions,
     Strength / Weakness / Improvement.
 
     Returns {"ok": True} on confirmed GAS success.
-    Raises RuntimeError with a human-readable message on any failure — the
+    Raises RuntimeError with a human-readable message on any failure â€” the
     caller MUST surface this; never fake success.
     """
     if not GAS_TUITION_URL or not GAS_ADMIN_SECRET:
         raise RuntimeError(
             "updateTuition: GAS_TUITION_URL or GAS_ADMIN_SECRET not configured "
-            "— set both Render env vars to enable tuition management."
+            "â€” set both Render env vars to enable tuition management."
         )
     payload: dict = {
         "action": "updateTuition",
@@ -3556,8 +3556,8 @@ async def _update_tuition_in_gas(
                 err_msg = j.get("message") or j.get("error") or j.get("detail") or "GAS returned ok:false"
                 raise RuntimeError(f"GAS update failed: {err_msg}")
             except (ValueError, AttributeError):
-                raise RuntimeError("GAS returned non-JSON response — update may not have applied")
-        raise RuntimeError(f"GAS HTTP {r.status_code} — update not applied")
+                raise RuntimeError("GAS returned non-JSON response â€” update may not have applied")
+        raise RuntimeError(f"GAS HTTP {r.status_code} â€” update not applied")
     except RuntimeError:
         raise
     except Exception as exc:
@@ -3570,14 +3570,14 @@ async def teacher_update_tuition(
     payload: dict,
     admin: User = Depends(require_admin),
 ):
-    """Controlled tuition update — teacher clicks Mark Paid / Mark Unpaid /
+    """Controlled tuition update â€” teacher clicks Mark Paid / Mark Unpaid /
     Extend 1 Month / Set Custom Due Date.
 
     Accepted actions:
-        mark_paid          — sets Paid, today as LastPaymentDate, safe NextDueDate
-        mark_unpaid        — sets Unpaid, clears LastPaymentDate
-        extend_one_month   — adds 1 month to NextDueDate (today if overdue/missing)
-        set_custom_due_date — sets NextDueDate to caller-provided YYYY-MM-DD
+        mark_paid          â€” sets Paid, today as LastPaymentDate, safe NextDueDate
+        mark_unpaid        â€” sets Unpaid, clears LastPaymentDate
+        extend_one_month   â€” adds 1 month to NextDueDate (today if overdue/missing)
+        set_custom_due_date â€” sets NextDueDate to caller-provided YYYY-MM-DD
 
     NEVER writes: StudentID, Name, Password, restriction, evaluation scores,
     month tabs, Archive, Comments, Coupons, Redemptions, Strength/Weakness/Improvement.
@@ -3646,7 +3646,7 @@ async def teacher_update_tuition(
             # Advance from the existing future/today due date
             next_due_date = _fmt(_add_one_month(current_ndd))
         else:
-            # Overdue or missing — advance from today
+            # Overdue or missing â€” advance from today
             next_due_date = _fmt(_add_one_month(today))
         # Optional: carry explicit PaymentAmount if provided
         if payload.get("paymentAmount") is not None:
@@ -3674,7 +3674,7 @@ async def teacher_update_tuition(
             )
         next_due_date = _fmt(custom)
 
-    # Call GAS — surface any failure as 502
+    # Call GAS â€” surface any failure as 502
     try:
         gas_result = await _update_tuition_in_gas(
             clean_id=clean_id,
@@ -3724,7 +3724,7 @@ async def teacher_deactivate_student(
         raise HTTPException(status_code=404, detail="Student not found")
     await db.student_sessions.delete_many({"student_id": student_id})
 
-    # Archive GAS evaluation rows — true fire-and-forget via create_task so the
+    # Archive GAS evaluation rows â€” true fire-and-forget via create_task so the
     # 15-second GAS timeout NEVER blocks this endpoint.
     import asyncio as _asyncio_deact
     _asyncio_deact.create_task(_archive_student_in_gas(doc["clean_id"]))
@@ -3798,7 +3798,7 @@ async def studio_audio_migrate_inline(admin: User = Depends(require_admin)):
 
 
 app.include_router(_build_status_router(db, _fan_out_push, require_admin))
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
     """Auto-enter a student into the active Speaking Lab session when they
@@ -3807,7 +3807,7 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
     try:
         # 1. Look up sender's display name and schedule from db.students
         #    GAS uses clean_id (e.g. "stu094") as the sender ID.
-        #    MongoDB stores both clean_id and student_id — try both.
+        #    MongoDB stores both clean_id and student_id â€” try both.
         student_doc = await db.students.find_one(
             {"$or": [{"clean_id": sender_id}, {"student_id": sender_id}]},
             {"display_name": 1, "name": 1, "group": 1, "schedule": 1, "clean_id": 1, "_id": 0},
@@ -3856,7 +3856,7 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
         session_id = session_doc["session_id"]
         display_name_key = display_name.lower()
 
-        # 3. Deduplicate — don't add the same student twice
+        # 3. Deduplicate â€” don't add the same student twice
         existing = await SL_ENTRIES.find_one(
             {"session_id": session_id, "display_name_key": display_name_key}
         )
@@ -3886,14 +3886,14 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
         })
 
 
-        # ── LUCKY DRAW SURGERY ─────────────────────────────────────────
+        # â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # The same P2P payment that put the student on the roster also
-        # buys their lucky code. Fire-and-forget — never blocks /enter.
+        # buys their lucky code. Fire-and-forget â€” never blocks /enter.
         await generate_and_publish_lucky_code(
             db, _sl_publish, session_id, sender_id, display_name,
             amount=amount, log=log,
         )
-        # ───────────────────────────────────────────────────────────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         log.info(
             "sl.auto_enter: %s (pos=%d) entered session %s via P2P fee=%d",
@@ -3902,15 +3902,15 @@ async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
     except Exception as exc:
         log.warning("sl.auto_enter error: %s", str(exc)[:200])
 
-# SPEAKING LAB — Live session, SSE roster, points grant
-# Added safely — no existing function modified.
-# ═══════════════════════════════════════════════════════════════════════════
+# SPEAKING LAB â€” Live session, SSE roster, points grant
+# Added safely â€” no existing function modified.
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 # Collection aliases
 SL_SESSIONS = db.speaking_lab_sessions
 SL_ENTRIES  = db.speaking_lab_entries
 
-# ── Pydantic models ───────────────────────────────────────────────────────
+# â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SLSessionCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -3935,7 +3935,7 @@ class SLAttendancePayload(BaseModel):
     date: str
     present: list[str]
 
-# ── SSE pub/sub (in-process, single Render instance) ─────────────────────
+# â”€â”€ SSE pub/sub (in-process, single Render instance) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _sl_subs: dict[str, set[asyncio.Queue]] = {}
 _sl_lock = asyncio.Lock()
@@ -3952,7 +3952,7 @@ async def _sl_publish(session_id: str, event: dict) -> None:
 def _sl_sse(event: dict) -> bytes:
     return ("data: " + json.dumps(event) + chr(10) + chr(10)).encode()
 
-# ── Points grant ──────────────────────────────────────────────────────────
+# â”€â”€ Points grant â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @api.post("/points/grant")
 async def sl_grant_points(
@@ -3968,7 +3968,7 @@ async def sl_grant_points(
     if not SL_TREASURY_PASSWORD:
         raise HTTPException(
             status_code=503,
-            detail="SL_TREASURY_PASSWORD not set on Render — add it in Environment settings.",
+            detail="SL_TREASURY_PASSWORD not set on Render â€” add it in Environment settings.",
         )
 
     # 1. Resolve student clean_id (push subscriptions use clean_id)
@@ -3978,7 +3978,7 @@ async def sl_grant_points(
     )
     student_clean_id = (stu_doc or {}).get("clean_id") or payload.studentID
 
-    # 2. Call GAS sendPoints — treasury → student (real balance transfer)
+    # 2. Call GAS sendPoints â€” treasury â†’ student (real balance transfer)
     nonce = secrets.token_hex(12)
     gas_payload = {
         "action":     "sendPoints",
@@ -4083,7 +4083,7 @@ async def sl_delete_questions(admin: User = Depends(require_admin)):
     await db.speaking_lab_settings.delete_one({"_id": "questions"})
     return {"ok": True, "reset": True}
 
-# ── Settings ──────────────────────────────────────────────────────────────
+# â”€â”€ Settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @api.get("/speaking-lab/settings")
 async def sl_get_settings(admin: User = Depends(require_admin)):
@@ -4100,7 +4100,7 @@ async def sl_save_settings(payload: dict, admin: User = Depends(require_admin)):
     )
     return {"ok": True, **data}
 
-# ── Attendance ────────────────────────────────────────────────────────────
+# â”€â”€ Attendance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @api.get("/speaking-lab/attendance")
 async def sl_get_attendance(
@@ -4132,7 +4132,7 @@ async def sl_save_attendance(
     )
     return {"ok": True}
 
-# ── Live sessions ─────────────────────────────────────────────────────────
+# â”€â”€ Live sessions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @api.post("/speaking-lab/sessions")
 async def sl_create_session(
@@ -4237,10 +4237,10 @@ async def sl_stream_session(
         },
     )
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # END SPEAKING LAB
 
-# ── LUCKY DRAW SURGERY ─────────────────────────────────────────────────
+# â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 register_lucky_draw_routes(
     api, db, _sl_publish,
     gas_url=GAS_POINTS_LOGIN_URL,
@@ -4249,7 +4249,7 @@ register_lucky_draw_routes(
     log=log,
     require_admin=require_admin,
 )
-# ───────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.add_middleware(
     CORSMiddleware,
@@ -4274,7 +4274,7 @@ app.add_middleware(
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.on_event("startup")
 async def startup():
@@ -4304,9 +4304,9 @@ async def startup():
     await db.speaking_lab_entries.create_index([("session_id", 1), ("display_name_key", 1)], unique=True)
     await db.speaking_lab_settings.create_index("_id")
     await db.speaking_lab_attendance.create_index([("schedule", 1), ("date", 1)], unique=True)
-    # ── LUCKY DRAW SURGERY ──
+    # â”€â”€ LUCKY DRAW SURGERY â”€â”€
     await ensure_lucky_draw_indexes(db)
-    # ────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Coupon system indexes
     await db.coupons.create_index("code", unique=True)
     await db.coupons.create_index("enabled")
@@ -4332,13 +4332,13 @@ async def shutdown():
     client.close()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# COUPON SYSTEM — v1.0 (append-only, zero existing routes modified)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# COUPON SYSTEM â€” v1.0 (append-only, zero existing routes modified)
 # Collections: coupons
 # Endpoints: POST/GET/PATCH/DELETE /api/coupons  (admin)
 #            POST /api/coupons/validate           (student)
 #            POST /api/coupons/redeem             (student)
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 import secrets as _secrets_coupon
 import string  as _string_coupon
@@ -4407,7 +4407,7 @@ async def _find_valid_coupon(
     return doc
 
 
-# ── Admin endpoints ──────────────────────────────────────────────────────
+# â”€â”€ Admin endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @api.post("/coupons")
 async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
@@ -4484,7 +4484,7 @@ async def delete_coupon(code: str, admin: User = Depends(require_admin)):
     return {"ok": True}
 
 
-# ── Student endpoints ────────────────────────────────────────────────────
+# â”€â”€ Student endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @api.post("/coupons/validate")
 async def validate_coupon(payload: dict):
@@ -4532,7 +4532,7 @@ async def redeem_coupon(payload: dict):
     discounted = _calc_discount(original, coupon)
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Atomic increment with max_uses guard — prevents race conditions
+    # Atomic increment with max_uses guard â€” prevents race conditions
     max_uses = coupon.get("max_uses")
     query: dict = {"code": code.upper()}
     if max_uses is not None:
@@ -4567,8 +4567,8 @@ async def redeem_coupon(payload: dict):
     }
 
 
-# ── END COUPON SYSTEM ──────────────────────────────────────────────────────
-# NOTE: # -- PAYMENT BRIDGE SURGERY (append only � zero existing code modified) -------
+# â”€â”€ END COUPON SYSTEM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── PAYMENT BRIDGE SURGERY (append only - zero existing code modified) ───────
 exec(open(Path(__file__).parent / "payment_bridge.py").read())
 # -----------------------------------------------------------------------------
 
@@ -4577,25 +4577,25 @@ app.include_router(api) has been moved to the END of this file
 # are registered before the router is attached to the app.
 """
 server_conversation_patch.py
-═══════════════════════════════════════════════════════════════════════════════
+â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 INTEGRATION INSTRUCTIONS:
   1. Open server.py
   2. Find the line: `async def _elevenlabs_generate(text: str, voice_id: str)`
      (around line 286)
   3. After the closing of that function (around line 340), paste everything
-     below the "# ─── PASTE HERE ───" marker.
+     below the "# â”€â”€â”€ PASTE HERE â”€â”€â”€" marker.
   4. Add the new route alongside the existing /elevenlabs route (around line 690).
   5. Add `pydub>=0.25.1` to requirements.txt
 
-EXISTING FUNCTION NOT MODIFIED — only new functions and one new endpoint added.
-═══════════════════════════════════════════════════════════════════════════════
+EXISTING FUNCTION NOT MODIFIED â€” only new functions and one new endpoint added.
+â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 """
 
-# ─── PASTE HERE (after _elevenlabs_generate function, before first @api route) ───
+# â”€â”€â”€ PASTE HERE (after _elevenlabs_generate function, before first @api route) â”€â”€â”€
 
-# ─────────────────────────────────────────────────────────────────────────── #
-#  Conversation Voice Studio helpers — teacher-side only                       #
-# ─────────────────────────────────────────────────────────────────────────── #
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
+#  Conversation Voice Studio helpers â€” teacher-side only                       #
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
 
 EMOTION_ACTING_NOTES: dict = {
     "neutral":   None,
@@ -4628,10 +4628,10 @@ def _strip_id3_tags(buf: bytes) -> bytes:
       ElevenLabs returns each TTS segment as a self-contained .mp3 file
       with its own ID3v2 header and (sometimes) an ID3v1 trailer. Naively
       byte-concatenating those segments produces a file with MULTIPLE
-      embedded ID3 headers — iOS AVFoundation reads only the first
+      embedded ID3 headers â€” iOS AVFoundation reads only the first
       header's reported duration (== duration of segment 1) and stops
       playback once currentTime crosses that value. Result: conversation
-      audio mysteriously cuts off after 1–2 minutes on every iPhone /
+      audio mysteriously cuts off after 1â€“2 minutes on every iPhone /
       iPad / Mac-Safari client. Chromium-family browsers are lenient and
       keep decoding past the bogus duration, which is why the bug never
       reproduced on desktop QA.
@@ -4666,16 +4666,16 @@ def _strip_id3_tags(buf: bytes) -> bytes:
 def _stitch_mp3_segments(segments):
     """Concatenate MP3 byte segments into one continuous decodable file.
 
-    v10 (2026-05) surgical audio fix — see _strip_id3_tags() docstring
+    v10 (2026-05) surgical audio fix â€” see _strip_id3_tags() docstring
     for the full root-cause analysis.
 
     Strategy:
-      • Keep the FIRST segment intact (its ID3v2 header — if any — becomes
+      â€¢ Keep the FIRST segment intact (its ID3v2 header â€” if any â€” becomes
         the single header for the stitched file).
-      • For every subsequent segment, strip both the ID3v2 header and the
+      â€¢ For every subsequent segment, strip both the ID3v2 header and the
         ID3v1 trailer so we emit only raw MPEG frames.
 
-    Valid when all segments share the same codec parameters — guaranteed
+    Valid when all segments share the same codec parameters â€” guaranteed
     when every clip comes from ElevenLabs mp3_44100_128 CBR output.
     """
     if not segments:
@@ -4707,10 +4707,10 @@ def _generate_silence_bytes(duration_seconds):
         pass
 
     # Fallback: repeat a minimal silent 128kbps MPEG-1 L3 frame.
-    # Frame holds 1152 samples at 44100 Hz → ~26.1 ms each.
+    # Frame holds 1152 samples at 44100 Hz â†’ ~26.1 ms each.
     # Header bytes: FF FB 90 00 (sync + 128kbps + 44100 + stereo + no padding)
     SILENT_FRAME = b"\xff\xfb\x90\x00" + b"\x00" * 413  # 417 bytes total
-    FRAME_DURATION = 1152 / 44100  # ≈ 0.02613 s
+    FRAME_DURATION = 1152 / 44100  # â‰ˆ 0.02613 s
     n_frames = max(1, int(duration_seconds / FRAME_DURATION) + 1)
     return SILENT_FRAME * n_frames
 
@@ -4719,8 +4719,8 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
     """Generate audio + word timestamps for one dialogue line.
 
     Extended variant of _elevenlabs_generate() that supports:
-      • voice_settings  dict  { stability, similarity_boost, style }
-      • acting_note     str   prepended as ElevenLabs emotion directive
+      â€¢ voice_settings  dict  { stability, similarity_boost, style }
+      â€¢ acting_note     str   prepended as ElevenLabs emotion directive
 
     Returns { audio_base64, word_timestamps, duration }.
     """
@@ -4811,7 +4811,7 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
     }
 
 
-# ─── PASTE NEW ROUTE alongside the existing /elevenlabs route ───────────── #
+# â”€â”€â”€ PASTE NEW ROUTE alongside the existing /elevenlabs route â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
 
 @api.post("/studio/books/{slug}/conversation")
 async def studio_conversation_generate(
@@ -4880,7 +4880,7 @@ async def studio_conversation_generate(
         if not _VOICE_ID_RE.match(raw_voice):
             line["voiceId"] = ELEVENLABS_DEFAULT_VOICE
             log.warning(
-                "conversation: line %d invalid voiceId %r → default", li, raw_voice
+                "conversation: line %d invalid voiceId %r â†’ default", li, raw_voice
             )
 
     audio_segments = []
@@ -4910,7 +4910,7 @@ async def studio_conversation_generate(
             # Log and skip this line rather than aborting the whole generation.
             # This ensures other lines still generate even if one fails.
             log.warning(
-                "conversation: line %d (%s) failed: %s — skipping",
+                "conversation: line %d (%s) failed: %s â€” skipping",
                 li + 1, line.get("speaker", "?"), exc,
             )
             line_results.append({
@@ -4926,7 +4926,7 @@ async def studio_conversation_generate(
 
         raw_audio_b64 = result.get("audio_base64") or ""
         if not raw_audio_b64:
-            log.warning("conversation: line %d (%s) returned empty audio — skipping",
+            log.warning("conversation: line %d (%s) returned empty audio â€” skipping",
                         li + 1, line.get("speaker", "?"))
             line_results.append({
                 "lineIndex": line.get("lineIndex"),
@@ -4942,7 +4942,7 @@ async def studio_conversation_generate(
         try:
             audio_bytes = base64.b64decode(raw_audio_b64)
         except Exception as exc:
-            log.warning("conversation: line %d b64decode failed: %s — skipping", li + 1, exc)
+            log.warning("conversation: line %d b64decode failed: %s â€” skipping", li + 1, exc)
             accumulated_time += pause_after
             continue
 
@@ -4971,7 +4971,7 @@ async def studio_conversation_generate(
             "wordTimestamps": shifted_wts,
         })
 
-        # Note: silence between lines removed — raw MP3 concatenation
+        # Note: silence between lines removed â€” raw MP3 concatenation
         # is cleaner than injecting synthetic frames. ElevenLabs clips
         # already have natural trailing silence.
         accumulated_time = line_end + pause_after
@@ -5029,7 +5029,7 @@ async def studio_conversation_generate(
     blocks.append({
         "type": "audio",
         "text": audio_url,
-        "heading": f"Conversation — {chapter.get('title', 'Chapter')}",
+        "heading": f"Conversation â€” {chapter.get('title', 'Chapter')}",
         "_elevenlabs_audio": True,
         "_conversation_audio": True,
         "_audio_id": audio_id,
@@ -5067,10 +5067,10 @@ async def studio_conversation_generate(
     }
 
 
-# ── Register all api routes with the app ────────────────────────────────────
+# â”€â”€ Register all api routes with the app â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # MUST be the last include_router(api) call so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
-# -- PAYMENT BRIDGE SURGERY (append only � zero existing code modified) -------
+# -- PAYMENT BRIDGE SURGERY (append only — zero existing code modified) -------
 exec(open(Path(__file__).parent / "payment_bridge.py").read())
 # -----------------------------------------------------------------------------
 
