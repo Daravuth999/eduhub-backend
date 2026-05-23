@@ -1292,6 +1292,106 @@ async def delete_points_package(
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Top-Up Popup configuration (Author Studio --- admin controlled)
+# ---------------------------------------------------------------------------
+# Surgical additive endpoints only. Stored as a single document in a NEW
+# lightweight collection `app_settings` keyed by `_id="topup_popup"`.
+# Does NOT touch payment_settings (points packages), payment_intents,
+# payment_transactions, push, coupons, auth, or any unrelated module.
+#
+# Public endpoint returns only safe display/config fields so the PWA can
+# read it without an admin token.  Admin endpoints require require_admin
+# (reuses the existing Studio admin guard).
+# ---------------------------------------------------------------------------
+
+_TOPUP_POPUP_DOC_ID = "topup_popup"
+
+_TOPUP_POPUP_DEFAULTS = {
+    "enabled":                  True,
+    "delay_seconds":            5,
+    "low_balance_threshold":    50,
+    "once_per_session":         True,
+    "headline_km":              "បញ្ចូលពិន្ទុ",
+    "body_km":                  (
+        "ពិន្ទុរបស់អ្នកនៅទាប។ អ្នកអាចបញ្ចូលពិន្ទុបន្ថែម "
+        "ដើម្បីបើកសៀវភៅ និងមុខងារបន្ថែមក្នុង App។"
+    ),
+    "enabled_routes":           ["/", "/library", "/portal", "/portal/me", "/game", "/assistant"],
+}
+
+
+def _coerce_topup_popup_doc(doc: dict | None) -> dict:
+    """Merge a (possibly partial) DB doc with safe defaults so the frontend
+    always receives every key it expects, even if an admin only saved a
+    subset."""
+    out = dict(_TOPUP_POPUP_DEFAULTS)
+    if isinstance(doc, dict):
+        for k, default_val in _TOPUP_POPUP_DEFAULTS.items():
+            if k in doc and doc[k] is not None:
+                v = doc[k]
+                # Light type-coercion so a bad admin save can never crash the
+                # public endpoint or the PWA.
+                try:
+                    if isinstance(default_val, bool):
+                        out[k] = bool(v)
+                    elif isinstance(default_val, int):
+                        out[k] = int(v)
+                    elif isinstance(default_val, list):
+                        out[k] = list(v) if isinstance(v, (list, tuple)) else default_val
+                    else:
+                        out[k] = str(v)
+                except Exception:
+                    out[k] = default_val
+    return out
+
+
+@api.get("/payments/topup-popup-config/public")
+async def get_topup_popup_config_public():
+    """Public read-only endpoint --- returns the current Top-Up popup
+    behaviour config so the PWA SmartTopUpTrigger / PointsTopUpPopup can
+    self-configure.  Safe to call without auth (no admin metadata)."""
+    doc = await db.app_settings.find_one({"_id": _TOPUP_POPUP_DOC_ID})
+    cfg = _coerce_topup_popup_doc(doc)
+    return {"ok": True, "config": cfg}
+
+
+@api.get("/admin/topup-popup-config")
+async def get_topup_popup_config_admin(admin: User = Depends(require_admin)):
+    """Admin read --- returns the current config plus light metadata."""
+    doc = await db.app_settings.find_one({"_id": _TOPUP_POPUP_DOC_ID})
+    cfg = _coerce_topup_popup_doc(doc)
+    meta = {}
+    if isinstance(doc, dict):
+        meta = {
+            "updated_at": doc.get("updated_at"),
+            "updated_by": doc.get("updated_by"),
+        }
+    return {"ok": True, "config": cfg, "meta": meta}
+
+
+@api.put("/admin/topup-popup-config")
+async def put_topup_popup_config_admin(
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Admin update (upsert).  Only known keys are accepted --- anything else
+    is silently dropped to keep the document tidy and tamper-proof."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    # Whitelist + coerce
+    clean = _coerce_topup_popup_doc(payload)
+    clean["_id"] = _TOPUP_POPUP_DOC_ID
+    clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+    clean["updated_by"] = getattr(admin, "email", "admin")
+    await db.app_settings.update_one(
+        {"_id": _TOPUP_POPUP_DOC_ID},
+        {"$set": clean},
+        upsert=True,
+    )
+    return {"ok": True, "config": _coerce_topup_popup_doc(clean)}
+
+
 # --- Dashboard stats ---
 
 @api.get("/payments/dashboard")
