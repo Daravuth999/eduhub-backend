@@ -39,6 +39,20 @@ from starlette.middleware.cors import CORSMiddleware
 
 from content_parser import extract_docx, parse_content
 
+# ── AI Scene Builder (Gemini engine — isolated module) ─────────────────── #
+# gemini_engine.py lives alongside server.py and has zero side-effects.      #
+# If the file is missing the feature is simply disabled; nothing else breaks. #
+try:
+    from gemini_engine import generate_scene as _gemini_generate_scene
+    from gemini_engine import is_enabled as _gemini_enabled
+    from gemini_engine import GEMINI_MODEL
+except ImportError:  # gemini_engine.py not yet deployed
+    async def _gemini_generate_scene(**_kw):  # type: ignore[misc]
+        raise RuntimeError("gemini_engine.py is not installed on this server.")
+    def _gemini_enabled() -> bool:  # type: ignore[misc]
+        return False
+    GEMINI_MODEL = None
+
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
@@ -3793,6 +3807,276 @@ async def studio_audio_migrate_inline(admin: User = Depends(require_admin)):
     return {"ok": True, "fixed_books": fixed_books, "fixed_blocks": fixed_blocks}
 
 
+# ─────────────────────────────────────────────────────────────────────────── #
+# AI SCENE BUILDER — v1.0                                                     #
+# POST /api/studio/books/{slug}/ai-scene                                      #
+#                                                                             #
+# Admin-only. Calls Gemini to generate a structured speaking-first scene.     #
+# Returns preview blocks ONLY — does NOT modify the live book.                #
+# The Author manually reviews and applies blocks via the Studio UI.           #
+#                                                                             #
+# ElevenLabs pipeline: completely untouched.                                  #
+# MongoDB books collection: NOT mutated here.                                 #
+# Students: cannot reach this endpoint (require_admin gate).                  #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+@api.get("/studio/ai-scene-status")
+async def studio_ai_scene_status(admin: User = Depends(require_admin)):
+    """Check if AI Scene Builder is available (GEMINI_API_KEY is set).
+    Safe to call on page load — returns {enabled: bool}.
+    """
+    return {
+        "enabled": _gemini_enabled(),
+        "model": GEMINI_MODEL if _gemini_enabled() else None,
+    }
+
+
+@api.post("/studio/books/{slug}/ai-scene")
+async def studio_ai_scene_generate(
+    slug: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Generate an AI scene preview using Gemini.
+
+    Admin-only. Returns structured preview blocks.
+    Does NOT save or modify the live book.
+    The author must explicitly review and copy blocks into the Editor.
+
+    Request payload:
+        topic            str  — scene topic / context
+        level            str  — "A1" | "A2" | "B1"
+        style            str  — "Adventure"|"Funny"|"Mystery"|"Emotional"|"Classroom"
+        includeKhmer     bool — include Khmer helper metadata (default: false)
+        generateQuiz     bool — include MCQ block (default: true)
+        generateVocab    bool — include vocabulary block (default: true)
+        generateSpeaking bool — include speaking prompt block (default: true)
+
+    Response:
+        { success, sceneId, geminiRaw, previewBlocks, warnings, generatedAt }
+    """
+    if not _gemini_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "AI Scene Builder is not configured. "
+                "Add GEMINI_API_KEY to Render environment variables to enable it."
+            ),
+        )
+
+    # ── Validate request params ─────────────────────────────────────────
+    topic = str(payload.get("topic") or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required.")
+
+    level = str(payload.get("level") or "A2").strip().upper()
+    if level not in ("A1", "A2", "B1"):
+        level = "A2"
+
+    style = str(payload.get("style") or "Adventure").strip().title()
+    if style not in ("Adventure", "Funny", "Mystery", "Emotional", "Classroom"):
+        style = "Adventure"
+
+    include_khmer    = bool(payload.get("includeKhmer", False))
+    generate_quiz    = bool(payload.get("generateQuiz", True))
+    generate_vocab   = bool(payload.get("generateVocab", True))
+    generate_speaking = bool(payload.get("generateSpeaking", True))
+
+    log.info(
+        "ai_scene: generating for slug=%s topic=%r level=%s style=%s admin=%s",
+        slug, topic, level, style, admin.email,
+    )
+
+    # ── Call Gemini (isolated in gemini_engine.py) ──────────────────────
+    scene_id = f"scene_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        gemini_data = await _gemini_generate_scene(
+            topic=topic,
+            level=level,
+            style=style,
+            include_khmer=include_khmer,
+        )
+    except RuntimeError as exc:
+        log.error("ai_scene: Gemini runtime error: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        log.error("ai_scene: Gemini validation error: %s", exc)
+        raise HTTPException(
+            status_code=422,
+            detail=f"AI returned invalid content after 2 attempts. Please retry. ({exc})",
+        ) from exc
+    except Exception as exc:
+        log.exception("ai_scene: unexpected error calling Gemini")
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI Scene generation failed unexpectedly: {type(exc).__name__}",
+        ) from exc
+
+    # ── Convert Gemini output → EduHub-compatible preview blocks ────────
+    # All blocks use EXISTING block types (paragraph, heading, quote, mcq).
+    # Extra underscore-prefixed metadata is silently ignored by the reader.
+    # This is PREVIEW ONLY — no book is modified here.
+
+    warnings: list[str] = []
+    preview_blocks: list[dict] = []
+
+    # 1. Heading — scene title
+    title_text = gemini_data.get("title", "").strip()
+    if title_text:
+        preview_blocks.append({
+            "type": "heading",
+            "text": title_text,
+            "_aiGenerated": True,
+            "_sceneId": scene_id,
+            "_learningFocus": "speaking_fluency",
+        })
+
+    # 2. Paragraph — English story text (PRIMARY speaking content)
+    english_text = gemini_data.get("englishText", "").strip()
+    if english_text:
+        para_block: dict = {
+            "type": "paragraph",
+            "text": english_text,
+            "_aiGenerated": True,
+            "_sceneId": scene_id,
+            "_learningFocus": "speaking_fluency",
+            "_level": level,
+            "_style": style,
+        }
+        # Khmer is stored as HIDDEN metadata only — never a visible paragraph
+        khmer_help = gemini_data.get("optionalKhmerHelp", "").strip()
+        if khmer_help and include_khmer:
+            para_block["_khmerHelp"] = khmer_help
+        preview_blocks.append(para_block)
+    else:
+        warnings.append("Gemini did not return English story text.")
+
+    # 3. Audio script placeholder (author generates real audio via ElevenLabs)
+    audio_script = gemini_data.get("audioScript", "").strip()
+    if audio_script:
+        preview_blocks.append({
+            "type": "paragraph",
+            "text": f"[Audio script — use ElevenLabs to generate audio]\n{audio_script}",
+            "_isAudioScriptPlaceholder": True,
+            "_audioScript": audio_script,
+            "_aiGenerated": True,
+            "_sceneId": scene_id,
+        })
+
+    # 4. Speaking prompt — classroom interaction
+    speaking_prompt = gemini_data.get("speakingPrompt", "").strip()
+    if generate_speaking and speaking_prompt:
+        preview_blocks.append({
+            "type": "quote",
+            "text": f"\U0001f3a4 Speaking Challenge: {speaking_prompt}",
+            "_aiGenerated": True,
+            "_sceneId": scene_id,
+            "_learningFocus": "speaking_fluency",
+            "_blockRole": "speaking_prompt",
+        })
+
+    # 5. Vocabulary list
+    vocab_list = gemini_data.get("vocabulary", [])
+    if generate_vocab and vocab_list:
+        vocab_lines = []
+        for item in vocab_list[:5]:
+            word    = str(item.get("word",    "")).strip()
+            meaning = str(item.get("meaning", "")).strip()
+            if word and meaning:
+                vocab_lines.append(f"\u2022 {word}: {meaning}")
+        if vocab_lines:
+            preview_blocks.append({
+                "type": "paragraph",
+                "text": "\U0001f4da Vocabulary\n" + "\n".join(vocab_lines),
+                "_aiGenerated": True,
+                "_sceneId": scene_id,
+                "_blockRole": "vocabulary",
+            })
+
+    # 6. MCQ comprehension question
+    cq = gemini_data.get("comprehensionQuestion", {})
+    if generate_quiz and isinstance(cq, dict) and cq.get("question"):
+        question      = str(cq.get("question", "")).strip()
+        choices       = cq.get("choices", [])
+        answer        = str(cq.get("answer", "")).strip()
+        valid_choices = [str(c).strip() for c in choices if str(c).strip()]
+        if question and len(valid_choices) >= 2 and answer:
+            preview_blocks.append({
+                "type": "mcq",
+                "question": question,
+                "choices": valid_choices,
+                "answer": answer,
+                "_aiGenerated": True,
+                "_sceneId": scene_id,
+                "_learningFocus": "comprehension",
+            })
+        else:
+            warnings.append("Comprehension question was malformed and was skipped.")
+
+    # 7. Image prompt note (author sources or generates image separately)
+    image_prompt = gemini_data.get("imagePrompt", "").strip()
+    if image_prompt:
+        preview_blocks.append({
+            "type": "paragraph",
+            "text": f"[Image prompt — replace with an image block after sourcing]\n{image_prompt}",
+            "_isImagePromptPlaceholder": True,
+            "_imagePrompt": image_prompt,
+            "_aiGenerated": True,
+            "_sceneId": scene_id,
+        })
+
+    # ── Persist job record (audit trail — non-fatal if it fails) ────────
+    try:
+        await db.ai_scene_jobs.insert_one({
+            "sceneId":       scene_id,
+            "slug":          slug,
+            "status":        "preview_ready",
+            "adminEmail":    admin.email,
+            "topic":         topic,
+            "level":         level,
+            "style":         style,
+            "includeKhmer":  include_khmer,
+            "geminiRaw":     gemini_data,
+            "previewBlocks": preview_blocks,
+            "warnings":      warnings,
+            "createdAt":     now,
+        })
+    except Exception as exc:
+        log.warning("ai_scene: job record insert failed (non-fatal): %s", exc)
+        warnings.append("Job record could not be persisted (preview is still valid).")
+
+    log.info(
+        "ai_scene: preview_ready slug=%s sceneId=%s blocks=%d warnings=%d",
+        slug, scene_id, len(preview_blocks), len(warnings),
+    )
+
+    return {
+        "success":      True,
+        "sceneId":      scene_id,
+        "slug":         slug,
+        "geminiRaw":    gemini_data,
+        "previewBlocks": preview_blocks,
+        "warnings":     warnings,
+        "generatedAt":  now,
+    }
+
+
+@api.get("/studio/ai-scene/{scene_id}")
+async def studio_ai_scene_get(
+    scene_id: str,
+    admin: User = Depends(require_admin),
+):
+    """Retrieve a previously generated AI scene preview by sceneId.
+    Admin-only. Allows the Author to reload a generated scene.
+    """
+    doc = await db.ai_scene_jobs.find_one({"sceneId": scene_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"AI scene '{scene_id}' not found.")
+    return doc
+
+
 app.include_router(_build_status_router(db, _fan_out_push, require_admin))
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
@@ -4313,6 +4597,10 @@ async def startup():
     await db.payment_transactions.create_index("matched_student_id")
     await db.payment_settings.create_index([("amount_khr", 1), ("active", 1)])
     await db.payment_audit_log.create_index([("txn_id", 1), ("at", -1)])
+    # AI Scene Builder indexes
+    await db.ai_scene_jobs.create_index("sceneId", unique=True)
+    await db.ai_scene_jobs.create_index([("slug", 1), ("createdAt", -1)])
+    await db.ai_scene_jobs.create_index("adminEmail")
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
