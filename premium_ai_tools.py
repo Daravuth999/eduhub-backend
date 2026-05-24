@@ -31,6 +31,7 @@ Env vars read (all already used elsewhere in this backend):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -51,9 +52,6 @@ log = logging.getLogger("eduhub.premium_ai")
 # --------------------------------------------------------------------------- #
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_ENDPOINT = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-)
 
 GAS_POINTS_LOGIN_URL = os.environ.get(
     "GAS_POINTS_LOGIN_URL",
@@ -191,6 +189,54 @@ def _strip_fences(text: str) -> str:
     return cleaned.strip()
 
 
+def _extract_json(text: str) -> dict:
+    """Parse JSON from Gemini text, even when the model wraps it in prose.
+
+    Strategy (in order):
+      1. Direct parse of the stripped text (fast path — works when model obeys).
+      2. Extract the first {...} block via regex (handles leading/trailing prose).
+      3. Raise json.JSONDecodeError if both fail — caller logs and raises 502.
+    """
+    stripped = _strip_fences(text)
+
+    # Fast path
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find the outermost { ... } in the response.
+    # re.DOTALL so newlines inside the JSON object are matched.
+    m = re.search(r"\{.*\}", stripped, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    raise json.JSONDecodeError("No valid JSON object found", text, 0)
+
+
+# Fallback model tried when the primary model returns 503 (overload).
+# gemini-2.0-flash is lighter and typically less congested.
+_GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
+
+
+async def _post_gemini(model_name: str, api_key: str, payload: dict) -> httpx.Response:
+    """Single Gemini POST. Returns the raw httpx.Response."""
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models"
+        f"/{model_name}:generateContent"
+    )
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        return await cli.post(
+            endpoint,
+            params={"key": api_key},
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Tiny internal Gemini REST helper (Phase 1 only; gemini_engine.py untouched) #
 # --------------------------------------------------------------------------- #
@@ -200,6 +246,12 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
     Raises HTTPException(503) when GEMINI_API_KEY is missing.
     Raises HTTPException(502) on any network / API / JSON error.
     On any failure path: NO points are charged.
+
+    Retry / fallback policy:
+      - Primary model: GEMINI_MODEL (default gemini-2.5-flash)
+      - On 503 (overload): retry once after 2 s, then try gemini-2.0-flash.
+      - Invalid JSON from model: extract the first {...} block from the prose
+        response before giving up (handles markdown-wrapped replies).
     """
     if not GEMINI_API_KEY:
         raise HTTPException(
@@ -216,48 +268,78 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
             "responseMimeType": "application/json",
         },
     }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as cli:
-            r = await cli.post(
-                GEMINI_ENDPOINT,
-                params={"key": GEMINI_API_KEY},
-                json=payload,
-                headers={"Content-Type": "application/json"},
+
+    # Attempt sequence: primary → primary retry → fallback model
+    attempts = [
+        (GEMINI_MODEL, 0.0),          # immediate
+        (GEMINI_MODEL, 2.0),          # retry after 2 s
+        (_GEMINI_FALLBACK_MODEL, 0.0),  # fallback model, immediate
+    ]
+
+    last_status = 502
+    last_detail = "AI service unreachable. No points were charged."
+
+    for model_name, delay in attempts:
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        try:
+            r = await _post_gemini(model_name, GEMINI_API_KEY, payload)
+        except httpx.HTTPError as exc:
+            log.warning("premium_ai: Gemini network error (model=%s): %s", model_name, exc)
+            last_detail = "AI service unreachable. No points were charged."
+            continue
+
+        if r.status_code == 503:
+            # Gemini overloaded — try next attempt
+            log.warning(
+                "premium_ai: Gemini 503 overload (model=%s), will retry: %s",
+                model_name, r.text[:200],
             )
-    except httpx.HTTPError as exc:
-        log.warning("premium_ai: Gemini network error: %s", exc)
-        raise HTTPException(
-            status_code=502,
-            detail="AI service unreachable. No points were charged.",
-        )
+            last_status = 503
+            last_detail = (
+                "AI service is temporarily overloaded. Please try again in a moment. "
+                "No points were charged."
+            )
+            continue
 
-    if r.status_code != 200:
-        log.warning(
-            "premium_ai: Gemini HTTP %s: %s", r.status_code, r.text[:200]
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"AI service error (HTTP {r.status_code}). No points were charged.",
-        )
+        if r.status_code != 200:
+            log.warning(
+                "premium_ai: Gemini HTTP %s (model=%s): %s",
+                r.status_code, model_name, r.text[:200],
+            )
+            last_status = r.status_code
+            last_detail = f"AI service error (HTTP {r.status_code}). No points were charged."
+            # Non-503 errors (e.g. 400 bad request) won't improve with retry
+            break
 
-    try:
-        data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as exc:  # noqa: BLE001
-        log.warning("premium_ai: Gemini response shape error: %s", exc)
-        raise HTTPException(
-            status_code=502,
-            detail="AI returned an unexpected response. No points were charged.",
-        )
+        # 200 OK — extract text from response
+        try:
+            data = r.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "premium_ai: Gemini response shape error (model=%s): %s",
+                model_name, exc,
+            )
+            last_detail = "AI returned an unexpected response. No points were charged."
+            break
 
-    try:
-        return json.loads(_strip_fences(text))
-    except json.JSONDecodeError:
-        log.warning("premium_ai: invalid JSON from Gemini: %s", text[:200])
-        raise HTTPException(
-            status_code=502,
-            detail="AI returned invalid response. No points were charged.",
-        )
+        # Parse JSON — with fallback extraction for markdown-wrapped responses
+        try:
+            result = _extract_json(text)
+            if model_name != GEMINI_MODEL:
+                log.info("premium_ai: succeeded with fallback model=%s", model_name)
+            return result
+        except json.JSONDecodeError:
+            log.warning(
+                "premium_ai: invalid JSON from Gemini (model=%s): %s",
+                model_name, text[:300],
+            )
+            last_detail = "AI returned invalid response. No points were charged."
+            break
+
+    raise HTTPException(status_code=502, detail=last_detail)
 
 
 # --------------------------------------------------------------------------- #
