@@ -221,6 +221,18 @@ def _extract_json(text: str) -> dict:
 # gemini-2.0-flash is lighter and typically less congested.
 _GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
 
+# Free-tier safety guards. In-memory only; resets on deploy/restart.
+ACTIVE_REQUESTS = set()
+COOLDOWN_REGISTRY = {}
+COOLDOWN_SECONDS = 60
+
+_RATE_LIMIT_DETAIL = (
+    "AI is busy right now because the free AI usage limit is temporarily reached. "
+    "Please try again in a moment."
+)
+
+_DUPLICATE_DETAIL = "Your previous AI request is still processing. Please wait."
+
 
 async def _post_gemini(model_name: str, api_key: str, payload: dict) -> httpx.Response:
     """Single Gemini POST. Returns the raw httpx.Response."""
@@ -303,6 +315,13 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
             last_detail = "AI service unreachable. No points were charged."
             continue
 
+        if r.status_code == 429:
+            log.warning(
+                "premium_ai: Gemini quota/rate limit hit model=%s",
+                model_name,
+            )
+            raise HTTPException(status_code=429, detail=_RATE_LIMIT_DETAIL)
+
         if r.status_code == 503:
             log.warning(
                 "premium_ai: Gemini 503 overload (model=%s), will retry: %s",
@@ -310,8 +329,7 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
             )
             last_status = 503
             last_detail = (
-                "AI service is temporarily overloaded. Please try again in a moment. "
-                "No points were charged."
+                "AI service is temporarily overloaded. Please try again in a moment."
             )
             continue
 
@@ -680,6 +698,18 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
             tool, student.student_id, student.clean_id, payload.book_slug,
         )
 
+        guard_key = f"{student.clean_id}:{tool}"
+        now = time.time()
+
+        cooldown_until = COOLDOWN_REGISTRY.get(guard_key)
+        if cooldown_until and now < cooldown_until:
+            raise HTTPException(status_code=429, detail=_RATE_LIMIT_DETAIL)
+        if cooldown_until and now >= cooldown_until:
+            COOLDOWN_REGISTRY.pop(guard_key, None)
+
+        if guard_key in ACTIVE_REQUESTS:
+            raise HTTPException(status_code=429, detail=_DUPLICATE_DETAIL)
+
         # 1. Load config + check global enable
         cfg = await _load_config()
         if not cfg.get("enabled", True):
@@ -749,9 +779,12 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
 
         # 5. Call Gemini FIRST. If this fails -> NO points are debited.
         log.info("premium_ai: gemini call start tool=%s", tool)
+        ACTIVE_REQUESTS.add(guard_key)
         try:
             ai_result = await _gemini_call(system_instruction, user_prompt)
         except HTTPException as he:
+            if he.status_code == 429:
+                COOLDOWN_REGISTRY[guard_key] = time.time() + COOLDOWN_SECONDS
             log.warning(
                 "premium_ai: gemini FAILED tool=%s status=%s",
                 tool, he.status_code,
@@ -762,6 +795,8 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
                 error="Gemini call failed",
             )
             raise
+        finally:
+            ACTIVE_REQUESTS.discard(guard_key)
         log.info("premium_ai: gemini OK tool=%s", tool)
 
         # 6. Deduct points ONLY after Gemini success. Cost==0 -> skip GAS call.
