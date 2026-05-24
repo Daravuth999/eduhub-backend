@@ -53,6 +53,19 @@ except ImportError:  # gemini_engine.py not yet deployed
         return False
     GEMINI_MODEL = None
 
+# ── Premium AI Tools (Phase 1 — isolated module) ────────────────────────── #
+# premium_ai_tools.py registers admin AI config + student decode-block /     #
+# executive-upgrade routes onto the existing /api router. Same defensive     #
+# import pattern as gemini_engine above: missing file → feature disabled,    #
+# every other route keeps working.                                           #
+try:
+    from premium_ai_tools import register_premium_ai_routes
+except ImportError:  # premium_ai_tools.py not yet deployed
+    def register_premium_ai_routes(*_a, **_kw):  # type: ignore[misc]
+        logging.getLogger("eduhub").warning(
+            "premium_ai_tools.py not installed — Premium AI Tools disabled."
+        )
+
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
@@ -5345,4 +5358,12 @@ async def studio_conversation_generate(
 # MUST be the last include_router(api) call — v2 so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
 exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").read())
+
+# ── Premium AI Tools (Phase 1) — register isolated routes onto /api ──────
+# Adds POST /api/student/premium/decode-block, POST /api/student/premium/
+# executive-upgrade, GET /api/student/premium/ai-config, plus admin routes
+# /api/admin/ai-tools-config (GET/PUT) and /api/admin/ai-tools-usage (GET).
+# Must run BEFORE app.include_router(api) below.
+register_premium_ai_routes(api, db, require_admin, require_student)
+
 app.include_router(api)
