@@ -1,4 +1,4 @@
-"""gemini_engine.py — Isolated Gemini AI helper for EduHub AI Scene Builder.
+﻿"""gemini_engine.py â€” Isolated Gemini AI helper for EduHub AI Scene Builder.
 
 This module is intentionally self-contained.
 It does NOT touch the ElevenLabs pipeline, the book save logic,
@@ -8,7 +8,7 @@ Called only from the POST /api/studio/books/{slug}/ai-scene route.
 
 Responsibilities:
   1. Build the Gemini prompt from the author's request parameters.
-  2. Call the Gemini REST API (no heavy SDK — just httpx, already in requirements).
+  2. Call the Gemini REST API (no heavy SDK â€” just httpx, already in requirements).
   3. Parse and strictly validate the JSON response.
   4. Return a typed Python dict or raise a clear ValueError / RuntimeError.
 
@@ -20,7 +20,7 @@ The caller (server.py route) is responsible for:
   - NOT modifying the live book without explicit admin confirmation
 
 Environment variables read here:
-  GEMINI_API_KEY   — required for AI Scene Builder; feature is disabled if absent.
+  GEMINI_API_KEY   â€” required for AI Scene Builder; feature is disabled if absent.
 """
 from __future__ import annotations
 
@@ -34,15 +34,15 @@ import httpx
 
 log = logging.getLogger("eduhub.gemini_engine")
 
-# ── Config ─────────────────────────────────────────────────────────────────
+# â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models"
     f"/{GEMINI_MODEL}:generateContent"
 )
 
-# ── Required output schema ──────────────────────────────────────────────────
+# â”€â”€ Required output schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # All keys must be present; values may be empty strings but not absent.
 _REQUIRED_KEYS: set[str] = {
     "title",
@@ -55,7 +55,7 @@ _REQUIRED_KEYS: set[str] = {
     "comprehensionQuestion",
 }
 
-# ── Gemini system instruction ───────────────────────────────────────────────
+# â”€â”€ Gemini system instruction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _SYSTEM_INSTRUCTION = """\
 You are EduHub's AI speaking-first story scene generator for Cambodian ESL students.
 
@@ -116,7 +116,7 @@ Comprehension question (comprehensionQuestion):
 
 Return only the JSON object. No preamble, no trailing text."""
 
-# ── Public API ──────────────────────────────────────────────────────────────
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def is_enabled() -> bool:
     """Return True if the Gemini API key is configured."""
@@ -162,14 +162,14 @@ async def generate_scene(
                 continue  # retry once
             break
         except Exception:
-            raise  # network errors, auth errors → propagate immediately
+            raise  # network errors, auth errors â†’ propagate immediately
 
     raise ValueError(
         f"Gemini returned invalid JSON after 2 attempts. Last error: {last_exc}"
     )
 
 
-# ── Internal helpers ─────────────────────────────────────────────────────────
+# â”€â”€ Internal helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _build_prompt(*, topic: str, level: str, style: str, include_khmer: bool) -> str:
     khmer_note = (
@@ -186,7 +186,7 @@ CEFR Level: {level}
 Scene style: {style}
 {khmer_note}
 
-Required JSON schema — return EXACTLY this structure:
+Required JSON schema â€” return EXACTLY this structure:
 {{
   "title": "Short scene title in English",
   "englishText": "2-4 short English sentences. Speakable. Natural. {level} level.",
@@ -317,3 +317,5 @@ def _validate(raw: str) -> dict[str, Any]:
             data[key] = data[key][:2000]
 
     return data
+
+
