@@ -35,6 +35,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -261,45 +263,133 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
 # --------------------------------------------------------------------------- #
 # GAS PointsBackend helpers (no schema / payment_bridge changes)              #
 # --------------------------------------------------------------------------- #
-async def _gas_get_balance(student_clean_id: str, password: str) -> int | None:
-    """Read student's current balance via GAS ?action=login. Returns int or None on failure.
-    Mirrors the helper at server.py line 1771 (_credit_revalidate_with_gas) but
-    extracts the points field. The password is used only for this one call.
+async def _gas_get_balance(
+    student_clean_id: str, password: str
+) -> tuple[int | None, str]:
+    """Read student's current balance via GAS ``?action=login``.
+
+    Returns ``(points, error_reason)`` where ``points`` is the numeric
+    balance on success or ``None`` on any failure. ``error_reason`` is a
+    short, operator-facing string (e.g. ``"missing_password"``,
+    ``"no_gas_url"``, ``"post_invalid"``, ``"get_invalid"``,
+    ``"get_no_points_in_response"``, ``"get_rejected_<msg>"``,
+    ``"post_status_<code>"``, ``"network_<type>"``) — NEVER contains the
+    password.
+
+    Mirrors the known-working ``_credit_revalidate_with_gas`` helper in
+    ``server.py`` (line 1784): POST first, then GET fallback with a
+    ``t=<ms>`` cache buster. The legacy GAS backend rejects ``POST login``
+    with "Invalid POST action", so a POST-only implementation fails on
+    legacy deployments — this dual-mode keeps us compatible with both
+    upgraded (POST-secured) and legacy (GET-classic) backends.
     """
-    if not GAS_POINTS_LOGIN_URL or not password:
-        return None
+    if not password:
+        return None, "missing_password"
+    if not GAS_POINTS_LOGIN_URL:
+        return None, "no_gas_url"
+
+    last_reason = "unknown"
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as cli:
-            r = await cli.post(
-                GAS_POINTS_LOGIN_URL,
-                data={
-                    "action": "login",
-                    "id": student_clean_id,
-                    "password": password,
-                },
-            )
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        if isinstance(j, dict) and j.get("success") and isinstance(
-            j.get("points"), (int, float)
-        ):
-            return int(j["points"])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("premium_ai: GAS balance read failed: %s", exc)
-    return None
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            follow_redirects=True,
+        ) as cli:
+            # Attempt 1 - POST (preferred by upgraded backend)
+            try:
+                r1 = await cli.post(
+                    GAS_POINTS_LOGIN_URL,
+                    data={
+                        "action": "login",
+                        "id": student_clean_id,
+                        "password": password,
+                        "t": str(int(time.time() * 1000)),
+                    },
+                )
+                if r1.status_code == 200:
+                    try:
+                        j1 = r1.json()
+                        if isinstance(j1, dict):
+                            log.info(
+                                "premium_ai: balance POST keys=%s success=%s",
+                                sorted(j1.keys()),
+                                j1.get("success"),
+                            )
+                            if j1.get("success") is True and isinstance(
+                                j1.get("points"), (int, float)
+                            ):
+                                return int(j1["points"]), ""
+                            last_reason = "post_invalid"
+                        else:
+                            last_reason = "post_bad_json_shape"
+                    except Exception:
+                        last_reason = "post_bad_json"
+                else:
+                    last_reason = f"post_status_{r1.status_code}"
+            except Exception as exc:
+                last_reason = f"post_network_{type(exc).__name__}"
+
+            # Attempt 2 - GET (legacy backend only accepts GET for login)
+            try:
+                r2 = await cli.get(
+                    GAS_POINTS_LOGIN_URL,
+                    params={
+                        "action": "login",
+                        "id": student_clean_id,
+                        "password": password,
+                        "t": str(int(time.time() * 1000)),
+                    },
+                )
+                if r2.status_code == 200:
+                    try:
+                        j2 = r2.json()
+                    except Exception:
+                        return None, "get_bad_json"
+                    if isinstance(j2, dict):
+                        log.info(
+                            "premium_ai: balance GET keys=%s success=%s",
+                            sorted(j2.keys()),
+                            j2.get("success"),
+                        )
+                        if j2.get("success") is True and isinstance(
+                            j2.get("points"), (int, float)
+                        ):
+                            return int(j2["points"]), ""
+                        # Legacy backend on bad creds returns success:false
+                        err_field = j2.get("error") or j2.get("message") or ""
+                        if err_field:
+                            return None, f"get_rejected_{str(err_field)[:40]}"
+                        return None, "get_no_points_in_response"
+                    return None, "get_bad_json_shape"
+                return None, f"get_status_{r2.status_code}"
+            except Exception as exc:
+                return None, f"get_network_{type(exc).__name__}"
+    except Exception as exc:
+        log.warning(
+            "premium_ai: GAS balance outer error: %s", type(exc).__name__
+        )
+        return None, f"outer_{type(exc).__name__}"
+
+    return None, last_reason
 
 
 async def _gas_debit(
     student_clean_id: str, password: str, amount: int
 ) -> tuple[bool, str]:
-    """Debit student via GAS sendPoints(student -> treasury). Returns (ok, error_msg).
-    Mirrors the existing purchaseBook flow in purchaseService.js byte-for-byte.
+    """Debit student via GAS ``sendPoints(student -> treasury)``.
+
+    Mirrors the existing ``sl.grant`` (server.py line 4275) and the
+    frontend's ``purchaseBook`` flow byte-for-byte: POST with a fresh
+    ``nonce`` (required by the secured backend, ignored by legacy).
     """
-    if not GAS_POINTS_LOGIN_URL or not password:
-        return False, "Points service not configured"
+    if not password:
+        return False, "missing_password"
+    if not GAS_POINTS_LOGIN_URL:
+        return False, "no_gas_url"
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as cli:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=6.0),
+            follow_redirects=True,
+        ) as cli:
             r = await cli.post(
                 GAS_POINTS_LOGIN_URL,
                 data={
@@ -308,11 +398,20 @@ async def _gas_debit(
                     "password": password,
                     "receiverId": TREASURY_ID,
                     "amount": str(amount),
+                    "nonce": secrets.token_hex(12),
                 },
             )
         if r.status_code != 200:
             return False, f"HTTP {r.status_code}"
-        j = r.json()
+        try:
+            j = r.json()
+        except Exception:
+            return False, f"bad_json: {r.text[:120]}"
+        log.info(
+            "premium_ai: debit POST keys=%s success=%s",
+            sorted(j.keys()) if isinstance(j, dict) else type(j).__name__,
+            (j or {}).get("success") if isinstance(j, dict) else None,
+        )
         if isinstance(j, dict) and j.get("success") is True:
             return True, ""
         msg = (
@@ -321,8 +420,8 @@ async def _gas_debit(
             or "Server rejected the transaction"
         )
         return False, str(msg)[:200]
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)[:200]
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:160]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +575,12 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
         payload: StudentToolRequest,
         student,
     ) -> dict:
+        # ── v1.2: safe debug logs (no password, no Gemini content) ──────── #
+        log.info(
+            "premium_ai: route=%s student_id=%s clean_id=%s book=%s",
+            tool, student.student_id, student.clean_id, payload.book_slug,
+        )
+
         # 1. Load config + check global enable
         cfg = await _load_config()
         if not cfg.get("enabled", True):
@@ -503,12 +608,32 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
             text = text[:2000]
 
         # 4. Pre-flight balance check (uses password but never persists it)
-        balance = await _gas_get_balance(student.clean_id, payload.password)
+        log.info("premium_ai: balance check start clean_id=%s", student.clean_id)
+        balance, reason = await _gas_get_balance(student.clean_id, payload.password)
         if balance is None:
+            log.warning(
+                "premium_ai: balance check FAILED clean_id=%s reason=%s",
+                student.clean_id, reason,
+            )
+            # Surface a precise reason so the operator can debug without
+            # exposing the password. The frontend already swallows the
+            # backend detail string into its generic error card if needed.
+            human = {
+                "missing_password": "Please sign in again to use premium AI tools.",
+                "no_gas_url": "Points service is not configured on the server.",
+                "post_invalid": "Could not verify your point balance. Please try again.",
+                "get_no_points_in_response": "Points service did not return a balance. Please try again.",
+            }.get(reason, "Could not verify your point balance. Please try again.")
             raise HTTPException(
                 status_code=502,
-                detail="Could not verify your point balance. Please try again.",
+                detail=f"{human} (code: {reason})",
             )
+
+        log.info(
+            "premium_ai: balance check OK clean_id=%s balance=%s cost=%s",
+            student.clean_id, balance, cost,
+        )
+
         if balance < cost:
             await _log_usage(
                 student, tool, cost, "insufficient_points", payload.book_slug,
@@ -524,18 +649,25 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
             }
 
         # 5. Call Gemini FIRST. If this fails -> NO points are debited.
+        log.info("premium_ai: gemini call start tool=%s", tool)
         try:
             ai_result = await _gemini_call(system_instruction, user_prompt)
-        except HTTPException:
+        except HTTPException as he:
+            log.warning(
+                "premium_ai: gemini FAILED tool=%s status=%s",
+                tool, he.status_code,
+            )
             await _log_usage(
                 student, tool, cost, "ai_error", payload.book_slug,
                 points_before=balance, points_after=balance,
                 error="Gemini call failed",
             )
             raise
+        log.info("premium_ai: gemini OK tool=%s", tool)
 
         # 6. Deduct points ONLY after Gemini success. Cost==0 -> skip GAS call.
         if cost > 0:
+            log.info("premium_ai: debit start clean_id=%s amount=%s", student.clean_id, cost)
             debit_ok, debit_err = await _gas_debit(
                 student.clean_id, payload.password, cost
             )
@@ -544,7 +676,10 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
 
         if not debit_ok:
             # Gemini succeeded but debit failed -> NOT a success. Surface clearly.
-            # Per safeguard: this is a payment failure, not an AI success.
+            log.warning(
+                "premium_ai: debit FAILED clean_id=%s amount=%s err=%s",
+                student.clean_id, cost, debit_err,
+            )
             await _log_usage(
                 student, tool, cost, "debit_failed", payload.book_slug,
                 points_before=balance, points_after=balance,
@@ -558,8 +693,10 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
                 ),
             )
 
+        log.info("premium_ai: debit OK clean_id=%s amount=%s", student.clean_id, cost)
+
         # 7. Re-read balance (best-effort) for the response card
-        new_balance = await _gas_get_balance(student.clean_id, payload.password)
+        new_balance, _reason2 = await _gas_get_balance(student.clean_id, payload.password)
         if new_balance is None:
             new_balance = max(0, balance - cost)
 
@@ -636,3 +773,4 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
     log.info(
         "premium_ai_tools: routes registered (Phase 1 = decode-block + executive-upgrade)"
     )
+
