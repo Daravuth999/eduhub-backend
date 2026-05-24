@@ -259,21 +259,34 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
             detail="AI tools are not configured on this server. Please contact admin.",
         )
 
+    # Append a hard JSON reminder to the user prompt so the model never
+    # switches to prose — this is the most reliable way to enforce JSON
+    # output when responseMimeType is occasionally ignored by the model.
+    json_enforced_prompt = (
+        user_prompt
+        + "\n\nIMPORTANT: Your entire response MUST be a single valid JSON object. "
+        "No prose, no markdown, no explanation outside the JSON."
+    )
+
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "contents": [{"role": "user", "parts": [{"text": json_enforced_prompt}]}],
         "generationConfig": {
             "temperature": 0.4,
-            "maxOutputTokens": 700,
+            # 1200 tokens — enough for all 5 schema fields with room to spare.
+            # 700 was causing mid-JSON truncation on longer student sentences.
+            "maxOutputTokens": 1200,
             "responseMimeType": "application/json",
         },
     }
 
     # Attempt sequence: primary → primary retry → fallback model
+    # Both 503 (overload) AND invalid JSON retry on the next model —
+    # invalid JSON can be caused by the model switching to prose under load.
     attempts = [
-        (GEMINI_MODEL, 0.0),          # immediate
-        (GEMINI_MODEL, 2.0),          # retry after 2 s
-        (_GEMINI_FALLBACK_MODEL, 0.0),  # fallback model, immediate
+        (GEMINI_MODEL, 0.0),             # immediate
+        (GEMINI_MODEL, 2.0),             # retry after 2 s
+        (_GEMINI_FALLBACK_MODEL, 0.0),   # fallback model, immediate
     ]
 
     last_status = 502
@@ -291,7 +304,6 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
             continue
 
         if r.status_code == 503:
-            # Gemini overloaded — try next attempt
             log.warning(
                 "premium_ai: Gemini 503 overload (model=%s), will retry: %s",
                 model_name, r.text[:200],
@@ -310,7 +322,7 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
             )
             last_status = r.status_code
             last_detail = f"AI service error (HTTP {r.status_code}). No points were charged."
-            # Non-503 errors (e.g. 400 bad request) won't improve with retry
+            # Non-503 errors (400, 429 etc.) won't improve with retry
             break
 
         # 200 OK — extract text from response
@@ -323,9 +335,12 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
                 model_name, exc,
             )
             last_detail = "AI returned an unexpected response. No points were charged."
-            break
+            # Shape errors can differ per model — try next
+            continue
 
-        # Parse JSON — with fallback extraction for markdown-wrapped responses
+        # Parse JSON — with fallback extraction for markdown-wrapped responses.
+        # On failure: continue to next attempt (different model may produce
+        # clean JSON where this one truncated or wrapped in prose).
         try:
             result = _extract_json(text)
             if model_name != GEMINI_MODEL:
@@ -337,7 +352,9 @@ async def _gemini_call(system_instruction: str, user_prompt: str) -> dict:
                 model_name, text[:300],
             )
             last_detail = "AI returned invalid response. No points were charged."
-            break
+            # Continue to next attempt instead of breaking — a different model
+            # or retry may produce valid JSON where this one truncated/wrapped.
+            continue
 
     raise HTTPException(status_code=502, detail=last_detail)
 
