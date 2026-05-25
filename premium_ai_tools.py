@@ -32,6 +32,7 @@ Env vars read (all already used elsewhere in this backend):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -132,6 +133,20 @@ class StudentToolRequest(BaseModel):
     # Used ONLY to call GAS sendPoints once. Never persisted, never logged,
     # never echoed back to the client, never sent to Gemini.
     password: str
+
+
+# v1.2 — Batch entitlement/status request shapes for the Reader page.
+class StudentAccessStatusItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    item_id: str        # opaque, frontend-generated; backend echoes it back.
+    tool: str           # "khmer_decoder" or "executive_upgrade" (or future).
+    block_text: str     # raw block text; normalised server-side.
+
+
+class StudentAccessStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    book_slug: str
+    items: list[StudentAccessStatusItem]
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +293,303 @@ def _cache_set(key: str, value: dict) -> None:
         except (ValueError, KeyError):
             pass
     RESULT_CACHE[key] = (time.time() + RESULT_CACHE_TTL_SECONDS, dict(value))
+
+
+# --------------------------------------------------------------------------- #
+# v1.6 — MongoDB persistent result cache (cost-saving layer).                 #
+#                                                                             #
+# Scope:                                                                      #
+#   - First durable layer for successful Premium AI tool outputs only.        #
+#   - Stored in a dedicated, additive-only collection: ai_result_cache.       #
+#   - NEVER reads from or writes to any Author Studio book/content            #
+#     collection (books, chapters, book blocks, audio, transcript, etc.).     #
+#   - NEVER stores student passwords, Bearer tokens, API keys, GAS URLs,      #
+#     admin instruction text, or payment data.                                #
+#                                                                             #
+# Policy:                                                                     #
+#   - Cache HIT skips the Gemini provider call only.                          #
+#   - Cache HIT does NOT skip student balance verification.                   #
+#   - Cache HIT does NOT skip student point deduction.                        #
+#   - Cached result is NEVER returned before the current student's            #
+#     point deduction succeeds (enforced in _run_premium_tool below).         #
+#                                                                             #
+# Failure mode:                                                               #
+#   - Any read/write failure is non-fatal. Premium AI continues to work       #
+#     using the existing in-memory cache and/or a fresh Gemini call.          #
+# --------------------------------------------------------------------------- #
+MONGO_CACHE_COLLECTION = "ai_result_cache"
+
+
+async def _mongo_cache_get(col, cache_key: str) -> dict | None:
+    """Look up a validated AI result in the MongoDB persistent cache.
+
+    Returns the stored ``result`` dict on hit, or ``None`` on miss / any
+    failure. Never raises — a broken cache must not break Premium AI.
+
+    The Author Studio Personality prompt hash is already part of the
+    cache_key, so a stale entry is naturally unreachable once the admin
+    changes the Personality config; no manual invalidation needed.
+    """
+    if col is None or not cache_key:
+        return None
+    try:
+        doc = await col.find_one(
+            {"_id": cache_key},
+            {"_id": 0, "result": 1},
+        )
+    except Exception as exc:  # noqa: BLE001 — cache MUST be non-fatal
+        log.warning(
+            "premium_ai: mongo cache READ failed key=%s err=%s",
+            cache_key[:10], type(exc).__name__,
+        )
+        return None
+    if not doc:
+        return None
+    result = doc.get("result")
+    if not isinstance(result, dict):
+        return None
+    # Return a shallow copy so callers cannot mutate the cached object
+    # via shared references.
+    return dict(result)
+
+
+async def _mongo_cache_set(
+    col,
+    cache_key: str,
+    result: dict,
+    metadata: dict,
+) -> None:
+    """Persist a successful validated AI result in the MongoDB cache.
+
+    Document shape (no TTL, no expiration, additive-only):
+
+        {
+          "_id": cache_key,
+          "tool": <tool>,
+          "book_slug": <book_slug>,
+          "result": <validated dict from Gemini>,
+          "tone": <tone_preset>,
+          "system_instruction_hash": sha1(admin_system_instruction),
+          "created_at": <iso utc>,    # only on first insert
+          "updated_at": <iso utc>,    # refreshed each successful regen
+          "hit_count": 0              # only on first insert
+        }
+
+    Never raises — a broken write must not fail the student request after
+    Gemini already succeeded.
+    """
+    if col is None or not cache_key or not isinstance(result, dict):
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    set_doc = {
+        "tool": metadata.get("tool", ""),
+        "book_slug": metadata.get("book_slug", ""),
+        "result": result,
+        "tone": metadata.get("tone", ""),
+        "system_instruction_hash": metadata.get("system_instruction_hash", ""),
+        "updated_at": now_iso,
+    }
+    set_on_insert = {
+        "created_at": now_iso,
+        "hit_count": 0,
+    }
+    try:
+        await col.update_one(
+            {"_id": cache_key},
+            {"$set": set_doc, "$setOnInsert": set_on_insert},
+            upsert=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — cache write MUST be non-fatal
+        log.warning(
+            "premium_ai: mongo cache WRITE failed key=%s err=%s",
+            cache_key[:10], type(exc).__name__,
+        )
+
+
+async def _mongo_cache_register_hit(col, cache_key: str) -> None:
+    """Increment hit_count and stamp last_hit_at on a cache HIT.
+
+    Best-effort and fully non-fatal: failures are logged at WARNING and
+    swallowed so the student response is unaffected.
+    """
+    if col is None or not cache_key:
+        return
+    try:
+        await col.update_one(
+            {"_id": cache_key},
+            {
+                "$inc": {"hit_count": 1},
+                "$set": {"last_hit_at": datetime.now(timezone.utc).isoformat()},
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "premium_ai: mongo cache HIT-stamp failed key=%s err=%s",
+            cache_key[:10], type(exc).__name__,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# v1.2 — Per-student entitlement (paid-access) layer.                         #
+#                                                                             #
+# Scope:                                                                      #
+#   - ai_result_access stores ONE document per (student, cache_key) pair      #
+#     so the same student does not pay twice for the same exact explanation. #
+#   - Author Studio Personality edits change the cache_key (because the      #
+#     admin_system_instruction sha1 is part of it), which also invalidates   #
+#     any prior entitlement under the OLD key — students may need to pay     #
+#     once again for the new explanation style. This matches the agreed     #
+#     business rule.                                                         #
+#                                                                             #
+# Fairness:                                                                   #
+#   - Student A pays once for cache_key X, gets an access record, and can     #
+#     reopen X for free thereafter.                                          #
+#   - Student B has no access record for X, so Student B pays once for X     #
+#     and gets a separate access record.                                     #
+#                                                                             #
+# Failure mode:                                                               #
+#   - Read failures FAIL CLOSED — _access_get raises _AccessReadError.       #
+#     `_run_premium_tool` catches that and returns HTTP 503 so a cached      #
+#     result is NEVER served for free during a Mongo read hiccup.            #
+#   - Write failures after successful debit are retried once, then logged    #
+#     at ERROR and swallowed (the student has already paid and must get     #
+#     their result). Documented risk: if the write was permanently lost the #
+#     student may be asked to pay again next time.                          #
+# --------------------------------------------------------------------------- #
+MONGO_ACCESS_COLLECTION = "ai_result_access"
+
+
+class _AccessReadError(Exception):
+    """Raised by `_access_get` on any Mongo read exception.
+
+    The caller MUST fail closed: do not serve cached results for free
+    while the entitlement layer is unreadable. This sentinel-via-exception
+    pattern is what the public flow contract relies on:
+
+        try:
+            doc = await _access_get(access_col, access_key)
+            unlocked = doc is not None
+        except _AccessReadError:
+            # fail closed — do NOT proceed to a free cache HIT
+            ...
+    """
+
+
+def _access_key(student_clean_id: str, cache_key: str) -> str:
+    """sha1("{clean_id}:{cache_key}") — opaque, deterministic, non-PII.
+
+    The clean_id is already a sanitised non-secret student identifier
+    (no password, no email, no Telegram chat id). Hashing prevents the
+    raw clean_id from being readable inside the `_id` of cache documents.
+    """
+    raw = f"{student_clean_id or ''}:{cache_key or ''}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+async def _access_get(col, access_key: str) -> dict | None:
+    """Look up a per-student paid-access record by access_key.
+
+    Returns:
+        - the access doc on HIT,
+        - ``None`` on a definite MISS.
+    Raises:
+        - ``_AccessReadError`` on any Mongo read exception. Callers MUST
+          fail closed (do not serve a cached result for free; surface a
+          friendly 503-style error to the student so the next attempt
+          re-evaluates the entitlement state).
+    """
+    if col is None or not access_key:
+        return None
+    try:
+        doc = await col.find_one(
+            {"_id": access_key},
+            {"_id": 1, "student_id": 1, "cache_key": 1,
+             "access_count": 1, "created_at": 1},
+        )
+    except Exception as exc:  # noqa: BLE001 — convert to typed exception
+        log.warning(
+            "premium_ai: entitlement read FAILED key=%s err=%s",
+            access_key[:10], type(exc).__name__,
+        )
+        raise _AccessReadError(type(exc).__name__) from exc
+    return doc
+
+
+async def _access_set(
+    col,
+    access_key: str,
+    student_id: str,
+    cache_key: str,
+    tool: str,
+    book_slug: str,
+    points_paid: int,
+) -> bool:
+    """Create the per-student entitlement after a SUCCESSFUL point deduction.
+
+    Idempotent: uses `$setOnInsert` so a re-entry never overwrites
+    `created_at` or `points_paid`. Retries once on transient exceptions.
+    Returns True on persisted write, False if both attempts failed.
+
+    NEVER raises — the student has already been debited; we must not break
+    the response. A permanent failure is logged at ERROR with the
+    documented risk that the student may be re-charged next visit.
+    """
+    if col is None or not access_key:
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "student_id": student_id,
+        "cache_key": cache_key,
+        "tool": tool,
+        "book_slug": book_slug,
+        "created_at": now_iso,
+        "last_access_at": now_iso,
+        "access_count": 1,
+        "points_paid": int(points_paid),
+    }
+    for attempt in (1, 2):
+        try:
+            await col.update_one(
+                {"_id": access_key},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — retry once
+            log.warning(
+                "premium_ai: entitlement WRITE failed attempt=%d key=%s err=%s",
+                attempt, access_key[:10], type(exc).__name__,
+            )
+    log.error(
+        "premium_ai: entitlement WRITE permanently failed key=%s student=%s "
+        "— student paid but entitlement was not stored; future access may be "
+        "charged again",
+        access_key[:10], student_id,
+    )
+    return False
+
+
+async def _access_register_hit(col, access_key: str) -> None:
+    """Increment access_count and stamp last_access_at on an entitlement HIT.
+
+    Fire-and-forget — wrapped in try/except, never raises, never blocks
+    the response.
+    """
+    if col is None or not access_key:
+        return
+    try:
+        await col.update_one(
+            {"_id": access_key},
+            {
+                "$inc": {"access_count": 1},
+                "$set": {"last_access_at": datetime.now(timezone.utc).isoformat()},
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "premium_ai: entitlement TOUCH failed key=%s err=%s",
+            access_key[:10], type(exc).__name__,
+        )
 
 
 # v1.5 — Compose the final system instruction from the tool-specific
@@ -678,6 +990,18 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
     ai_config_col = db["ai_tools_config"]
     ai_logs_col = db["ai_usage_logs"]
     books_col = db["books"]
+    # v1.6 — Dedicated persistent cache collection for successful Premium AI
+    # outputs. ADDITIVE-ONLY. This collection is COMPLETELY SEPARATE from
+    # Author Studio book data (books / chapters / blocks / audio / transcript
+    # / unlocks / payments / students) and is never used to render Library or
+    # Reader content. Reuses the existing shared `db` (motor) handle — no new
+    # MongoDB connection is created here.
+    ai_result_cache_col = db[MONGO_CACHE_COLLECTION]
+    # v1.2 — Per-student paid-access (entitlement) collection. ADDITIVE-ONLY.
+    # Completely separate from any Author Studio book/content collection and
+    # from `students`, `payments`, `unlocks`, etc. Reuses the same shared
+    # `db` handle — no new Mongo connection.
+    access_col = db[MONGO_ACCESS_COLLECTION]
 
     async def _load_config() -> dict:
         doc = await ai_config_col.find_one({"_id": CONFIG_DOC_ID})
@@ -799,202 +1123,375 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
         if cooldown_until and now >= cooldown_until:
             COOLDOWN_REGISTRY.pop(guard_key, None)
 
-        # v1.1 — duplicate-click guard moved to atomic check-then-add
-        # immediately before ACTIVE_REQUESTS.add(guard_key) inside the
-        # cache-miss else-branch below. The previous early check here
-        # created a race: two rapid clicks could both pass before either
-        # one registered itself in ACTIVE_REQUESTS.
+        # v1.1.1 — Outer-scope duplicate-click guard. The check and the
+        # add are adjacent with NO await between them, so CPython's GIL
+        # makes the test+add effectively atomic on the asyncio event
+        # loop. This widens the v1 guard so it now wraps BOTH the
+        # cache HIT path AND the cache MISS / Gemini path — preventing
+        # rapid double-taps from triggering duplicate point deductions
+        # against a cached result. The cache HIT path still runs the
+        # full balance + debit flow (see steps 4 and 6 below); the
+        # guard merely serialises overlapping requests from the same
+        # (student, tool) pair so a rapid double-tap cannot debit twice.
+        if guard_key in ACTIVE_REQUESTS:
+            raise HTTPException(status_code=429, detail=_DUPLICATE_DETAIL)
+        ACTIVE_REQUESTS.add(guard_key)
+        try:
 
-        # 1. Load config + check global enable
-        cfg = await _load_config()
-        if not cfg.get("enabled", True):
-            raise HTTPException(
-                status_code=503,
-                detail="AI tools are temporarily disabled by the administrator.",
+            # 1. Load config + check global enable
+            cfg = await _load_config()
+            if not cfg.get("enabled", True):
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI tools are temporarily disabled by the administrator.",
+                )
+
+            cost = max(0, int((cfg.get("pricing") or {}).get(cfg_key) or 0))
+
+            # 2. Tier rule check
+            tier = await _resolve_book_tier(payload.book_slug)
+            allowed = _tier_allows(cfg, tier, cfg_key)
+            if not allowed:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"This AI tool is not available on {tier}-tier books.",
+                )
+
+            # 3. Validate text input
+            text = (payload.block_text or "").strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="No text was selected.")
+            if len(text) > 2000:
+                text = text[:2000]
+
+            # 4. v1.2 — Compose effective system instruction + cache_key
+            # BEFORE the entitlement and balance steps so the cache_key is
+            # available for the entitlement lookup. Author Studio Personality
+            # (tone preset + system_instruction) is folded in here; the tool
+            # baseline still owns the JSON schema (see _PRIORITY_RULES).
+            effective_sys, tone_used, admin_sys = _compose_system_instruction(
+                system_instruction, cfg
             )
-
-        cost = max(0, int((cfg.get("pricing") or {}).get(cfg_key) or 0))
-
-        # 2. Tier rule check
-        tier = await _resolve_book_tier(payload.book_slug)
-        allowed = _tier_allows(cfg, tier, cfg_key)
-        if not allowed:
-            raise HTTPException(
-                status_code=403,
-                detail=f"This AI tool is not available on {tier}-tier books.",
-            )
-
-        # 3. Validate text input
-        text = (payload.block_text or "").strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="No text was selected.")
-        if len(text) > 2000:
-            text = text[:2000]
-
-        # 4. Pre-flight balance check (uses password but never persists it)
-        log.info("premium_ai: balance check start clean_id=%s", student.clean_id)
-        balance, reason = await _gas_get_balance(student.clean_id, payload.password)
-        if balance is None:
-            log.warning(
-                "premium_ai: balance check FAILED clean_id=%s reason=%s",
-                student.clean_id, reason,
-            )
-            # Surface a precise reason so the operator can debug without
-            # exposing the password. The frontend already swallows the
-            # backend detail string into its generic error card if needed.
-            human = {
-                "missing_password": "Please sign in again to use premium AI tools.",
-                "no_gas_url": "Points service is not configured on the server.",
-                "post_invalid": "Could not verify your point balance. Please try again.",
-                "get_no_points_in_response": "Points service did not return a balance. Please try again.",
-            }.get(reason, "Could not verify your point balance. Please try again.")
-            raise HTTPException(
-                status_code=502,
-                detail=f"{human} (code: {reason})",
-            )
-
-        log.info(
-            "premium_ai: balance check OK clean_id=%s balance=%s cost=%s",
-            student.clean_id, balance, cost,
-        )
-
-        if balance < cost:
-            await _log_usage(
-                student, tool, cost, "insufficient_points", payload.book_slug,
-                points_before=balance, points_after=balance,
-                error=f"need {cost} have {balance}",
-            )
-            return {
-                "success": False,
-                "error": "insufficient_points",
-                "required_points": cost,
-                "points_remaining": balance,
-                "message": f"You need {cost} points to use this premium AI tool.",
-            }
-
-        # 5. Call Gemini FIRST. If this fails -> NO points are debited.
-        # v1.5 — Compose effective system instruction from the tool baseline
-        # PLUS the admin's Author Studio Personality config (tone preset +
-        # system instruction). The admin controls style/language/tone; the
-        # tool baseline owns the JSON schema and safety rules. Admin text
-        # cannot override the schema (see _PRIORITY_RULES).
-        effective_sys, tone_used, admin_sys = _compose_system_instruction(
-            system_instruction, cfg
-        )
-        log.info(
-            "premium_ai: personality tool=%s tone=%s admin_sys_len=%d",
-            tool, tone_used, len(admin_sys),
-        )
-
-        # v1.5 — Result cache lookup. Skip Gemini entirely on a hit, but
-        # still pay points (existing point policy unchanged). Cache key
-        # includes tone + sha1 of admin_sys so any Personality edit
-        # invalidates older entries for the same sentence/book/tool.
-        import hashlib as _hl  # noqa: WPS433 — local to keep imports surface stable
-        admin_sys_sig = _hl.sha1(admin_sys.encode("utf-8")).hexdigest()
-        cache_key = _cache_key(tool, payload.book_slug, text, tone_used, admin_sys_sig)
-        cached = _cache_get(cache_key)
-        if cached is not None:
-            log.info("premium_ai: cache HIT tool=%s key=%s", tool, cache_key[:10])
-            ai_result = cached
-        else:
             log.info(
-                "premium_ai: gemini call start tool=%s cache=MISS key=%s",
-                tool, cache_key[:10],
+                "premium_ai: personality tool=%s tone=%s admin_sys_len=%d",
+                tool, tone_used, len(admin_sys),
             )
-            # v1.1 — Atomic duplicate-click guard: check-then-add in one
-            # step, immediately before the provider call. This is the
-            # single source of truth for "is this student/tool already
-            # being processed". CPython's GIL makes the `in` test +
-            # `add()` effectively atomic for the asyncio event loop
-            # because no `await` separates them.
-            if guard_key in ACTIVE_REQUESTS:
-                raise HTTPException(status_code=429, detail=_DUPLICATE_DETAIL)
-            ACTIVE_REQUESTS.add(guard_key)
+            admin_sys_sig = hashlib.sha1(admin_sys.encode("utf-8")).hexdigest()
+            cache_key = _cache_key(tool, payload.book_slug, text, tone_used, admin_sys_sig)
+            access_key = _access_key(student.clean_id, cache_key)
+
+            # 5. v1.2 — Entitlement check FIRST, before balance + Gemini.
+            #
+            # Flow contract (matches AUDIT_REPORT.md):
+            #   - DB ERROR   → fail closed: 503, no Gemini, no debit.
+            #   - HIT        → student already paid for this exact explanation:
+            #                  pull cached result, NO balance check, NO Gemini,
+            #                  NO debit; fire-and-forget hit/touch counters.
+            #   - MISS       → continue to balance check + cache lookup + Gemini.
             try:
-                ai_result = await _gemini_call(effective_sys, user_prompt)
-            except HTTPException as he:
-                if he.status_code == 429:
-                    COOLDOWN_REGISTRY[guard_key] = time.time() + COOLDOWN_SECONDS
+                access_doc = await _access_get(access_col, access_key)
+            except _AccessReadError as exc:
+                # Fail closed — do NOT serve a cached result for free.
+                await _log_usage(
+                    student, tool, cost, "entitlement_read_failed", payload.book_slug,
+                    points_before=0, points_after=0,
+                    error=f"access read failed: {exc}",
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI service temporarily unavailable. Please try again in a moment.",
+                )
+
+            already_unlocked = access_doc is not None
+
+            if already_unlocked:
+                log.info(
+                    "premium_ai: entitlement HIT student=%s key=%s tool=%s book=%s",
+                    student.clean_id, access_key[:10], tool, payload.book_slug,
+                )
+
+                # Pull result from ai_result_cache (MongoDB → in-memory fallback).
+                # No Gemini call is allowed on the entitlement-HIT path.
+                cached: dict | None = None
+                cache_source: str = "miss"
+                mongo_hit = await _mongo_cache_get(ai_result_cache_col, cache_key)
+                if mongo_hit is not None:
+                    cached = mongo_hit
+                    cache_source = "mongo"
+                    _cache_set(cache_key, cached)
+                else:
+                    mem_hit = _cache_get(cache_key)
+                    if mem_hit is not None:
+                        cached = mem_hit
+                        cache_source = "memory"
+
+                if cached is None:
+                    # Defensive: entitlement exists but the result cache row is
+                    # gone (e.g. an admin manually dropped ai_result_cache).
+                    # Spec mandates "SKIP Gemini" on entitlement HIT — surface a
+                    # friendly error so support can rebuild the cache row.
+                    log.error(
+                        "premium_ai: entitlement HIT but cache MISS — refusing to call Gemini "
+                        "tool=%s book=%s key=%s student=%s",
+                        tool, payload.book_slug, cache_key[:10], student.clean_id,
+                    )
+                    await _log_usage(
+                        student, tool, cost, "cache_missing_after_entitlement",
+                        payload.book_slug, points_before=0, points_after=0,
+                        error="cache row missing for unlocked entitlement",
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "Your saved explanation is temporarily unavailable. "
+                            "Please try again shortly."
+                        ),
+                    )
+
+                ai_result = cached
+                log.info(
+                    "premium_ai: cache HIT via=%s tool=%s key=%s (entitlement path)",
+                    cache_source, tool, cache_key[:10],
+                )
+
+                # Fire-and-forget counters (non-fatal).
+                await _access_register_hit(access_col, access_key)
+                await _mongo_cache_register_hit(ai_result_cache_col, cache_key)
+
+                # v1.2 — Spec mandates NO GAS balance read on entitlement HIT.
+                # No debit is happening, so we must not consume the student's
+                # password against the GAS backend on every unlocked re-read.
+                # The frontend keeps its locally cached balance for display.
+                # Audit log — success with zero deduction (entitlement HIT).
+                await _log_usage(
+                    student, tool, 0, "success_unlocked", payload.book_slug,
+                    points_before=None, points_after=None,
+                )
+
+                greeting_default = (
+                    f"Hi {_first_name(student.display_name, student.clean_id)},"
+                )
+                response: dict = {
+                    "success": True,
+                    "tool": tool,
+                    "points_deducted": 0,
+                    "unlocked": True,
+                    "greeting": str(ai_result.get("greeting") or greeting_default)[:300],
+                }
+                for k in (
+                    "khmer_mindset",
+                    "natural_version",
+                    "executive_version",
+                    "practice_line",
+                    "why_it_works",
+                ):
+                    if k in ai_result:
+                        response[k] = str(ai_result[k])[:2000]
+                return response
+
+            # ───────── Entitlement MISS — paid flow continues below ─────────
+            log.info(
+                "premium_ai: entitlement MISS student=%s key=%s tool=%s — paid flow",
+                student.clean_id, access_key[:10], tool,
+            )
+
+            # 6. Pre-flight balance check (uses password but never persists it)
+            log.info("premium_ai: balance check start clean_id=%s", student.clean_id)
+            balance, reason = await _gas_get_balance(student.clean_id, payload.password)
+            if balance is None:
                 log.warning(
-                    "premium_ai: gemini FAILED tool=%s status=%s",
-                    tool, he.status_code,
+                    "premium_ai: balance check FAILED clean_id=%s reason=%s",
+                    student.clean_id, reason,
+                )
+                human = {
+                    "missing_password": "Please sign in again to use premium AI tools.",
+                    "no_gas_url": "Points service is not configured on the server.",
+                    "post_invalid": "Could not verify your point balance. Please try again.",
+                    "get_no_points_in_response": "Points service did not return a balance. Please try again.",
+                }.get(reason, "Could not verify your point balance. Please try again.")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{human} (code: {reason})",
+                )
+
+            log.info(
+                "premium_ai: balance check OK clean_id=%s balance=%s cost=%s",
+                student.clean_id, balance, cost,
+            )
+
+            if balance < cost:
+                await _log_usage(
+                    student, tool, cost, "insufficient_points", payload.book_slug,
+                    points_before=balance, points_after=balance,
+                    error=f"need {cost} have {balance}",
+                )
+                return {
+                    "success": False,
+                    "error": "insufficient_points",
+                    "required_points": cost,
+                    "points_remaining": balance,
+                    "message": f"You need {cost} points to use this premium AI tool.",
+                }
+
+            # 7. Provider-cost cache lookup: MongoDB → in-memory → Gemini.
+            cached = None
+            cache_source = "miss"
+            mongo_hit = await _mongo_cache_get(ai_result_cache_col, cache_key)
+            if mongo_hit is not None:
+                log.info(
+                    "premium_ai: mongo cache HIT tool=%s book=%s key=%s student=%s",
+                    tool, payload.book_slug, cache_key[:10], student.clean_id,
+                )
+                cached = mongo_hit
+                cache_source = "mongo"
+                _cache_set(cache_key, cached)
+                await _mongo_cache_register_hit(ai_result_cache_col, cache_key)
+            else:
+                log.info(
+                    "premium_ai: mongo cache MISS tool=%s book=%s key=%s",
+                    tool, payload.book_slug, cache_key[:10],
+                )
+                mem_hit = _cache_get(cache_key)
+                if mem_hit is not None:
+                    log.info(
+                        "premium_ai: memory cache HIT tool=%s key=%s",
+                        tool, cache_key[:10],
+                    )
+                    cached = mem_hit
+                    cache_source = "memory"
+
+            if cached is not None:
+                log.info(
+                    "premium_ai: cache HIT via=%s tool=%s key=%s",
+                    cache_source, tool, cache_key[:10],
+                )
+                ai_result = cached
+            else:
+                log.info(
+                    "premium_ai: gemini call start tool=%s cache=MISS key=%s",
+                    tool, cache_key[:10],
+                )
+                # Inner try/except below is kept ONLY to register a 60-s
+                # cooldown on Gemini 429 and to write the ai_error audit
+                # row. The duplicate-click guard is handled by the outer
+                # ACTIVE_REQUESTS try/finally above (v1.1.1).
+                try:
+                    ai_result = await _gemini_call(effective_sys, user_prompt)
+                except HTTPException as he:
+                    if he.status_code == 429:
+                        COOLDOWN_REGISTRY[guard_key] = time.time() + COOLDOWN_SECONDS
+                    log.warning(
+                        "premium_ai: gemini FAILED tool=%s status=%s",
+                        tool, he.status_code,
+                    )
+                    await _log_usage(
+                        student, tool, cost, "ai_error", payload.book_slug,
+                        points_before=balance, points_after=balance,
+                        error="Gemini call failed",
+                    )
+                    raise
+                log.info("premium_ai: gemini OK tool=%s", tool)
+                if isinstance(ai_result, dict):
+                    _cache_set(cache_key, ai_result)
+                    await _mongo_cache_set(
+                        ai_result_cache_col,
+                        cache_key,
+                        ai_result,
+                        {
+                            "tool": tool,
+                            "book_slug": payload.book_slug,
+                            "tone": tone_used,
+                            "system_instruction_hash": admin_sys_sig,
+                        },
+                    )
+                    log.info(
+                        "premium_ai: mongo cache SET tool=%s book=%s key=%s",
+                        tool, payload.book_slug, cache_key[:10],
+                    )
+
+            # 8. Deduct points ONLY after a valid result is in hand.
+            if cost > 0:
+                log.info("premium_ai: debit start clean_id=%s amount=%s", student.clean_id, cost)
+                debit_ok, debit_err = await _gas_debit(
+                    student.clean_id, payload.password, cost
+                )
+            else:
+                debit_ok, debit_err = True, ""
+
+            if not debit_ok:
+                log.warning(
+                    "premium_ai: debit FAILED clean_id=%s amount=%s err=%s",
+                    student.clean_id, cost, debit_err,
                 )
                 await _log_usage(
-                    student, tool, cost, "ai_error", payload.book_slug,
+                    student, tool, cost, "debit_failed", payload.book_slug,
                     points_before=balance, points_after=balance,
-                    error="Gemini call failed",
+                    error=debit_err,
                 )
-                raise
-            finally:
-                ACTIVE_REQUESTS.discard(guard_key)
-            log.info("premium_ai: gemini OK tool=%s", tool)
-            # Only cache successfully-parsed dict results.
-            if isinstance(ai_result, dict):
-                _cache_set(cache_key, ai_result)
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "AI ran successfully but we could not charge the points. "
+                        f"No points were taken. ({debit_err})"
+                    ),
+                )
 
-        # 6. Deduct points ONLY after Gemini success. Cost==0 -> skip GAS call.
-        if cost > 0:
-            log.info("premium_ai: debit start clean_id=%s amount=%s", student.clean_id, cost)
-            debit_ok, debit_err = await _gas_debit(
-                student.clean_id, payload.password, cost
-            )
-        else:
-            debit_ok, debit_err = True, ""
+            log.info("premium_ai: debit OK clean_id=%s amount=%s", student.clean_id, cost)
 
-        if not debit_ok:
-            # Gemini succeeded but debit failed -> NOT a success. Surface clearly.
-            log.warning(
-                "premium_ai: debit FAILED clean_id=%s amount=%s err=%s",
-                student.clean_id, cost, debit_err,
+            # 9. v1.2 — Register the per-student entitlement ONLY after a
+            # successful debit. Idempotent ($setOnInsert). Non-fatal: a
+            # permanent write failure is logged at ERROR but does not break
+            # the student response — the student has already paid.
+            access_written = await _access_set(
+                access_col,
+                access_key,
+                student.clean_id,
+                cache_key,
+                tool,
+                payload.book_slug,
+                cost,
             )
+            if access_written:
+                log.info(
+                    "premium_ai: entitlement SET student=%s key=%s tool=%s book=%s",
+                    student.clean_id, access_key[:10], tool, payload.book_slug,
+                )
+
+            # 10. Re-read balance (best-effort) for the response card
+            new_balance, _reason2 = await _gas_get_balance(student.clean_id, payload.password)
+            if new_balance is None:
+                new_balance = max(0, balance - cost)
+
+            # 11. Audit log (NO password, NO Gemini output stored)
             await _log_usage(
-                student, tool, cost, "debit_failed", payload.book_slug,
-                points_before=balance, points_after=balance,
-                error=debit_err,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "AI ran successfully but we could not charge the points. "
-                    f"No points were taken. ({debit_err})"
-                ),
+                student, tool, cost, "success", payload.book_slug,
+                points_before=balance, points_after=new_balance,
             )
 
-        log.info("premium_ai: debit OK clean_id=%s amount=%s", student.clean_id, cost)
-
-        # 7. Re-read balance (best-effort) for the response card
-        new_balance, _reason2 = await _gas_get_balance(student.clean_id, payload.password)
-        if new_balance is None:
-            new_balance = max(0, balance - cost)
-
-        # 8. Audit log (NO password, NO Gemini output stored)
-        await _log_usage(
-            student, tool, cost, "success", payload.book_slug,
-            points_before=balance, points_after=new_balance,
-        )
-
-        # 9. Return the result card to the frontend
-        greeting_default = (
-            f"Hi {_first_name(student.display_name, student.clean_id)},"
-        )
-        response: dict = {
-            "success": True,
-            "tool": tool,
-            "points_deducted": cost,
-            "points_remaining": new_balance,
-            "greeting": str(ai_result.get("greeting") or greeting_default)[:300],
-        }
-        for k in (
-            "khmer_mindset",
-            "natural_version",
-            "executive_version",
-            "practice_line",
-            "why_it_works",
-        ):
-            if k in ai_result:
-                response[k] = str(ai_result[k])[:2000]
-        return response
+            # 12. Return the result card to the frontend
+            greeting_default = (
+                f"Hi {_first_name(student.display_name, student.clean_id)},"
+            )
+            response = {
+                "success": True,
+                "tool": tool,
+                "points_deducted": cost,
+                "points_remaining": new_balance,
+                "unlocked": True,
+                "greeting": str(ai_result.get("greeting") or greeting_default)[:300],
+            }
+            for k in (
+                "khmer_mindset",
+                "natural_version",
+                "executive_version",
+                "practice_line",
+                "why_it_works",
+            ):
+                if k in ai_result:
+                    response[k] = str(ai_result[k])[:2000]
+            return response
+        finally:
+            ACTIVE_REQUESTS.discard(guard_key)
 
     @api.post("/student/premium/decode-block")
     async def student_decode_block(
@@ -1037,6 +1534,80 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
             payload=payload,
             student=student,
         )
+
+    # v1.2 — Batch entitlement-status endpoint used by the Reader to render
+    # per-block "Unlocked" badges WITHOUT calling Gemini or touching points.
+    # Read-only. Compute cache_key/access_key server-side from the current
+    # Author Studio Personality config so the frontend never sees the admin's
+    # system_instruction text or the raw cache_key.
+    @api.post("/student/premium/access-status")
+    async def student_premium_access_status(
+        payload: StudentAccessStatusRequest,
+        student=Depends(require_student),
+    ):
+        # Hard cap to prevent abuse / accidental N+1 floods from the Reader.
+        MAX_ITEMS = 20
+        if not payload.items:
+            return {"success": True, "access": {}}
+        if len(payload.items) > MAX_ITEMS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many items (max {MAX_ITEMS} per request).",
+            )
+
+        # Load Personality config ONCE server-side. The frontend NEVER sends
+        # tone_preset or system_instruction — those come from the admin's
+        # Author Studio config.
+        try:
+            cfg = await _load_config()
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully
+            log.warning(
+                "premium_ai: access-status _load_config failed err=%s",
+                type(exc).__name__,
+            )
+            return {"success": False, "access": {}}
+
+        effective_sys_unused, tone_used, admin_sys = _compose_system_instruction(
+            "", cfg
+        )
+        admin_sys_sig = hashlib.sha1(admin_sys.encode("utf-8")).hexdigest()
+
+        access_map: dict[str, bool] = {}
+        for item in payload.items:
+            tool = (item.tool or "").strip()
+            block_text = (item.block_text or "").strip()
+            item_id = (item.item_id or "").strip()
+            if not item_id or not tool or not block_text:
+                # Echo back as false so the frontend renders the paid pill.
+                if item_id:
+                    access_map[item_id] = False
+                continue
+            try:
+                # Clamp to the same 2000-char ceiling _run_premium_tool uses
+                # so cache_key matches what the real endpoint will compute.
+                if len(block_text) > 2000:
+                    block_text = block_text[:2000]
+                cache_key = _cache_key(
+                    tool, payload.book_slug, block_text, tone_used, admin_sys_sig,
+                )
+                access_key = _access_key(student.clean_id, cache_key)
+                try:
+                    doc = await _access_get(access_col, access_key)
+                except _AccessReadError:
+                    # Per-item fail-safe: this item shows as "not unlocked"
+                    # so the student is asked to pay rather than served a
+                    # free cached result during a Mongo hiccup.
+                    access_map[item_id] = False
+                    continue
+                access_map[item_id] = doc is not None
+            except Exception as exc:  # noqa: BLE001 — degrade per item
+                log.warning(
+                    "premium_ai: access-status per-item failed item=%s err=%s",
+                    item_id[:32], type(exc).__name__,
+                )
+                access_map[item_id] = False
+
+        return {"success": True, "access": access_map}
 
     log.info(
         "premium_ai_tools: routes registered (Phase 1 = decode-block + executive-upgrade)"
