@@ -66,6 +66,18 @@ except ImportError:  # premium_ai_tools.py not yet deployed
             "premium_ai_tools.py not installed — Premium AI Tools disabled."
         )
 
+# ── EduTalk (Phase 2A — isolated module) ────────────────────────────────── #
+# edutalk_tools.py registers admin EduTalk config + student start / message  #
+# / session routes onto the existing /api router. Same defensive import      #
+# pattern: missing file → EduTalk disabled, every other route keeps working. #
+try:
+    from edutalk_tools import register_edutalk_routes
+except ImportError:  # edutalk_tools.py not yet deployed
+    def register_edutalk_routes(*_a, **_kw):  # type: ignore[misc]
+        logging.getLogger("eduhub").warning(
+            "edutalk_tools.py not installed — EduTalk disabled."
+        )
+
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
@@ -5365,5 +5377,6 @@ exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").rea
 # /api/admin/ai-tools-config (GET/PUT) and /api/admin/ai-tools-usage (GET).
 # Must run BEFORE app.include_router(api) below.
 register_premium_ai_routes(api, db, require_admin, require_student)
+register_edutalk_routes(api, db, require_admin, require_student)
 
 app.include_router(api)
