@@ -79,6 +79,20 @@ except ImportError:  # edutalk_tools.py not yet deployed
         )
 
 # --------------------------------------------------------------------------- #
+# PHASE 3: edutalk_tier_config_tools.py registers tier-aware AI feature       #
+# config + promotion CRUD onto the existing /api router. Same defensive       #
+# import pattern: missing file → Phase 3 features disabled, every other       #
+# route (Phase 1 + Phase 2A EduTalk) keeps working unchanged.                 #
+# --------------------------------------------------------------------------- #
+try:
+    from edutalk_tier_config_tools import register_tier_config_routes
+except ImportError:  # edutalk_tier_config_tools.py not yet deployed
+    def register_tier_config_routes(*_a, **_kw):  # type: ignore[misc]
+        logging.getLogger("eduhub").warning(
+            "edutalk_tier_config_tools.py not installed — Phase 3 tier config disabled."
+        )
+
+# --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
 ROOT_DIR = Path(__file__).parent
@@ -5378,5 +5392,7 @@ exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").rea
 # Must run BEFORE app.include_router(api) below.
 register_premium_ai_routes(api, db, require_admin, require_student)
 register_edutalk_routes(api, db, require_admin, require_student)
+# PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
+register_tier_config_routes(api, db, require_admin, require_student)
 
 app.include_router(api)
