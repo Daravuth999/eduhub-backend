@@ -461,7 +461,20 @@ def register_tier_config_routes(api: APIRouter, db, require_admin, require_stude
     @api.get("/admin/edutalk-tier-config")
     async def admin_get_tier_config(admin=Depends(require_admin)):
         _ = admin
-        tiers = await load_tier_config(db)
+        # Defensive: even if the Mongo read raises (network blip, transient
+        # cluster error, doc shape mismatch), the Author Studio UI must
+        # still receive a renderable payload. Falling back to in-memory
+        # DEFAULT_TIER_CONFIG keeps the panel functional and lets the admin
+        # save a fresh document — which then becomes the new source of truth.
+        try:
+            tiers = await load_tier_config(db)
+            if not isinstance(tiers, dict) or not tiers:
+                raise ValueError("load_tier_config returned empty mapping")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "edutalk_tier_config: load failed, returning defaults: %s", exc,
+            )
+            tiers = {t: dict(DEFAULT_TIER_CONFIG[t]) for t in VALID_TIERS}
         return {
             "success": True,
             "tiers": tiers,
