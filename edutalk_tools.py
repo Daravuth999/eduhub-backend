@@ -667,6 +667,64 @@ def _detect_script_language(text: str) -> str:
     return "khmer" if _KHMER_RE.search(text or "") else "english"
 
 
+def _khmer_char_ratio(text: str) -> float:
+    """Return the fraction of characters that are in the Khmer Unicode block.
+
+    Used to decide whether a voice script faithfully preserves a Khmer reply.
+    """
+    if not text:
+        return 0.0
+    khmer_count = sum(1 for ch in text if "ក" <= ch <= "៿")
+    return khmer_count / len(text)
+
+
+def _clean_reply_for_tts(text: str) -> str:
+    """Strip markdown symbols from a reply so it reads naturally when spoken.
+
+    Removes: * _ ` # bold/italic markers, bullet dash lines, header lines.
+    Preserves: Khmer characters, English words, punctuation, spaces, newlines.
+    """
+    t = str(text or "").strip()
+    # Remove bold/italic markers and backticks
+    t = re.sub(r"[*_`]+", "", t)
+    # Remove markdown headers (# ## ###)
+    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.MULTILINE)
+    # Collapse multiple blank lines to one
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _is_bad_khmer_voice_script(script: str, reply_text: str) -> bool:
+    """Return True when the generated script does not adequately cover the Khmer reply.
+
+    This catches cases where Gemini "rewriting" collapses the Khmer content
+    into a generic English greeting or a very short acknowledgement.
+
+    Conditions that trigger fallback to cleaned reply_text:
+    - Script is shorter than 60 characters.
+    - Script contains less than 10 % Khmer characters while reply had ≥ 30 %.
+    - Script is less than 25 % the length of the original reply.
+    """
+    if len(script) < 60:
+        log.info("edutalk: khmer script too short (%d chars) — using fallback", len(script))
+        return True
+    reply_khmer_ratio = _khmer_char_ratio(reply_text)
+    script_khmer_ratio = _khmer_char_ratio(script)
+    if reply_khmer_ratio >= 0.30 and script_khmer_ratio < 0.10:
+        log.info(
+            "edutalk: khmer script lost Khmer content (reply_ratio=%.2f script_ratio=%.2f) "
+            "— using fallback", reply_khmer_ratio, script_khmer_ratio,
+        )
+        return True
+    if len(reply_text) > 120 and len(script) < len(reply_text) * 0.25:
+        log.info(
+            "edutalk: khmer script too compressed (%d → %d chars) — using fallback",
+            len(reply_text), len(script),
+        )
+        return True
+    return False
+
+
 def _pcm_to_wav_b64(pcm_b64: str, sample_rate: int = 24000,
                     channels: int = 1, bits: int = 16) -> str:
     """Wrap raw Linear-PCM base64 in a WAV container and re-encode as base64.
@@ -1748,24 +1806,56 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                     )
                 deducted = voice_cost
 
-            # 3) Generate the voice script via Gemini.
-            try:
-                voice_script = await _edutalk_gemini_voice_script(
-                    cfg, session, payload.reply_text, session.get("student_name", ""),
+            # 3) Generate the voice script.
+            #
+            # Strategy differs by reply language:
+            #
+            # KHMER REPLY → skip Gemini voice-script rewriting entirely.
+            #   Gemini rewriting compresses the Khmer explanation into a
+            #   very short generic script, losing teaching content.
+            #   Instead, clean the raw reply_text for speech and use it
+            #   directly.  If cleaning produces something too short or
+            #   clearly broken, fall back to the truncated raw reply.
+            #
+            # ENGLISH REPLY → use existing Gemini voice-script generation
+            #   (_edutalk_gemini_voice_script) so English is restructured
+            #   for natural spoken delivery with correct tone/pace.
+            #
+            raw_reply = (payload.reply_text or "").strip()
+            reply_is_khmer = _detect_script_language(raw_reply) == "khmer"
+
+            if reply_is_khmer:
+                # Clean for TTS: remove markdown, preserve Khmer + English examples.
+                voice_script = _clean_reply_for_tts(raw_reply)
+                # Cap at 1800 chars so TTS latency stays reasonable (~60 s).
+                if len(voice_script) > 1800:
+                    voice_script = voice_script[:1800].rsplit(".", 1)[0] + "."
+                if len(voice_script) < 20:
+                    # Extreme edge case — cleaned string is almost empty.
+                    voice_script = raw_reply[:800]
+                log.info(
+                    "edutalk: khmer speak — using cleaned reply_text (%d chars) "
+                    "session=%s", len(voice_script), payload.session_id[:12],
                 )
-            except HTTPException as he:
-                # Refund on Gemini failure.
-                if deducted > 0:
-                    await _gas_refund(
-                        student.clean_id, payload.password, deducted,
-                        reason="voice_gemini_failure",
+            else:
+                # English path — use Gemini to rewrite for natural spoken delivery.
+                try:
+                    voice_script = await _edutalk_gemini_voice_script(
+                        cfg, session, raw_reply, session.get("student_name", ""),
                     )
-                await _log_usage(
-                    student, "speak", "ai_error", 0,
-                    session.get("book_slug", ""), session.get("chapter_idx"),
-                    payload.session_id, error_reason=str(he.detail)[:120],
-                )
-                raise
+                except HTTPException as he:
+                    # Refund on Gemini failure.
+                    if deducted > 0:
+                        await _gas_refund(
+                            student.clean_id, payload.password, deducted,
+                            reason="voice_gemini_failure",
+                        )
+                    await _log_usage(
+                        student, "speak", "ai_error", 0,
+                        session.get("book_slug", ""), session.get("chapter_idx"),
+                        payload.session_id, error_reason=str(he.detail)[:120],
+                    )
+                    raise
 
             # 4) Language-aware TTS routing.
             #
