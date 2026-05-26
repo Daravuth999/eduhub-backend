@@ -309,6 +309,22 @@ async def load_tier_config(db) -> dict[str, dict[str, Any]]:
     return _merge_tier_config(doc)
 
 
+async def has_admin_saved_tier_config(db) -> bool:
+    """Return True only when an admin has explicitly saved tier config via UI.
+
+    Auto-seeded documents have `seeded_at` but NOT `updated_by`.
+    Admin-saved documents always have `updated_by` (set by PUT route).
+    This lets _resolve_effective_book_config distinguish between
+    "admin chose these settings" vs "auto-seeded conservative defaults".
+    """
+    col = db[MONGO_TIER_CONFIG_COLLECTION]
+    doc = await col.find_one(
+        {"_id": TIER_CONFIG_DOC_ID},
+        {"updated_by": 1},
+    )
+    return bool(doc and doc.get("updated_by"))
+
+
 async def resolve_active_promotion(
     db,
     *,

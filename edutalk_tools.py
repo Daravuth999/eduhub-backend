@@ -94,6 +94,7 @@ try:
         resolve_active_promotion as _tc_resolve_active_promotion,
         apply_promotion_to_cost as _tc_apply_promotion_to_cost,
         list_active_banners as _tc_list_active_banners,
+        has_admin_saved_tier_config as _tc_has_admin_saved,
         VALID_TIERS as _TC_VALID_TIERS,
     )
     _PHASE3_HELPERS_OK = True
@@ -102,6 +103,7 @@ except Exception:  # noqa: BLE001
     _tc_resolve_active_promotion = None  # type: ignore[assignment]
     _tc_apply_promotion_to_cost = None  # type: ignore[assignment]
     _tc_list_active_banners = None  # type: ignore[assignment]
+    _tc_has_admin_saved = None  # type: ignore[assignment]
     _TC_VALID_TIERS = ("free", "standard", "premium", "limited_edition")
     _PHASE3_HELPERS_OK = False
 
@@ -857,10 +859,29 @@ async def _resolve_effective_book_config(
     # Build effective config layer-by-layer.
     eff: dict[str, Any] = {}
 
-    # Master enabled flag — tier wins, but global enabled is required.
-    eff["edutalk_enabled"] = bool(global_cfg.get("enabled")) and bool(
-        tier_cfg.get("edutalk_enabled", True)
-    )
+    # Master enabled flag:
+    # - Global "enabled" is always required (master switch).
+    # - Tier config only restricts EduTalk when an admin has EXPLICITLY saved
+    #   tier defaults via Author Studio. Auto-seeded tier docs (no updated_by)
+    #   must not override the global switch — otherwise enabling EduTalk
+    #   globally has no visible effect until the admin also saves tier config.
+    _tier_admin_saved: bool = False
+    if _PHASE3_HELPERS_OK and _tc_has_admin_saved is not None:
+        try:
+            _tier_admin_saved = await _tc_has_admin_saved(db)
+        except Exception:  # noqa: BLE001
+            _tier_admin_saved = False
+
+    if _tier_admin_saved:
+        # Admin explicitly configured tiers — respect their per-tier setting.
+        eff["edutalk_enabled"] = bool(global_cfg.get("enabled")) and bool(
+            tier_cfg.get("edutalk_enabled", True)
+        )
+    else:
+        # Tiers not yet admin-configured — global flag alone decides.
+        # This ensures "Enable EduTalk" in Author Studio works immediately
+        # without requiring a separate trip to the Tier Defaults panel.
+        eff["edutalk_enabled"] = bool(global_cfg.get("enabled"))
     eff["edutalk_cost"] = int(tier_cfg.get("edutalk_cost", global_cfg.get("session_cost", 5)))
     eff["edutalk_replies"] = int(tier_cfg.get("edutalk_replies", global_cfg.get("reply_limit", 5)))
     eff["session_expiry_minutes"] = int(
