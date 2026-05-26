@@ -1233,6 +1233,261 @@ def _detect_exercise_or_challenge_context(session: dict) -> bool:
         return True
     return False
 
+
+# ============================================================================
+# COACH MEMORY v1 (additive, failure-safe)
+# ============================================================================
+# Goal: make students feel recognised — "the coach remembers me".
+# Stores ONLY tiny learning facts per student. No transcripts. No PII.
+# No exam answers. No Gemini call (pure heuristic extraction).
+# All read/write is wrapped — failures NEVER block EduTalk.
+#
+# Collection: student_edutalk_memory   (key = student_id, upsert)
+# Schema (all strings, soft):
+#   student_id, last_book_slug, last_book_title, last_chapter_title,
+#   last_learning_focus, last_vocab_word, last_practice_type, updated_at
+# ----------------------------------------------------------------------------
+MEMORY_COLLECTION_NAME = "student_edutalk_memory"
+
+# Vocabulary word detector — fires only when learning_focus == "vocabulary".
+# Captures patterns like:  what does "surprised" mean?  /  meaning of confident
+_MEMORY_VOCAB_RE = re.compile(
+    r"(?:what\s+(?:does|is)|what's|whats|meaning\s+of|define|definition\s+of)\s+"
+    r"[\"'\u2018\u2019\u201C\u201D`]?([A-Za-z][A-Za-z\-']{1,24})[\"'\u2018\u2019\u201C\u201D`]?",
+    re.IGNORECASE,
+)
+_MEMORY_VOCAB_QUOTED_RE = re.compile(
+    r"[\"'\u2018\u2019\u201C\u201D`]([A-Za-z][A-Za-z\-']{1,24})[\"'\u2018\u2019\u201C\u201D`]"
+)
+
+# Learning-focus router — ordered, first match wins. Keep coarse-grained
+# so we never bombard the student with overly specific labels.
+_MEMORY_FOCUS_ROUTES = (
+    ("vocabulary", re.compile(
+        r"(vocab\b|vocabulary|what does|meaning of|define|difficult word|explain.*word)",
+        re.IGNORECASE,
+    )),
+    ("summary", re.compile(r"\bsummar(?:y|ise|ize|ising|izing)\b", re.IGNORECASE)),
+    ("grammar", re.compile(
+        r"\bgrammar\b|\btense\b|\bverb\b|\bsentence\s+structure\b",
+        re.IGNORECASE,
+    )),
+    ("reflection questions", re.compile(
+        r"reflect(?:ion)?|ask\s+me\s+question|comprehension\s+question",
+        re.IGNORECASE,
+    )),
+    ("translation", re.compile(r"translate|translation|\u1794\u1780\u1794\u17D2\u179A\u17C2", re.IGNORECASE)),
+    ("exercise practice", re.compile(r"quiz|exercise|challenge|hint|practice", re.IGNORECASE)),
+)
+
+# Khmer translations for the learning_focus when used inside the audio greeting.
+_MEMORY_FOCUS_KH = {
+    "vocabulary":           "\u179C\u17B6\u1780\u17D2\u1799\u179F\u1796\u17D2\u1791",                          # វាក្យសព្ទ
+    "summary":              "\u1780\u17B6\u179A\u179F\u1784\u17D2\u1781\u17C1\u1794",                          # ការសង្ខេប
+    "grammar":              "\u179C\u17C1\u1799\u17D2\u1799\u17B6\u1780\u179A\u178E\u17CD",                    # វេយ្យាករណ៍
+    "reflection questions": "\u1780\u17B6\u179A\u179F\u17BD\u179A\u179F\u17C6\u178E\u17BD\u179A\u1786\u17D2\u179B\u17BB\u17C7\u1794\u1789\u17D2\u1785\u17B6\u17C6\u1784",  # ការសួរសំណួរឆ្លុះបញ្ចាំង
+    "translation":          "\u1780\u17B6\u179A\u1794\u1780\u1794\u17D2\u179A\u17C2",                          # ការបកប្រែ
+    "exercise practice":    "\u1780\u17B6\u179A\u179F\u17B6\u1780\u179B\u17C2\u1784\u179B\u17C6\u17A0\u17B6\u178F\u17CB",  # ការសាកល្បងលំហាត់
+    "reading comprehension": "\u1780\u17B6\u179A\u17A2\u17B6\u1793\u1799\u179B\u17CB",                         # ការអានយល់
+}
+
+
+async def _coach_memory_load(db, student_id: str) -> dict | None:
+    """Load a student's memory doc. Returns None on any failure / not-found.
+
+    NEVER raises to the caller — EduTalk must keep working if Mongo
+    is unreachable or the collection is empty.
+    """
+    try:
+        if not student_id or db is None:
+            return None
+        doc = await db[MEMORY_COLLECTION_NAME].find_one({"student_id": student_id})
+        if not doc:
+            return None
+        return {
+            "last_book_slug":      str(doc.get("last_book_slug") or "")[:80],
+            "last_book_title":     str(doc.get("last_book_title") or "")[:120],
+            "last_chapter_title":  str(doc.get("last_chapter_title") or "")[:120],
+            "last_learning_focus": str(doc.get("last_learning_focus") or "")[:60],
+            "last_vocab_word":     str(doc.get("last_vocab_word") or "")[:40],
+            "last_practice_type":  str(doc.get("last_practice_type") or "")[:60],
+            "updated_at":          str(doc.get("updated_at") or "")[:40],
+        }
+    except Exception as exc:  # noqa: BLE001  — failure-safe by design
+        log.warning("coach_memory: load failed (non-blocking): %s", exc)
+        return None
+
+
+async def _coach_memory_save(db, student_id: str, facts: dict) -> None:
+    """Upsert 1–3 lightweight facts. NEVER raises to caller.
+
+    `facts` may contain any subset of the schema keys.  Empty / falsy
+    values are dropped.  Every value is coerced to str and length-capped
+    so we cannot accidentally persist huge content.
+    """
+    try:
+        if not student_id or db is None or not facts:
+            return
+        allowed = {
+            "last_book_slug", "last_book_title", "last_chapter_title",
+            "last_learning_focus", "last_vocab_word", "last_practice_type",
+        }
+        clean: dict = {}
+        for k, v in facts.items():
+            if k not in allowed:
+                continue
+            s = str(v or "").strip()
+            if not s:
+                continue
+            clean[k] = s[:160]
+        if not clean:
+            return
+        clean["student_id"] = student_id
+        clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await db[MEMORY_COLLECTION_NAME].update_one(
+            {"student_id": student_id},
+            {"$set": clean},
+            upsert=True,
+        )
+    except Exception as exc:  # noqa: BLE001  — failure-safe by design
+        log.warning("coach_memory: save failed (non-blocking): %s", exc)
+
+
+def _coach_memory_extract_facts(
+    *, question: str, reply: str, session: dict
+) -> dict:
+    """Pure heuristic extraction of 1–3 small facts. No Gemini call.
+
+    Inputs:
+      - question: the student's last message text
+      - reply:    the assistant's reply text (used as a soft fallback only)
+      - session:  the EduTalk session dict (carries book_slug/title etc.)
+
+    Output: dict subset of the memory schema.  Empty dict if nothing useful.
+
+    Exercise safeguard:
+      - If the page/book is exercise/challenge/quiz, force learning_focus
+        to "exercise practice" and DO NOT extract a vocab word.  We never
+        want to store final-answer content as memory.
+    """
+    q = (question or "")[:400]
+    _r = (reply or "")[:400]  # reserved for future heuristics; intentionally unused
+    facts: dict = {}
+
+    book_slug = str(session.get("book_slug") or "").strip()
+    book_title = str(session.get("book_title") or "").strip()
+    chapter_title = str(session.get("chapter_title") or "").strip()
+    if book_slug:
+        facts["last_book_slug"] = book_slug
+    if book_title:
+        facts["last_book_title"] = book_title
+    if chapter_title:
+        facts["last_chapter_title"] = chapter_title
+
+    # Detect learning focus from the student's question.
+    focus = "reading comprehension"
+    for label, rx in _MEMORY_FOCUS_ROUTES:
+        if rx.search(q):
+            focus = label
+            break
+
+    # Exercise safeguard — generic label, no vocab extraction.
+    is_exercise_ctx = _detect_exercise_or_challenge_context(session)
+    if is_exercise_ctx:
+        focus = "exercise practice"
+
+    facts["last_learning_focus"] = focus
+    facts["last_practice_type"] = focus
+
+    # Vocab word — ONLY for vocabulary focus, NEVER for exercise.
+    if focus == "vocabulary" and not is_exercise_ctx:
+        m = _MEMORY_VOCAB_RE.search(q)
+        if m:
+            facts["last_vocab_word"] = m.group(1).lower().strip("\"'`")
+        else:
+            # Fallback: a single quoted English token in the question.
+            m2 = _MEMORY_VOCAB_QUOTED_RE.search(q)
+            if m2:
+                facts["last_vocab_word"] = m2.group(1).lower().strip("\"'`")
+
+    return facts
+
+
+def _coach_memory_sentence_en(mem: dict | None) -> str:
+    """Build a short English memory sentence for the visible greeting.
+
+    Returns "" when there is no useful memory.  Wording is intentionally
+    warm and positive — never says "you were weak at…".
+    """
+    if not mem:
+        return ""
+    vocab = (mem.get("last_vocab_word") or "").strip()
+    focus = (mem.get("last_learning_focus") or "").strip()
+    book = (mem.get("last_book_title") or "").strip()
+
+    if vocab:
+        return (
+            f"Last time, you practiced the word \u201c{vocab}\u201d \u2014 "
+            f"let\u2019s keep building your confidence today."
+        )
+    if focus and focus != "reading comprehension":
+        return (
+            f"Last time, you worked on {focus} \u2014 let\u2019s continue today."
+        )
+    if book:
+        return (
+            f"Welcome back \u2014 last time you were reading "
+            f"\u201c{book}\u201d. Let\u2019s pick up where you left off."
+        )
+    return ""
+
+
+def _coach_memory_sentence_kh(mem: dict | None) -> str:
+    """Build a short Khmer memory sentence for the greeting AUDIO.
+
+    Returns "" when there is no useful memory.  Cluster-audited valid
+    Khmer (no orphan COENG, no replacement chars).
+    """
+    if not mem:
+        return ""
+    vocab = (mem.get("last_vocab_word") or "").strip()
+    focus = (mem.get("last_learning_focus") or "").strip()
+    book = (mem.get("last_book_title") or "").strip()
+
+    if vocab:
+        # លើកមុន អ្នកបានហាត់ពាក្យ "{vocab}"។ ថ្ងៃនេះយើងនឹងបន្តបន្តិចម្តងៗ។
+        return (
+            f"\u179B\u17BE\u1780\u1798\u17BB\u1793 "
+            f"\u17A2\u17D2\u1793\u1780\u1794\u17B6\u1793\u17A0\u17B6\u178F\u17CB"
+            f"\u1796\u17B6\u1780\u17D2\u1799 \u201c{vocab}\u201d\u17D4 "
+            f"\u1790\u17D2\u1784\u17C3\u1793\u17C1\u17C7"
+            f"\u1799\u17BE\u1784\u1793\u17B9\u1784\u1794\u1793\u17D2\u178F"
+            f"\u1794\u1793\u17D2\u178F\u17B7\u1785\u1798\u17D2\u178F\u1784\u17D7\u17D4"
+        )
+    if focus and focus != "reading comprehension":
+        kh_focus = _MEMORY_FOCUS_KH.get(focus, focus)
+        # លើកមុន អ្នកបានធ្វើ{kh_focus}។ ថ្ងៃនេះយើងបន្តដោយរីករាយ។
+        return (
+            f"\u179B\u17BE\u1780\u1798\u17BB\u1793 "
+            f"\u17A2\u17D2\u1793\u1780\u1794\u17B6\u1793\u1792\u17D2\u179C\u17BE"
+            f"{kh_focus}\u17D4 "
+            f"\u1790\u17D2\u1784\u17C3\u1793\u17C1\u17C7\u1799\u17BE\u1784"
+            f"\u1794\u1793\u17D2\u178F\u178A\u17C4\u1799\u179A\u17B8\u1780\u179A\u17B6\u1799\u17D4"
+        )
+    if book:
+        # សូមស្វាគមន៍ត្រលប់មកវិញ! ថ្ងៃនេះយើងបន្តរឿង "{book}"។
+        return (
+            f"\u179F\u17BC\u1798\u179F\u17D2\u179C\u17B6\u1782\u1798\u1793\u17CD"
+            f"\u178F\u17D2\u179A\u179B\u1794\u17CB\u1798\u1780\u179C\u17B7\u1789\u0021 "
+            f"\u1790\u17D2\u1784\u17C3\u1793\u17C1\u17C7\u1799\u17BE\u1784"
+            f"\u1794\u1793\u17D2\u178F\u179A\u17BF\u1784 \u201c{book}\u201d\u17D4"
+        )
+    return ""
+# ============================================================================
+# END COACH MEMORY v1
+# ============================================================================
+
+
 async def _build_voice_script_for_visible_khmer(
     cfg: dict,
     session: dict,
@@ -1986,6 +2241,28 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                 greeting_audio_script = opening
                 opening_language = "khmer"
 
+            # --- COACH MEMORY v1 — gentle, warm, additive layer. ----------
+            # Load lightweight learning facts from previous sessions and
+            # weave ONE short sentence into both the visible (English) and
+            # audio (Khmer) greetings.  100% failure-safe: any Mongo issue
+            # is logged and silently ignored — the greeting still works.
+            try:
+                _mem = await _coach_memory_load(db, student.clean_id)
+                _mem_en = _coach_memory_sentence_en(_mem)
+                _mem_kh = _coach_memory_sentence_kh(_mem)
+                if _mem_en:
+                    opening = (opening + " " + _mem_en).strip()
+                if _mem_kh:
+                    greeting_audio_script = (
+                        greeting_audio_script + " " + _mem_kh
+                    ).strip()
+            except Exception as _mem_exc:  # noqa: BLE001
+                log.warning(
+                    "coach_memory: greeting weave skipped (non-blocking): %s",
+                    _mem_exc,
+                )
+            # --- END COACH MEMORY v1 --------------------------------------
+
             session_id = uuid4().hex[:24]
 
             # Phase 3 — snapshot student_context onto the session so we never
@@ -2195,6 +2472,25 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
             student, "message", "success", 0,
             session.get("book_slug", ""), session.get("chapter_idx"), payload.session_id,
         )
+
+        # --- COACH MEMORY v1 — extract & upsert 1-3 small facts. ----------
+        # Runs AFTER the success log so a memory failure cannot affect
+        # the user-visible reply.  Pure heuristic — no Gemini call, no
+        # cost.  Exercise safeguard is enforced inside the extractor.
+        try:
+            _facts = _coach_memory_extract_facts(
+                question=payload.message,
+                reply=reply_text,
+                session=session,
+            )
+            await _coach_memory_save(db, student.clean_id, _facts)
+        except Exception as _mem_exc:  # noqa: BLE001
+            log.warning(
+                "coach_memory: extract/save skipped (non-blocking): %s",
+                _mem_exc,
+            )
+        # --- END COACH MEMORY v1 ------------------------------------------
+
         return {
             "success": True,
             "reply": reply_text,
