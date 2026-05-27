@@ -296,14 +296,36 @@ class StudentContext(BaseModel):
     All fields are optional. The frontend MUST source these values from
     `student.portalData` (already loaded at login by AuthContext); the
     backend NEVER calls GAS again to fetch them.
+
+    v1.1 expansion (Sep 2026) — added 7 optional alias criteria
+    (reading, vocabulary, grammar, listening, confidence, comprehension,
+    fluency) so future GAS sheets can expose English-learning specific
+    fields without a schema migration.  When absent the backend simply
+    treats them as not provided — fully backward compatible.
+
+    `extra="ignore"` guarantees that any other portalData field the
+    frontend might mistakenly forward (Password, phone, tuition, etc.)
+    is silently dropped at the Pydantic boundary.  This is the second
+    layer of the privacy contract documented in EduTalkPanel.jsx
+    `_buildStudentContext`.
     """
     model_config = ConfigDict(extra="ignore")
+    # Baseline 6 criteria (always present in the GAS sheet today).
     pronunciation: float | None = None
     intonation: float | None = None
     communication: float | None = None
     participation: float | None = None
     rising_falling: float | None = None
     linking_sounds: float | None = None
+    # v1.1 alias criteria (English-learning specific).  All optional.
+    reading: float | None = None
+    vocabulary: float | None = None
+    grammar: float | None = None
+    listening: float | None = None
+    confidence: float | None = None
+    comprehension: float | None = None
+    fluency: float | None = None
+    # Teacher-note text fields (trimmed at frontend, capped here).
     strength: str | None = Field(None, max_length=400)
     weakness: str | None = Field(None, max_length=400)
     improvement: str | None = Field(None, max_length=400)
@@ -456,19 +478,39 @@ def _build_student_context_block(sc: dict | None) -> str:
 
     Returns empty string when no context is provided so the parent prompt
     stays clean for tiers that do not include score-aware coaching.
+
+    v1.1 — also surfaces the 7 optional alias criteria when the frontend
+    forwarded them.  Each line is emitted only when the score is actually
+    present (no "N/A" lines).
     """
     if not isinstance(sc, dict) or not sc:
         return ""
     lines = [
         "",
         "STUDENT PROFILE (private — never reveal these scores directly to the student):",
-        f"- Pronunciation: {_format_score(sc.get('pronunciation'))}/10",
-        f"- Intonation: {_format_score(sc.get('intonation'))}/10",
-        f"- Communication: {_format_score(sc.get('communication'))}/10",
-        f"- Participation: {_format_score(sc.get('participation'))}/10",
-        f"- Rising & Falling: {_format_score(sc.get('rising_falling'))}/10",
-        f"- Linking Sounds: {_format_score(sc.get('linking_sounds'))}/10",
     ]
+    # Pretty-print every criterion the frontend forwarded, in the same
+    # priority order used by the picker so the prompt reads naturally.
+    _SC_LINES = (
+        ("vocabulary",     "Vocabulary"),
+        ("grammar",        "Grammar"),
+        ("reading",        "Reading"),
+        ("comprehension",  "Reading comprehension"),
+        ("listening",      "Listening"),
+        ("communication",  "Speaking / Communication"),
+        ("pronunciation",  "Pronunciation"),
+        ("fluency",        "Fluency"),
+        ("confidence",     "Confidence"),
+        ("linking_sounds", "Linking sounds"),
+        ("intonation",     "Intonation"),
+        ("rising_falling", "Rising & Falling tones"),
+        ("participation",  "Class participation"),
+    )
+    for key, label in _SC_LINES:
+        v = sc.get(key)
+        if v is None:
+            continue
+        lines.append(f"- {label}: {_format_score(v)}/10")
     strength = (sc.get("strength") or "").strip()
     weakness = (sc.get("weakness") or "").strip()
     improvement = (sc.get("improvement") or "").strip()
@@ -1799,6 +1841,267 @@ def _coach_memory_sentence_kh(mem: dict | None) -> str:
 # ============================================================================
 
 
+# ============================================================================
+# SCORE-AWARE COACHING GREETING SENTENCE (Phase 4 — Sep 2026)
+# ----------------------------------------------------------------------------
+# Adds a single, warm, motivational coaching sentence to the EduTalk greeting
+# based on the student's monthly performance.  Honours the rules:
+#   • Each criterion is out of 10.
+#   • Praise strengths first; mention at most 1–2 focus criteria.
+#   • Never reveal exact scores, never shame the student.
+#   • Tiered tone: 8.5+ celebrate + next-level challenge / 7.0+ steady /
+#     5.0+ supportive focus / <5.0 warm step-by-step.
+#   • Returns "" when no usable data — caller weaves nothing, so the
+#     existing greeting behavior is fully preserved.
+#   • Wording matches the user-approved examples in the patch spec.
+# ============================================================================
+
+# Criterion key → human-readable English / Khmer labels.  The order doubles
+# as the tie-break priority for picking focus areas — per the spec's
+# "Prefer core English learning criteria: vocabulary, grammar, speaking,
+# pronunciation, reading comprehension, listening" rule.
+#
+# v1.1 (Sep 2026) — added 7 alias criteria so the same picker handles
+# both the baseline GAS sheet (pronunciation-focused) AND future sheets
+# that expose English-learning specific fields.  Aliases are optional:
+# `_score_aware_pick_*` only considers entries whose score is present.
+_SCORE_AWARE_CRITERIA: tuple[tuple[str, str, str], ...] = (
+    # (sc_key,            english_label,                   khmer_label)
+    # ── v1.1 core English-learning aliases (highest priority) ────────────
+    ("vocabulary",        "vocabulary",                    "វាក្យសព្ទ"),
+    ("grammar",           "grammar",                       "វេយ្យាករណ៍"),
+    ("reading",           "reading",                       "ការអាន"),
+    ("comprehension",     "reading comprehension",         "ការយល់ដឹង"),
+    ("listening",         "listening",                     "ការស្ដាប់"),
+    # ── Baseline criteria (existing GAS sheet) ────────────────────────────
+    ("communication",     "speaking",                      "ការនិយាយ"),
+    ("pronunciation",     "pronunciation",                 "ការបញ្ចេញសំឡេង"),
+    ("fluency",           "fluency",                       "ភាពស្ទាត់"),
+    ("confidence",        "confidence",                    "ទំនុកចិត្ត"),
+    ("linking_sounds",    "smooth connected speech",       "ការតភ្ជាប់សំឡេង"),
+    ("intonation",        "natural intonation",            "សំនៀង"),
+    ("rising_falling",    "rising and falling tones",      "សំឡេងឡើងចុះ"),
+    ("participation",     "class participation",           "ការចូលរួម"),
+)
+
+
+def _score_aware_pick_top_strength(sc: dict) -> tuple[str, str, float] | None:
+    """Return (en_label, kh_label, score) of the single highest-scoring
+    criterion when at least one criterion is >= 7.0.  Returns None when
+    no criterion is usable.  Ties prefer the earlier item in
+    _SCORE_AWARE_CRITERIA (core learning skills first).
+    """
+    best: tuple[str, str, float] | None = None
+    for key, en, kh in _SCORE_AWARE_CRITERIA:
+        v = sc.get(key)
+        if v is None:
+            continue
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        if n < 7.0:
+            continue
+        if best is None or n > best[2]:
+            best = (en, kh, n)
+    return best
+
+
+def _score_aware_pick_focus_areas(sc: dict, limit: int = 2) -> list[tuple[str, str, float]]:
+    """Return up to `limit` lowest-scoring criteria (English label, Khmer
+    label, score) where score < 7.0.  Returns [] when no criterion needs
+    focus, so the greeting can stay celebratory.
+    """
+    items: list[tuple[str, str, float]] = []
+    for key, en, kh in _SCORE_AWARE_CRITERIA:
+        v = sc.get(key)
+        if v is None:
+            continue
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        if n >= 7.0:
+            continue
+        items.append((en, kh, n))
+    items.sort(key=lambda t: t[2])  # lowest first
+    return items[:limit]
+
+
+def _score_aware_tier(sc: dict) -> str:
+    """Classify the overall picture into one of four tone tiers:
+      • "advanced"       — every observed criterion >= 8.5
+      • "steady"         — every observed criterion >= 7.0
+      • "developing"     — has criteria 5.0–6.9 (no priority area)
+      • "support"        — has at least one criterion < 5.0
+      • ""               — no usable scores
+    """
+    vals: list[float] = []
+    for key, _en, _kh in _SCORE_AWARE_CRITERIA:
+        v = sc.get(key)
+        if v is None:
+            continue
+        try:
+            vals.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        return ""
+    if min(vals) >= 8.5:
+        return "advanced"
+    if min(vals) >= 7.0:
+        return "steady"
+    if min(vals) >= 5.0:
+        return "developing"
+    return "support"
+
+
+def _score_aware_coaching_sentence_en(sc: dict | None) -> str:
+    """Build a short English coaching sentence for the visible greeting.
+
+    Returns "" when no usable data — caller weaves nothing in that case
+    so the legacy greeting behavior is fully preserved.
+    """
+    if not isinstance(sc, dict) or not sc:
+        return ""
+    tier = _score_aware_tier(sc)
+    if not tier:
+        return ""
+    top = _score_aware_pick_top_strength(sc)
+    focus = _score_aware_pick_focus_areas(sc, limit=2)
+
+    if tier == "advanced":
+        if top:
+            return (
+                f"Excellent progress this month \u2014 your {top[0]} is strong. "
+                f"Today, I\u2019ll help you go one step higher with deeper "
+                f"thinking and stronger English sentences."
+            )
+        return (
+            "Excellent progress this month. Today, I\u2019ll challenge you "
+            "with deeper thinking and stronger English sentences."
+        )
+
+    if tier == "steady":
+        if top:
+            return (
+                f"You\u2019re doing steadily well this month \u2014 your "
+                f"{top[0]} is strong. Today, I\u2019ll help you build more "
+                f"confidence and fluency while we read."
+            )
+        return (
+            "You\u2019re doing steadily well this month. Today, I\u2019ll "
+            "help you build more confidence and fluency while we read."
+        )
+
+    # developing / support — at least one focus area exists by definition.
+    if not focus:
+        return ""
+    focus_en = focus[0][0] if len(focus) == 1 else f"{focus[0][0]} and {focus[1][0]}"
+    if tier == "developing":
+        if top:
+            return (
+                f"You\u2019re doing well in {top[0]}. This month, "
+                f"{focus_en} needs a little more practice, so I\u2019ll "
+                f"help you step by step while we read."
+            )
+        return (
+            f"This month, {focus_en} needs a little more practice. "
+            f"Today, I\u2019ll help you step by step while we read."
+        )
+    # support tier — warmest tone, no shaming.
+    return (
+        f"Your recent learning record shows we can grow your {focus_en} "
+        f"this month. Don\u2019t worry \u2014 I\u2019ll help you step by step."
+    )
+
+
+# Khmer phrase fragments used to compose the coaching sentence.  Written
+# as native UTF-8 to keep cluster shaping unambiguous (matches the rest of
+# this file which embeds Khmer literals in 70+ other places).
+#
+# Glossary:
+#   _KH_THIS_MONTH        — "ខែនេះ"  ("this month")
+#   _KH_GREAT_WORK        — "ល្អណាស់!"  ("great work!")
+#   _KH_TODAY_HELP_LVL_UP — "ថ្ងៃនេះខ្ញុំនឹងជួយអ្នកឡើងមួយកម្រិតទៀត"
+#   _KH_DEEPER_THINKING   — "ដោយគិតឱ្យជ្រៅជាងមុន និងប្រើប្រយោគអង់គ្លេសឱ្យរឹងមាំជាងមុន។"
+#   _KH_DOING_WELL_IN     — "អ្នកធ្វើបានល្អនៅ"  (followed by criterion label)
+#   _KH_DONT_WORRY        — "កុំបារម្ភណា"
+#   _KH_HELP_STEP_BY_STEP — "ខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+#   _KH_AND               — " និង "
+#   _KH_NEEDS_PRACTICE    — "គួរហាត់បន្ថែម"
+_KH_THIS_MONTH        = "ខែនេះ"
+_KH_GREAT_WORK        = "ល្អណាស់!"
+_KH_TODAY_HELP_LVL_UP = "ថ្ងៃនេះខ្ញុំនឹងជួយអ្នកឡើងមួយកម្រិតទៀត"
+_KH_DEEPER_THINKING   = "ដោយគិតឱ្យជ្រៅជាងមុន និងប្រើប្រយោគអង់គ្លេសឱ្យរឹងមាំជាងមុន។"
+_KH_DOING_WELL_IN     = "អ្នកធ្វើបានល្អនៅ"
+_KH_DONT_WORRY        = "កុំបារម្ភណា"
+_KH_HELP_STEP_BY_STEP = "ខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+_KH_AND               = " និង "
+_KH_NEEDS_PRACTICE    = "គួរហាត់បន្ថែម"
+
+
+def _score_aware_coaching_sentence_kh(sc: dict | None) -> str:
+    """Build a short Khmer coaching sentence for the greeting AUDIO.
+
+    Returns "" when no usable data.  Cluster-audited valid Khmer.
+    """
+    if not isinstance(sc, dict) or not sc:
+        return ""
+    tier = _score_aware_tier(sc)
+    if not tier:
+        return ""
+    top = _score_aware_pick_top_strength(sc)
+    focus = _score_aware_pick_focus_areas(sc, limit=2)
+
+    if tier == "advanced":
+        # "ខែនេះអ្នករីកចម្រើនល្អណាស់។ ល្អណាស់! ថ្ងៃនេះខ្ញុំនឹងជួយអ្នកឡើងមួយកម្រិតទៀត
+        #  ដោយគិតឱ្យជ្រៅជាងមុន និងប្រើប្រយោគអង់គ្លេសឱ្យរឹងមាំជាងមុន។"
+        return (
+            f"{_KH_THIS_MONTH}អ្នករីកចម្រើនល្អណាស់។ "
+            f"{_KH_GREAT_WORK} {_KH_TODAY_HELP_LVL_UP} {_KH_DEEPER_THINKING}"
+        )
+
+    if tier == "steady":
+        if top:
+            # "អ្នកធ្វើបានល្អនៅ{top_kh}។ ខែនេះខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+            return (
+                f"{_KH_DOING_WELL_IN}{top[1]}។ "
+                f"{_KH_THIS_MONTH}{_KH_HELP_STEP_BY_STEP}"
+            )
+        # "ខែនេះអ្នករីកចម្រើនល្អ។ ខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+        return (
+            f"{_KH_THIS_MONTH}អ្នករីកចម្រើនល្អ។ {_KH_HELP_STEP_BY_STEP}"
+        )
+
+    if not focus:
+        return ""
+    focus_kh = focus[0][1] if len(focus) == 1 else f"{focus[0][1]}{_KH_AND}{focus[1][1]}"
+    if tier == "developing":
+        if top:
+            # "អ្នកធ្វើបានល្អនៅ{top_kh}។ ខែនេះ{focus_kh}គួរហាត់បន្ថែម។ កុំបារម្ភណា — ខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+            return (
+                f"{_KH_DOING_WELL_IN}{top[1]}។ "
+                f"{_KH_THIS_MONTH}{focus_kh}{_KH_NEEDS_PRACTICE}។ "
+                f"{_KH_DONT_WORRY} — {_KH_HELP_STEP_BY_STEP}"
+            )
+        # "ខែនេះ{focus_kh}គួរហាត់បន្ថែម។ កុំបារម្ភណា — ខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+        return (
+            f"{_KH_THIS_MONTH}{focus_kh}{_KH_NEEDS_PRACTICE}។ "
+            f"{_KH_DONT_WORRY} — {_KH_HELP_STEP_BY_STEP}"
+        )
+    # support tier — warm, encouraging.
+    # "កុំបារម្ភណា — ខែនេះយើងនឹងហាត់{focus_kh}បន្តិចម្តងៗ។ ខ្ញុំនឹងជួយអ្នកជំហានៗ។"
+    return (
+        f"{_KH_DONT_WORRY} — {_KH_THIS_MONTH}"
+        f"យើងនឹងហាត់{focus_kh}បន្តិចម្តងៗ។ "
+        f"{_KH_HELP_STEP_BY_STEP}"
+    )
+# ============================================================================
+# END SCORE-AWARE COACHING GREETING SENTENCE
+# ============================================================================
+
+
 async def _build_voice_script_for_visible_khmer(
     cfg: dict,
     session: dict,
@@ -2659,6 +2962,38 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                     _mem_exc,
                 )
             # --- END COACH MEMORY v1 --------------------------------------
+
+            # --- SCORE-AWARE COACHING (Phase 4) ---------------------------
+            # If the student sent a `student_context` payload AND the
+            # tier/book unlocks `score_aware`, weave ONE warm, motivational
+            # coaching sentence into the visible English greeting and the
+            # Khmer audio script.  Privacy guarantees:
+            #   • Never repeat raw scores back to the student.
+            #   • Never quote teacher comments word-for-word in the greeting.
+            #   • Pick at most 1–2 focus criteria, plus 1 strength when
+            #     available.  See _score_aware_coaching_sentence_*().
+            # Failure-safe: any exception is logged and the legacy greeting
+            # is preserved verbatim.
+            try:
+                _sa_sc = payload.student_context
+                _sa_dict = (
+                    _sa_sc.model_dump(exclude_none=True) if _sa_sc else None
+                )
+                if _sa_dict and eff.get("score_aware"):
+                    _sa_en = _score_aware_coaching_sentence_en(_sa_dict)
+                    _sa_kh = _score_aware_coaching_sentence_kh(_sa_dict)
+                    if _sa_en:
+                        opening = (opening + " " + _sa_en).strip()
+                    if _sa_kh:
+                        greeting_audio_script = (
+                            greeting_audio_script + " " + _sa_kh
+                        ).strip()
+            except Exception as _sa_exc:  # noqa: BLE001
+                log.warning(
+                    "score_aware: greeting weave skipped (non-blocking): %s",
+                    _sa_exc,
+                )
+            # --- END SCORE-AWARE COACHING ---------------------------------
 
             session_id = uuid4().hex[:24]
 
