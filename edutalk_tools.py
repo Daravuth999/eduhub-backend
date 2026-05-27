@@ -224,6 +224,20 @@ DEFAULT_CONFIG: dict = {
     "topup_trigger_promotion_aware":  True,
     "topup_respect_audio_playing":    True,
     "topup_respect_free_read":        True,
+    # ----------------------------------------------------------------------
+    # Premium Smart Badge config (Top-Up modal/banner).  Driven entirely by
+    # Author Studio → Top-Up Prompt Settings.  Reader reads via book-config.
+    # v1.1 — Safe defaults are intentionally NON-CLAIM ("Best Value" /
+    # "តម្លៃល្អ").  "50% more" must come from admin config or from an
+    # active promotion banner, never as a hardcoded default, because it
+    # would imply a real bonus that the system did not actually grant.
+    # ----------------------------------------------------------------------
+    "topup_badge_enabled":            True,
+    "topup_badge_text_en":            "Best Value",
+    "topup_badge_text_kh":            "តម្លៃល្អ",
+    "topup_badge_style":              "bonus",                 # bonus | recommended | flash_sale | premium
+    "topup_badge_target":             "recommended_package",   # recommended_package | first_package | highest_value_package | promotion_package_if_available
+    "topup_badge_promotion_aware":    True,
 }
 
 TONE_PRESETS = {
@@ -301,6 +315,13 @@ class AdminEdutalkConfigUpdate(BaseModel):
     topup_trigger_promotion_aware: bool | None = None
     topup_respect_audio_playing: bool | None = None
     topup_respect_free_read: bool | None = None
+    # Premium Smart Badge fields (Top-Up modal/banner).
+    topup_badge_enabled: bool | None = None
+    topup_badge_text_en: str | None = None
+    topup_badge_text_kh: str | None = None
+    topup_badge_style: str | None = None
+    topup_badge_target: str | None = None
+    topup_badge_promotion_aware: bool | None = None
 
 
 class StudentContext(BaseModel):
@@ -1508,6 +1529,26 @@ def _sanitise_config_update(p: AdminEdutalkConfigUpdate) -> dict:
         upd["topup_respect_audio_playing"] = bool(p.topup_respect_audio_playing)
     if p.topup_respect_free_read is not None:
         upd["topup_respect_free_read"] = bool(p.topup_respect_free_read)
+    # --- Premium Smart Badge — clamp + enum-validate ---
+    if p.topup_badge_enabled is not None:
+        upd["topup_badge_enabled"] = bool(p.topup_badge_enabled)
+    if p.topup_badge_text_en is not None:
+        upd["topup_badge_text_en"] = str(p.topup_badge_text_en).strip()[:40]
+    if p.topup_badge_text_kh is not None:
+        upd["topup_badge_text_kh"] = str(p.topup_badge_text_kh).strip()[:40]
+    if p.topup_badge_style is not None:
+        v = str(p.topup_badge_style).strip().lower()[:30]
+        upd["topup_badge_style"] = v if v in {
+            "bonus", "recommended", "flash_sale", "premium",
+        } else "bonus"
+    if p.topup_badge_target is not None:
+        v = str(p.topup_badge_target).strip().lower()[:40]
+        upd["topup_badge_target"] = v if v in {
+            "recommended_package", "first_package",
+            "highest_value_package", "promotion_package_if_available",
+        } else "recommended_package"
+    if p.topup_badge_promotion_aware is not None:
+        upd["topup_badge_promotion_aware"] = bool(p.topup_badge_promotion_aware)
     return upd
 
 
@@ -3074,6 +3115,10 @@ async def _resolve_effective_book_config(
         "topup_trigger_low_balance", "topup_trigger_replies_left",
         "topup_trigger_after_value", "topup_trigger_promotion_aware",
         "topup_respect_audio_playing", "topup_respect_free_read",
+        # Premium Smart Badge — surfaced to PointsGateModal via book-config.
+        "topup_badge_enabled", "topup_badge_text_en", "topup_badge_text_kh",
+        "topup_badge_style", "topup_badge_target",
+        "topup_badge_promotion_aware",
     ):
         eff[k] = global_cfg.get(k)
 
