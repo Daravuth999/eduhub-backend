@@ -914,6 +914,173 @@ def _trim_to_sentence_boundary(text: str, max_chars: int) -> str:
     return head.rstrip()
 
 
+# ---------------------------------------------------------------------------
+# v1.5 (audio_script_completeness_fix_v1) — _finalize_voice_script_complete
+# ---------------------------------------------------------------------------
+# Goal:
+#   Make ALL audio scripts (Khmer + English, greeting + reply, all builders)
+#   end with a complete natural sentence before TTS is called.  The visible
+#   text is NEVER changed — this only post-processes the spoken script.
+#
+# Behaviour:
+#   1. Sentence-boundary trim using the existing helper so we never exceed
+#      `hard_char_cap` and never cut mid-word.
+#   2. Strip broken endings:
+#        - dangling commas, semicolons, colons, open quotes, em/en dashes
+#        - dangling conjunctions / partial words at the very end
+#   3. If the remaining script ends WITHOUT a sentence terminator
+#      (`.!?` for English / `។ ៕ ៚` for Khmer):
+#        a. Try to trim back one more time to the last terminator.
+#        b. If still no terminator (rare — entire script is one fragment),
+#           append a SAFE closing sentence in the requested language.
+#   4. If the script is shorter than a small minimum AND it is NOT
+#      exercise / challenge content, append a SAFE closing sentence to
+#      avoid generic / unfinished feel.  Exercise content keeps its
+#      scaffold ending verbatim — we never add an answer-like sentence.
+#   5. Result is re-clamped to `hard_char_cap` at the end.  If appending
+#      the closing would exceed the cap, we DROP the closer rather than
+#      truncating it (preserves "complete sentence" guarantee).
+#
+# Pure-Python, no Gemini call, no new dependencies, no I/O.  Failure-safe
+# wrappers around it in each builder ensure a finalizer exception NEVER
+# blocks audio generation.
+# ---------------------------------------------------------------------------
+
+# Trailing punctuation / connector tokens to strip when an audio script
+# ends abruptly mid-thought.  Order matters — we strip layer by layer.
+_BROKEN_TAIL_RE = re.compile(
+    r"(?:[\s,;:\-\u2013\u2014\"'(\[\{\u201c\u2018\u00ab]|"
+    r"\b(?:and|or|but|so|because|that|to|for|with|by|from|of|"
+    r"\u0e2f|\u17d8|\u17d9|\u17da|\u17db|\u17dc|\u17dd)\b)+$",
+    re.IGNORECASE,
+)
+
+# Sentence-terminator predicates (kept in sync with _trim_to_sentence_boundary).
+_ENGLISH_TERMINATORS = (".", "!", "?")
+_KHMER_TERMINATORS = ("\u17d4", "\u17d5", "\u17da")  # ។ ៕ ៚
+
+
+def _ends_with_terminator(text: str, language: str) -> bool:
+    """Return True when `text` ends with a sentence terminator for `language`.
+
+    Trailing whitespace is ignored.  Khmer terminators count for both
+    languages because Khmer scripts sometimes contain mixed punctuation,
+    but English scripts must use ASCII terminators to count as complete.
+    """
+    s = (text or "").rstrip()
+    if not s:
+        return False
+    last = s[-1]
+    if language == "khmer":
+        return last in _KHMER_TERMINATORS or last in _ENGLISH_TERMINATORS
+    return last in _ENGLISH_TERMINATORS
+
+
+def _safe_closing_sentence(language: str, *, exercise: bool) -> str:
+    """Return a short, safe closing sentence in the requested language.
+
+    Exercise / challenge variant NEVER reveals an answer — it nudges the
+    student to try first instead, matching the existing scaffold policy.
+    """
+    if language == "khmer":
+        if exercise:
+            # "Please try by yourself first."
+            return "\u179f\u17bc\u1798\u179f\u17b6\u1780\u179b\u17d2\u1794\u1784" \
+                   "\u178a\u17c4\u1799\u1781\u17d2\u179b\u17bd\u1793\u17a2\u17c2\u1784" \
+                   "\u1787\u17b6\u1798\u17bb\u1793\u179f\u17b7\u1793\u17d4"
+        # "Let's continue step by step together."
+        return "\u178f\u17c4\u17c7\u1794\u1793\u17d2\u178f\u179a\u17c0\u1793" \
+               "\u1787\u17b6\u1798\u17bd\u1799\u200b\u1782\u17d2\u1793\u17b6" \
+               "\u1787\u17b6\u1787\u17c6\u17a0\u17b6\u1793\u17d7\u17d4"
+    # English — pick a learner-friendly closer.
+    if exercise:
+        return "Take your time and try first."
+    return "Let's continue step by step."
+
+
+def _finalize_voice_script_complete(
+    script: str,
+    *,
+    language: str,
+    hard_char_cap: int,
+    exercise: bool = False,
+    minimum_chars: int = 0,
+) -> str:
+    """v1.5 — Ensure an audio script ends with a complete natural sentence.
+
+    See the module-level note above for full behaviour.  Wrap any call to
+    this helper in a try/except so a finalizer bug NEVER blocks audio
+    generation (each builder does this already).
+    """
+    if not script:
+        return script
+
+    lang = "khmer" if language == "khmer" else "english"
+    cap = max(60, int(hard_char_cap or 0)) or 1800
+
+    # 1) Trim to sentence boundary so we never exceed the hard cap.
+    s = _trim_to_sentence_boundary(str(script).strip(), cap)
+
+    # 2) Strip broken tail tokens (commas, dashes, hanging conjunctions).
+    #    Repeat a couple of times because stripping a connector may expose
+    #    another stripped char beneath it.
+    for _ in range(3):
+        new_s = _BROKEN_TAIL_RE.sub("", s).rstrip()
+        if new_s == s:
+            break
+        s = new_s
+
+    # 3) If the cleaned script still does NOT end with a terminator, try
+    #    one more aggressive sentence-boundary trim.  This handles the
+    #    case where Gemini's last sentence was cut by maxOutputTokens and
+    #    the broken-tail strip left a fragment in place.
+    if not _ends_with_terminator(s, lang):
+        # Re-scan from end for the last terminator anywhere in the script.
+        terms = _KHMER_TERMINATORS + _ENGLISH_TERMINATORS if lang == "khmer" \
+            else _ENGLISH_TERMINATORS
+        best = -1
+        for ch in terms:
+            idx = s.rfind(ch)
+            if idx > best:
+                best = idx
+        # Only trim back if we keep at least 40% of the content; otherwise
+        # leave the fragment in place and rely on the closer below so we
+        # don't lose substantial teaching content.
+        if best >= int(len(s) * 0.4):
+            s = s[: best + 1].rstrip()
+
+    needs_closer = (
+        not _ends_with_terminator(s, lang)
+        or (minimum_chars > 0 and len(s) < minimum_chars and not exercise)
+    )
+
+    # 4) Append a safe closing sentence when needed AND when it fits in
+    #    the hard cap.  Skip the closer if it would push us past the cap
+    #    — preserving "complete sentence" beats forcing extra content.
+    if needs_closer:
+        closer = _safe_closing_sentence(lang, exercise=exercise)
+        # Add a single space separator if the existing script does not
+        # already end with whitespace.
+        sep = "" if not s or s.endswith((" ", "\n", "\t")) else " "
+        candidate = s + sep + closer
+        if len(candidate) <= cap:
+            s = candidate
+        else:
+            # Closer didn't fit — best-effort: at least re-trim to the
+            # last terminator (if any) so we don't ship a fragment.
+            terms = _KHMER_TERMINATORS + _ENGLISH_TERMINATORS if lang == "khmer" \
+                else _ENGLISH_TERMINATORS
+            best = -1
+            for ch in terms:
+                idx = s.rfind(ch)
+                if idx > best:
+                    best = idx
+            if best > 0:
+                s = s[: best + 1].rstrip()
+
+    return s.strip()
+
+
 def _build_english_voice_script(
     cfg: dict,
     session: dict,
@@ -943,7 +1110,20 @@ def _build_english_voice_script(
         return ""
     complexity = _classify_audio_complexity(cleaned, session)
     budget = _resolve_audio_budget(cfg, session, complexity)
-    return _trim_to_sentence_boundary(cleaned, budget["hard_char_cap"])
+    trimmed = _trim_to_sentence_boundary(cleaned, budget["hard_char_cap"])
+    # v1.5 — make sure ElevenLabs never receives a fragment.  Wrap the
+    # finalizer in a try/except so a finalizer bug NEVER blocks audio.
+    try:
+        return _finalize_voice_script_complete(
+            trimmed,
+            language="english",
+            hard_char_cap=budget["hard_char_cap"],
+            exercise=_detect_exercise_or_challenge_context(session),
+            minimum_chars=0,  # English-from-English already inherits depth.
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("edutalk: english-voice finalizer skipped: %s", exc)
+        return trimmed
 
 
 
@@ -2369,7 +2549,20 @@ async def _build_voice_script_for_visible_khmer(
             text = data["candidates"][0]["content"]["parts"][0]["text"]
             cleaned = re.sub(r"[*_`#]+", "", str(text)).strip()
             # v1.2 — sentence-boundary trim so the cap never lands mid-sentence.
-            return _trim_to_sentence_boundary(cleaned, _budget["hard_char_cap"])
+            trimmed = _trim_to_sentence_boundary(cleaned, _budget["hard_char_cap"])
+            # v1.5 — final completeness pass (append safe Khmer closer if
+            # the script still ends abruptly).  Failure-safe.
+            try:
+                return _finalize_voice_script_complete(
+                    trimmed,
+                    language="khmer",
+                    hard_char_cap=_budget["hard_char_cap"],
+                    exercise=_detect_exercise_or_challenge_context(session),
+                    minimum_chars=0,
+                )
+            except Exception as _fin_exc:  # noqa: BLE001
+                log.warning("edutalk: khmer-coaching finalizer skipped: %s", _fin_exc)
+                return trimmed
         except Exception as exc:  # noqa: BLE001
             log.warning("edutalk: khmer-coaching-audio shape error: %s", exc)
             continue
@@ -2380,6 +2573,17 @@ async def _build_voice_script_for_visible_khmer(
     if len(script) > _cap:
         # v1.2 — sentence-boundary trim for the fallback path as well.
         script = _trim_to_sentence_boundary(script, _cap)
+    # v1.5 — fallback path also gets the completeness pass.
+    try:
+        script = _finalize_voice_script_complete(
+            script,
+            language="khmer",
+            hard_char_cap=_cap,
+            exercise=_detect_exercise_or_challenge_context(session),
+            minimum_chars=0,
+        )
+    except Exception as _fin_exc:  # noqa: BLE001
+        log.warning("edutalk: khmer-coaching fallback finalizer skipped: %s", _fin_exc)
     return script or reply_text[:800]
 
 
@@ -2524,7 +2728,21 @@ async def _build_khmer_support_audio_for_visible_english(
             cleaned = re.sub(r"[*_`#]+", "", str(text)).strip()
             # Resolver-driven hard char cap — admin-tunable upper bound.
             # v1.2 — sentence-boundary trim so the cap never lands mid-sentence.
-            return _trim_to_sentence_boundary(cleaned, _budget["hard_char_cap"])
+            trimmed = _trim_to_sentence_boundary(cleaned, _budget["hard_char_cap"])
+            # v1.5 — final completeness pass for Khmer support audio.
+            try:
+                return _finalize_voice_script_complete(
+                    trimmed,
+                    language="khmer",
+                    hard_char_cap=_budget["hard_char_cap"],
+                    exercise=is_exercise_ctx,
+                    minimum_chars=0,
+                )
+            except Exception as _fin_exc:  # noqa: BLE001
+                log.warning(
+                    "edutalk: khmer-support finalizer skipped: %s", _fin_exc,
+                )
+                return trimmed
         except Exception as exc:  # noqa: BLE001
             log.warning("edutalk: khmer-support-audio shape error: %s", exc)
             continue
@@ -2614,7 +2832,10 @@ async def _build_english_voice_script_for_visible_khmer(
         f"- Minimum acceptable: at least 4 complete English sentences with "
         f"real teaching content. Never reply with only a one-line greeting.\n"
         f"- Hard ceiling: never exceed {budget['hard_max_seconds']} seconds.\n"
-        f"- Do NOT abbreviate, do NOT bullet, do NOT summarise to one line."
+        f"- Do NOT abbreviate, do NOT bullet, do NOT summarise to one line.\n"
+        f"- CRITICAL: ALWAYS finish on a COMPLETE sentence that ends with "
+        f"a period (.), exclamation (!), or question mark (?). Do NOT end "
+        f"on a comma, a dangling conjunction, or a partial word."
     )
 
     prompt_text = (
@@ -2700,7 +2921,24 @@ async def _build_english_voice_script_for_visible_khmer(
                 )
                 last_detail = "AI returned the wrong language. Please try again."
                 continue
-            return _trim_to_sentence_boundary(cleaned, budget["hard_char_cap"])
+            trimmed = _trim_to_sentence_boundary(cleaned, budget["hard_char_cap"])
+            # v1.5 — final completeness pass: strip broken endings + append
+            # a short safe English closer if the script ends abruptly.
+            # Minimum char hint guards against suspiciously short greetings.
+            try:
+                return _finalize_voice_script_complete(
+                    trimmed,
+                    language="english",
+                    hard_char_cap=budget["hard_char_cap"],
+                    exercise=is_exercise_ctx,
+                    minimum_chars=160,
+                )
+            except Exception as _fin_exc:  # noqa: BLE001
+                log.warning(
+                    "edutalk: english-from-khmer finalizer skipped: %s",
+                    _fin_exc,
+                )
+                return trimmed
         except Exception as exc:  # noqa: BLE001
             log.warning("edutalk: english-from-khmer-audio shape error: %s", exc)
             continue
@@ -3873,6 +4111,47 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                         payload.session_id, error_reason=str(he.detail)[:120],
                     )
                     raise
+
+                # v1.5 — completeness retry (one shot) for Quadrant B
+                # mirrors the Quadrant C retry.  Fires only when the
+                # generated script is suspiciously short AND the page is
+                # NOT exercise / challenge content.  Non-fatal: if the
+                # retry itself fails, we keep the original script.
+                try:
+                    _is_ex_b = _detect_exercise_or_challenge_context(session)
+                    _too_short_b = (
+                        not _is_ex_b
+                        and isinstance(voice_script, str)
+                        and len(voice_script.strip()) < 220
+                    )
+                    if _too_short_b:
+                        log.info(
+                            "edutalk: english-from-khmer audio too short "
+                            "(%d chars) — retrying once session=%s",
+                            len(voice_script.strip()),
+                            payload.session_id[:12],
+                        )
+                        try:
+                            retry_script_b = await _build_english_voice_script_for_visible_khmer(
+                                cfg, session, raw_reply,
+                                session.get("student_name", ""),
+                            )
+                            if (
+                                isinstance(retry_script_b, str)
+                                and len(retry_script_b.strip())
+                                > len(voice_script.strip())
+                            ):
+                                voice_script = retry_script_b
+                        except HTTPException as _retry_he_b:
+                            log.warning(
+                                "edutalk: english-from-khmer retry "
+                                "failed: %s", _retry_he_b.detail,
+                            )
+                except Exception as _retry_b_exc:  # noqa: BLE001
+                    log.warning(
+                        "edutalk: english-from-khmer retry skipped "
+                        "(non-blocking): %s", _retry_b_exc,
+                    )
                 log.info(
                     "edutalk: english-audio script (from KH visible, %d chars) session=%s",
                     len(voice_script), payload.session_id[:12],
