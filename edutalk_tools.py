@@ -238,6 +238,17 @@ DEFAULT_CONFIG: dict = {
     "topup_badge_style":              "bonus",                 # bonus | recommended | flash_sale | premium
     "topup_badge_target":             "recommended_package",   # recommended_package | first_package | highest_value_package | promotion_package_if_available
     "topup_badge_promotion_aware":    True,
+    # ----------------------------------------------------------------------
+    # Sticky mini top-up hook (non-blocking teaser above the EduTalk
+    # typing box).  When the student is running low — but still has
+    # enough for the next action — a small premium pill renders above
+    # the input.  Tapping it opens the full PointsGateModal.  Hidden by
+    # default of OFF would break the request for "small eye-catching
+    # sticky top-up hook"; default ON so it appears for new installs.
+    # Anti-spam, cooldown, dismiss-cap, audio-respect, free-read-respect
+    # all use the EXISTING `topup_*` knobs — no parallel state.
+    # ----------------------------------------------------------------------
+    "topup_mini_hook_enabled":        True,
 }
 
 TONE_PRESETS = {
@@ -322,6 +333,8 @@ class AdminEdutalkConfigUpdate(BaseModel):
     topup_badge_style: str | None = None
     topup_badge_target: str | None = None
     topup_badge_promotion_aware: bool | None = None
+    # Mini top-up sticky hook above EduTalk typing input.
+    topup_mini_hook_enabled: bool | None = None
 
 
 class StudentContext(BaseModel):
@@ -1549,6 +1562,8 @@ def _sanitise_config_update(p: AdminEdutalkConfigUpdate) -> dict:
         } else "recommended_package"
     if p.topup_badge_promotion_aware is not None:
         upd["topup_badge_promotion_aware"] = bool(p.topup_badge_promotion_aware)
+    if p.topup_mini_hook_enabled is not None:
+        upd["topup_mini_hook_enabled"] = bool(p.topup_mini_hook_enabled)
     return upd
 
 
@@ -3119,6 +3134,8 @@ async def _resolve_effective_book_config(
         "topup_badge_enabled", "topup_badge_text_en", "topup_badge_text_kh",
         "topup_badge_style", "topup_badge_target",
         "topup_badge_promotion_aware",
+        # Mini hook (sticky pill above EduTalk input).
+        "topup_mini_hook_enabled",
     ):
         eff[k] = global_cfg.get(k)
 
