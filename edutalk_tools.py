@@ -195,6 +195,24 @@ DEFAULT_CONFIG: dict = {
     # "" / "use_global"  → fall back to global audio_depth_mode
     # standard / detailed / premium_coach / exercise_scaffold → force mode
     "audio_depth_override":      "",
+    # ----------------------------------------------------------------------
+    # PART 2 — Smart Top-Up Triggers (business strategy controls).
+    # All fields optional, all surfaced via GET /book-config so the reader
+    # can run useTopUpTriggerGuard() with admin-tuned thresholds.  Anti-spam
+    # state lives entirely in sessionStorage on the client — these values
+    # are read-only configuration knobs, never write paths.
+    # ----------------------------------------------------------------------
+    "topup_low_balance_threshold":    10,    # show prompt when balance <= N
+    "topup_cooldown_seconds":         180,   # min seconds between prompts
+    "topup_max_per_session":          3,     # hard max prompts per session
+    "topup_dismiss_cap_per_session":  2,     # stop after N dismissals
+    "topup_after_value_every_n":      3,     # after-value cadence
+    "topup_trigger_low_balance":      True,
+    "topup_trigger_replies_left":     True,
+    "topup_trigger_after_value":      False, # admin opt-in only (powerful)
+    "topup_trigger_promotion_aware":  True,
+    "topup_respect_audio_playing":    True,
+    "topup_respect_free_read":        True,
 }
 
 TONE_PRESETS = {
@@ -258,6 +276,18 @@ class AdminEdutalkConfigUpdate(BaseModel):
     # Phase 3 per-book override toggle (only applied when saving with
     # book_slug query param — see admin_save_book_override route).
     tier_override: bool | None = None
+    # Part 2 — Smart Top-Up Triggers
+    topup_low_balance_threshold: int | None = None
+    topup_cooldown_seconds: int | None = None
+    topup_max_per_session: int | None = None
+    topup_dismiss_cap_per_session: int | None = None
+    topup_after_value_every_n: int | None = None
+    topup_trigger_low_balance: bool | None = None
+    topup_trigger_replies_left: bool | None = None
+    topup_trigger_after_value: bool | None = None
+    topup_trigger_promotion_aware: bool | None = None
+    topup_respect_audio_playing: bool | None = None
+    topup_respect_free_read: bool | None = None
 
 
 class StudentContext(BaseModel):
@@ -1079,6 +1109,29 @@ def _sanitise_config_update(p: AdminEdutalkConfigUpdate) -> dict:
         upd["audio_depth_override"] = v if v in _ENUM_AUDIO_OVERRIDE else ""
     if p.tier_override is not None:
         upd["tier_override"] = bool(p.tier_override)
+    # --- PART 2 — Smart Top-Up Triggers (clamp + coerce) ---
+    if p.topup_low_balance_threshold is not None:
+        upd["topup_low_balance_threshold"] = max(0, min(int(p.topup_low_balance_threshold), 1000))
+    if p.topup_cooldown_seconds is not None:
+        upd["topup_cooldown_seconds"] = max(30, min(int(p.topup_cooldown_seconds), 1800))
+    if p.topup_max_per_session is not None:
+        upd["topup_max_per_session"] = max(1, min(int(p.topup_max_per_session), 10))
+    if p.topup_dismiss_cap_per_session is not None:
+        upd["topup_dismiss_cap_per_session"] = max(1, min(int(p.topup_dismiss_cap_per_session), 10))
+    if p.topup_after_value_every_n is not None:
+        upd["topup_after_value_every_n"] = max(1, min(int(p.topup_after_value_every_n), 20))
+    if p.topup_trigger_low_balance is not None:
+        upd["topup_trigger_low_balance"] = bool(p.topup_trigger_low_balance)
+    if p.topup_trigger_replies_left is not None:
+        upd["topup_trigger_replies_left"] = bool(p.topup_trigger_replies_left)
+    if p.topup_trigger_after_value is not None:
+        upd["topup_trigger_after_value"] = bool(p.topup_trigger_after_value)
+    if p.topup_trigger_promotion_aware is not None:
+        upd["topup_trigger_promotion_aware"] = bool(p.topup_trigger_promotion_aware)
+    if p.topup_respect_audio_playing is not None:
+        upd["topup_respect_audio_playing"] = bool(p.topup_respect_audio_playing)
+    if p.topup_respect_free_read is not None:
+        upd["topup_respect_free_read"] = bool(p.topup_respect_free_read)
     return upd
 
 
@@ -2114,6 +2167,13 @@ async def _resolve_effective_book_config(
         "topup_show_packages", "topup_highlight_recommended",
         "topup_recommended_label_kh", "topup_recommended_label_en",
         "topup_after_behaviour",
+        # Part 2 — smart top-up trigger config (read by useTopUpTriggerGuard)
+        "topup_low_balance_threshold", "topup_cooldown_seconds",
+        "topup_max_per_session", "topup_dismiss_cap_per_session",
+        "topup_after_value_every_n",
+        "topup_trigger_low_balance", "topup_trigger_replies_left",
+        "topup_trigger_after_value", "topup_trigger_promotion_aware",
+        "topup_respect_audio_playing", "topup_respect_free_read",
     ):
         eff[k] = global_cfg.get(k)
 
@@ -2379,6 +2439,21 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                 "topup_recommended_label_kh": eff["topup_recommended_label_kh"],
                 "topup_recommended_label_en": eff["topup_recommended_label_en"],
                 "topup_after_behaviour": eff["topup_after_behaviour"],
+                # Part 2 — smart top-up trigger config (consumed by
+                # useTopUpTriggerGuard in the reader).  Each field falls
+                # back to a safe default if the config row predates the
+                # migration so older deployments stay non-breaking.
+                "topup_low_balance_threshold":    eff.get("topup_low_balance_threshold", 10),
+                "topup_cooldown_seconds":         eff.get("topup_cooldown_seconds", 180),
+                "topup_max_per_session":          eff.get("topup_max_per_session", 3),
+                "topup_dismiss_cap_per_session":  eff.get("topup_dismiss_cap_per_session", 2),
+                "topup_after_value_every_n":      eff.get("topup_after_value_every_n", 3),
+                "topup_trigger_low_balance":      eff.get("topup_trigger_low_balance", True),
+                "topup_trigger_replies_left":     eff.get("topup_trigger_replies_left", True),
+                "topup_trigger_after_value":      eff.get("topup_trigger_after_value", False),
+                "topup_trigger_promotion_aware":  eff.get("topup_trigger_promotion_aware", True),
+                "topup_respect_audio_playing":    eff.get("topup_respect_audio_playing", True),
+                "topup_respect_free_read":        eff.get("topup_respect_free_read", True),
                 # Audio Depth Engine v1 — surface admin-tunable fields so the
                 # Studio panel can render them. Use .get() with built-in
                 # defaults so older config rows (pre-migration) never crash.
