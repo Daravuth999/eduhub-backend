@@ -200,6 +200,13 @@ def _sanitise_tier_block(raw: dict | None) -> dict:
             else:
                 v = v[:1500]
             out[k] = v
+    # v1.4 — tier-level audio_support_lang (additive).
+    # Allowed: "" (inherit global), "khmer", "english".  Any other
+    # incoming value collapses to "" (inherit) so existing tiers stay
+    # bit-for-bit identical until admin explicitly chooses a value.
+    if "audio_support_lang" in raw:
+        v_asl = str(raw["audio_support_lang"] or "").strip().lower()[:20]
+        out["audio_support_lang"] = v_asl if v_asl in ("khmer", "english") else ""
     return out
 
 
