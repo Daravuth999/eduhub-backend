@@ -409,6 +409,20 @@ class StudentSpeakRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=200)
 
 
+class StudentTranscribeRequest(BaseModel):
+    """EduTalk Voice Input — transcribe a short spoken question to text.
+
+    Free of charge.  Points are only deducted at /message when the
+    student actually sends the transcribed question.  The audio is sent
+    as base64 inline_data to Gemini and never persisted server-side.
+    """
+    model_config = ConfigDict(extra="ignore")
+    session_id: str = Field(..., min_length=8, max_length=80)
+    audio_b64: str = Field(..., min_length=10, max_length=4_000_000)
+    mime_type: str = Field("audio/mp4", max_length=40)
+    password: str = Field(..., min_length=1, max_length=200)
+
+
 # --------------------------------------------------------------------------- #
 # Helpers — content-mode heuristic (pure Python, no Gemini call)              #
 # --------------------------------------------------------------------------- #
@@ -4393,6 +4407,92 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
             }
         finally:
             ACTIVE_EDUTALK_SPEAKS.discard(guard_key)
+
+    # ---------------- Student: voice-input transcription (free) ----------------
+    @api.post("/student/edutalk/transcribe")
+    async def student_transcribe(
+        payload: StudentTranscribeRequest, student=Depends(require_student),
+    ):
+        """EduTalk Voice Input — transcribe a short spoken question.
+
+        Free of charge.  Points are only deducted at /message when the
+        student actually sends the transcribed question.  The audio is
+        passed through Gemini inline_data and never persisted.
+        """
+        session = await sess_col.find_one({"session_id": payload.session_id})
+        if not session or session.get("status") != "active":
+            raise HTTPException(status_code=404, detail="EduTalk session not found.")
+        if session.get("student_id") != student.clean_id:
+            raise HTTPException(
+                status_code=404, detail="EduTalk session not found.",
+            )
+
+        if not GEMINI_API_KEY or _post_gemini is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Voice input is not configured on this server. Please contact admin.",
+            )
+
+        book_title = str(session.get("book_title", "") or "").strip()
+        prompt_text = (
+            "You are transcribing a student's spoken question. "
+            f"Context: the student is reading a book called '{book_title}'. "
+            "Transcribe ONLY what was spoken. "
+            "Return ONLY the transcribed text with no preamble, "
+            "no explanation, no quotes. "
+            "If the audio is silent or inaudible return an empty string."
+        )
+        gemini_payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": payload.mime_type,
+                            "data": payload.audio_b64,
+                        }
+                    },
+                    {"text": prompt_text},
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 300,
+            },
+        }
+
+        try:
+            r = await _post_gemini(GEMINI_MODEL, GEMINI_API_KEY, gemini_payload)
+        except httpx.HTTPError as exc:
+            log.warning("edutalk: transcribe network error: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail="Transcription failed. Please type your question.",
+            ) from exc
+
+        if r.status_code != 200:
+            log.warning("edutalk: transcribe HTTP %s", r.status_code)
+            raise HTTPException(
+                status_code=502,
+                detail="Transcription failed. Please type your question.",
+            )
+
+        try:
+            data = r.json()
+            transcribed_text = str(
+                data["candidates"][0]["content"]["parts"][0]["text"]
+            ).strip()[:800]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("edutalk: transcribe response shape error: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail="Transcription failed. Please type your question.",
+            ) from exc
+
+        log.info(
+            "edutalk: transcribe session=%s mime=%s text_len=%d",
+            payload.session_id[:12], payload.mime_type, len(transcribed_text),
+        )
+        return {"success": True, "text": transcribed_text}
 
     # ---------------- Student: fetch session (resume) ----------------
     @api.get("/student/edutalk/session/{session_id}")
