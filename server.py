@@ -2002,8 +2002,14 @@ async def push_notify_credit(
         raise HTTPException(status_code=500, detail="log insert failed")
 
     # ---- Server-rendered Khmer + English template ------------------------
-    title = f"+{payload.amount} Points Credited!"
-    body = f"+{payload.amount} points added to your account."
+    # Bilingual Khmer + English. Khmer is written as literal UTF-8 so the
+    # source file MUST be saved as UTF-8 (Python 3 default). Do NOT re-encode
+    # via PowerShell Set-Content or any tool that may transcode to cp1252.
+    title = f"+{payload.amount} ពិន្ទុបានបន្ថែម! / Points Credited!"
+    body = (
+        f"អ្នកទទួលបាន +{payload.amount} ពិន្ទុ។ / "
+        f"+{payload.amount} points added to your account."
+    )
     url_target = "/portal/me"
 
     # ---- Fan out via the EXISTING helper (unchanged) ---------------------
@@ -2863,11 +2869,15 @@ async def teacher_push_points(
     Wrapped in try/except   push failure must never break the points save flow."""
     try:
         if payload.delta > 0:
+            # Bilingual Khmer + English. Literal UTF-8 strings — NEVER use
+            # PowerShell Set-Content or any tool that may transcode to cp1252,
+            # which is what produced the previous Khmer mojibake (UTF-8 bytes
+            # of "ពិន្ទុ" interpreted as cp1252) on iPhone notification banners.
             sent, failed = await _fan_out_push(
                 {"studentId": student_id},
-                title=f"\U0001F389 +{payload.delta} áž–áž·áž“áŸ’áž‘áž»! / Points!",
+                title=f"🎉 +{payload.delta} ពិន្ទុបានបន្ថែម! / Points Credited!",
                 body=(
-                    f"áž¢áŸ’áž“áž€áž”áž¶áž“áž‘áž‘áž½áž›áž–áž·áž“áŸ’áž‘áž» +{payload.delta} âœ¨\n"
+                    f"អ្នកទទួលបាន +{payload.delta} ពិន្ទុ ✨\n"
                     f"You received +{payload.delta} points. Keep it up!"
                 ),
                 url="/portal",
@@ -4360,10 +4370,10 @@ async def sl_grant_points(
     asyncio.create_task(
         _fan_out_push(
             {"studentId": student_clean_id},
-            title=f"\U0001F389 +{payload.points} \u178F\u17B7\u1793\u17D0! / Points Credited!",
+            title=f"🎉 +{payload.points} ពិន្ទុបានបន្ថែម! / Points Credited!",
             body=(
-                f"\u17A2\u17D2\u1793\u1780\u200b\u1794\u17B6\u1793\u200b\u1791\u1791\u1793\u200b\u178F\u17B7\u1793\u200b\u178E +{payload.points} \u2728\n"
-                f"+{payload.points} pts from Treasury \u00b7 {payload.description or 'Speaking Lab award'}"
+                f"អ្នកទទួលបាន +{payload.points} ពិន្ទុ ✨\n"
+                f"+{payload.points} pts from Treasury · {payload.description or 'Speaking Lab award'}"
             ),
             url="/portal",
         )
