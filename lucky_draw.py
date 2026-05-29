@@ -335,6 +335,7 @@ def register_lucky_draw_routes(
     log: Optional[logging.Logger] = None,
     mock_gas: Optional[bool] = None,
     require_admin: Optional[Callable] = None,
+    push_notify: Optional[Callable[[str, int, str], Awaitable[None]]] = None,
 ) -> None:
     """Mount the four /api/speaking-lab/sessions/{id}/... endpoints onto the
     existing `api` router. Safe to call once at server.py startup."""
@@ -402,6 +403,7 @@ def register_lucky_draw_routes(
                 db, sl_publish, session_id, config, gas_url, treasury_id,
                 treasury_password, mock_gas, log,
                 granted_by=getattr(admin, "email", "admin"),
+                push_notify=push_notify,
             )
     else:
         # Dev mode — admit any caller
@@ -417,6 +419,7 @@ def register_lucky_draw_routes(
                 db, sl_publish, session_id, config, gas_url, treasury_id,
                 treasury_password, mock_gas, log,
                 granted_by="dev",
+                push_notify=push_notify,
             )
 
 
@@ -469,6 +472,7 @@ async def _run_draw(
     db, sl_publish, session_id: str, config: LuckyDrawConfig,
     gas_url: str, treasury_id: str, treasury_password: str,
     mock_gas: bool, log: logging.Logger, *, granted_by: str,
+    push_notify: Optional[Callable[[str, int, str], Awaitable[None]]] = None,
 ) -> dict:
     SL_SESSIONS = db.speaking_lab_sessions
     SL_LUCKY    = db.speaking_lab_lucky_codes
@@ -547,6 +551,19 @@ async def _run_draw(
             "type":         "draw_winner",
             **rec,
         })
+
+        # Phase 3: notify the winner's phone via Web Push as soon as
+        # the GAS transfer succeeds. Never block the draw loop on push
+        # — fire-and-forget so a slow webpush doesn't delay the next
+        # winner's SSE event. The push helper is best-effort and never
+        # raises.
+        if ok and push_notify is not None:
+            try:
+                asyncio.create_task(
+                    push_notify(w["student_id"], amt, w.get("code") or "")
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lucky_draw push schedule error: %s", str(exc)[:200])
 
     # Persist audit row + flip session flag (atomic-ish)
     now_iso = datetime.now(timezone.utc).isoformat()

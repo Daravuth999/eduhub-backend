@@ -2056,10 +2056,17 @@ async def push_notify_credit(
     # If this transfer goes to the treasury (stu092), check if the sender
     # is paying an entry fee for an active session.  If so, their name
     # appears on the teacher board automatically â€” no manual join needed.
-    TREASURY_ID = "stu092"
-    if recipient_id == TREASURY_ID and not is_self_detect:
+    # FIX (Phase 1): use env-backed SL_TREASURY_ID + normalized comparison
+    # so "STU092", " stu092 ", "Stu092" etc. all route to Speaking Lab
+    # auto-entry. Treasury can be rotated via the SL_TREASURY_ID env var
+    # without a code change. The auto-entry task itself is also tolerant
+    # of mixed-case sender IDs, missing Mongo records, and fee mismatches.
+    if (
+        _norm_student_id(recipient_id) == _norm_student_id(SL_TREASURY_ID)
+        and not is_self_detect
+    ):
         asyncio.create_task(
-            _sl_try_auto_enter(sender_id, payload.amount)
+            _sl_try_auto_enter(sender_id, payload.amount, source="notify_credit")
         )
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -4129,107 +4136,433 @@ async def studio_ai_scene_get(
 app.include_router(_build_status_router(db, _fan_out_push, require_admin))
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-async def _sl_try_auto_enter(sender_id: str, amount: int) -> None:
-    """Auto-enter a student into the active Speaking Lab session when they
-    pay the entry fee to stu092 via P2P.  Called as a fire-and-forget task
-    from push_notify_credit so it never blocks the credit response."""
+# ─── Phase 1 Speaking Lab P2P-pool reliability helpers ────────────────
+#
+# These helpers replace the previous _sl_try_auto_enter() with a version
+# that is tolerant of:
+#
+#   1. Mixed-case sender / treasury IDs            (STU004 == stu004)
+#   2. Students missing from db.students            (PWA-only / GAS-only
+#                                                    records still enter
+#                                                    the pool with a
+#                                                    fallback display
+#                                                    name and a
+#                                                    diagnostic event).
+#   3. Fee mismatches                               (exact session match
+#                                                    first; latest
+#                                                    waiting/active pool
+#                                                    session as fallback,
+#                                                    diagnostic recorded).
+#   4. Missing lucky codes on existing entries      (repair instead of
+#                                                    silently returning).
+#   5. Legacy entries inserted via manual /enter    (deduplicate by
+#                                                    student_id first;
+#                                                    fall back to
+#                                                    display_name_key
+#                                                    for legacy rows).
+#
+# Diagnostic events are written to db.speaking_lab_pool_events so admins
+# can answer "why did/didn't stu004 appear in the pool?" via the new
+# GET /api/speaking-lab/sessions/{id}/pool-diagnostics endpoint.
+#
+# The /api/push/notify-credit endpoint is unchanged in shape (same
+# request body, same response, same audit row) — only the internal hook
+# that schedules this task now uses the env-backed SL_TREASURY_ID and
+# normalized comparisons.
+
+def _norm_student_id(value) -> str:
+    """Canonical student_id for comparisons.
+
+    Strips whitespace (including stray \\n / \\r picked up from sheets),
+    drops zero-width spaces, and lowercases. Returns "" for None / non-
+    strings. Safe to call on every ID before any equality check or Mongo
+    query.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    # Strip ASCII + common Unicode whitespace and zero-width chars.
+    for ch in ("\\u200b", "\\u200c", "\\u200d", "\\ufeff"):
+        s = s.replace(ch, "")
+    return s.strip().lower()
+
+
+async def _sl_log_pool_event(
+    session_id,
+    student_id: str,
+    amount: int,
+    status: str,
+    reason: str = "",
+    source: str = "my_portal_p2p",
+    display_name: str = "",
+    extra=None,
+) -> None:
+    """Insert a structured diagnostic row into speaking_lab_pool_events.
+
+    `status` is one of:
+      "accepted" "repaired" "rejected" "warned" "duplicate"
+
+    Never raises — diagnostics must never break the pool flow.
+    """
     try:
-        # 1. Look up sender's display name and schedule from db.students
-        #    GAS uses clean_id (e.g. "stu094") as the sender ID.
-        #    MongoDB stores both clean_id and student_id â€” try both.
-        student_doc = await db.students.find_one(
-            {"$or": [{"clean_id": sender_id}, {"student_id": sender_id}]},
-            {"display_name": 1, "name": 1, "group": 1, "schedule": 1, "clean_id": 1, "_id": 0},
-        )
-        if not student_doc:
-            log.info("sl.auto_enter: sender %s not in db.students", sender_id)
-            return
+        doc = {
+            "session_id":   session_id,
+            "student_id":   _norm_student_id(student_id),
+            "raw_student_id": student_id,
+            "display_name": display_name,
+            "amount":       int(amount or 0),
+            "status":       status,
+            "reason":       reason,
+            "source":       source,
+            "created_at":   datetime.now(timezone.utc).isoformat(),
+        }
+        if extra and isinstance(extra, dict):
+            doc.update({k: v for k, v in extra.items() if k not in doc})
+        await db.speaking_lab_pool_events.insert_one(doc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sl.pool.event log error: %s", str(exc)[:200])
 
-        display_name = (
-            student_doc.get("display_name")
-            or student_doc.get("name")
-            or sender_id
-        )
-        schedule = (
-            student_doc.get("group")
-            or student_doc.get("schedule")
-            or ""
-        ).upper()
 
-        # 2. Find the most recent waiting/active session for this schedule
-        #    that has the matching entry_fee
-        session_doc = await SL_SESSIONS.find_one(
+async def _sl_find_target_session(amount: int, schedule: str):
+    """Return (session_doc, fee_match_kind).
+
+    fee_match_kind is one of:
+      "exact_schedule" "exact_any_schedule"
+      "fallback_schedule" "fallback_any" "none"
+
+    1. Try exact entry_fee + schedule match.
+    2. Try exact entry_fee match for any schedule.
+    3. Fallback: latest waiting/active session for this schedule
+       (regardless of entry_fee).
+    4. Fallback: latest waiting/active session anywhere.
+    """
+    if schedule:
+        sess = await SL_SESSIONS.find_one(
             {
-                "schedule": schedule,
+                "schedule":  schedule,
                 "entry_fee": amount,
-                "status": {"$in": ["waiting", "active"]},
+                "status":    {"$in": ["waiting", "active"]},
             },
             sort=[("created_at", -1)],
         )
-        if not session_doc:
-            # Try without schedule filter (any active session with matching fee)
-            session_doc = await SL_SESSIONS.find_one(
-                {
-                    "entry_fee": amount,
-                    "status": {"$in": ["waiting", "active"]},
-                },
-                sort=[("created_at", -1)],
+        if sess:
+            return sess, "exact_schedule"
+    sess = await SL_SESSIONS.find_one(
+        {
+            "entry_fee": amount,
+            "status":    {"$in": ["waiting", "active"]},
+        },
+        sort=[("created_at", -1)],
+    )
+    if sess:
+        return sess, "exact_any_schedule"
+    if schedule:
+        sess = await SL_SESSIONS.find_one(
+            {
+                "schedule": schedule,
+                "status":   {"$in": ["waiting", "active"]},
+            },
+            sort=[("created_at", -1)],
+        )
+        if sess:
+            return sess, "fallback_schedule"
+    sess = await SL_SESSIONS.find_one(
+        {"status": {"$in": ["waiting", "active"]}},
+        sort=[("created_at", -1)],
+    )
+    if sess:
+        return sess, "fallback_any"
+    return None, "none"
+
+
+async def _sl_try_auto_enter(
+    sender_id: str,
+    amount: int,
+    *,
+    source: str = "notify_credit",
+) -> dict:
+    """Robust auto-enter for a P2P pool entry.
+
+    Always returns a dict so callers (or future endpoints) can inspect
+    the result; never raises. The dict shape is:
+      {
+        "status": "accepted" | "repaired" | "rejected" | "duplicate"
+                  | "warned",
+        "reason": str,
+        "session_id": str | None,
+        "student_id": str | None,
+        "display_name": str | None,
+      }
+    """
+    norm_id = _norm_student_id(sender_id)
+    if not norm_id:
+        return {"status": "rejected", "reason": "empty_sender_id",
+                "session_id": None, "student_id": None,
+                "display_name": None}
+
+    try:
+        # 1. Look up sender in db.students (try multiple normalized fields).
+        student_doc = await db.students.find_one(
+            {"$or": [
+                {"clean_id":   norm_id},
+                {"student_id": norm_id},
+                # Tolerate legacy uppercase / unstripped rows.
+                {"clean_id":   sender_id.strip()},
+                {"student_id": sender_id.strip()},
+                {"clean_id":   sender_id.strip().upper()},
+                {"student_id": sender_id.strip().upper()},
+            ]},
+            {"display_name": 1, "name": 1, "group": 1,
+             "schedule": 1, "clean_id": 1, "_id": 0},
+        )
+
+        if student_doc:
+            display_name = (
+                student_doc.get("display_name")
+                or student_doc.get("name")
+                or norm_id
             )
+            schedule = (
+                student_doc.get("group")
+                or student_doc.get("schedule")
+                or ""
+            ).upper()
+            mongo_fallback = False
+        else:
+            # NEW: do not silently reject — the student exists in Google
+            # Sheets / My Portal but not in db.students. Allow fallback
+            # entry so paid players are never lost.
+            display_name = norm_id
+            schedule = ""
+            mongo_fallback = True
+            log.info("sl.pool.p2p.warning: %s not in db.students — using fallback", norm_id)
+
+        # 2. Resolve the target session.
+        session_doc, fee_match_kind = await _sl_find_target_session(amount, schedule)
         if not session_doc:
+            await _sl_log_pool_event(
+                None, norm_id, amount, "rejected",
+                reason="no_active_session",
+                source=source, display_name=display_name,
+                extra={"schedule_hint": schedule,
+                       "mongo_fallback": mongo_fallback},
+            )
             log.info(
-                "sl.auto_enter: no active session fee=%d schedule=%s",
-                amount, schedule,
+                "sl.pool.p2p.rejected: no_active_session sender=%s amount=%d schedule=%s",
+                norm_id, amount, schedule,
             )
-            return
+            return {"status": "rejected", "reason": "no_active_session",
+                    "session_id": None, "student_id": norm_id,
+                    "display_name": display_name}
 
         session_id = session_doc["session_id"]
-        display_name_key = display_name.lower()
+        session_entry_fee = int(session_doc.get("entry_fee") or 0)
+        warnings: list[str] = []
+        if mongo_fallback:
+            warnings.append(
+                "student_not_found_in_mongo_but_entry_created_with_fallback"
+            )
+        if fee_match_kind not in ("exact_schedule", "exact_any_schedule"):
+            warnings.append(
+                f"fee_mismatch_or_no_exact_session_fee:paid={amount},session_fee={session_entry_fee}"
+            )
 
-        # 3. Deduplicate â€” don't add the same student twice
+        # 3. Dedup — student_id FIRST, then legacy display_name_key.
+        norm_dn_key = (display_name or norm_id).lower()
         existing = await SL_ENTRIES.find_one(
-            {"session_id": session_id, "display_name_key": display_name_key}
+            {"session_id": session_id, "student_id": norm_id},
+            {"_id": 0},
         )
+        legacy_match = False
+        if not existing:
+            legacy = await SL_ENTRIES.find_one(
+                {"session_id": session_id,
+                 "display_name_key": norm_dn_key,
+                 "$or": [
+                     {"student_id": {"$exists": False}},
+                     {"student_id": None},
+                     {"student_id": ""},
+                     # Manual /enter inserts a synthetic "sl-<hex>" id —
+                     # treat that as a legacy row that can be linked to
+                     # the real student.
+                     {"student_id": {"$regex": "^sl-"}},
+                 ]},
+                {"_id": 0},
+            )
+            if legacy:
+                legacy_match = True
+                # Link the legacy row to the real student so future
+                # lookups dedup correctly. Lucky-code repair follows.
+                try:
+                    await SL_ENTRIES.update_one(
+                        {"session_id": session_id,
+                         "display_name_key": norm_dn_key},
+                        {"$set": {"student_id": norm_id,
+                                  "display_name": display_name,
+                                  "linked_from_legacy_at":
+                                      datetime.now(timezone.utc).isoformat()}},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("sl.pool.legacy link error: %s", str(exc)[:200])
+                existing = await SL_ENTRIES.find_one(
+                    {"session_id": session_id, "student_id": norm_id},
+                    {"_id": 0},
+                ) or legacy
+
         if existing:
-            log.info("sl.auto_enter: %s already in session %s", display_name, session_id)
-            return
+            # Repair: ensure this student has a lucky code. If missing,
+            # generate one now and broadcast — this fixes the original
+            # bug where students paid but never appeared on the draw UI.
+            lucky_doc = await db.speaking_lab_lucky_codes.find_one(
+                {"session_id": session_id, "student_id": norm_id},
+                {"_id": 0, "code": 1},
+            )
+            if not lucky_doc or not lucky_doc.get("code"):
+                # Use the session fee if the paid amount was off so the
+                # pool total stays consistent with the session config.
+                code_amount = (
+                    amount
+                    if fee_match_kind in ("exact_schedule", "exact_any_schedule")
+                    else (session_entry_fee or amount)
+                )
+                await generate_and_publish_lucky_code(
+                    db, _sl_publish, session_id, norm_id, display_name,
+                    amount=code_amount, log=log,
+                )
+                await _sl_log_pool_event(
+                    session_id, norm_id, amount, "repaired",
+                    reason="missing_lucky_code_repaired" + (
+                        " | legacy_linked" if legacy_match else ""
+                    ),
+                    source=source, display_name=display_name,
+                    extra={"warnings": warnings,
+                           "fee_match_kind": fee_match_kind,
+                           "mongo_fallback": mongo_fallback},
+                )
+                log.info("sl.pool.p2p.repaired: %s lucky_code generated session=%s",
+                         norm_id, session_id)
+                return {"status": "repaired",
+                        "reason": "missing_lucky_code_repaired",
+                        "session_id": session_id,
+                        "student_id": norm_id,
+                        "display_name": display_name}
+            await _sl_log_pool_event(
+                session_id, norm_id, amount, "duplicate",
+                reason="already_in_pool",
+                source=source, display_name=display_name,
+                extra={"warnings": warnings,
+                       "fee_match_kind": fee_match_kind},
+            )
+            log.info("sl.pool.p2p.duplicate: %s already in session %s",
+                     norm_id, session_id)
+            return {"status": "duplicate", "reason": "already_in_pool",
+                    "session_id": session_id, "student_id": norm_id,
+                    "display_name": display_name}
 
-        # 4. Insert entry and publish to SSE stream
-        position = (await SL_ENTRIES.count_documents({"session_id": session_id})) + 1
+        # 4. Fresh insert + publish + lucky code.
+        position = (
+            await SL_ENTRIES.count_documents({"session_id": session_id})
+        ) + 1
         entered_at = datetime.now(timezone.utc).isoformat()
-
-        await SL_ENTRIES.insert_one({
+        entry_doc = {
             "session_id":       session_id,
-            "student_id":       sender_id,
+            "student_id":       norm_id,
             "display_name":     display_name,
-            "display_name_key": display_name_key,
+            "display_name_key": norm_dn_key,
             "position":         position,
             "entered_at":       entered_at,
-        })
+            "source":           source,
+        }
+        if mongo_fallback:
+            entry_doc["mongo_fallback"] = True
+        try:
+            await SL_ENTRIES.insert_one(entry_doc)
+        except Exception as exc:  # noqa: BLE001
+            # Race / unique-index collision on (session_id,
+            # display_name_key). Fetch what is now there and treat as a
+            # duplicate insert; lucky-code path still runs below to
+            # ensure repair.
+            if "duplicate" in str(exc).lower() or "E11000" in str(exc):
+                existing = await SL_ENTRIES.find_one(
+                    {"session_id": session_id,
+                     "display_name_key": norm_dn_key},
+                    {"_id": 0},
+                )
+                await _sl_log_pool_event(
+                    session_id, norm_id, amount, "duplicate",
+                    reason="unique_index_race",
+                    source=source, display_name=display_name,
+                    extra={"warnings": warnings},
+                )
+            else:
+                await _sl_log_pool_event(
+                    session_id, norm_id, amount, "rejected",
+                    reason=f"insert_error:{str(exc)[:120]}",
+                    source=source, display_name=display_name,
+                )
+                log.warning("sl.pool.p2p.rejected insert_error: %s",
+                            str(exc)[:200])
+                return {"status": "rejected",
+                        "reason": "insert_error",
+                        "session_id": session_id,
+                        "student_id": norm_id,
+                        "display_name": display_name}
 
         await _sl_publish(session_id, {
             "type":         "entry",
-            "student_id":   sender_id,
+            "student_id":   norm_id,
             "display_name": display_name,
             "position":     position,
             "entered_at":   entered_at,
         })
 
-
-        # â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # The same P2P payment that put the student on the roster also
-        # buys their lucky code. Fire-and-forget â€” never blocks /enter.
+        # Lucky code (same P2P payment that put the student on the roster
+        # also buys their lucky code). Idempotent in lucky_draw.py.
+        code_amount = (
+            amount
+            if fee_match_kind in ("exact_schedule", "exact_any_schedule")
+            else (session_entry_fee or amount)
+        )
         await generate_and_publish_lucky_code(
-            db, _sl_publish, session_id, sender_id, display_name,
-            amount=amount, log=log,
+            db, _sl_publish, session_id, norm_id, display_name,
+            amount=code_amount, log=log,
         )
-        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        log.info(
-            "sl.auto_enter: %s (pos=%d) entered session %s via P2P fee=%d",
-            display_name, position, session_id, amount,
+        await _sl_log_pool_event(
+            session_id, norm_id, amount,
+            "warned" if warnings else "accepted",
+            reason=" | ".join(warnings) if warnings else "ok",
+            source=source, display_name=display_name,
+            extra={"position": position,
+                   "fee_match_kind": fee_match_kind,
+                   "mongo_fallback": mongo_fallback,
+                   "session_entry_fee": session_entry_fee},
         )
-    except Exception as exc:
-        log.warning("sl.auto_enter error: %s", str(exc)[:200])
+        log.info(
+            "sl.pool.p2p.accepted: %s (pos=%d) entered session %s paid=%d fee=%d kind=%s",
+            display_name, position, session_id, amount,
+            session_entry_fee, fee_match_kind,
+        )
+        return {"status": "warned" if warnings else "accepted",
+                "reason": " | ".join(warnings) or "ok",
+                "session_id": session_id,
+                "student_id": norm_id,
+                "display_name": display_name}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sl.pool.p2p.error: %s", str(exc)[:300])
+        try:
+            await _sl_log_pool_event(
+                None, sender_id, amount, "rejected",
+                reason=f"unhandled_exception:{type(exc).__name__}:{str(exc)[:120]}",
+                source=source,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "rejected",
+                "reason": f"unhandled_exception:{type(exc).__name__}",
+                "session_id": None,
+                "student_id": _norm_student_id(sender_id),
+                "display_name": None}
 
 # SPEAKING LAB â€” Live session, SSE roster, points grant
 # Added safely â€” no existing function modified.
@@ -4366,10 +4699,25 @@ async def sl_grant_points(
         "display_sender":     "Treasury",
     })
 
-    # 4. Push notification to student device
+    # 4. Push notification to student device.
+    #
+    # FIX (Phase 3): push subscriptions may have been saved under the raw
+    # student_id at signup time (e.g. "STU004") or under the canonical
+    # clean_id ("stu004"). Match against BOTH so a paid student always
+    # gets a phone notification regardless of how their device first
+    # subscribed. Never raises — push is best-effort.
+    push_candidates: list[str] = []
+    for _c in (
+        student_clean_id,
+        _norm_student_id(student_clean_id),
+        _norm_student_id(payload.studentID),
+        payload.studentID,
+    ):
+        if _c and _c not in push_candidates:
+            push_candidates.append(_c)
     asyncio.create_task(
         _fan_out_push(
-            {"studentId": student_clean_id},
+            {"studentId": {"$in": push_candidates}},
             title=f"🎉 +{payload.points} ពិន្ទុបានបន្ថែម! / Points Credited!",
             body=(
                 f"អ្នកទទួលបាន +{payload.points} ពិន្ទុ ✨\n"
@@ -4569,7 +4917,149 @@ async def sl_stream_session(
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # END SPEAKING LAB
 
-# â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Phase 1 Speaking Lab P2P-pool diagnostics + backend-ready confirm ─
+#
+# Both endpoints are admin-only. They are additive and DO NOT change any
+# existing endpoint's request/response shape. The original PWA frontend
+# is unchanged in this patch — these are operator/admin tools and a
+# backend-ready confirmation endpoint that a future patch can wire up
+# from the PWA without further backend work.
+
+class SLP2PPoolConfirmPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    sender_student_id: str = Field(..., min_length=1, max_length=64)
+    recipient_student_id: str = Field(..., min_length=1, max_length=64)
+    amount: int = Field(..., ge=1, le=100000)
+    transfer_id: str | None = None
+
+
+@api.post("/speaking-lab/p2p-pool/confirm")
+async def sl_p2p_pool_confirm(
+    payload: SLP2PPoolConfirmPayload,
+    admin: User = Depends(require_admin),
+):
+    """Backend-ready endpoint to register a confirmed P2P transfer to the
+    Speaking Lab treasury as a pool entry. ADMIN-ONLY."""
+    recip_norm = _norm_student_id(payload.recipient_student_id)
+    treasury_norm = _norm_student_id(SL_TREASURY_ID)
+    if recip_norm != treasury_norm:
+        await _sl_log_pool_event(
+            None, payload.sender_student_id, payload.amount, "rejected",
+            reason="rejected_wrong_recipient",
+            source="manual_confirm",
+            extra={"recipient": recip_norm, "treasury": treasury_norm,
+                   "by": admin.email,
+                   "transfer_id": payload.transfer_id or ""},
+        )
+        return {"ok": False, "status": "rejected",
+                "reason": "rejected_wrong_recipient",
+                "recipient": recip_norm,
+                "treasury": treasury_norm}
+
+    result = await _sl_try_auto_enter(
+        payload.sender_student_id, payload.amount,
+        source="manual_confirm",
+    )
+    return {"ok": result.get("status") in ("accepted", "warned",
+                                          "repaired", "duplicate"),
+            **result}
+
+
+@api.get("/speaking-lab/sessions/{session_id}/pool-diagnostics")
+async def sl_pool_diagnostics(
+    session_id: str,
+    admin: User = Depends(require_admin),
+    limit: int = 200,
+):
+    """Return accepted/warned/repaired/rejected/duplicate events for this
+    session + roster entries missing a lucky code. ADMIN-ONLY."""
+    sess = await SL_SESSIONS.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    limit = max(1, min(int(limit or 200), 1000))
+    events: list[dict] = []
+    try:
+        cursor = db.speaking_lab_pool_events.find(
+            {"session_id": session_id}, {"_id": 0},
+        ).sort("created_at", -1).limit(limit)
+        async for row in cursor:
+            events.append(row)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sl.pool.diagnostics events read error: %s", str(exc)[:200])
+
+    missing_lucky_codes: list[dict] = []
+    try:
+        entry_ids: list[str] = []
+        async for r in SL_ENTRIES.find(
+            {"session_id": session_id}, {"_id": 0, "student_id": 1,
+                                          "display_name": 1},
+        ):
+            sid = _norm_student_id(r.get("student_id"))
+            if sid and not sid.startswith("sl-"):
+                entry_ids.append(sid)
+        if entry_ids:
+            have_codes: set[str] = set()
+            async for r in db.speaking_lab_lucky_codes.find(
+                {"session_id": session_id,
+                 "student_id": {"$in": entry_ids}},
+                {"_id": 0, "student_id": 1},
+            ):
+                sid = _norm_student_id(r.get("student_id"))
+                if sid:
+                    have_codes.add(sid)
+            for sid in entry_ids:
+                if sid not in have_codes:
+                    missing_lucky_codes.append({"student_id": sid})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sl.pool.diagnostics missing-codes error: %s",
+                    str(exc)[:200])
+
+    buckets: dict[str, list[dict]] = {
+        "accepted": [], "warned": [], "repaired": [],
+        "rejected": [], "duplicate": [],
+    }
+    for ev in events:
+        buckets.setdefault(ev.get("status") or "other", []).append(ev)
+
+    return {
+        "success":              True,
+        "session_id":           session_id,
+        "accepted_entries":     buckets.get("accepted", []),
+        "warned_events":        buckets.get("warned", []),
+        "repaired_events":      buckets.get("repaired", []),
+        "rejected_events":      buckets.get("rejected", []),
+        "duplicate_events":     buckets.get("duplicate", []),
+        "missing_lucky_codes":  missing_lucky_codes,
+        "event_count":          len(events),
+        "treasury_id":          _norm_student_id(SL_TREASURY_ID),
+    }
+
+
+# ── LUCKY DRAW SURGERY ────────────────────────────────────────────────
+async def _lucky_draw_push_notify(student_id: str, amount: int, code: str) -> None:
+    """Phase 3: send a Web Push to a Lucky Draw winner regardless of how
+    their device originally subscribed (raw id vs clean_id, vs case).
+    Never raises — push is best-effort, the GAS transfer is the truth."""
+    norm = _norm_student_id(student_id)
+    candidates: list[str] = []
+    for c in (student_id, norm, norm.upper()):
+        if c and c not in candidates:
+            candidates.append(c)
+    try:
+        await _fan_out_push(
+            {"studentId": {"$in": candidates}},
+            title=f"🎰 +{amount} Lucky Draw Winner!",
+            body=(
+                f"អ្នកឈ្នះ +{amount} ពិន្ទុពី Speaking Lab Lucky Draw! ✨\n"
+                f"You won +{amount} pts from the Speaking Lab pool · ticket {code}"
+            ),
+            url="/portal",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("lucky_draw push notify error: %s", str(exc)[:200])
+
+
 register_lucky_draw_routes(
     api, db, _sl_publish,
     gas_url=GAS_POINTS_LOGIN_URL,
@@ -4577,6 +5067,7 @@ register_lucky_draw_routes(
     treasury_password=SL_TREASURY_PASSWORD,
     log=log,
     require_admin=require_admin,
+    push_notify=_lucky_draw_push_notify,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -4631,6 +5122,11 @@ async def startup():
     await db.points_history.create_index([("student_id", 1), ("created_at", -1)])
     await db.speaking_lab_sessions.create_index("session_id", unique=True)
     await db.speaking_lab_entries.create_index([("session_id", 1), ("display_name_key", 1)], unique=True)
+    # Phase 1: per-student dedup for P2P pool entries — additive, non-unique.
+    await db.speaking_lab_entries.create_index([("session_id", 1), ("student_id", 1)])
+    # Phase 1: diagnostic events log for the new pool-diagnostics endpoint.
+    await db.speaking_lab_pool_events.create_index([("session_id", 1), ("created_at", -1)])
+    await db.speaking_lab_pool_events.create_index([("student_id", 1), ("created_at", -1)])
     await db.speaking_lab_settings.create_index("_id")
     await db.speaking_lab_attendance.create_index([("schedule", 1), ("date", 1)], unique=True)
     # â”€â”€ LUCKY DRAW SURGERY â”€â”€
