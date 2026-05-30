@@ -408,6 +408,24 @@ def register_lucky_draw_routes(
                 granted_by=getattr(admin, "email", "admin"),
                 push_notify=push_notify,
             )
+        # Phase 4 (treasury-safety + UI suspense): the original
+        # POST /lucky-draw is now PREPARE-only — it locks the draw and
+        # picks winners but does NOT transfer GAS or send winner pushes.
+        # The cinematic on the teacher's screen plays, and only after the
+        # final reveal does the client POST /lucky-draw/finalize, which
+        # is idempotent: a separate atomic flag (`finalized=True` on the
+        # `speaking_lab_lucky_draws` doc) guarantees the GAS transfers
+        # and winner pushes happen exactly once.
+        @api.post("/speaking-lab/sessions/{session_id}/lucky-draw/finalize")
+        async def lucky_draw_finalize_post(
+            session_id: str,
+            admin=Depends(require_admin),
+        ):
+            return await _finalize_draw(
+                db, sl_publish, session_id, gas_url, treasury_id,
+                treasury_password, mock_gas, log,
+                push_notify=push_notify,
+            )
     else:
         # Dev mode — admit any caller
         @api.get("/speaking-lab/sessions/{session_id}/pool")
@@ -425,6 +443,14 @@ def register_lucky_draw_routes(
                 db, sl_publish, session_id, config, gas_url, treasury_id,
                 treasury_password, mock_gas, log,
                 granted_by="dev",
+                push_notify=push_notify,
+            )
+        # Same finalize route in dev mode (no admin gate).
+        @api.post("/speaking-lab/sessions/{session_id}/lucky-draw/finalize")
+        async def lucky_draw_finalize_post_dev(session_id: str):
+            return await _finalize_draw(
+                db, sl_publish, session_id, gas_url, treasury_id,
+                treasury_password, mock_gas, log,
                 push_notify=push_notify,
             )
 
@@ -651,53 +677,41 @@ async def _run_draw(
         winners = _weighted_pick(candidates, slot_picked, num_winners)
         amounts = _normalize_split(list(split), num_winners, pool_total)
 
-        # Execute GAS transfers + collect results.
-        # From here on we are committed — even on failure we will NOT
-        # release the claim, so a partial payout can never be re-paid.
-        payout_started = True
-        results: list[dict] = []
+        # ── PREPARE-ONLY phase. Do NOT touch GAS, do NOT push, do NOT
+        # emit `draw_winner` / `draw_complete` SSE events yet. Those
+        # side-effects are deferred to `_finalize_draw`, which the
+        # frontend invokes ONLY after the full cinematic reveal has
+        # finished on the teacher's screen. This prevents the
+        # early-push bug (winners' phones used to buzz before the
+        # teacher had stopped the last ticket block).
+        #
+        # Treasury safety is unchanged: the atomic `lucky_draw_done`
+        # claim above guarantees this prepare block runs at most once
+        # per session, so the winner list + amounts are locked in
+        # before the cinematic begins.
+        payout_started = False  # GAS not invoked here at all.
         use_mock = bool(config.mock) or mock_gas
+        results: list[dict] = []
         for w, amt in zip(winners, amounts):
-            ok, err = await _gas_send_points(
-                gas_url, treasury_id, treasury_password,
-                w["student_id"], amt, mock=use_mock, log=log,
-            )
-            rec = {
-                "student_id":   w["student_id"],
-                "display_name": w["display_name"],
-                "code":         w["code"],
-                "amount":       amt,
-                "transfer_ok":  ok,
-                "transfer_err": "" if ok else err,
+            results.append({
+                "student_id":      w["student_id"],
+                "display_name":    w["display_name"],
+                "code":            w["code"],
+                "amount":          amt,
+                # `transfer_ok` left None — finalize will fill it in.
+                "transfer_ok":     None,
+                "transfer_err":    "",
                 "was_slot_picked": w["student_id"] in slot_picked,
-            }
-            results.append(rec)
-            # SSE per winner (drives LuckyDraw cinematic on teacher screen)
-            await sl_publish(session_id, {
-                "type":         "draw_winner",
-                **rec,
             })
 
-            # Phase 3: notify the winner's phone via Web Push as soon as
-            # the GAS transfer succeeds. Never block the draw loop on push
-            # — fire-and-forget so a slow webpush doesn't delay the next
-            # winner's SSE event. The push helper is best-effort and never
-            # raises.
-            if ok and push_notify is not None:
-                try:
-                    asyncio.create_task(
-                        push_notify(w["student_id"], amt, w.get("code") or "")
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("lucky_draw push schedule error: %s", str(exc)[:200])
-
-        # Persist audit row + stamp completion time.
-        # NOTE: we do NOT re-flip `lucky_draw_done` here — it was set
-        # atomically at the start of this function. Re-flipping would
-        # reopen the race window if a parallel request was queued.
+        # Persist the audit row in a NOT-yet-finalized state. The
+        # `finalized` flag is the second-stage idempotency guard: only
+        # one `_finalize_draw` call can flip it to True, so GAS
+        # transfers + winner pushes also happen exactly once.
         now_iso = datetime.now(timezone.utc).isoformat()
+        draw_id = f"draw-{uuid.uuid4().hex[:12]}"
         await SL_DRAWS.insert_one({
-            "draw_id":      f"draw-{uuid.uuid4().hex[:12]}",
+            "draw_id":      draw_id,
             "session_id":   session_id,
             "pool_total":   pool_total,
             "num_winners":  num_winners,
@@ -707,29 +721,30 @@ async def _run_draw(
             "granted_by":   granted_by,
             "mock":         use_mock,
             "drawn_at":     now_iso,
+            "finalized":    False,    # set True atomically in finalize
+            "prepared_at":  now_iso,
         })
+        # Stamp the latest prepared `draw_id` on the session so finalize
+        # can find it without an extra query parameter from the client.
         await SL_SESSIONS.update_one(
             {"session_id": session_id},
-            {"$set": {"lucky_draw_at": now_iso}},
+            {"$set": {"lucky_draw_prepared_draw_id": draw_id}},
         )
-
-        # Broadcast the closing summary event
-        await sl_publish(session_id, {
-            "type":        "draw_complete",
-            "pool_total":  pool_total,
-            "num_winners": num_winners,
-            "results":     list(results),
-        })
 
         return {
             "ok":          True,
             "session_id":  session_id,
+            "draw_id":     draw_id,
             "pool_total":  pool_total,
             "num_winners": num_winners,
             "split":       list(split),
             "winners":     results,
             "mock":        use_mock,
             "drawn_at":    now_iso,
+            # New field — tells the frontend that a separate finalize
+            # call is required after the cinematic reveal.
+            "finalized":   False,
+            "requires_finalize": True,
         }
     except HTTPException:
         # Already handled — claim released above if applicable. Re-raise.
@@ -747,6 +762,211 @@ async def _run_draw(
         raise
 
 
+async def _finalize_draw(
+    db, sl_publish, session_id: str,
+    gas_url: str, treasury_id: str, treasury_password: str,
+    mock_gas: bool, log: logging.Logger,
+    *,
+    push_notify: Optional[Callable[[str, int, str], Awaitable[None]]] = None,
+) -> dict:
+    """
+    Phase 4: commit the previously-prepared draw.
+
+    `_run_draw` only LOCKS the winners and persists the plan. It does
+    NOT transfer GAS points and does NOT push to the winners. This
+    function performs both, idempotently.
+
+    Idempotency model:
+      • Each prepared draw lives in `speaking_lab_lucky_draws` with
+        `finalized=False`.
+      • We claim it with an atomic `update_one(..., finalized:{$ne:True},
+        ...->finalized=True)`. Only ONE concurrent caller can win that
+        flip; every other caller sees `matched_count == 0` and we
+        return the already-finalized record (200 OK, no payout, no
+        push). This is exactly the same pattern as the start-of-draw
+        atomic claim — same safety guarantee, different document.
+      • If finalize is called BEFORE prepare (no draw record found):
+        return 404. The frontend never does this; it's a safety check
+        against stray clients.
+
+    Safety re-statement:
+      • Atomic claim at draw start → exactly one prepare per session.
+      • Atomic finalize flip → exactly one set of GAS transfers per
+        prepared draw.
+      • Together: exactly one payout per session, no double-pay,
+        even under refresh/retry/concurrent admin tabs.
+    """
+    SL_SESSIONS = db.speaking_lab_sessions
+    SL_DRAWS    = db.speaking_lab_lucky_draws
+
+    sess = await SL_SESSIONS.find_one({"session_id": session_id}, {"_id": 0})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Locate the prepared draw. We prefer the `lucky_draw_prepared_draw_id`
+    # pointer set by `_run_draw`, but fall back to the most recent
+    # un-finalized draw for this session so that a draw prepared by an
+    # older build (without the pointer) can still be finalized.
+    prepared_id = sess.get("lucky_draw_prepared_draw_id")
+    draw_doc = None
+    if prepared_id:
+        draw_doc = await SL_DRAWS.find_one(
+            {"draw_id": prepared_id, "session_id": session_id},
+            {"_id": 0},
+        )
+    if not draw_doc:
+        draw_doc = await SL_DRAWS.find_one(
+            {"session_id": session_id, "finalized": {"$ne": True}},
+            {"_id": 0}, sort=[("prepared_at", -1)],
+        )
+    if not draw_doc:
+        # Either no draw was ever prepared, or it's already finalized.
+        # If a finalized record exists, return it idempotently.
+        existing = await SL_DRAWS.find_one(
+            {"session_id": session_id, "finalized": True},
+            {"_id": 0}, sort=[("finalized_at", -1)],
+        )
+        if existing:
+            return {
+                "ok":          True,
+                "session_id":  session_id,
+                "draw_id":     existing.get("draw_id"),
+                "pool_total":  existing.get("pool_total"),
+                "num_winners": existing.get("num_winners"),
+                "split":       existing.get("split"),
+                "winners":     existing.get("results", []),
+                "mock":        existing.get("mock"),
+                "drawn_at":    existing.get("drawn_at"),
+                "finalized":   True,
+                "already_finalized": True,
+            }
+        raise HTTPException(
+            status_code=404,
+            detail="No prepared draw found for this session",
+        )
+
+    draw_id = draw_doc["draw_id"]
+
+    # ── ATOMIC FINALIZE CLAIM ─────────────────────────────────────────
+    finalized_started_at = datetime.now(timezone.utc).isoformat()
+    claim = await SL_DRAWS.update_one(
+        {"draw_id": draw_id, "finalized": {"$ne": True}},
+        {"$set": {
+            "finalized":              True,
+            "finalize_started_at":    finalized_started_at,
+        }},
+    )
+    if claim.matched_count == 0:
+        # Already finalized by an earlier call (refresh, retry,
+        # concurrent tab). Return the existing finalized record —
+        # idempotent 200, no payout, no push.
+        existing = await SL_DRAWS.find_one({"draw_id": draw_id}, {"_id": 0})
+        if log:
+            log.info("lucky_draw: finalize idempotent hit for %s/%s",
+                     session_id, draw_id)
+        return {
+            "ok":          True,
+            "session_id":  session_id,
+            "draw_id":     draw_id,
+            "pool_total":  existing.get("pool_total") if existing else None,
+            "num_winners": existing.get("num_winners") if existing else None,
+            "split":       existing.get("split") if existing else None,
+            "winners":     (existing or {}).get("results", []),
+            "mock":        (existing or {}).get("mock"),
+            "drawn_at":    (existing or {}).get("drawn_at"),
+            "finalized":   True,
+            "already_finalized": True,
+        }
+
+    # We won the claim. Execute GAS transfers + pushes for each winner.
+    prepared_results = list(draw_doc.get("results") or [])
+    use_mock = bool(draw_doc.get("mock") or mock_gas)
+    final_results: list[dict] = []
+    for rec in prepared_results:
+        student_id   = rec.get("student_id")
+        display_name = rec.get("display_name")
+        code         = rec.get("code") or ""
+        amount       = int(rec.get("amount") or 0)
+        ok, err = await _gas_send_points(
+            gas_url, treasury_id, treasury_password,
+            student_id, amount, mock=use_mock, log=log,
+        )
+        merged = {
+            **rec,
+            "transfer_ok":  ok,
+            "transfer_err": "" if ok else err,
+        }
+        final_results.append(merged)
+
+        # SSE for the teacher screen (post-reveal — the cinematic is
+        # already complete by now, so this event is mostly audit; the
+        # frontend already painted winners from the prepare response).
+        try:
+            await sl_publish(session_id, {
+                "type":  "draw_winner",
+                **merged,
+            })
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log.warning("lucky_draw: sl_publish error: %s",
+                            str(exc)[:200])
+
+        # Winner push — fire-and-forget so a slow webpush never blocks
+        # the rest of finalize.
+        if ok and push_notify is not None:
+            try:
+                asyncio.create_task(
+                    push_notify(student_id, amount, code)
+                )
+            except Exception as exc:  # noqa: BLE001
+                if log:
+                    log.warning(
+                        "lucky_draw push schedule error: %s",
+                        str(exc)[:200],
+                    )
+
+    # Persist final results back onto the draw doc + stamp session.
+    finalized_at = datetime.now(timezone.utc).isoformat()
+    await SL_DRAWS.update_one(
+        {"draw_id": draw_id},
+        {"$set": {
+            "results":      list(final_results),
+            "finalized_at": finalized_at,
+        }},
+    )
+    await SL_SESSIONS.update_one(
+        {"session_id": session_id},
+        {"$set": {"lucky_draw_at": finalized_at}},
+    )
+
+    try:
+        await sl_publish(session_id, {
+            "type":        "draw_complete",
+            "pool_total":  draw_doc.get("pool_total"),
+            "num_winners": draw_doc.get("num_winners"),
+            "results":     list(final_results),
+        })
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log.warning("lucky_draw: sl_publish draw_complete error: %s",
+                        str(exc)[:200])
+
+    return {
+        "ok":          True,
+        "session_id":  session_id,
+        "draw_id":     draw_id,
+        "pool_total":  draw_doc.get("pool_total"),
+        "num_winners": draw_doc.get("num_winners"),
+        "split":       draw_doc.get("split"),
+        "winners":     final_results,
+        "mock":        use_mock,
+        "drawn_at":    draw_doc.get("drawn_at"),
+        "finalized":   True,
+        "finalized_at": finalized_at,
+        "already_finalized": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Optional: helper to ensure the Mongo indexes exist. Call once at startup.
 # ---------------------------------------------------------------------------
@@ -760,3 +980,5 @@ async def ensure_lucky_draw_indexes(db) -> None:
     )
     await db.speaking_lab_lucky_draws.create_index("session_id")
     await db.speaking_lab_lucky_draws.create_index("drawn_at")
+    # Phase 4: support the finalize-idempotency lookup.
+    await db.speaking_lab_lucky_draws.create_index("draw_id", unique=True)
