@@ -389,7 +389,10 @@ def register_lucky_draw_routes(
     if require_admin:
         @api.get("/speaking-lab/sessions/{session_id}/pool")
         async def lucky_pool_get(session_id: str, admin=Depends(require_admin)):
-            return await _pool_payload(SL_SESSIONS, SL_LUCKY, session_id)
+            return await _pool_payload(
+                SL_SESSIONS, SL_LUCKY, session_id,
+                db=db, sl_publish=sl_publish, log=log,
+            )
         @api.get("/speaking-lab/sessions/{session_id}/lucky-codes")
         async def lucky_codes_get(session_id: str, admin=Depends(require_admin)):
             return await _codes_payload(SL_SESSIONS, SL_LUCKY, session_id)
@@ -409,7 +412,10 @@ def register_lucky_draw_routes(
         # Dev mode — admit any caller
         @api.get("/speaking-lab/sessions/{session_id}/pool")
         async def lucky_pool_get_dev(session_id: str):
-            return await _pool_payload(SL_SESSIONS, SL_LUCKY, session_id)
+            return await _pool_payload(
+                SL_SESSIONS, SL_LUCKY, session_id,
+                db=db, sl_publish=sl_publish, log=log,
+            )
         @api.get("/speaking-lab/sessions/{session_id}/lucky-codes")
         async def lucky_codes_get_dev(session_id: str):
             return await _codes_payload(SL_SESSIONS, SL_LUCKY, session_id)
@@ -423,10 +429,73 @@ def register_lucky_draw_routes(
             )
 
 
-async def _pool_payload(SL_SESSIONS, SL_LUCKY, session_id: str) -> dict:
+async def _pool_payload(
+    SL_SESSIONS, SL_LUCKY, session_id: str,
+    *, db=None, sl_publish=None, log: Optional[logging.Logger] = None,
+) -> dict:
     sess = await SL_SESSIONS.find_one({"session_id": session_id}, {"_id": 0})
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # ── Safety-net repair: regenerate lucky codes for paid roster entries
+    # that are missing one. This fixes the bug where a student paid the
+    # entry fee (and therefore appears in `speaking_lab_entries`) but their
+    # `speaking_lab_lucky_codes` doc was never created — usually because
+    # the original `_sl_try_auto_enter` call hit a transient error or the
+    # process was killed mid-flight. We repair every fetch so the pool UI
+    # self-heals without operator action. Never raises into the caller.
+    if db is not None and sl_publish is not None and not sess.get("lucky_draw_done"):
+        try:
+            entry_ids: list[str] = []
+            entry_names: dict[str, str] = {}
+            async for r in db.speaking_lab_entries.find(
+                {"session_id": session_id},
+                {"_id": 0, "student_id": 1, "display_name": 1},
+            ):
+                sid = (r.get("student_id") or "").strip()
+                if sid and not sid.startswith("sl-"):
+                    entry_ids.append(sid)
+                    dn = r.get("display_name")
+                    if dn:
+                        entry_names[sid] = dn
+            if entry_ids:
+                have_codes: set[str] = set()
+                async for r in SL_LUCKY.find(
+                    {"session_id": session_id,
+                     "student_id": {"$in": entry_ids}},
+                    {"_id": 0, "student_id": 1},
+                ):
+                    sid = (r.get("student_id") or "").strip()
+                    if sid:
+                        have_codes.add(sid)
+                missing = [s for s in entry_ids if s not in have_codes]
+                if missing:
+                    fee = int(sess.get("entry_fee") or 0)
+                    for sid in missing:
+                        try:
+                            await generate_and_publish_lucky_code(
+                                db, sl_publish, session_id, sid,
+                                entry_names.get(sid, sid),
+                                amount=fee, log=log,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            if log:
+                                log.warning(
+                                    "lucky_draw: pool repair failed for %s/%s: %s",
+                                    session_id, sid, str(exc)[:200],
+                                )
+                    if log:
+                        log.info(
+                            "lucky_draw: pool repair generated %d code(s) "
+                            "for session %s", len(missing), session_id,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log.warning(
+                    "lucky_draw: pool repair scan error: %s",
+                    str(exc)[:200],
+                )
+
     codes_cursor = SL_LUCKY.find(
         {"session_id": session_id}, {"_id": 0},
     ).sort("awarded_at", 1)
@@ -482,126 +551,200 @@ async def _run_draw(
     sess = await SL_SESSIONS.find_one({"session_id": session_id}, {"_id": 0})
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
-    if sess.get("lucky_draw_done"):
+
+    # ── TREASURY-SAFETY CLAIM ───────────────────────────────────────────
+    # Atomically flip `lucky_draw_done` to True at the very start, BEFORE
+    # building candidates or sending any GAS payout. Only one concurrent
+    # request can win this update; all others see matched_count == 0 and
+    # get a clean 409. This is the single guard that prevents the
+    # treasury double-payout bug (stu092 paying repeated winnings).
+    #
+    # Conditions:
+    #   • lucky_draw_done is not True
+    #   • optional belt-and-braces: no draw is currently in-flight by
+    #     another worker (we don't have a separate flag; the not-equal-
+    #     True check above is sufficient because we set it to True here).
+    claim_started_at = datetime.now(timezone.utc).isoformat()
+    claim = await SL_SESSIONS.update_one(
+        {"session_id": session_id, "lucky_draw_done": {"$ne": True}},
+        {"$set": {
+            "lucky_draw_done":        True,
+            "lucky_draw_started_at":  claim_started_at,
+            "lucky_draw_granted_by":  granted_by,
+        }},
+    )
+    if claim.matched_count == 0:
+        # Either already drawn, or another request claimed it first.
+        # Idempotent 409 — same response shape as before.
         raise HTTPException(status_code=409,
                             detail="Lucky draw already run for this session")
 
-    # Build candidate list
-    candidates: list[dict] = []
-    async for r in SL_LUCKY.find({"session_id": session_id}, {"_id": 0}):
-        candidates.append({
-            "student_id":   r.get("student_id"),
-            "display_name": r.get("display_name"),
-            "code":         r.get("code"),
-            "entry_fee":    int(r.get("entry_fee") or 0),
-        })
-    if not candidates:
-        raise HTTPException(status_code=400, detail="No lucky codes — pool is empty")
+    # If we ever reach a GAS transfer, we must NEVER release the claim,
+    # even on unexpected errors. Tracks the half-way point.
+    payout_started = False
 
-    pool_total = sum(c["entry_fee"] for c in candidates)
-    if pool_total <= 0:
-        raise HTTPException(status_code=400, detail="Pool total is zero")
+    async def _release_claim(reason: str) -> None:
+        """Safely release the claim — ONLY callable before any GAS
+        transfer started. We use a guarded update so we never undo a
+        completed draw."""
+        try:
+            await SL_SESSIONS.update_one(
+                {"session_id": session_id,
+                 "lucky_draw_started_at": claim_started_at,
+                 "lucky_draw_at": {"$exists": False}},
+                {"$set":   {"lucky_draw_done": False},
+                 "$unset": {"lucky_draw_started_at": "",
+                            "lucky_draw_granted_by": ""}},
+            )
+            if log:
+                log.info("lucky_draw: claim released for %s (%s)",
+                         session_id, reason)
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log.warning("lucky_draw: claim release error %s/%s: %s",
+                            session_id, reason, str(exc)[:200])
 
-    # Resolve settings (config override > session > settings doc > defaults)
-    settings_doc = await SL_SETTINGS.find_one({"_id": "settings"}, {"_id": 0}) or {}
-    num_winners = (
-        config.num_winners
-        or int(settings_doc.get("luckyDrawWinners") or 0)
-        or DEFAULT_NUM_WINNERS
-    )
-    num_winners = max(1, min(3, int(num_winners)))
-    split = (
-        config.split
-        or settings_doc.get("luckyDrawSplit")
-        or DEFAULT_SPLIT
-    )
-    # Clamp candidates if fewer than winners
-    num_winners = min(num_winners, len(candidates))
+    try:
+        # Build candidate list (now claim is locked).
+        candidates: list[dict] = []
+        async for r in SL_LUCKY.find({"session_id": session_id}, {"_id": 0}):
+            candidates.append({
+                "student_id":   r.get("student_id"),
+                "display_name": r.get("display_name"),
+                "code":         r.get("code"),
+                "entry_fee":    int(r.get("entry_fee") or 0),
+            })
+        if not candidates:
+            # Safe to release: no GAS transfer started yet.
+            await _release_claim("empty_pool")
+            raise HTTPException(status_code=400,
+                                detail="No lucky codes — pool is empty")
 
-    # Slot-picked set (passed in by client OR stored on session)
-    slot_picked: set[str] = set()
-    if config.slot_picks:
-        slot_picked = set(config.slot_picks)
-    elif isinstance(sess.get("slot_picks"), list):
-        slot_picked = set(sess["slot_picks"])
+        pool_total = sum(c["entry_fee"] for c in candidates)
+        if pool_total <= 0:
+            await _release_claim("zero_pool_total")
+            raise HTTPException(status_code=400, detail="Pool total is zero")
 
-    winners = _weighted_pick(candidates, slot_picked, num_winners)
-    amounts = _normalize_split(list(split), num_winners, pool_total)
-
-    # Execute GAS transfers + collect results
-    results: list[dict] = []
-    use_mock = bool(config.mock) or mock_gas
-    for w, amt in zip(winners, amounts):
-        ok, err = await _gas_send_points(
-            gas_url, treasury_id, treasury_password,
-            w["student_id"], amt, mock=use_mock, log=log,
+        # Resolve settings (config override > session > settings doc > defaults)
+        settings_doc = await SL_SETTINGS.find_one({"_id": "settings"}, {"_id": 0}) or {}
+        num_winners = (
+            config.num_winners
+            or int(settings_doc.get("luckyDrawWinners") or 0)
+            or DEFAULT_NUM_WINNERS
         )
-        rec = {
-            "student_id":   w["student_id"],
-            "display_name": w["display_name"],
-            "code":         w["code"],
-            "amount":       amt,
-            "transfer_ok":  ok,
-            "transfer_err": "" if ok else err,
-            "was_slot_picked": w["student_id"] in slot_picked,
-        }
-        results.append(rec)
-        # SSE per winner (drives LuckyDraw cinematic on teacher screen)
+        num_winners = max(1, min(3, int(num_winners)))
+        split = (
+            config.split
+            or settings_doc.get("luckyDrawSplit")
+            or DEFAULT_SPLIT
+        )
+        # Clamp candidates if fewer than winners
+        num_winners = min(num_winners, len(candidates))
+
+        # Slot-picked set (passed in by client OR stored on session)
+        slot_picked: set[str] = set()
+        if config.slot_picks:
+            slot_picked = set(config.slot_picks)
+        elif isinstance(sess.get("slot_picks"), list):
+            slot_picked = set(sess["slot_picks"])
+
+        winners = _weighted_pick(candidates, slot_picked, num_winners)
+        amounts = _normalize_split(list(split), num_winners, pool_total)
+
+        # Execute GAS transfers + collect results.
+        # From here on we are committed — even on failure we will NOT
+        # release the claim, so a partial payout can never be re-paid.
+        payout_started = True
+        results: list[dict] = []
+        use_mock = bool(config.mock) or mock_gas
+        for w, amt in zip(winners, amounts):
+            ok, err = await _gas_send_points(
+                gas_url, treasury_id, treasury_password,
+                w["student_id"], amt, mock=use_mock, log=log,
+            )
+            rec = {
+                "student_id":   w["student_id"],
+                "display_name": w["display_name"],
+                "code":         w["code"],
+                "amount":       amt,
+                "transfer_ok":  ok,
+                "transfer_err": "" if ok else err,
+                "was_slot_picked": w["student_id"] in slot_picked,
+            }
+            results.append(rec)
+            # SSE per winner (drives LuckyDraw cinematic on teacher screen)
+            await sl_publish(session_id, {
+                "type":         "draw_winner",
+                **rec,
+            })
+
+            # Phase 3: notify the winner's phone via Web Push as soon as
+            # the GAS transfer succeeds. Never block the draw loop on push
+            # — fire-and-forget so a slow webpush doesn't delay the next
+            # winner's SSE event. The push helper is best-effort and never
+            # raises.
+            if ok and push_notify is not None:
+                try:
+                    asyncio.create_task(
+                        push_notify(w["student_id"], amt, w.get("code") or "")
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("lucky_draw push schedule error: %s", str(exc)[:200])
+
+        # Persist audit row + stamp completion time.
+        # NOTE: we do NOT re-flip `lucky_draw_done` here — it was set
+        # atomically at the start of this function. Re-flipping would
+        # reopen the race window if a parallel request was queued.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await SL_DRAWS.insert_one({
+            "draw_id":      f"draw-{uuid.uuid4().hex[:12]}",
+            "session_id":   session_id,
+            "pool_total":   pool_total,
+            "num_winners":  num_winners,
+            "split":        list(split),
+            "results":      list(results),
+            "slot_picks":   list(slot_picked),
+            "granted_by":   granted_by,
+            "mock":         use_mock,
+            "drawn_at":     now_iso,
+        })
+        await SL_SESSIONS.update_one(
+            {"session_id": session_id},
+            {"$set": {"lucky_draw_at": now_iso}},
+        )
+
+        # Broadcast the closing summary event
         await sl_publish(session_id, {
-            "type":         "draw_winner",
-            **rec,
+            "type":        "draw_complete",
+            "pool_total":  pool_total,
+            "num_winners": num_winners,
+            "results":     list(results),
         })
 
-        # Phase 3: notify the winner's phone via Web Push as soon as
-        # the GAS transfer succeeds. Never block the draw loop on push
-        # — fire-and-forget so a slow webpush doesn't delay the next
-        # winner's SSE event. The push helper is best-effort and never
-        # raises.
-        if ok and push_notify is not None:
-            try:
-                asyncio.create_task(
-                    push_notify(w["student_id"], amt, w.get("code") or "")
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("lucky_draw push schedule error: %s", str(exc)[:200])
-
-    # Persist audit row + flip session flag (atomic-ish)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    await SL_DRAWS.insert_one({
-        "draw_id":      f"draw-{uuid.uuid4().hex[:12]}",
-        "session_id":   session_id,
-        "pool_total":   pool_total,
-        "num_winners":  num_winners,
-        "split":        list(split),
-        "results":      list(results),
-        "slot_picks":   list(slot_picked),
-        "granted_by":   granted_by,
-        "mock":         use_mock,
-        "drawn_at":     now_iso,
-    })
-    await SL_SESSIONS.update_one(
-        {"session_id": session_id},
-        {"$set": {"lucky_draw_done": True, "lucky_draw_at": now_iso}},
-    )
-
-    # Broadcast the closing summary event
-    await sl_publish(session_id, {
-        "type":        "draw_complete",
-        "pool_total":  pool_total,
-        "num_winners": num_winners,
-        "results":     list(results),
-    })
-
-    return {
-        "ok":          True,
-        "session_id":  session_id,
-        "pool_total":  pool_total,
-        "num_winners": num_winners,
-        "split":       list(split),
-        "winners":     results,
-        "mock":        use_mock,
-        "drawn_at":    now_iso,
-    }
+        return {
+            "ok":          True,
+            "session_id":  session_id,
+            "pool_total":  pool_total,
+            "num_winners": num_winners,
+            "split":       list(split),
+            "winners":     results,
+            "mock":        use_mock,
+            "drawn_at":    now_iso,
+        }
+    except HTTPException:
+        # Already handled — claim released above if applicable. Re-raise.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Unexpected failure. If we never started a GAS transfer we can
+        # safely release the claim so the teacher can retry. Once any
+        # GAS call has been issued (`payout_started=True`) we MUST keep
+        # the claim — a partial draw must never be re-paid.
+        if not payout_started:
+            await _release_claim(f"pre_payout_exception:{type(exc).__name__}")
+        if log:
+            log.exception("lucky_draw: unhandled error in _run_draw: %s",
+                          str(exc)[:200])
+        raise
 
 
 # ---------------------------------------------------------------------------
