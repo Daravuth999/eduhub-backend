@@ -1430,6 +1430,148 @@ async def import_wallet_one(
 # using the existing ``require_admin`` dependency from server.py.             #
 # Phase 1 only registers READ + balance-audit + reconcile (no live writes).   #
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# Phase 1.5 — manual Sheet snapshot import (no GAS call, no password)         #
+# --------------------------------------------------------------------------- #
+
+async def import_wallet_one_manual(
+    db: AsyncIOMotorDatabase,
+    *,
+    student_id: str,
+    clean_id: str,
+    trusted_balance: float,
+    overwrite_existing: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Seed one wallet from a trusted admin-supplied Sheet snapshot.
+
+    Used when balance_source="manual_sheet_snapshot" is in the payload.
+    No GAS call. No password accepted or stored.
+
+    Status values returned:
+      * would_import         — dry_run=True; all checks passed; write skipped.
+      * imported             — wallet written successfully.
+      * skipped_existing     — wallet exists; overwrite_existing=False.
+      * invalid              — validation failed (bad id, negative balance, etc.)
+      * failed               — unexpected database error.
+    """
+    sid     = _norm_id(student_id)
+    cleaned = (clean_id or sid).strip().lower()
+
+    out: dict[str, Any] = {
+        "student_id":    sid,
+        "clean_id":      cleaned,
+        "gas_balance":   None,
+        "trusted_balance": trusted_balance,
+        "mongo_balance": None,
+        "status":        "failed",
+        "balance_source": "manual_sheet_snapshot",
+    }
+
+    # Validate balance
+    if not isinstance(trusted_balance, (int, float)):
+        out["status"] = "invalid"
+        out["reason"] = "balance must be numeric"
+        return out
+    if trusted_balance < 0:
+        out["status"] = "invalid"
+        out["reason"] = "negative balance rejected"
+        return out
+
+    # Verify student is active in db.students
+    stu_doc = await db.students.find_one(
+        {"$or": [
+            {"student_id": sid,     "is_active": True},
+            {"student_id": sid,     "is_active": {"$exists": False}},
+            {"clean_id":  cleaned,  "is_active": True},
+            {"clean_id":  cleaned,  "is_active": {"$exists": False}},
+        ]},
+        {"_id": 0, "student_id": 1, "clean_id": 1},
+    )
+    if not stu_doc:
+        out["status"] = "invalid"
+        out["reason"] = (
+            f"student_id={sid!r} / clean_id={cleaned!r} not found in "
+            "db.students or not active"
+        )
+        return out
+
+    # Use canonical IDs from the database row
+    sid     = stu_doc.get("student_id") or sid
+    cleaned = stu_doc.get("clean_id")   or cleaned
+    out["student_id"] = sid
+    out["clean_id"]   = cleaned
+
+    # Check existing wallet
+    existing = await db[COLL_WALLETS].find_one(
+        {"student_id": sid}, {"_id": 0, "balance": 1}
+    )
+    if existing and "balance" in existing:
+        out["mongo_balance"] = float(existing["balance"])
+
+    if existing and not overwrite_existing:
+        out["status"] = "skipped_existing"
+        out["reason"]  = (
+            "wallet already exists; set overwrite_existing=true to overwrite"
+        )
+        return out
+
+    # Dry-run — no writes
+    if dry_run:
+        out["status"] = "would_import"
+        return out
+
+    # Real import
+    now_iso = _utcnow()
+    balance_to_store: Any = (
+        int(trusted_balance)
+        if trusted_balance == int(trusted_balance)
+        else round(trusted_balance, 6)
+    )
+    doc = {
+        "student_id":               sid,
+        "clean_id":                 cleaned,
+        "balance":                  balance_to_store,
+        "status":                   STATUS_ACTIVE,
+        "created_at":               now_iso,
+        "updated_at":               now_iso,
+        "version":                  0,
+        "leaderboard_earned_points": 0,
+        "lifetime_top_up":          0,
+        "last_imported_from":       "manual_sheet_snapshot",
+        "last_imported_at":         now_iso,
+    }
+    try:
+        if existing and overwrite_existing:
+            await db[COLL_WALLETS].update_one(
+                {"student_id": sid},
+                {"$set": {
+                    "balance":            balance_to_store,
+                    "updated_at":         now_iso,
+                    "last_imported_from": "manual_sheet_snapshot",
+                    "last_imported_at":   now_iso,
+                }},
+            )
+        else:
+            await db[COLL_WALLETS].update_one(
+                {"student_id": sid},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+        confirmed = await db[COLL_WALLETS].find_one(
+            {"student_id": sid}, {"_id": 0, "balance": 1}
+        )
+        out["mongo_balance"] = (
+            float(confirmed["balance"]) if confirmed else balance_to_store
+        )
+        out["status"] = "imported"
+    except Exception as exc:  # noqa: BLE001
+        out["status"] = "failed"
+        out["reason"]  = f"{type(exc).__name__}: {str(exc)[:160]}"
+    return out
+
+
 def register_migration_routes(api, db, require_admin) -> None:
     """Mount /api/teacher/migration/* onto the existing FastAPI router.
     The router and admin dependency come from server.py — this module
@@ -1556,6 +1698,12 @@ def register_migration_routes(api, db, require_admin) -> None:
             )
         overwrite_existing = bool(payload.get("overwrite_existing", False))
         dry_run = bool(payload.get("dry_run", True))
+        # Phase 1.5 — manual Sheet snapshot path.
+        # When balance_source="manual_sheet_snapshot", each student row must
+        # supply a trusted balance directly.  GAS is NOT called and no
+        # legacy password is accepted or required on this path.
+        balance_source = (payload.get("balance_source") or "").strip().lower()
+        is_manual_seed = balance_source == "manual_sheet_snapshot"
         gas_url = os.environ.get(
             "GAS_POINTS_LOGIN_URL", payload.get("gas_url") or "",
         )
@@ -1563,17 +1711,52 @@ def register_migration_routes(api, db, require_admin) -> None:
         for s in students[:500]:
             sid = (s or {}).get("student_id") or ""
             cid = (s or {}).get("clean_id") or sid
-            pw = (s or {}).get("legacy_password")
             try:
-                row = await import_wallet_one(
-                    db,
-                    student_id=sid,
-                    clean_id=cid,
-                    gas_login_url=gas_url,
-                    legacy_password=pw,
-                    overwrite_existing=overwrite_existing,
-                    dry_run=dry_run,
-                )
+                if is_manual_seed:
+                    # Trusted balance from Sheet — bypass GAS entirely.
+                    raw_bal = (s or {}).get("balance")
+                    if raw_bal is None:
+                        row = {
+                            "student_id": sid, "clean_id": cid,
+                            "gas_balance": None, "mongo_balance": None,
+                            "status": "invalid",
+                            "reason": "balance field required for manual_sheet_snapshot",
+                            "balance_source": "manual_sheet_snapshot",
+                        }
+                    else:
+                        try:
+                            trusted_bal = float(raw_bal)
+                        except (TypeError, ValueError):
+                            trusted_bal = None
+                        if trusted_bal is None:
+                            row = {
+                                "student_id": sid, "clean_id": cid,
+                                "gas_balance": None, "mongo_balance": None,
+                                "status": "invalid",
+                                "reason": f"balance must be numeric, got {raw_bal!r}",
+                                "balance_source": "manual_sheet_snapshot",
+                            }
+                        else:
+                            row = await import_wallet_one_manual(
+                                db,
+                                student_id=sid,
+                                clean_id=cid,
+                                trusted_balance=trusted_bal,
+                                overwrite_existing=overwrite_existing,
+                                dry_run=dry_run,
+                            )
+                else:
+                    # Original GAS-backed path (requires legacy_password).
+                    pw = (s or {}).get("legacy_password")
+                    row = await import_wallet_one(
+                        db,
+                        student_id=sid,
+                        clean_id=cid,
+                        gas_login_url=gas_url,
+                        legacy_password=pw,
+                        overwrite_existing=overwrite_existing,
+                        dry_run=dry_run,
+                    )
             except WalletError as exc:
                 row = {
                     "student_id": sid, "clean_id": cid,
