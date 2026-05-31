@@ -39,6 +39,22 @@ from starlette.middleware.cors import CORSMiddleware
 
 from content_parser import extract_docx, parse_content
 
+# ─────────────────────────────────────────────────────────────
+# Phase 1 GAS→Mongo migration preflight: wallet service import
+# Safe default: unavailable if import fails; no student behavior change.
+# ─────────────────────────────────────────────────────────────
+try:
+    import wallet_service
+    _WALLET_SERVICE_AVAILABLE = True
+except Exception as _wallet_service_import_error:
+    wallet_service = None
+    _WALLET_SERVICE_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "migration preflight wallet_service unavailable: %s",
+        _wallet_service_import_error,
+    )
+
+
 # ── AI Scene Builder (Gemini engine — isolated module) ─────────────────── #
 # gemini_engine.py lives alongside server.py and has zero side-effects.      #
 # If the file is missing the feature is simply disabled; nothing else breaks. #
@@ -5150,6 +5166,22 @@ async def startup():
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
 
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 1 GAS→Mongo migration preflight startup
+    # Creates wallet indexes and detects Mongo transaction support.
+    # Failure is non-fatal and must not affect live student flows.
+    # ─────────────────────────────────────────────────────────
+    if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
+        try:
+            await wallet_service.ensure_wallet_indexes(db)
+            await wallet_service.detect_transaction_support(db)
+        except Exception as _wallet_startup_error:
+            logging.getLogger(__name__).warning(
+                "migration preflight startup skipped/failed: %s",
+                _wallet_startup_error,
+            )
+
 @app.on_event("shutdown")
 async def shutdown():
     client.close()
@@ -5900,5 +5932,22 @@ register_premium_ai_routes(api, db, require_admin, require_student)
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 1 GAS→Mongo migration preflight routes
+# Admin-only migration status/audit/import routes.
+# Registered before app.include_router(api).
+# Failure is non-fatal and does not affect existing routes.
+# ─────────────────────────────────────────────────────────────
+if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
+    try:
+        wallet_service.register_migration_routes(api, db, require_admin)
+    except Exception as _wallet_route_error:
+        logging.getLogger(__name__).warning(
+            "migration preflight route registration skipped/failed: %s",
+            _wallet_route_error,
+        )
+
 
 app.include_router(api)
