@@ -1572,6 +1572,123 @@ async def import_wallet_one_manual(
     return out
 
 
+# ============================================================================ #
+# Phase 3 — student-facing points read routes                                  #
+# ============================================================================ #
+# Registered by server.py startup AFTER register_migration_routes().           #
+# All routes are flag-gated: when USE_MONGO_POINTS_READ != "true"/"1"/"yes"    #
+# they return {"mode": "disabled"} so an accidental flag flip cannot expose    #
+# stale balances to students.                                                  #
+#                                                                              #
+# Flag intent:                                                                 #
+#   USE_MONGO_POINTS_READ=false  → GAS is source of truth (current default)   #
+#   USE_MONGO_POINTS_READ=true   → Mongo is source of truth (Phase 3 flip)    #
+#                                                                              #
+# This function is a no-op when the flag is off — the routes are registered   #
+# but return a clear disabled response so the frontend can detect the state.  #
+# ============================================================================ #
+
+def register_student_points_routes(api, db, require_student) -> None:
+    """Mount /api/student/points/* onto the existing FastAPI router.
+
+    Called once from server.py startup after register_migration_routes().
+    require_student is the FastAPI dependency from server.py — never
+    imported here to avoid circular imports.
+    """
+    import os as _os
+    from fastapi import Depends as _Depends, HTTPException as _HTTPException
+
+    COLL_WALLETS_P3 = "points_wallets"
+    COLL_TXN_P3     = "points_transactions"
+
+    def _read_enabled() -> bool:
+        v = (_os.environ.get("USE_MONGO_POINTS_READ") or "").strip().lower()
+        return v in ("true", "1", "yes")
+
+    @api.get("/student/points/balance")
+    async def _student_points_balance(student=_Depends(require_student)):
+        """Return the student's MongoDB wallet balance.
+
+        When USE_MONGO_POINTS_READ is off: returns mode="disabled" so
+        the frontend falls back to GAS polling.
+        When on: returns the live Mongo balance as a float (preserves
+        decimals — e.g. 277.5, 240.858).
+        """
+        if not _read_enabled():
+            return {
+                "mode":       "disabled",
+                "student_id": student.student_id,
+                "balance":    None,
+            }
+        wallet = await db[COLL_WALLETS_P3].find_one(
+            {"student_id": student.student_id},
+            {"_id": 0, "balance": 1, "updated_at": 1, "status": 1},
+        )
+        if not wallet:
+            raise _HTTPException(status_code=404, detail="wallet_not_found")
+        if wallet.get("status") != "active":
+            raise _HTTPException(status_code=403, detail="wallet_not_active")
+        return {
+            "mode":       "mongo",
+            "student_id": student.student_id,
+            "clean_id":   student.clean_id,
+            "balance":    float(wallet.get("balance") or 0),
+            "updated_at": wallet.get("updated_at"),
+        }
+
+    @api.get("/student/points/history")
+    async def _student_points_history(
+        limit: int = 50,
+        student=_Depends(require_student),
+    ):
+        """Return recent points transactions for this student from MongoDB.
+
+        Only returns rows where the student is the from_id (debits) or
+        to_id (credits), excluding shadow-only rows.
+        When USE_MONGO_POINTS_READ is off: returns mode="disabled".
+        """
+        if not _read_enabled():
+            return {
+                "mode":         "disabled",
+                "student_id":   student.student_id,
+                "transactions": [],
+            }
+        sid = student.student_id
+        # Fetch both debit (from_id) and credit (to_id) rows, sorted newest first
+        limit_safe = max(1, min(int(limit), 200))
+        cursor = db[COLL_TXN_P3].find(
+            {
+                "$or": [{"from_id": sid}, {"to_id": sid}],
+                "status": {"$ne": "shadow"},   # exclude Phase 2 shadow-only rows
+            },
+            {
+                "_id":               0,
+                "txn_id":            1,
+                "type":              1,
+                "amount":            1,
+                "source":            1,
+                "source_category":   1,
+                "from_id":           1,
+                "to_id":             1,
+                "balance_after":     1,
+                "created_at":        1,
+                "status":            1,
+            },
+        ).sort("created_at", -1).limit(limit_safe)
+        rows = await cursor.to_list(length=limit_safe)
+        # Normalise: convert any int amounts to float for consistency
+        for row in rows:
+            if "amount" in row:
+                row["amount"] = float(row["amount"])
+            if "balance_after" in row:
+                row["balance_after"] = float(row.get("balance_after") or 0)
+        return {
+            "mode":         "mongo",
+            "student_id":   sid,
+            "transactions": rows,
+        }
+
+
 def register_migration_routes(api, db, require_admin) -> None:
     """Mount /api/teacher/migration/* onto the existing FastAPI router.
     The router and admin dependency come from server.py — this module

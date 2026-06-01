@@ -5944,6 +5944,11 @@ if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
     try:
         wallet_service.register_migration_routes(api, db, require_admin)
 
+        # Phase 3 — register student-facing points read routes.
+        # Routes return {"mode":"disabled"} when USE_MONGO_POINTS_READ != "true"
+        # so the frontend falls back to GAS polling until the flag is flipped.
+        wallet_service.register_student_points_routes(api, db, require_student)
+
         # Phase 2 — register shadow_writer with the live db handle.
         # This ensures shadow writes use the same Motor pool as the app.
         # Non-fatal: if shadow_writer import fails, only shadow writes
