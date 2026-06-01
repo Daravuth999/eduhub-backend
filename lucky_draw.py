@@ -882,7 +882,7 @@ async def _finalize_draw(
     prepared_results = list(draw_doc.get("results") or [])
     use_mock = bool(draw_doc.get("mock") or mock_gas)
     final_results: list[dict] = []
-    for rec in prepared_results:
+    for _rank, rec in enumerate(prepared_results):
         student_id   = rec.get("student_id")
         display_name = rec.get("display_name")
         code         = rec.get("code") or ""
@@ -891,6 +891,29 @@ async def _finalize_draw(
             gas_url, treasury_id, treasury_password,
             student_id, amount, mock=use_mock, log=log,
         )
+        if ok:
+            # Phase 2 shadow credit — non-fatal, fire-and-forget.
+            # Key: draw_id + session_id + rank + student_id — stable per draw.
+            try:
+                _ld_ikey = (
+                    f"shadow:credit:lucky_draw:{draw_id}"
+                    f":{session_id}:{_rank}:{student_id}"
+                )
+                from shadow_writer import shadow_credit as _sw_credit
+                import asyncio as _asyncio
+                _asyncio.create_task(_sw_credit(
+                    student_clean_id=student_id,
+                    student_mongo_id="",
+                    amount=amount,
+                    source="lucky_draw",
+                    idempotency_key=_ld_ikey,
+                ))
+            except Exception as _sw_exc:  # noqa: BLE001
+                if log:
+                    log.warning(
+                        "lucky_draw: shadow credit hook error (non-fatal): %s",
+                        str(_sw_exc)[:200],
+                    )
         merged = {
             **rec,
             "transfer_ok":  ok,

@@ -324,7 +324,7 @@ class WalletService:
         )
         if not doc:
             return 0
-        return int(doc.get("balance") or 0)
+        return float(doc.get("balance") or 0)
 
     async def get_wallet(self, student_id: str) -> Mapping[str, Any] | None:
         sid = _norm_id(student_id)
@@ -424,7 +424,7 @@ class WalletService:
             raise WalletStatusBlocked(sid, status)
         if was_debit and needed_balance is not None:
             raise InsufficientFunds(
-                sid, int(cur.get("balance") or 0), needed_balance,
+                sid, float(cur.get("balance") or 0), needed_balance,
             )
         raise WalletError(
             "UPDATE_FAILED",
@@ -452,7 +452,7 @@ class WalletService:
             return {
                 "ok": True,
                 "duplicate": True,
-                "balance_after": int(hit.get("balance_after") or 0),
+                "balance_after": float(hit.get("balance_after") or 0),
                 "transaction": hit,
             }
         await self._ensure_wallet(sid, clean_id=clean_id)
@@ -501,7 +501,7 @@ class WalletService:
             return {
                 "ok": True,
                 "duplicate": True,
-                "balance_after": int(hit.get("balance_after") or 0),
+                "balance_after": float(hit.get("balance_after") or 0),
                 "transaction": hit,
             }
         await self._ensure_wallet(sid)
@@ -509,7 +509,7 @@ class WalletService:
         self._enforce_status(wallet or {"student_id": sid}, "debit", allow_status)
         bypass = bool(admin_bypass_status) or bool(allow_status)
 
-        bal = int((wallet or {}).get("balance") or 0)
+        bal = float((wallet or {}).get("balance") or 0)
         if not allow_negative and bal < amt:
             raise InsufficientFunds(sid, bal, amt)
 
@@ -573,7 +573,7 @@ class WalletService:
         self._enforce_status(wt or {"student_id": t_id}, "transfer", allow_status)
         bypass = bool(admin_bypass_status) or bool(allow_status)
 
-        bal_from = int((wf or {}).get("balance") or 0)
+        bal_from = float((wf or {}).get("balance") or 0)
         if bal_from < amt:
             raise InsufficientFunds(f_id, bal_from, amt)
 
@@ -624,7 +624,7 @@ class WalletService:
             return {
                 "ok": True,
                 "duplicate": True,
-                "balance_after": int(hit.get("balance_after") or 0),
+                "balance_after": float(hit.get("balance_after") or 0),
                 "transaction": hit,
             }
         await self._ensure_wallet(sid)
@@ -711,7 +711,7 @@ class WalletService:
                         await self._diagnose_no_match(
                             sid, was_debit=False, session=s,
                         )
-                balance_after_holder["v"] = int(upd.get("balance") or 0)
+                balance_after_holder["v"] = float(upd.get("balance") or 0)
                 rec = TransactionRecord(
                     student_id=sid,
                     operation=operation,
@@ -776,7 +776,7 @@ class WalletService:
                     await self._diagnose_no_match(
                         f_id, was_debit=True, needed_balance=amt, session=s,
                     )
-                f_bal["v"] = int(upd_from.get("balance") or 0)
+                f_bal["v"] = float(upd_from.get("balance") or 0)
 
                 upd_to = await self.wallets.find_one_and_update(
                     to_filter,
@@ -789,7 +789,7 @@ class WalletService:
                     await self._diagnose_no_match(
                         t_id, was_debit=False, session=s,
                     )
-                t_bal["v"] = int(upd_to.get("balance") or 0)
+                t_bal["v"] = float(upd_to.get("balance") or 0)
 
                 # Two ledger rows — one debit, one credit, sharing the
                 # idempotency_key suffix so a replay short-circuits.
@@ -880,7 +880,7 @@ class WalletService:
                 return {
                     "ok": True,
                     "duplicate": True,
-                    "balance_after": int((hit or {}).get("balance_after") or 0),
+                    "balance_after": float((hit or {}).get("balance_after") or 0),
                     "transaction": hit,
                 }
             raise
@@ -917,7 +917,7 @@ class WalletService:
                 if not upd:
                     await self.txns.delete_one({"_id": ins.inserted_id})
                     await self._diagnose_no_match(sid, was_debit=False)
-            balance_after = int(upd.get("balance") or 0)
+            balance_after = float(upd.get("balance") or 0)
         except InsufficientFunds:
             raise
         except WalletStatusBlocked:
@@ -1005,7 +1005,7 @@ class WalletService:
             await self._diagnose_no_match(
                 f_id, was_debit=True, needed_balance=amt,
             )
-        f_bal = int(upd_from.get("balance") or 0)
+        f_bal = float(upd_from.get("balance") or 0)
 
         # 3) pending credit ledger — if a crash happens before step 4
         #    the Phase 2 replayer finds this row and credits the recipient.
@@ -1033,7 +1033,7 @@ class WalletService:
         if not upd_to:
             # Leave the credit_pending row for the Phase 2 replayer to surface.
             await self._diagnose_no_match(t_id, was_debit=False)
-        t_bal = int(upd_to.get("balance") or 0)
+        t_bal = float(upd_to.get("balance") or 0)
 
         # 5) patch BOTH ledger rows with the REAL post-update balances.
         await self.txns.update_one(
@@ -1107,7 +1107,7 @@ async def balance_audit_one(
         {"student_id": sid}, {"_id": 0, "balance": 1}
     )
     mongo_balance: int | None = (
-        int(mongo_doc["balance"]) if mongo_doc and "balance" in mongo_doc else None
+        float(mongo_doc["balance"]) if mongo_doc and "balance" in mongo_doc else None
     )
 
     if not gas_login_url:
@@ -1366,7 +1366,7 @@ async def import_wallet_one(
             doc = {
                 "student_id": sid,
                 "clean_id": cleaned,
-                "balance": int(gas_balance),
+                "balance": float(gas_balance),
                 "status": STATUS_ACTIVE,
                 "created_at": now_iso,
                 "updated_at": now_iso,
@@ -1385,14 +1385,14 @@ async def import_wallet_one(
             confirmed = await db[COLL_WALLETS].find_one(
                 {"student_id": sid}, {"_id": 0, "balance": 1}
             )
-            out["mongo_balance"] = int((confirmed or {}).get("balance") or 0)
+            out["mongo_balance"] = float((confirmed or {}).get("balance") or 0)
             out["status"] = "imported"
         except Exception as exc:  # noqa: BLE001
             out["status"] = "failed"
             out["reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         return out
     # Wallet already present.
-    if int(mongo_balance) == int(gas_balance):
+    if round(float(mongo_balance or 0), 6) == round(float(gas_balance or 0), 6):
         out["status"] = "matched_existing"
         return out
     # Balances differ.
@@ -1408,7 +1408,7 @@ async def import_wallet_one(
         await db[COLL_WALLETS].update_one(
             {"student_id": sid},
             {"$set": {
-                "balance": int(gas_balance),
+                "balance": float(gas_balance),
                 "clean_id": cleaned,
                 "status": STATUS_ACTIVE,
                 "updated_at": now_iso,
@@ -1416,7 +1416,7 @@ async def import_wallet_one(
                 "last_imported_at": now_iso,
             }},
         )
-        out["mongo_balance"] = int(gas_balance)
+        out["mongo_balance"] = float(gas_balance)
         out["status"] = "imported"
         out["overwrite"] = True
     except Exception as exc:  # noqa: BLE001

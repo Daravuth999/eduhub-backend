@@ -413,6 +413,43 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
         gas_error = str(exc)[:200]
 
     if gas_ok:
+        # Phase 2 shadow credit — non-fatal, fire-and-forget.
+        # Idempotency key uses stable payment identifiers only.
+        # Never use a random nonce — unstable across retries.
+        try:
+            _trx_id = str(txn.get("transaction_id") or "").strip()
+            _apv    = str(txn.get("apv") or "").strip()
+            _ord_id = str(txn.get("order_id") or txn.get("tran_id") or "").strip()
+            if _trx_id and _apv:
+                _p2_ikey = f"shadow:credit:payment:{_trx_id}:{_apv}"
+            elif _trx_id:
+                _p2_ikey = f"shadow:credit:payment:{_trx_id}"
+            elif _ord_id:
+                _p2_ikey = f"shadow:credit:payment:ord:{_ord_id}"
+            else:
+                # No stable ID — skip shadow write and log warning
+                _p2_ikey = None
+                import logging as _logging
+                _logging.getLogger("eduhub.payment_bridge").warning(
+                    "payment_bridge: shadow credit skipped — no stable "
+                    "idempotency identifier for clean_id=%s", clean_id
+                )
+            if _p2_ikey:
+                from shadow_writer import shadow_credit as _sw_credit
+                import asyncio as _asyncio
+                _asyncio.create_task(_sw_credit(
+                    student_clean_id=clean_id,
+                    student_mongo_id="",
+                    amount=points_to_credit,
+                    source="payment_bridge",
+                    idempotency_key=_p2_ikey,
+                ))
+        except Exception as _sw_exc:  # noqa: BLE001
+            import logging as _logging
+            _logging.getLogger("eduhub.payment_bridge").warning(
+                "payment_bridge: shadow credit hook error (non-fatal): %s",
+                str(_sw_exc)[:200],
+            )
         # Audit
         await db.points_history.insert_one({
             "student_id":  clean_id,

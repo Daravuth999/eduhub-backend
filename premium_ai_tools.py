@@ -894,18 +894,31 @@ async def _gas_get_balance(
 
 
 async def _gas_debit(
-    student_clean_id: str, password: str, amount: int
+    student_clean_id: str, password: str, amount: int,
+    *,
+    gas_nonce: str | None = None,
 ) -> tuple[bool, str]:
     """Debit student via GAS ``sendPoints(student -> treasury)``.
 
     Mirrors the existing ``sl.grant`` (server.py line 4275) and the
     frontend's ``purchaseBook`` flow byte-for-byte: POST with a fresh
     ``nonce`` (required by the secured backend, ignored by legacy).
+
+    Phase 2 addition:
+    gas_nonce — if supplied, this nonce is sent to GAS AND used as the
+    basis of the shadow idempotency key.  The caller generates it once
+    BEFORE calling _gas_debit so the same key is reused on retry.
+    If None, a fresh nonce is generated (shadow write is then skipped
+    to avoid a random-nonce idempotency key).
     """
     if not password:
         return False, "missing_password"
     if not GAS_POINTS_LOGIN_URL:
         return False, "no_gas_url"
+    # Use the caller-supplied nonce so the shadow key is tied to the
+    # same GAS transaction.  Fall back to a fresh random nonce only
+    # when no shadow key is needed (gas_nonce=None path).
+    _nonce = gas_nonce or secrets.token_hex(12)
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(15.0, connect=6.0),
@@ -919,7 +932,7 @@ async def _gas_debit(
                     "password": password,
                     "receiverId": TREASURY_ID,
                     "amount": str(amount),
-                    "nonce": secrets.token_hex(12),
+                    "nonce": _nonce,
                 },
             )
         if r.status_code != 200:
@@ -934,6 +947,27 @@ async def _gas_debit(
             (j or {}).get("success") if isinstance(j, dict) else None,
         )
         if isinstance(j, dict) and j.get("success") is True:
+            # Phase 2 shadow write — non-fatal, fire-and-forget.
+            # Use gas_nonce as the shadow idempotency key so the key is
+            # tied to the actual GAS transaction nonce — stable across
+            # retries (same nonce → same idempotency key → no double-apply).
+            if gas_nonce:
+                _shadow_ikey = f"shadow:debit:premium_ai:{student_clean_id}:{amount}:{gas_nonce}"
+                try:
+                    from shadow_writer import shadow_debit as _sw_debit
+                    import asyncio as _asyncio
+                    _asyncio.create_task(_sw_debit(
+                        student_clean_id=student_clean_id,
+                        student_mongo_id="",  # resolved by shadow_writer
+                        amount=amount,
+                        source="premium_ai_or_edutalk",
+                        idempotency_key=_shadow_ikey,
+                    ))
+                except Exception as _sw_exc:  # noqa: BLE001
+                    log.warning(
+                        "premium_ai: shadow_debit hook error (non-fatal): %s",
+                        str(_sw_exc)[:200],
+                    )
             return True, ""
         msg = (
             (j or {}).get("message")
@@ -1412,8 +1446,16 @@ def register_premium_ai_routes(api: APIRouter, db, require_admin, require_studen
             # 8. Deduct points ONLY after a valid result is in hand.
             if cost > 0:
                 log.info("premium_ai: debit start clean_id=%s amount=%s", student.clean_id, cost)
+                # Phase 2: generate GAS nonce BEFORE calling _gas_debit.
+                # The same nonce is sent to GAS AND used as the shadow
+                # idempotency key.  On retry, the same nonce is reused
+                # so the shadow writer sees an already-applied event and
+                # skips the wallet update — no double-apply possible.
+                import secrets as _secrets
+                _gas_nonce = _secrets.token_hex(12)
                 debit_ok, debit_err = await _gas_debit(
-                    student.clean_id, payload.password, cost
+                    student.clean_id, payload.password, cost,
+                    gas_nonce=_gas_nonce,
                 )
             else:
                 debit_ok, debit_err = True, ""

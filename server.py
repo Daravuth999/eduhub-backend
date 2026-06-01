@@ -5943,6 +5943,20 @@ register_tier_config_routes(api, db, require_admin, require_student)
 if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
     try:
         wallet_service.register_migration_routes(api, db, require_admin)
+
+        # Phase 2 — register shadow_writer with the live db handle.
+        # This ensures shadow writes use the same Motor pool as the app.
+        # Non-fatal: if shadow_writer import fails, only shadow writes
+        # are disabled — all live student flows continue unchanged.
+        try:
+            import shadow_writer as _sw_mod
+            _sw_mod.register_shadow_db(db)
+            log.info("startup: shadow_writer registered with live db")
+        except Exception as _sw_err:
+            log.warning(
+                "startup: shadow_writer registration failed (non-fatal): %s",
+                str(_sw_err)[:200],
+            )
     except Exception as _wallet_route_error:
         logging.getLogger(__name__).warning(
             "migration preflight route registration skipped/failed: %s",
