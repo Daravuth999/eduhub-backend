@@ -218,6 +218,111 @@ db = client[DB_NAME]
 # GridFS bucket for ElevenLabs AI voice audio (avoids multi-MB inline base64)
 audio_bucket = None  # initialised in startup()
 
+# --------------------------------------------------------------------------- #
+# Cloudflare R2 audio upload helper - Phase 1 (new ElevenLabs generations)    #
+#                                                                             #
+# Design contract:                                                            #
+#   - _r2_config() returns a dict only when ALL five R2 env vars are set.     #
+#     If any var is missing it returns None and the caller uses GridFS.       #
+#   - _upload_audio_to_r2() NEVER raises. On any failure it logs a warning    #
+#     and returns None so the caller falls back to GridFS automatically.      #
+#   - boto3 is imported lazily inside the function so a missing package       #
+#     silently disables R2 without breaking any other route.                  #
+#   - The GridFS stream endpoint /api/studio/audio/{filename} is untouched.   #
+#   - Existing GridFS audio continues to play regardless of R2 state.         #
+# --------------------------------------------------------------------------- #
+
+def _r2_config():
+    """Return R2 credentials dict if all five env vars are present, else None.
+
+    Required Render env vars (set ONLY in the Render dashboard, never in code):
+        R2_ACCOUNT_ID         Cloudflare account ID
+        R2_ACCESS_KEY_ID      R2 API token key ID  (Object Read & Write on bucket)
+        R2_SECRET_ACCESS_KEY  R2 API token secret
+        R2_BUCKET_NAME        R2 bucket name  (e.g. audiobook)
+        R2_PUBLIC_URL         Public base URL  (e.g. https://pub-<hash>.r2.dev)
+    """
+    required = [
+        "R2_ACCOUNT_ID",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_BUCKET_NAME",
+        "R2_PUBLIC_URL",
+    ]
+    cfg = {k: os.environ.get(k, "").strip() for k in required}
+    if all(cfg.values()):
+        return cfg
+    return None
+
+
+async def _upload_audio_to_r2(audio_bytes, audio_id, metadata):
+    """Upload MP3 bytes to Cloudflare R2 and return the public URL.
+
+    Returns:
+        str  - public R2 URL on success  e.g. https://pub-xxx.r2.dev/<uuid>.mp3
+        None - on any failure (env vars missing, boto3 absent, network error)
+
+    This function NEVER raises. All failures are logged as WARNING and
+    return None so the caller can fall back to GridFS transparently.
+
+    The boto3 S3 upload runs in a thread-pool executor so it never blocks
+    the FastAPI async event loop.
+    """
+    cfg = _r2_config()
+    if cfg is None:
+        return None  # R2 not configured - silent GridFS fallback
+
+    try:
+        import boto3  # type: ignore[import-not-found]
+        from botocore.config import Config as _BotocoreConfig  # type: ignore[import-not-found]
+        import asyncio as _asyncio
+
+        endpoint    = f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+        filename    = f"{audio_id}.mp3"
+        bucket      = cfg["R2_BUCKET_NAME"]
+        public_base = cfg["R2_PUBLIC_URL"].rstrip("/")
+
+        def _do_upload(_b=audio_bytes, _fn=filename, _bkt=bucket, _ep=endpoint):
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=_ep,
+                aws_access_key_id=cfg["R2_ACCESS_KEY_ID"],
+                aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"],
+                region_name="auto",
+                config=_BotocoreConfig(signature_version="s3v4"),
+            )
+            s3.put_object(
+                Bucket=_bkt,
+                Key=_fn,
+                Body=_b,
+                ContentType="audio/mpeg",
+                Metadata={str(k): str(v) for k, v in (metadata or {}).items()},
+            )
+
+        loop = _asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_upload)
+
+        r2_url = f"{public_base}/{filename}"
+        log.info(
+            "r2: uploaded %s (%d bytes) bucket=%s url=%s",
+            filename, len(audio_bytes), bucket, r2_url,
+        )
+        return r2_url
+
+    except ImportError:
+        log.warning(
+            "r2: boto3 not installed - add boto3>=1.34 to requirements.txt "
+            "to enable R2 uploads. Falling back to GridFS."
+        )
+        return None
+
+    except Exception as _r2_err:  # noqa: BLE001
+        log.warning(
+            "r2: upload failed for %s.mp3 - %s: %s - falling back to GridFS.",
+            audio_id, type(_r2_err).__name__, _r2_err,
+        )
+        return None
+
 # Collection references for the Push Studio module
 push_subscriptions = db["push_subscriptions"]
 push_history = db["push_history"]
@@ -928,34 +1033,69 @@ async def studio_elevenlabs_generate(
     audio_b64 = result["audio_base64"]
     word_timestamps = result["word_timestamps"]
 
-    # Upload MP3 to MongoDB GridFS â€” avoids storing multi-MB base64 inline
-    # which crashes the frontend when the book document is loaded.
-    # FIX v9.9: motor's GridFSBucket.upload_from_stream() requires a file-like
-    # object with a .read() method. Passing raw bytes raises
-    # AttributeError: 'bytes' object has no attribute 'read' â€” which manifests
-    # as a 500 (no CORS headers) and looks like a CORS error in the browser.
+    # -- Audio storage: R2-first, GridFS fallback -----------------------------
+    # FIX v9.9 (preserved): motor GridFSBucket.upload_from_stream() needs a
+    # file-like object - raw bytes raise AttributeError: no attribute 'read'.
+    #
+    # Phase 1 R2 addition:
+    #   Try _upload_audio_to_r2() first. On success the returned public URL is
+    #   stored in the book block and GridFS is NOT written - saving Atlas
+    #   storage. On any failure (env vars absent, boto3 missing, network error)
+    #   _upload_audio_to_r2 returns None and the code falls through to the
+    #   original GridFS path unchanged.
+    #
+    #   The existing GridFS stream endpoint /api/studio/audio/{filename} is
+    #   completely untouched and continues to serve every previously-generated
+    #   audio file indefinitely.
     audio_bytes = base64.b64decode(audio_b64)
-    audio_id = str(uuid.uuid4())
-    try:
-        await audio_bucket.upload_from_stream(
-            f"{audio_id}.mp3",
-            io.BytesIO(audio_bytes),
-            metadata={
-                "slug": slug,
-                "chapter_index": chapter_index,
-                "voice": voice_id,
-                "created_at": now,
-                "created_by": admin.email,
-            },
+    audio_id    = str(uuid.uuid4())
+
+    # Attempt R2 upload - returns None silently if R2 is not configured.
+    r2_url = await _upload_audio_to_r2(
+        audio_bytes,
+        audio_id,
+        {
+            "slug":          slug,
+            "chapter_index": str(chapter_index),
+            "voice":         voice_id,
+            "created_at":    now,
+            "created_by":    admin.email,
+        },
+    )
+
+    if r2_url:
+        # R2 success - use the Cloudflare public URL; GridFS intentionally NOT
+        # written. frontend media-urls.js already handles r2.dev URLs.
+        audio_url = r2_url
+        log.info(
+            "elevenlabs: audio stored on R2 slug=%s chapter=%s",
+            slug, chapter_index,
         )
-    except Exception as exc:  # noqa: BLE001
-        log.exception("elevenlabs: GridFS upload failed for slug=%s", slug)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to store generated audio: {type(exc).__name__}: {exc}",
-        ) from exc
-    # Build absolute URL so both Vercel frontend and student PWA can stream it
-    audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+    else:
+        # GridFS fallback - original behaviour, byte-for-byte unchanged.
+        try:
+            await audio_bucket.upload_from_stream(
+                f"{audio_id}.mp3",
+                io.BytesIO(audio_bytes),
+                metadata={
+                    "slug":          slug,
+                    "chapter_index": chapter_index,
+                    "voice":         voice_id,
+                    "created_at":    now,
+                    "created_by":    admin.email,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("elevenlabs: GridFS upload failed for slug=%s", slug)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to store generated audio: {type(exc).__name__}: {exc}",
+            ) from exc
+        audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+        log.info(
+            "elevenlabs: audio stored on GridFS slug=%s chapter=%s",
+            slug, chapter_index,
+        )
 
     # Inject into blocks:
     # 1. Remove any existing ElevenLabs audio block

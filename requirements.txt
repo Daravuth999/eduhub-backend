@@ -14,3 +14,4 @@ py-vapid>=1.9
 cryptography>=42.0
 
 passlib[bcrypt]>=1.7
+boto3>=1.34         # Cloudflare R2 S3-compatible upload
