@@ -313,6 +313,17 @@ class _CamCreateIntent(_CamPM):
     package_id: str
 
 
+@api.get("/payments/camrapidpay/config")
+async def camrapidpay_config(student=Depends(require_student)):
+    """Lightweight config check — no invoice created, no DB write.
+
+    Returns {"enabled": bool} so the frontend can show or hide the KHQR
+    button without calling create-intent as a probe.
+    Called once on PointsPurchaseModal open; tiny payload, fast response.
+    """
+    return {"enabled": _cam.is_enabled()}
+
+
 @api.post("/payments/camrapidpay/create-intent")
 async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(require_student)):
     """Create a CamRapidPay KHQR invoice for a points package.
@@ -358,7 +369,15 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     base_webhook = cfg.get("callback_url") or "https://eduhub-backend-td3a.onrender.com/api/payments/camrapidpay/webhook"
     secret = cfg.get("webhook_secret", "")
     webhook_url = f"{base_webhook}?token={secret}" if secret else base_webhook
-    success_url = cfg.get("return_url") or ""
+    # Append the internal intent ID to the return URL so the frontend can
+    # recover the pending intent after CamRapidPay redirects the student back.
+    # The intent_id is not a secret - it is a MongoDB ObjectId used only as
+    # a lookup key. Crediting is always decided by server-to-server status
+    # check, never by the URL alone.
+    _return_base = (cfg.get("return_url") or "").rstrip("/")
+    # success_url is set after insert, so we build a placeholder here and
+    # update it after insert. Use a sentinel to defer.
+    success_url = _return_base  # will be updated below with intent id
 
     # Insert internal pending intent FIRST (so a fast webhook can find it).
     intent_doc = {
@@ -387,6 +406,15 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     ins = await _cam_intents.insert_one(intent_doc)
 
     # Call CamRapidPay to create the invoice.
+    # Now that we have the inserted_id, build the final success_url.
+    # CamRapidPay redirects the student's browser to this URL after payment.
+    # The ?khqr_intent= param lets the frontend recover the pending intent
+    # if the student's original tab was refreshed or closed.
+    if _return_base:
+        success_url = f"{_return_base}?khqr_intent={str(ins.inserted_id)}"
+    else:
+        success_url = ""
+
     created = await _cam.create_payment(
         _cam_httpx_factory, amount_usd, reference, success_url, webhook_url,
     )
