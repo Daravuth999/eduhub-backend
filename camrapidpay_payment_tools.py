@@ -315,13 +315,39 @@ class _CamCreateIntent(_CamPM):
 
 @api.get("/payments/camrapidpay/config")
 async def camrapidpay_config():
-    """Lightweight config check — no invoice created, no DB write.
+    """Lightweight config check — no invoice created, no DB write, no auth.
 
-    Returns {"enabled": bool} so the frontend can show or hide the KHQR
-    button without calling create-intent as a probe.
-    Called once on PointsPurchaseModal open; tiny payload, fast response.
+    Returns ``{"enabled": bool, "reason": str}`` so the frontend can show or
+    hide the KHQR button without calling create-intent as a probe.
+
+    NOTE on auth: this endpoint is intentionally PUBLIC. It returns only a
+    boolean feature flag plus a coarse, non-sensitive reason code — no API
+    keys, no callback URLs, no merchant IDs are exposed. Making it public
+    eliminates a class of iOS Safari ITP / cross-site cookie failures that
+    otherwise silently hides the KHQR button (frontend swallows 401 as
+    ``enabled: false``).
+
+    The ``reason`` codes are admin-friendly diagnostics, never secrets:
+      * ``"ok"``                – feature is live
+      * ``"flag_off"``          – ``CAMRAPIDPAY_ENABLED`` is not ``"true"``
+      * ``"missing_api_key"``   – flag is on but ``CAMRAPIDPAY_API_KEY`` is empty
+      * ``"missing_base_url"``  – flag is on but ``CAMRAPIDPAY_BASE_URL`` is empty
     """
-    return {"enabled": _cam.is_enabled()}
+    import os as _os_diag
+    enabled = (_os_diag.environ.get("CAMRAPIDPAY_ENABLED", "false").strip().lower() == "true")
+    api_key = _os_diag.environ.get("CAMRAPIDPAY_API_KEY", "").strip()
+    base_url = _os_diag.environ.get("CAMRAPIDPAY_BASE_URL", "").strip()
+    if not enabled:
+        return {"enabled": False, "reason": "flag_off"}
+    if not api_key:
+        return {"enabled": False, "reason": "missing_api_key"}
+    if not base_url:
+        return {"enabled": False, "reason": "missing_base_url"}
+    # Final sanity: ask the provider helper too (catches anything the helper
+    # may add in the future). Still no secrets leaked.
+    if not _cam.is_enabled():
+        return {"enabled": False, "reason": "provider_disabled"}
+    return {"enabled": True, "reason": "ok"}
 
 
 @api.post("/payments/camrapidpay/create-intent")
