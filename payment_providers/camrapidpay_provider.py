@@ -73,7 +73,7 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
     Args:
         httpx_client_factory: a zero-arg callable returning an httpx.AsyncClient
             context manager (passed in so we reuse server.py's httpx import).
-        amount: float USD amount (> 0), set server-side from the package.
+        amount: int KHR amount (> 0), set server-side from the package (e.g. 5000, 10000).
         reference: unique reference (<= 50 chars).
         success_url: browser redirect URL (UX only, never proof).
         webhook_url: our webhook URL (may include ?token= filter).
@@ -86,24 +86,22 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
     cfg = read_config()
     if cfg is None:
         return {"ok": False, "error": "provider_disabled"}
-    if not amount or float(amount) <= 0:
+    if not amount or int(amount) <= 0:
         return {"ok": False, "error": "invalid_amount"}
     if not reference or len(reference) > 50:
         return {"ok": False, "error": "invalid_reference"}
 
     url = f"{cfg['base_url']}/api/v1/khqr/create-payments"
     body = {
-        "api_key":     cfg["api_key"],
-        "amount":      float(amount),
-        "reference":   reference,
+        "api_key":   cfg["api_key"],
+        "amount":    int(amount),     # KHR integer — NOT USD decimal
+        "currency":  "KHR",           # explicit currency for KHQR generation
+        "reference": reference,
         "webhook_url": webhook_url,
     }
     if success_url:
         body["success_url"] = success_url
 
-    # Log the sanitised outgoing payload so Render logs confirm correct fields.
-    _safe = {k: ("***" if k == "api_key" else v) for k, v in body.items()}
-    _log.info("camrapidpay: → POST create-payments ref=%s payload=%s", reference, _safe)
     try:
         async with httpx_client_factory() as cli:
             r = await cli.post(
@@ -112,27 +110,15 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
             )
         if r.status_code != 200:
-            # Log the full response body — this shows the exact CamRapidPay
-            # rejection reason in Render logs (api_key value stripped).
-            try:
-                _body = r.text[:600].replace(cfg.get("api_key", ""), "***")
-            except Exception:
-                _body = "<unreadable>"
-            _log.warning(
-                "camrapidpay: create HTTP %s ref=%s | CamRapidPay response: %s",
-                r.status_code, reference, _body,
-            )
-            return {"ok": False, "error": f"provider_http_{r.status_code}"}
+            _log.warning("camrapidpay: create HTTP %s for ref=%s", r.status_code, reference)
+            return {"ok": False, "error": f"http_{r.status_code}"}
         j = r.json()
         if not isinstance(j, dict) or j.get("success") is not True:
-            # Log the provider message — it will say "Invalid API key" or similar.
-            # This is the most actionable error for diagnosis.
-            msg = str(j.get("message", "create_failed"))[:200] if isinstance(j, dict) else "create_failed"
-            _log.warning(
-                "camrapidpay: create rejected ref=%s | provider says: %s",
-                reference, msg,
-            )
-            return {"ok": False, "error": "provider_rejected", "message": msg}
+            # Do NOT echo provider message verbatim if it could contain the key;
+            # CamRapidPay messages are generic, but stay safe.
+            msg = str(j.get("message", "create_failed"))[:120] if isinstance(j, dict) else "create_failed"
+            _log.warning("camrapidpay: create rejected ref=%s msg=%s", reference, msg)
+            return {"ok": False, "error": msg}
         return {
             "ok":            True,
             "status":        _normalize_status(j.get("status")),
