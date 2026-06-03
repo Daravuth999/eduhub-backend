@@ -101,6 +101,9 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
     if success_url:
         body["success_url"] = success_url
 
+    # Log the sanitised outgoing payload so Render logs confirm correct fields.
+    _safe = {k: ("***" if k == "api_key" else v) for k, v in body.items()}
+    _log.info("camrapidpay: → POST create-payments ref=%s payload=%s", reference, _safe)
     try:
         async with httpx_client_factory() as cli:
             r = await cli.post(
@@ -109,15 +112,27 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
             )
         if r.status_code != 200:
-            _log.warning("camrapidpay: create HTTP %s for ref=%s", r.status_code, reference)
-            return {"ok": False, "error": f"http_{r.status_code}"}
+            # Log the full response body — this shows the exact CamRapidPay
+            # rejection reason in Render logs (api_key value stripped).
+            try:
+                _body = r.text[:600].replace(cfg.get("api_key", ""), "***")
+            except Exception:
+                _body = "<unreadable>"
+            _log.warning(
+                "camrapidpay: create HTTP %s ref=%s | CamRapidPay response: %s",
+                r.status_code, reference, _body,
+            )
+            return {"ok": False, "error": f"provider_http_{r.status_code}"}
         j = r.json()
         if not isinstance(j, dict) or j.get("success") is not True:
-            # Do NOT echo provider message verbatim if it could contain the key;
-            # CamRapidPay messages are generic, but stay safe.
-            msg = str(j.get("message", "create_failed"))[:120] if isinstance(j, dict) else "create_failed"
-            _log.warning("camrapidpay: create rejected ref=%s msg=%s", reference, msg)
-            return {"ok": False, "error": msg}
+            # Log the provider message — it will say "Invalid API key" or similar.
+            # This is the most actionable error for diagnosis.
+            msg = str(j.get("message", "create_failed"))[:200] if isinstance(j, dict) else "create_failed"
+            _log.warning(
+                "camrapidpay: create rejected ref=%s | provider says: %s",
+                reference, msg,
+            )
+            return {"ok": False, "error": "provider_rejected", "message": msg}
         return {
             "ok":            True,
             "status":        _normalize_status(j.get("status")),
