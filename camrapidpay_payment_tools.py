@@ -314,7 +314,7 @@ class _CamCreateIntent(_CamPM):
 
 
 @api.get("/payments/camrapidpay/config")
-async def camrapidpay_config(student=Depends(require_student)):
+async def camrapidpay_config():
     """Lightweight config check — no invoice created, no DB write.
 
     Returns {"enabled": bool} so the frontend can show or hide the KHQR
