@@ -5305,6 +5305,32 @@ async def startup():
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
+    # -- CamRapidPay KHQR Top Up: index + reconciliation sweep --------------
+    # Index for fast reference lookup (webhook + status + reconcile).
+    try:
+        await db.camrapidpay_intents.create_index("reference", unique=True)
+        await db.camrapidpay_intents.create_index([("status", 1), ("expires_at", 1)])
+    except Exception as _cam_idx_err:  # noqa: BLE001
+        log.warning("camrapidpay: index setup skipped: %s", _cam_idx_err)
+    # Reconciliation sweep: re-verifies still-pending paid invoices so a lost
+    # webhook AND a lost client poll can never leave a paid student
+    # uncredited. Runs every 60s, non-fatal, only acts when the flag is on.
+    async def _camrapidpay_reconcile_loop():
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if "_camrapidpay_reconcile_once" in globals():
+                    await _camrapidpay_reconcile_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as _rec_err:  # noqa: BLE001
+                log.warning("camrapidpay: reconcile loop error: %s", _rec_err)
+    try:
+        asyncio.create_task(_camrapidpay_reconcile_loop())
+        log.info("camrapidpay: reconciliation sweep scheduled (60s)")
+    except Exception as _rec_start_err:  # noqa: BLE001
+        log.warning("camrapidpay: reconcile sweep not started: %s", _rec_start_err)
+
 
 
     # ─────────────────────────────────────────────────────────
@@ -6062,6 +6088,15 @@ async def studio_conversation_generate(
 # MUST be the last include_router(api) call — v2 so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
 exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").read())
+
+# -- CamRapidPay KHQR Points Top Up provider (flag-gated, dormant by default) --
+# Loaded AFTER payment_bridge so it can reuse _complete_points_payment,
+# _send_topup_push_once, and the shared api/db/log/httpx/require_student
+# globals. Adds POST /api/payments/camrapidpay/create-intent, POST
+# /api/payments/camrapidpay/webhook, GET /api/payments/camrapidpay/status/{id}.
+# When CAMRAPIDPAY_ENABLED != "true" the routes exist but report unavailable,
+# so the existing ABA/manual fallback continues unchanged.
+exec(open(__import__("pathlib").Path(__file__).parent / "camrapidpay_payment_tools.py").read())
 
 # ── Premium AI Tools (Phase 1) — register isolated routes onto /api ──────
 # Adds POST /api/student/premium/decode-block, POST /api/student/premium/
