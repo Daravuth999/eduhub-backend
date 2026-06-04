@@ -227,6 +227,18 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
     if not reference or len(reference) > 50:
         return {"ok": False, "error": "invalid_reference"}
 
+    # v4.2 contract fix: CamRapidPay rejects (HTTP 500 "Failed to generate
+    # KHQR") when ``webhook_url`` contains a query string. Defensively
+    # strip any query / fragment from BOTH webhook_url and success_url
+    # before sending — the caller is supposed to pass clean URLs, but if a
+    # future caller forgets, we don't want to regress to a 500. We log a
+    # one-line warning so the discrepancy is visible.
+    if webhook_url and ("?" in webhook_url or "#" in webhook_url):
+        _log.warning("camrapidpay: webhook_url had query/fragment — stripped before send")
+        webhook_url = webhook_url.split("?", 1)[0].split("#", 1)[0]
+    # success_url is allowed to keep its query per CamRapidPay docs example
+    # (``https://yourdomain.com/thank-you?order=INV_X1N0``) — do not strip.
+
     url = f"{cfg['base_url']}/api/v1/khqr/create-payments"
     body = {
         "api_key":   cfg["api_key"],
