@@ -277,7 +277,12 @@ class TransactionRejectPayload(_PM):
 
 class PointsPackageCreate(_PM):
     label:               str
-    amount_khr:          int
+    # v4 (USD packages): amount_usd is the PRIMARY price. amount_khr is kept
+    # optional + auto-derived for backward compatibility with the ABA / manual
+    # matching path which still keys on amount_khr. If neither is supplied,
+    # the create endpoint rejects the request.
+    amount_usd:          float | None = None
+    amount_khr:          int   | None = None
     points:              int
     bonus_points:        int = 0
     min_purchase:        int = 0
@@ -293,7 +298,8 @@ class PointsPackageCreate(_PM):
 
 class PointsPackagePatch(_PM):
     label:               str | None = None
-    amount_khr:          int | None = None
+    amount_usd:          float | None = None
+    amount_khr:          int   | None = None
     points:              int | None = None
     discount_pct:        int | None = None
     discount_label:      str | None = None
@@ -305,6 +311,56 @@ class PointsPackagePatch(_PM):
     active:         bool | None = None
     notes:          str | None = None
     payment_link:   str | None = None
+
+
+# v4 (USD packages) — single source of truth for KHR<->USD on payment packages.
+# Default rate is 4000 KHR / 1 USD (NOT 4100); identical to the CamRapidPay
+# gateway rate used by camrapidpay_payment_tools.py. The env var is shared so
+# operators only have to tune one place.
+import os as _v4_pkg_os
+
+def _v4_pkg_rate() -> float:
+    """Return the active KHR-per-USD rate (defaults to 4000.0)."""
+    try:
+        raw = _v4_pkg_os.environ.get("CAMRAPIDPAY_USD_KHR_RATE", "4000").strip()
+        r = float(raw) if raw else 4000.0
+        return r if r > 0 else 4000.0
+    except (ValueError, TypeError):
+        return 4000.0
+
+
+def _v4_normalize_pkg_amounts(d: dict) -> dict:
+    """Ensure a package doc has BOTH `amount_usd` (float) and `amount_khr` (int).
+
+    - If amount_usd is missing/<=0 but amount_khr is present, derive
+      amount_usd = round(amount_khr / rate, 2).
+    - If amount_khr is missing/<=0 but amount_usd is present, derive
+      amount_khr = round(amount_usd * rate).
+    - If both are present, keep them as authored (admin may have priced a
+      package slightly off-rate intentionally — we never silently rewrite).
+    Mutates and returns ``d``. Safe to call on a Mongo document or a
+    pydantic .model_dump() dict. Never raises.
+    """
+    rate = _v4_pkg_rate()
+    try:
+        usd = d.get("amount_usd")
+        usd = float(usd) if usd is not None else None
+    except (ValueError, TypeError):
+        usd = None
+    try:
+        khr = d.get("amount_khr")
+        khr = int(khr) if khr is not None else None
+    except (ValueError, TypeError):
+        khr = None
+    if (usd is None or usd <= 0) and (khr is not None and khr > 0):
+        usd = round(khr / rate, 2)
+    if (khr is None or khr <= 0) and (usd is not None and usd > 0):
+        khr = int(round(usd * rate))
+    if usd is not None:
+        d["amount_usd"] = float(usd)
+    if khr is not None:
+        d["amount_khr"] = int(khr)
+    return d
 
 
 # ------ Internal helpers ------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1235,12 +1291,22 @@ async def reject_transaction(
 
 @api.get("/payments/packages/public")
 async def list_points_packages_public():
-    """Public read-only endpoint - returns active packages only. No auth required."""
+    """Public read-only endpoint - returns active packages only. No auth required.
+
+    v4 (USD packages):
+      - Every returned package is normalised so BOTH ``amount_usd`` (float)
+        and ``amount_khr`` (int) are present, regardless of which the admin
+        authored. Frontend modal renders USD; ABA/manual matching still uses
+        amount_khr.
+      - Sort is performed in Python on the normalised amount_usd to keep
+        legacy KHR-only docs and new USD-only docs in the same order.
+    """
     from datetime import datetime, timezone as _tz
     now = datetime.now(_tz.utc)
-    docs = await db.payment_settings.find({"active": True}).sort("amount_khr", 1).to_list(100)
+    docs = await db.payment_settings.find({"active": True}).to_list(100)
     for d in docs:
         d["_id"] = str(d["_id"])
+        _v4_normalize_pkg_amounts(d)
         pct = int(d.get("discount_pct", 0) or 0)
         on  = bool(d.get("discount_active", False))
         exp = d.get("discount_expires_at")
@@ -1250,24 +1316,39 @@ async def list_points_packages_public():
                 if e.tzinfo is None: e = e.replace(tzinfo=_tz.utc)
                 if e < now: on = False
             except Exception: pass
-        orig = int(d.get("amount_khr", 0))
+        orig_khr = int(d.get("amount_khr", 0) or 0)
+        orig_usd = float(d.get("amount_usd", 0) or 0.0)
         if on and pct > 0:
             d["discount_active_live"] = True
-            d["discounted_amount_khr"] = max(100, int(orig * (1 - pct / 100)))
-            d["original_amount_khr"]  = orig
+            # KHR-side legacy fields kept for any existing consumer.
+            d["discounted_amount_khr"] = max(100, int(orig_khr * (1 - pct / 100))) if orig_khr else 0
+            d["original_amount_khr"]   = orig_khr
+            # USD-side discounted fields for the v4 USD-native modal.
+            d["discounted_amount_usd"] = round(orig_usd * (1 - pct / 100), 2) if orig_usd > 0 else 0.0
+            d["original_amount_usd"]   = orig_usd
         else:
             d["discount_active_live"] = False
-            d["discounted_amount_khr"] = orig
-            d["original_amount_khr"]  = orig
+            d["discounted_amount_khr"] = orig_khr
+            d["original_amount_khr"]   = orig_khr
+            d["discounted_amount_usd"] = orig_usd
+            d["original_amount_usd"]   = orig_usd
+    docs.sort(key=lambda x: (float(x.get("amount_usd") or 0.0), int(x.get("amount_khr") or 0)))
     return {"ok": True, "packages": docs}
 
 
 @api.get("/payments/settings/points-packages")
 async def list_points_packages(admin: User = Depends(require_admin)):
-    """List all points conversion packages."""
-    docs = await db.payment_settings.find({}).sort("amount_khr", 1).to_list(100)
+    """List all points conversion packages.
+
+    v4 (USD packages): every doc is normalised so both ``amount_usd`` and
+    ``amount_khr`` are present in the admin payload, and the list is sorted
+    by USD. Author Studio renders the USD field.
+    """
+    docs = await db.payment_settings.find({}).to_list(100)
     for d in docs:
         d["_id"] = str(d["_id"])
+        _v4_normalize_pkg_amounts(d)
+    docs.sort(key=lambda x: (float(x.get("amount_usd") or 0.0), int(x.get("amount_khr") or 0)))
     return {"ok": True, "packages": docs}
 
 
@@ -1276,10 +1357,23 @@ async def create_points_package(
     payload: PointsPackageCreate,
     admin: User = Depends(require_admin),
 ):
-    """Create a new points conversion package."""
+    """Create a new points conversion package.
+
+    v4 (USD packages): admin may submit ``amount_usd`` (preferred),
+    ``amount_khr`` (legacy), or both. The missing field is auto-derived using
+    the shared CamRapidPay rate (default 4000 KHR / 1 USD) so the ABA /
+    manual matching path which still keys on amount_khr keeps working.
+    """
+    raw = payload.model_dump()
+    _v4_normalize_pkg_amounts(raw)
+    if not (raw.get("amount_usd") and raw.get("amount_usd") > 0):
+        raise HTTPException(
+            status_code=400,
+            detail="amount_usd or amount_khr must be provided and positive",
+        )
     now_str = datetime.now(timezone.utc).isoformat()
     doc = {
-        **payload.model_dump(),
+        **raw,
         "created_by": admin.email,
         "created_at": now_str,
         "updated_at": now_str,
@@ -1294,7 +1388,12 @@ async def update_points_package(
     payload: PointsPackagePatch,
     admin: User = Depends(require_admin),
 ):
-    """Update a points package (partial update)."""
+    """Update a points package (partial update).
+
+    v4 (USD packages): if the admin updates only one of ``amount_usd`` /
+    ``amount_khr``, derive the other from the active rate before saving so
+    the two fields never drift out of sync on disk.
+    """
     try:
         oid = ObjectId(pkg_id)
     except Exception:
@@ -1304,6 +1403,11 @@ async def update_points_package(
     updates = {k: v for k, v in payload.model_dump(exclude_unset=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
+
+    # v4: cross-derive amount_khr / amount_usd if only one was edited.
+    if ("amount_usd" in updates) ^ ("amount_khr" in updates):
+        _v4_normalize_pkg_amounts(updates)
+
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     updates["updated_by"] = admin.email
 

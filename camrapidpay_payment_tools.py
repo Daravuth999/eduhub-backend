@@ -366,11 +366,18 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     if not pkg or not pkg.get("active", True):
         raise HTTPException(status_code=404, detail="Package not found")
 
-    amount_khr = int(pkg.get("amount_khr", 0))
+    amount_khr = int(pkg.get("amount_khr", 0) or 0)
     base_points = int(pkg.get("points", 0))
     bonus_points = int(pkg.get("bonus_points", 0))
     total_points = base_points + bonus_points
-    if amount_khr <= 0 or total_points <= 0:
+    # v4 (USD packages): a package is valid if EITHER amount_usd > 0 OR
+    # amount_khr > 0 (we'll cross-derive the missing side below). Points
+    # still must be > 0.
+    try:
+        _pkg_amount_usd_probe = float(pkg.get("amount_usd") or 0)
+    except (ValueError, TypeError):
+        _pkg_amount_usd_probe = 0.0
+    if (amount_khr <= 0 and _pkg_amount_usd_probe <= 0) or total_points <= 0:
         raise HTTPException(status_code=400, detail="Invalid package configuration")
 
     # CamRapidPay is invoiced in USD (the CamRapidPay Client Portal explicitly
@@ -405,6 +412,14 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     amount_usd = float(amount_usd)
     if amount_usd <= 0:
         raise HTTPException(status_code=400, detail="Invalid package amount")
+
+    # v4 (USD packages): if the admin authored a USD-only package the
+    # ``amount_khr`` field on disk is 0. Derive it from the USD price using
+    # the same rate so the ABA / manual matching path (which keys on
+    # amount_khr) and the intent doc (which stores amount_khr for downstream
+    # crediting reference) both keep working.
+    if amount_khr <= 0:
+        amount_khr = int(round(amount_usd * _khr_per_usd))
 
     student_id = getattr(student, "clean_id", None) or getattr(student, "student_id", "")
     short_ts = _cam_now().strftime("%m%d%H%M%S")
