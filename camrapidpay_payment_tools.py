@@ -373,10 +373,37 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     if amount_khr <= 0 or total_points <= 0:
         raise HTTPException(status_code=400, detail="Invalid package configuration")
 
-    # Send amount in KHR integer — CamRapidPay KHQR generation requires
-    # the raw KHR amount (e.g. 5000, 10000) not a USD decimal (1.22, 2.44).
-    # Sending USD decimals causes: {"message": "Failed to generate KHQR"}.
-    if amount_khr <= 0:
+    # CamRapidPay is invoiced in USD (the CamRapidPay Client Portal explicitly
+    # asks for "Amount (USD)" and renders the checkout / KHQR invoice in USD).
+    # Convert the package KHR price -> USD using a fixed configurable rate.
+    #
+    # v3 (USD gateway restore, 4000 rate):
+    #   - Rate is read from CAMRAPIDPAY_USD_KHR_RATE (default 4000).
+    #   - Default is 4000 (not 4100) per product owner instruction.
+    #   - If the package has an explicit positive ``amount_usd`` field we
+    #     prefer it (lets ops tune individual packages); otherwise we
+    #     compute amount_usd = round(amount_khr / rate, 2).
+    # Student-facing UI still displays the package in KHR / ៛ — only the
+    # provider gateway leg is denominated in USD.
+    try:
+        _rate_raw = _cam_os.environ.get("CAMRAPIDPAY_USD_KHR_RATE", "4000").strip()
+        _khr_per_usd = float(_rate_raw) if _rate_raw else 4000.0
+        if _khr_per_usd <= 0:
+            _khr_per_usd = 4000.0
+    except (ValueError, TypeError):
+        _khr_per_usd = 4000.0
+
+    amount_usd_pkg = pkg.get("amount_usd")
+    try:
+        amount_usd_pkg = float(amount_usd_pkg) if amount_usd_pkg is not None else None
+    except (ValueError, TypeError):
+        amount_usd_pkg = None
+    if amount_usd_pkg is not None and amount_usd_pkg > 0:
+        amount_usd = round(amount_usd_pkg, 2)
+    else:
+        amount_usd = round(amount_khr / _khr_per_usd, 2)
+    amount_usd = float(amount_usd)
+    if amount_usd <= 0:
         raise HTTPException(status_code=400, detail="Invalid package amount")
 
     student_id = getattr(student, "clean_id", None) or getattr(student, "student_id", "")
@@ -407,9 +434,9 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
         "student_id":          student_id,
         "package_id":          payload.package_id,
         "package_label":       pkg.get("label", "KHQR Top-Up"),
-        "amount":              amount_khr,   # KHR integer
+        "amount":              amount_usd,
         "amount_khr":          amount_khr,
-        "currency":            "KHR",
+        "currency":            "USD",
         "base_points":         base_points,
         "bonus_points":        bonus_points,
         "total_points":        total_points,
@@ -438,7 +465,7 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
         success_url = ""
 
     created = await _cam.create_payment(
-        _cam_httpx_factory, amount_khr, reference, success_url, webhook_url,
+        _cam_httpx_factory, amount_usd, reference, success_url, webhook_url,
     )
     if not created.get("ok"):
         await _cam_intents.update_one(
@@ -461,9 +488,14 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
         "provider":           "camrapidpay",
         "provider_invoice_id": created.get("bill_number", ""),
         "reference":          reference,
-        "amount":             amount_khr,    # KHR integer (e.g. 5000)
-        "amount_khr":         amount_khr,    # explicit KHR field for frontend display
-        "currency":           "KHR",
+        # v3: ``amount`` remains the USD gateway amount (back-compat with any
+        # existing consumer); ``amount_khr`` is what the student-facing
+        # KHQR/Bakong screen renders. ``currency`` stays USD because that is
+        # the currency the CamRapidPay invoice is denominated in.
+        "amount":             amount_usd,
+        "amount_khr":         amount_khr,
+        "amount_usd":         amount_usd,
+        "currency":           "USD",
         "payment_url":        created.get("payment_url", ""),
         "qr_code":            created.get("qr_code", ""),
         "expires_at":         expires.isoformat(),
