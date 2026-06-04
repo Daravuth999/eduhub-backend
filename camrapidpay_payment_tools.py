@@ -132,6 +132,16 @@ async def verify_camrapidpay_payment_and_credit_once(reference: str) -> dict:
     if intent.get("status") == "crediting":
         return {"ok": True, "status": "pending", "credited": False}
 
+    # v4.1 security hardening: a "failed" intent means create_payment never
+    # produced a provider invoice (e.g. provider HTTP 500, auth rejected).
+    # There is NO point hitting check-transaction-api for a reference the
+    # provider never received — that just wastes a request and (before the
+    # logging filter was added) leaked the api_key in the URL. Short-circuit
+    # the entire verify path so this reference is dormant. The sweep filter
+    # ({"status": {"$in": ["pending","paid"]}}) already excludes failed.
+    if intent.get("status") == "failed":
+        return {"ok": True, "status": "failed", "credited": False}
+
     # v1.4 fix: do NOT treat local "expired" as a terminal state before
     # checking the provider. A student may have paid just before the 5-minute
     # window closed, but our local expiry sweep ran first. CamRapidPay is the
@@ -483,9 +493,25 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
         _cam_httpx_factory, amount_usd, reference, success_url, webhook_url,
     )
     if not created.get("ok"):
+        # v4.1 security hardening: mark the intent failed AND force the
+        # expiry into the past so the reconcile sweep (which still also
+        # filters by expires_at > now) can never pick it up. The intent
+        # exists on disk for audit only; no further check-transaction-api
+        # request will be issued for this reference.
+        _past_iso = (_cam_now() - timedelta(days=1)).isoformat()
         await _cam_intents.update_one(
             {"_id": ins.inserted_id},
-            {"$set": {"status": "failed", "error_message": str(created.get("error", ""))[:200]}},
+            {"$set": {
+                "status":        "failed",
+                "error_message": str(created.get("error", ""))[:200],
+                "expires_at":    _past_iso,
+                "updated_at":    _cam_now().isoformat(),
+            }},
+        )
+        _CAM_LOG.warning(
+            "camrapidpay: create-intent FAILED ref=%s reason=%s (no provider invoice; "
+            "polling suppressed)",
+            reference, str(created.get("error", ""))[:80],
         )
         raise HTTPException(status_code=502, detail="Could not create KHQR payment. Please try again.")
 
