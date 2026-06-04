@@ -279,16 +279,42 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
     # v4.3: ``api_key_fingerprint`` lets the operator cross-check that
     # Render is using the SAME api_key value as a known-working environment
     # (e.g. their local PowerShell tests) WITHOUT ever logging the key.
+    # v4.4: stop hiding query strings on the URLs we log. The previous
+    # ``_safe_url_path()`` strip on ``success_url`` masked the
+    # ``?khqr_intent=...`` that CamRapidPay was actually rejecting. We now
+    # emit the full URL (with the global redaction filter still scrubbing
+    # secret query parameters), plus explicit ``*_has_query`` booleans so a
+    # quick grep of Render logs can spot any future regression.
+    _su_raw = body.get("success_url", "")
+    _wu_raw = body.get("webhook_url", "")
+    _su_has_query = ("?" in _su_raw) or ("#" in _su_raw)
+    _wu_has_query = ("?" in _wu_raw) or ("#" in _wu_raw)
     _safe_payload = {
-        "endpoint":            url,
-        "amount":              body["amount"],
-        "reference":           body["reference"],
-        "success_url":         _safe_url_path(body.get("success_url", "")),
-        "webhook_url":         _redact_url_secrets(body.get("webhook_url", "")),
-        "api_key":             "***",
-        "api_key_fingerprint": _api_key_fingerprint(cfg.get("api_key", "")),
+        "endpoint":              url,
+        "amount":                body["amount"],
+        "reference":             body["reference"],
+        "success_url":           _redact_url_secrets(_su_raw),
+        "success_url_has_query": _su_has_query,
+        "webhook_url":           _redact_url_secrets(_wu_raw),
+        "webhook_url_has_query": _wu_has_query,
+        "api_key":               "***",
+        "api_key_fingerprint":   _api_key_fingerprint(cfg.get("api_key", "")),
     }
     _log.info("camrapidpay: -> POST create-payments %s", _safe_payload)
+    # v4.4 extra diagnostic: also emit the exact JSON body STRING (with
+    # api_key masked) so an operator can see character-for-character what
+    # hits the wire. Helps catch any silent JSON serializer surprise
+    # (escape sequences, ordering, etc.) without exposing secrets.
+    try:
+        import json as _v44_json
+        _body_for_log = dict(body)
+        _body_for_log["api_key"] = "***"
+        _log.info(
+            "camrapidpay: exact request body=%s",
+            _v44_json.dumps(_body_for_log, separators=(", ", ": ")),
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     try:
         async with httpx_client_factory() as cli:

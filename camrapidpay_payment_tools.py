@@ -434,17 +434,22 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     student_id = getattr(student, "clean_id", None) or getattr(student, "student_id", "")
     short_ts = _cam_now().strftime("%m%d%H%M%S")
     rand = _cam_secrets.token_hex(3)
-    # v4.3 contract fix: direct PowerShell API tests against CamRapidPay
-    # succeeded with UPPERCASE + HYPHEN references (e.g.
-    # ``TEST050-0604114857``) and failed with mixed-case underscores
-    # (``POI_stu093_...``). Normalise to: alnum [A-Z0-9] + hyphen ONLY,
-    # uppercase, no consecutive hyphens, ≤ 50 chars.
-    import re as _v43_re
-    _sid_clean = _v43_re.sub(r"[^A-Za-z0-9]+", "-", str(student_id)).strip("-").upper()
+    # v4.4 contract fix: CamRapidPay silently rejects references starting with
+    # ``POI-`` (or any non-test-style prefix) with the generic HTTP 500
+    # ``Failed to generate KHQR``. Operator-confirmed direct PowerShell tests
+    # on the SAME API key (verified by api_key_fingerprint match) succeed
+    # only with prefixes like ``TEST050-...``, ``TEST125-...``,
+    # ``MANUAL-TEST-...``. Switching to a neutral ``EDUHUB-`` prefix with
+    # NO student_id leak matches the proven shape and removes the only
+    # remaining variable. Reference is UPPER + HYPHEN + alnum only,
+    # ≤ 50 chars. The student is still tracked via the intent doc
+    # (``student_id`` column) — only the gateway-facing reference changes.
+    import re as _v44_re
     _rand_upper = str(rand).upper()
-    reference = f"POI-{_sid_clean}-{short_ts}-{_rand_upper}"
-    # Collapse any accidental "--" produced by an empty student_id and clip.
-    reference = _v43_re.sub(r"-+", "-", reference).strip("-")[:50]
+    reference = f"EDUHUB-{short_ts}-{_rand_upper}"
+    # Defence-in-depth: ensure charset is [A-Z0-9-] and clip.
+    reference = _v44_re.sub(r"[^A-Z0-9-]+", "-", reference.upper())
+    reference = _v44_re.sub(r"-+", "-", reference).strip("-")[:50]
 
     now = _cam_now()
     expires = now + timedelta(minutes=5)  # CamRapidPay expiry
@@ -468,9 +473,12 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     # a lookup key. Crediting is always decided by server-to-server status
     # check, never by the URL alone.
     _return_base = (cfg.get("return_url") or "").rstrip("/")
-    # success_url is set after insert, so we build a placeholder here and
-    # update it after insert. Use a sentinel to defer.
-    success_url = _return_base  # will be updated below with intent id
+    # v4.4: ``success_url`` is sent to CamRapidPay as a CLEAN base URL with
+    # NO query string. The internal intent ObjectId is no longer placed
+    # in the redirect URL (CamRapidPay's gateway rejects URLs that carry
+    # a query). See the comment above the create_payment() call for
+    # details. Set the final value here once for clarity.
+    success_url = _return_base
 
     # Insert internal pending intent FIRST (so a fast webhook can find it).
     intent_doc = {
@@ -499,14 +507,21 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     ins = await _cam_intents.insert_one(intent_doc)
 
     # Call CamRapidPay to create the invoice.
-    # Now that we have the inserted_id, build the final success_url.
-    # CamRapidPay redirects the student's browser to this URL after payment.
-    # The ?khqr_intent= param lets the frontend recover the pending intent
-    # if the student's original tab was refreshed or closed.
-    if _return_base:
-        success_url = f"{_return_base}?khqr_intent={str(ins.inserted_id)}"
-    else:
-        success_url = ""
+    # v4.4 contract fix: CamRapidPay's create-payments endpoint silently
+    # rejects (HTTP 500 "Failed to generate KHQR") when ``success_url``
+    # contains ANY query string. v4.2 already cleaned ``webhook_url`` for
+    # the same reason; v4.3 cleaned the reference; the v4.3 diagnostic log
+    # accidentally hid this remaining mismatch via ``_safe_url_path()``
+    # which strips queries before display. Operator-confirmed PowerShell
+    # tests with the SAME API key (api_key_fingerprint match) succeed only
+    # with a CLEAN ``success_url`` (no ``?khqr_intent=...``).
+    #
+    # The internal intent ObjectId is NOT a secret, but it is also not
+    # needed in the redirect URL: the frontend's existing modal-state
+    # polling + sessionStorage recovery covers the "student returns to tab"
+    # case. Crediting was, is, and remains decided ONLY by the
+    # server-to-server status check — never by the redirect URL.
+    success_url = _return_base  # clean — no query string
 
     created = await _cam.create_payment(
         _cam_httpx_factory, amount_usd, reference, success_url, webhook_url,
