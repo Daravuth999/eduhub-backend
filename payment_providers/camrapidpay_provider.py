@@ -28,6 +28,7 @@ Security contract (v4.1):
 
 import os as _os
 import re as _re
+import hashlib as _hashlib
 import logging as _logging
 
 _log = _logging.getLogger("eduhub.camrapidpay")
@@ -75,6 +76,31 @@ def _redact_text_secrets(text: str, *extra_secrets: str) -> str:
             except Exception:  # noqa: BLE001
                 pass
     return out
+
+
+def _api_key_fingerprint(api_key: str) -> str:
+    """Return a SAFE non-reversible fingerprint of the API key.
+
+    v4.3: emitted in the outgoing-payload log so operators can confirm two
+    different environments (e.g. local PowerShell vs Render) are using
+    the SAME API key value, without ever exposing the key itself.
+
+    Output shape: ``"a1b2c3d4 (..last4)"`` where:
+      - ``a1b2c3d4`` is the first 8 hex chars of SHA-256(api_key)
+      - ``last4``    is the last 4 chars of the api_key (useful for human
+        cross-check against the CamRapidPay portal which displays the
+        key trailing chars).
+
+    Returns ``"<none>"`` for empty/None input. Never raises.
+    """
+    if not api_key:
+        return "<none>"
+    try:
+        digest = _hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:8]
+        last4 = api_key[-4:] if len(api_key) >= 4 else "?"
+        return f"{digest} (..{last4})"
+    except Exception:  # noqa: BLE001
+        return "<error>"
 
 
 class _SecretRedactingFilter(_logging.Filter):
@@ -250,13 +276,17 @@ async def create_payment(httpx_client_factory, amount, reference, success_url, w
         body["success_url"] = success_url
 
     # v4.1 SAFE DIAGNOSTIC LOG — Render-readable, secret-free.
+    # v4.3: ``api_key_fingerprint`` lets the operator cross-check that
+    # Render is using the SAME api_key value as a known-working environment
+    # (e.g. their local PowerShell tests) WITHOUT ever logging the key.
     _safe_payload = {
-        "endpoint":    url,
-        "amount":      body["amount"],
-        "reference":   body["reference"],
-        "success_url": _safe_url_path(body.get("success_url", "")),
-        "webhook_url": _redact_url_secrets(body.get("webhook_url", "")),
-        "api_key":     "***",
+        "endpoint":            url,
+        "amount":              body["amount"],
+        "reference":           body["reference"],
+        "success_url":         _safe_url_path(body.get("success_url", "")),
+        "webhook_url":         _redact_url_secrets(body.get("webhook_url", "")),
+        "api_key":             "***",
+        "api_key_fingerprint": _api_key_fingerprint(cfg.get("api_key", "")),
     }
     _log.info("camrapidpay: -> POST create-payments %s", _safe_payload)
 

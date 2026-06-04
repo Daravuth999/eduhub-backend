@@ -434,14 +434,17 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
     student_id = getattr(student, "clean_id", None) or getattr(student, "student_id", "")
     short_ts = _cam_now().strftime("%m%d%H%M%S")
     rand = _cam_secrets.token_hex(3)
-    # v4.2 contract fix: CamRapidPay's API docs example uses alnum + underscore
-    # for ``reference`` (e.g. ``REF_10001_KHQR``). Defensively replace hyphens
-    # in the student id portion with underscores so the final reference is
-    # ``POI_stu093_0604032942_aaf9ec`` instead of ``POI-stu093-...-...``.
-    # Both forms are valid "string" per the docs, but the docs example only
-    # uses underscores and some upstream validators are stricter.
-    _sid_safe = str(student_id).replace("-", "_").replace(" ", "_")
-    reference = f"POI_{_sid_safe}_{short_ts}_{rand}"[:50]
+    # v4.3 contract fix: direct PowerShell API tests against CamRapidPay
+    # succeeded with UPPERCASE + HYPHEN references (e.g.
+    # ``TEST050-0604114857``) and failed with mixed-case underscores
+    # (``POI_stu093_...``). Normalise to: alnum [A-Z0-9] + hyphen ONLY,
+    # uppercase, no consecutive hyphens, ≤ 50 chars.
+    import re as _v43_re
+    _sid_clean = _v43_re.sub(r"[^A-Za-z0-9]+", "-", str(student_id)).strip("-").upper()
+    _rand_upper = str(rand).upper()
+    reference = f"POI-{_sid_clean}-{short_ts}-{_rand_upper}"
+    # Collapse any accidental "--" produced by an empty student_id and clip.
+    reference = _v43_re.sub(r"-+", "-", reference).strip("-")[:50]
 
     now = _cam_now()
     expires = now + timedelta(minutes=5)  # CamRapidPay expiry
