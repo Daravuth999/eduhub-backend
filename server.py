@@ -6104,6 +6104,24 @@ exec(open(__import__("pathlib").Path(__file__).parent / "camrapidpay_payment_too
 # /api/admin/ai-tools-config (GET/PUT) and /api/admin/ai-tools-usage (GET).
 # Must run BEFORE app.include_router(api) below.
 register_premium_ai_routes(api, db, require_admin, require_student)
+
+# ── Login Reward Campaigns (additive, isolated module) ────────────────────
+# Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
+# require_admin, require_student, _norm_student_id, GAS treasury constants,
+# and Student/User pydantic types. Adds:
+#   /api/admin/rewards/login-campaigns         (GET / POST)
+#   /api/admin/rewards/login-campaigns/{id}    (GET / PUT / DELETE)
+#   /api/admin/rewards/login-campaigns/{id}/claims (GET)
+#   /api/rewards/login-campaigns/active        (GET, student)
+#   /api/rewards/login-campaigns/{id}/claim    (POST, student)
+# All existing endpoints and wallet migration flags are untouched.
+try:
+    exec(open(__import__("pathlib").Path(__file__).parent / "login_reward_tools.py").read())
+except Exception as _lrc_load_err:
+    logging.getLogger("eduhub").warning(
+        "login_reward_tools.py failed to load (feature disabled): %s",
+        _lrc_load_err,
+    )
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
