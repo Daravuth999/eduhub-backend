@@ -5302,6 +5302,24 @@ async def startup():
     await db.ai_scene_jobs.create_index("sceneId", unique=True)
     await db.ai_scene_jobs.create_index([("slug", 1), ("createdAt", -1)])
     await db.ai_scene_jobs.create_index("adminEmail")
+
+    # ── Referral System v1: ensure indexes during startup (non-fatal) ──
+    # `_ref_ensure_indexes` is exec'd into module globals by referral_tools.py
+    # near the bottom of this file. It is resolved at runtime (not at
+    # decoration time) so the lookup succeeds regardless of file ordering.
+    # Any Mongo error inside the helper is already swallowed and warned by
+    # the helper itself; the outer guard here is a belt-and-braces second
+    # layer so a missing/renamed module can never break server startup.
+    try:
+        _ref_idx_fn = globals().get("_ref_ensure_indexes")
+        if _ref_idx_fn is not None:
+            await _ref_idx_fn()
+    except Exception as _ref_idx_exc:  # noqa: BLE001
+        log.warning(
+            "referral: ensure_indexes during startup failed (non-fatal): %s",
+            _ref_idx_exc,
+        )
+
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 

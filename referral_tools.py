@@ -127,15 +127,12 @@ async def _ref_ensure_indexes() -> None:
         _REF_LOG.warning("referral: index creation skipped: %s", _exc)
 
 
-# Register the index creation as a FastAPI startup event. This avoids the
-# "no running event loop" / un-awaited-coroutine warning that occurs when
-# the module is exec()'d during server.py import (before uvicorn has
-# started the loop). Startup failure remains non-fatal: the handler logs
-# at warning level but never raises into the app boot sequence.
-try:
-    app.add_event_handler("startup", _ref_ensure_indexes)
-except Exception as _exc:  # noqa: BLE001
-    _REF_LOG.warning("referral: could not register startup index handler: %s", _exc)
+# Index creation is awaited from inside server.py's existing @app.on_event(
+# "startup") handler — `_ref_ensure_indexes` is the helper for that. This
+# avoids both the import-time event-loop issue and any FastAPI/Starlette
+# version differences around `add_event_handler`. The startup hook in
+# server.py wraps the call in try/except so a Mongo error here can never
+# block app boot.
 
 
 # ── lazy code lookup / creation for a logged-in student ─────────────────────
