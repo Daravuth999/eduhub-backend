@@ -1,4 +1,4 @@
-﻿# ===========================================================================
+# ===========================================================================
 # referral_tools.py - EduHub Referral System v1
 #
 # Loaded via exec() into server.py's namespace (same pattern as
