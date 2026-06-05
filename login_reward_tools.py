@@ -215,6 +215,20 @@ class _LRCCampaignIn(BaseModel):
     dismiss_mode: Literal["next_login", "after_24h", "never"] = "next_login"
     claim_limit_per_student: int = 1
 
+    # ── Premium animation upgrade v1 (additive, all optional, safe defaults) ──
+    # Visual-only UI fields. These do NOT influence the claim pipeline,
+    # points-credit logic, idempotency, push, audience eligibility, or any
+    # other server-side rule. They are persisted exactly as supplied and
+    # echoed back through _lrc_serialize so the frontend popup / studio
+    # preview can react to admin choices.
+    animation_enabled: bool = True
+    particle_intensity: Literal["subtle", "premium", "celebration"] = "premium"
+    countdown_enabled: bool = False
+    countdown_mode: Literal["none", "campaign_end", "expires_after_open"] = "none"
+    countdown_seconds: int | None = None
+    countdown_label: str | None = ""
+    urgency_text: str | None = ""
+
 
 def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
     """Convert + validate an inbound campaign body into a Mongo-ready dict."""
@@ -259,6 +273,37 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
         # Phase 1 enforces a single claim per student per campaign.
         claim_limit = 1
 
+    # ── Premium animation upgrade v1 — sanitise optional UI fields ──────
+    # These fields never influence claim eligibility or crediting; they
+    # are pure visual instructions for the React popup. Defensive bounds
+    # keep accidentally-huge values from bloating the document.
+    animation_enabled = bool(p.animation_enabled) if p.animation_enabled is not None else True
+    particle_intensity = (p.particle_intensity or "premium").strip().lower()
+    if particle_intensity not in ("subtle", "premium", "celebration"):
+        particle_intensity = "premium"
+    countdown_enabled = bool(p.countdown_enabled) if p.countdown_enabled is not None else False
+    countdown_mode = (p.countdown_mode or "none").strip().lower()
+    if countdown_mode not in ("none", "campaign_end", "expires_after_open"):
+        countdown_mode = "none"
+    # countdown_seconds: only relevant for "expires_after_open". Allow
+    # 5..86400 (5 sec to 24 h). Anything outside falls back to None so the
+    # popup uses a safe default / hides the timer.
+    raw_secs = p.countdown_seconds
+    if raw_secs is None or raw_secs == "":
+        countdown_seconds = None
+    else:
+        try:
+            countdown_seconds = int(raw_secs)
+        except Exception:
+            countdown_seconds = None
+        if countdown_seconds is not None:
+            if countdown_seconds < 5:
+                countdown_seconds = None
+            elif countdown_seconds > 86400:
+                countdown_seconds = 86400
+    countdown_label = (p.countdown_label or "").strip()[:80]
+    urgency_text = (p.urgency_text or "").strip()[:140]
+
     return {
         "name": name,
         "enabled": bool(p.enabled),
@@ -281,6 +326,14 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
         "accent_color": accent_color,
         "dismiss_mode": (p.dismiss_mode or "next_login"),
         "claim_limit_per_student": claim_limit,
+        # Premium animation v1 — additive UI hints (visual only).
+        "animation_enabled": animation_enabled,
+        "particle_intensity": particle_intensity,
+        "countdown_enabled": countdown_enabled,
+        "countdown_mode": countdown_mode,
+        "countdown_seconds": countdown_seconds,
+        "countdown_label": countdown_label,
+        "urgency_text": urgency_text,
     }
 
 
