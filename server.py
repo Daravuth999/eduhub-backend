@@ -6126,6 +6126,29 @@ register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
 
+# ── Referral System v1 (additive, isolated module, default OFF) ──────────
+# Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
+# require_admin/require_student, _norm_student_id, GAS treasury constants,
+# Student/User pydantic types, ObjectId, BaseModel/ConfigDict/Field, and
+# the existing _fan_out_push helper. Registers:
+#   /api/referral/my-code                          (GET, student)
+#   /api/referral/stats                            (GET, student)
+#   /api/referral/leads                            (POST, public)
+#   /api/admin/referral/config                     (GET / POST, admin)
+#   /api/admin/referral/leads                      (GET, admin)
+#   /api/admin/referral/leads/{lead_id}            (PUT, admin)
+#   /api/admin/referral/leads/{lead_id}/mark-class-paid  (POST, admin)
+#   /api/admin/referral/rewards                    (GET, admin)
+# Failure is non-fatal — referral routes simply will not be registered if
+# the module fails to load, leaving all existing flows untouched.
+try:
+    exec(open(__import__("pathlib").Path(__file__).parent / "referral_tools.py").read())
+except Exception as _ref_load_err:
+    logging.getLogger("eduhub").warning(
+        "referral_tools.py failed to load (feature disabled): %s",
+        _ref_load_err,
+    )
+
 
 # ─────────────────────────────────────────────────────────────
 # Phase 1 GAS→Mongo migration preflight routes

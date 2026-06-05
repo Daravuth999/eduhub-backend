@@ -528,6 +528,36 @@ async def _complete_points_payment(db, student_id: str, txn: dict, pkg: dict | N
         )
         log.info("payment_bridge: points auto-credited %d pts to %s (trx=%s)",
                  points_to_credit, clean_id, txn.get("transaction_id"))
+
+        # ── Referral System v1 (additive, non-fatal post-success hook) ──
+        # Runs AFTER points have already been credited and the top-up push
+        # has been sent. Looks up any pending referral lead linked to this
+        # student and credits the referrer if all admin-config conditions
+        # pass. The hook is idempotent and double-credit safe (see
+        # referral_tools._ref_qualify_and_reward). Never raises.
+        try:
+            _ref_hook = globals().get("_referral_on_points_purchase_success")
+            if _ref_hook:
+                _ref_txn_id = str(txn.get("transaction_id") or "").strip()
+                _ref_apv    = str(txn.get("apv") or "").strip()
+                _ref_ord    = str(txn.get("order_id") or txn.get("tran_id") or "").strip()
+                _ref_amt_usd = float(
+                    (pkg or {}).get("amount_usd")
+                    or txn.get("amount_usd")
+                    or 0
+                )
+                _ref_reference = _ref_txn_id or _ref_ord or _ref_apv or "unknown"
+                await _ref_hook(
+                    clean_id=clean_id,
+                    amount_usd=_ref_amt_usd,
+                    payment_reference=_ref_reference,
+                )
+        except Exception as _ref_hook_exc:  # noqa: BLE001
+            log.warning(
+                "payment_bridge: referral post-success hook error (non-fatal): %s",
+                str(_ref_hook_exc)[:200],
+            )
+
         return {"ok": True, "clean_id": clean_id, "points_credited": points_to_credit}
     else:
         log.warning("payment_bridge: GAS points transfer failed for %s: %s", clean_id, gas_error)
