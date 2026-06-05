@@ -127,13 +127,15 @@ async def _ref_ensure_indexes() -> None:
         _REF_LOG.warning("referral: index creation skipped: %s", _exc)
 
 
-# Fire-and-forget index creation on import. Mongo errors here must never
-# break the rest of the app.
+# Register the index creation as a FastAPI startup event. This avoids the
+# "no running event loop" / un-awaited-coroutine warning that occurs when
+# the module is exec()'d during server.py import (before uvicorn has
+# started the loop). Startup failure remains non-fatal: the handler logs
+# at warning level but never raises into the app boot sequence.
 try:
-    import asyncio as _ref_asyncio
-    _ref_asyncio.create_task(_ref_ensure_indexes())
+    app.add_event_handler("startup", _ref_ensure_indexes)
 except Exception as _exc:  # noqa: BLE001
-    _REF_LOG.warning("referral: could not schedule index task: %s", _exc)
+    _REF_LOG.warning("referral: could not register startup index handler: %s", _exc)
 
 
 # ── lazy code lookup / creation for a logged-in student ─────────────────────
