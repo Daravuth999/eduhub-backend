@@ -1,4 +1,4 @@
-# ===========================================================================
+﻿# ===========================================================================
 # referral_tools.py - EduHub Referral System v1
 #
 # Loaded via exec() into server.py's namespace (same pattern as
@@ -19,15 +19,15 @@
 #   * Monthly cap enforced server-side
 #   * Reward is double-credit safe via a unique idempotency_key index and
 #     atomic insert-or-skip semantics
-#   * Feature defaults to OFF — no rewards are credited until admin enables
+#   * Feature defaults to OFF â€” no rewards are credited until admin enables
 #
 # Design principles (per brief):
-#   * Backend is the source of truth — reward_points / monthly_cap /
+#   * Backend is the source of truth â€” reward_points / monthly_cap /
 #     minimum_payment_usd / qualifying_trigger are never trusted from the
 #     client.
 #   * NO public self-registration. Lead submission only stores a lead
 #     document; admin must create the student account separately.
-#   * Reuses existing require_admin / require_student deps — no new auth.
+#   * Reuses existing require_admin / require_student deps â€” no new auth.
 #   * Uses the same treasury -> student GAS sendPoints pipeline that
 #     /api/points/grant + login_reward_tools.py already use, so wallet
 #     migration flags and existing crediting behaviour are untouched.
@@ -49,13 +49,13 @@ except NameError:  # pragma: no cover
 
 _REF_LOG = _ref_logging.getLogger("eduhub.referral")
 
-# ── collections ──────────────────────────────────────────────────────────────
+# â”€â”€ collections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _ref_codes    = db["referral_codes"]
 _ref_leads    = db["referral_leads"]
 _ref_rewards  = db["referral_rewards"]
 _ref_config   = db["referral_config"]
 
-# ── public share URL base (frontend host) ───────────────────────────────────
+# â”€â”€ public share URL base (frontend host) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Lives in env so we can move host without code changes. Falls back to the
 # current Vercel test host listed in the brief.
 _REF_SHARE_BASE = _ref_os.environ.get(
@@ -64,7 +64,7 @@ _REF_SHARE_BASE = _ref_os.environ.get(
 ).rstrip("/")
 
 
-# ── default singleton config (feature OFF) ───────────────────────────────────
+# â”€â”€ default singleton config (feature OFF) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _ref_default_config() -> dict:
     return {
         "enabled": False,
@@ -98,7 +98,7 @@ async def _ref_get_config() -> dict:
     return merged
 
 
-# ── code generator: 8 chars, upper + digits, ambiguous chars removed ────────
+# â”€â”€ code generator: 8 chars, upper + digits, ambiguous chars removed â”€â”€â”€â”€â”€â”€â”€â”€
 _REF_ALPHABET = "".join(
     c for c in (_ref_string.ascii_uppercase + _ref_string.digits)
     if c not in "O0I1L"
@@ -128,14 +128,14 @@ async def _ref_ensure_indexes() -> None:
 
 
 # Index creation is awaited from inside server.py's existing @app.on_event(
-# "startup") handler — `_ref_ensure_indexes` is the helper for that. This
+# "startup") handler â€” `_ref_ensure_indexes` is the helper for that. This
 # avoids both the import-time event-loop issue and any FastAPI/Starlette
 # version differences around `add_event_handler`. The startup hook in
 # server.py wraps the call in try/except so a Mongo error here can never
 # block app boot.
 
 
-# ── lazy code lookup / creation for a logged-in student ─────────────────────
+# â”€â”€ lazy code lookup / creation for a logged-in student â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def _ref_get_or_create_code(student) -> dict:
     sid = (student.student_id or "").strip()
     norm = _norm_student_id(sid)
@@ -159,7 +159,7 @@ async def _ref_get_or_create_code(student) -> dict:
             }
             await _ref_codes.insert_one(doc)
             return doc
-        except Exception:  # duplicate key — retry
+        except Exception:  # duplicate key â€” retry
             continue
     raise HTTPException(status_code=500, detail="Could not allocate referral code")
 
@@ -168,7 +168,7 @@ def _ref_build_share_url(code: str) -> str:
     return f"{_REF_SHARE_BASE}/?ref={code}"
 
 
-# ── monthly cap helper ──────────────────────────────────────────────────────
+# â”€â”€ monthly cap helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _ref_month_window():
     now = datetime.now(timezone.utc)
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -184,7 +184,7 @@ async def _ref_monthly_count(referrer_norm: str) -> int:
     })
 
 
-# ── reward credit (uses existing treasury → student GAS sendPoints) ─────────
+# â”€â”€ reward credit (uses existing treasury â†’ student GAS sendPoints) â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def _ref_credit_referrer_points(
     *,
     referrer_clean_id: str,
@@ -238,7 +238,7 @@ async def _ref_credit_referrer_points(
         return False, str(exc)[:200]
 
 
-# ── core qualification / reward routine (idempotent + monthly-cap gated) ────
+# â”€â”€ core qualification / reward routine (idempotent + monthly-cap gated) â”€â”€â”€â”€
 async def _ref_qualify_and_reward(
     *,
     lead_doc: dict,
@@ -339,13 +339,13 @@ async def _ref_qualify_and_reward(
     }
 
     # Atomic claim of the idempotency key. If the unique index rejects, we
-    # have already processed this exact event — short-circuit cleanly.
+    # have already processed this exact event â€” short-circuit cleanly.
     try:
         ins = await _ref_rewards.insert_one(pending_doc)
         reward_id = ins.inserted_id
     except Exception as _dup_exc:  # noqa: BLE001
         _REF_LOG.info(
-            "referral: idempotency hit — skipping duplicate credit (%s)",
+            "referral: idempotency hit â€” skipping duplicate credit (%s)",
             idem_key,
         )
         return {"ok": False, "reason": "idempotent_skip"}
@@ -395,7 +395,7 @@ async def _ref_qualify_and_reward(
             await _fan_out(
                 student_clean_id=referrer_clean_id,
                 title="Referral reward earned",
-                body=f"+{reward_points} PTS — a friend you invited just qualified.",
+                body=f"+{reward_points} PTS â€” a friend you invited just qualified.",
                 data={"kind": "referral_reward"},
             )
     except Exception:
@@ -408,11 +408,11 @@ async def _ref_qualify_and_reward(
     return {"ok": True, "reason": "rewarded", "reward_points": reward_points}
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Public hook used by payment_bridge.py after a confirmed points purchase.
 # Exposed via globals() so the additive hook in payment_bridge can pick it
 # up at runtime without import order issues. NEVER raises.
-# ──────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def _referral_on_points_purchase_success(
     *,
     clean_id: str,
@@ -627,7 +627,7 @@ async def admin_referral_config_set(
 
     await _ref_config.update_one(
         {"_id": "singleton"},
-        {"$set": fields, "$setOnInsert": _ref_default_config()},
+        {"$set": fields, "$setOnInsert": {k: v for k, v in _ref_default_config().items() if k not in fields}},
         upsert=True,
     )
     return await _ref_get_config()
@@ -716,7 +716,7 @@ async def admin_referral_mark_class_paid(
     """Admin-safe manual class-payment confirmation.
 
     Triggers the same idempotent reward pipeline used by the automatic
-    points-purchase hook. Repeated calls are safe — the unique
+    points-purchase hook. Repeated calls are safe â€” the unique
     idempotency_key prevents double-credit.
     """
     try:
@@ -772,3 +772,4 @@ async def admin_referral_rewards_list(
 
 
 _REF_LOG.info("referral_tools: registered routes (default config = OFF)")
+
