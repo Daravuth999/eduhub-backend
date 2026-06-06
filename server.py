@@ -94,6 +94,19 @@ except ImportError:  # edutalk_tools.py not yet deployed
             "edutalk_tools.py not installed — EduTalk disabled."
         )
 
+# ── AI Assistant (isolated module) ──────────────────────────────────────── #
+# ai_assistant_tools.py registers admin AI Assistant config + student chat   #
+# routes onto the existing /api router. Defensive import pattern: missing    #
+# file → AI Assistant disabled, every other route keeps working. EduTalk     #
+# is NOT touched by this module.                                             #
+try:
+    from ai_assistant_tools import register_ai_assistant_routes
+except ImportError:  # ai_assistant_tools.py not yet deployed
+    def register_ai_assistant_routes(*_a, **_kw):  # type: ignore[misc]
+        logging.getLogger("eduhub").warning(
+            "ai_assistant_tools.py not installed — AI Assistant disabled."
+        )
+
 # --------------------------------------------------------------------------- #
 # PHASE 3: edutalk_tier_config_tools.py registers tier-aware AI feature       #
 # config + promotion CRUD onto the existing /api router. Same defensive       #
@@ -6143,6 +6156,19 @@ except Exception as _lrc_load_err:
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
+
+# ── AI Assistant (isolated, additive) ────────────────────────────────────
+# Registers admin config + student chat routes for the rebuilt AI Assistant
+# personal English coach. Powered by Gemini 2.5 Flash. EduTalk and Premium AI
+# Reader tools are NOT modified by this module. Safe debit reuses the same
+# helpers Premium AI uses, so wallet behaviour is unchanged.
+try:
+    register_ai_assistant_routes(api, db, require_admin, require_student)
+except Exception as _ai_asst_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "ai_assistant_tools route registration failed (feature disabled): %s",
+        _ai_asst_err,
+    )
 
 # ── Referral System v1 (additive, isolated module, default OFF) ──────────
 # Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
