@@ -283,7 +283,45 @@ DEFAULT_VR_CONFIG: dict[str, Any] = {
         "push_enabled": True,
         "template": "You earned +{points} points for completing {mission}!",
     },
+    # v1.1.0 — Speech Delivery / Confidence Score (transcript + timing only).
+    # No phoneme-level / audio-feature scoring. See AUDIT_REPORT for the
+    # exact subscore formulas. Defaults are conservative and student-friendly.
+    "scoring": {
+        "enabled": True,
+        "show_to_student": True,
+        "target_wpm_min": 100,
+        "target_wpm_max": 160,
+        "filler_penalty_per_pct": 1,
+        "min_score_for_reward_enabled": False,
+        "min_score_for_reward": 50,
+        "retry_improvement_bonus": 5,
+    },
 }
+
+
+# v1.1.0 — Filler-word lists used by the live counter AND the server-side
+# Speech Delivery Score. Pure text matching (no audio decoding). Khmer
+# entries appear last and are matched with simple substring checks so the
+# tokenizer regex does not need to be locale-aware.
+FILLER_WORDS_EN: tuple[str, ...] = (
+    "um", "uh", "uhm", "umm", "uhh", "erm", "er",
+    "ah", "ahh", "hmm", "mhm", "mm",
+    "like", "you know", "i mean", "sort of", "kind of",
+    "actually", "basically", "literally", "honestly",
+    "so", "well", "right", "okay", "ok",
+)
+
+FILLER_WORDS_KM: tuple[str, ...] = (
+    "អឺ", "អា", "ចឹង", "ហើយ", "នឹង",
+)
+
+SCORE_LABELS: tuple[tuple[int, str], ...] = (
+    (85, "Premium Speaker"),
+    (70, "Clear Speaker"),
+    (55, "Steady Speaker"),
+    (40, "Building Up"),
+    (0,  "Warming Up"),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +438,7 @@ def _public_vr_config(cfg: dict) -> dict:
     rew = cfg.get("rewards") or {}
     vp = cfg.get("voice_practice") or {}
     fr = cfg.get("fraud") or {}
+    sc = cfg.get("scoring") or {}
     return {
         "missions_enabled": bool(miss.get("enabled", True)),
         "retry_required": bool(miss.get("retry_required", True)),
@@ -435,6 +474,15 @@ def _public_vr_config(cfg: dict) -> dict:
             "min_words": int(fr.get("min_words", 8)),
             "min_duration_seconds": int(fr.get("min_duration_seconds", 10)),
             "min_attempts": int(fr.get("min_attempts", 2)),
+        },
+        # v1.1.0 — Speech Delivery / Confidence Score student-side flags.
+        "scoring": {
+            "enabled": bool(sc.get("enabled", True)),
+            "show_to_student": bool(sc.get("show_to_student", True)),
+            "target_wpm_min": int(sc.get("target_wpm_min", 100)),
+            "target_wpm_max": int(sc.get("target_wpm_max", 160)),
+            "min_score_for_reward_enabled": bool(sc.get("min_score_for_reward_enabled", False)),
+            "min_score_for_reward": int(sc.get("min_score_for_reward", 50)),
         },
     }
 
@@ -525,22 +573,38 @@ class _GeminiError(Exception):
 
 
 _FEEDBACK_SYSTEM = (
-    "You are EduHub's Speech Coach. The student is practicing English "
-    "speaking and you receive ONLY a transcript (no audio). Give honest, "
-    "encouraging feedback. Do NOT claim phoneme accuracy, accent scoring, "
-    "or audio-level pronunciation grading — you only see text. Focus on "
-    "grammar, sentence structure, vocabulary, clarity, completeness, and "
-    "delivery suggestions (pauses, rhythm) inferred from the transcript. "
-    "Reply with strict JSON only, no markdown, matching this schema:\n\n"
+    "You are the EduHub Speech Coach — Daravuth's classroom Mini-Coach for "
+    "Cambodian English learners. You are NOT a generic chatbot, NOT EduTalk, "
+    "and NOT a book tutor. You ONLY coach SPOKEN ENGLISH delivery: clarity, "
+    "natural rhythm, pause discipline, attractive delivery, confidence and "
+    "sentence shape. If the student asks about a book page, chapter, exercise "
+    "or worksheet content, redirect them politely to EduTalk in the "
+    "retry_instruction field. Do NOT invent book content.\n\n"
+    "Coaching style — speak the way Daravuth speaks in live class:\n"
+    "  • warm, direct, teacher-like, confidence-building\n"
+    "  • short sentences, plain words\n"
+    "  • mention rhythm, clear pauses, and one clean breath where useful\n"
+    "  • only use a tiny line of simple Khmer in confidence_message when it "
+    "really helps a beginner (one short sentence max, optional)\n"
+    "  • prefer phrases like \"By EduHub Speech Coach standard…\", "
+    "\"Try this with a clear pause…\", \"Say it again with stronger confidence…\"\n"
+    "  • never claim phoneme accuracy, accent scoring, audio-level pronunciation "
+    "grading, certified assessment or human teacher review — you ONLY see "
+    "text. You may comment on apparent clarity inferred from the transcript.\n\n"
+    "Reply with STRICT JSON only, no markdown, matching this schema (all "
+    "fields REQUIRED, all strings short and warm — 1–2 sentences each):\n"
     "{\n"
-    "  \"what_was_clear\": string,\n"
-    "  \"corrected_version\": string,\n"
-    "  \"grammar_tip\": string,\n"
-    "  \"delivery_tip\": string,\n"
-    "  \"retry_instruction\": string,\n"
-    "  \"confidence_message\": string\n"
+    "  \"what_was_clear\": string,           // 1 specific thing the student did well\n"
+    "  \"corrected_version\": string,        // a cleaner, natural rewrite of their answer\n"
+    "  \"grammar_tip\": string,              // one small sentence-structure fix\n"
+    "  \"delivery_tip\": string,             // pause / rhythm / clarity tip\n"
+    "  \"retry_instruction\": string,        // exact next take to record\n"
+    "  \"confidence_message\": string,       // short Daravuth-style encouragement\n"
+    "  \"clarity_rating\": integer,          // 1 (unclear) .. 5 (very clear), based on transcript\n"
+    "  \"delivery_rating\": integer          // 1 (flat) .. 5 (attractive delivery), inferred\n"
     "}\n\n"
-    "Keep each field warm, short (1–2 sentences), and actionable."
+    "clarity_rating and delivery_rating are MANDATORY integers 1..5. Be honest "
+    "but kind. If the transcript is empty or under 5 words, use 1 for both."
 )
 
 
@@ -564,6 +628,222 @@ def _safe_feedback_fallback(mode: str) -> dict:
         "delivery_tip": "Speak a little slower and pause between ideas.",
         "retry_instruction": f"Record one more clear take of your {label}.",
         "confidence_message": "Every attempt makes you stronger. Keep going.",
+        # v1.1.0 — neutral default ratings when Gemini is unavailable.
+        "clarity_rating": 0,
+        "delivery_rating": 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# v1.1.0 — Filler counter (transcript text only, no audio decoding)           #
+# --------------------------------------------------------------------------- #
+_FILLER_TOKEN_RE_EN = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(w) for w in sorted(FILLER_WORDS_EN, key=len, reverse=True)
+    ) + r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _count_fillers(text: str) -> dict[str, Any]:
+    """Count filler words in a transcript.
+
+    v1.1.0 uses ONLY the text transcript (no audio decoding). English
+    fillers are matched with a word-boundary regex; Khmer fillers use
+    plain substring containment because the regex word-boundary class
+    is not Khmer-aware. Returns:
+
+        {"total": int, "by_word": {word: count, ...}}
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {"total": 0, "by_word": {}}
+
+    by_word: dict[str, int] = {}
+    # English (and other ASCII) — word-boundary safe
+    for m in _FILLER_TOKEN_RE_EN.finditer(raw):
+        w = m.group(0).lower()
+        by_word[w] = by_word.get(w, 0) + 1
+    # Khmer — substring match (no Unicode word boundary available)
+    for w in FILLER_WORDS_KM:
+        if not w:
+            continue
+        c = raw.count(w)
+        if c:
+            by_word[w] = by_word.get(w, 0) + c
+
+    return {"total": sum(by_word.values()), "by_word": by_word}
+
+
+# --------------------------------------------------------------------------- #
+# v1.1.0 — Speech Delivery / Confidence Score                                 #
+# ---                                                                         #
+# IMPORTANT: this score is computed from TRANSCRIPT + TIMING signals only.    #
+# We DO NOT decode audio, run phoneme analysis, accent detection, or any     #
+# certified pronunciation assessment. Student-facing labels say "Speech       #
+# Delivery Score" / "Confidence Score" — never "pronunciation score".        #
+# --------------------------------------------------------------------------- #
+def _score_label(score: int) -> str:
+    for threshold, label in SCORE_LABELS:
+        if score >= threshold:
+            return label
+    return SCORE_LABELS[-1][1]
+
+
+def _improvement_tip(weakest: str, *, fillers_pct: float, wpm: float, target_lo: int, target_hi: int) -> str:
+    """Pick a short, kind, Daravuth-style tip based on the weakest subscore."""
+    if weakest == "pace":
+        if wpm and wpm > target_hi:
+            return "Slow down a little — aim for clear, attractive delivery, not speed."
+        if wpm and wpm < target_lo and wpm > 0:
+            return "Push your pace a bit. Speak with confidence and keep the energy moving."
+        return "Find a steady pace — speak like you mean it, not too fast, not too slow."
+    if weakest == "clarity":
+        if fillers_pct >= 8:
+            return "Try one clean pause instead of saying 'um' or 'uh'. Silence is power."
+        return "Pronounce keywords clearly and finish each sentence before the next idea."
+    if weakest == "structure":
+        return "Use full sentences. Start with one idea, then add one more — keep it simple."
+    if weakest == "confidence":
+        return "Say it again with a stronger voice. Imagine you are explaining to the class."
+    return "Try again with a clear pause after your first idea."
+
+
+def _compute_speech_score(
+    *,
+    transcript: str,
+    duration_seconds: float,
+    word_count: int,
+    filler_count: int,
+    attempt_number: int,
+    passes_min_words: bool,
+    passes_min_duration: bool,
+    duplicate_blocked: bool,
+    clarity_rating_1_to_5: int,
+    delivery_rating_1_to_5: int,
+    prev_score: int | None,
+    cfg: dict,
+) -> dict:
+    """Compute the v1.1.0 Speech Delivery / Confidence Score.
+
+    Returns a dict with keys:
+        speech_score (0..100), score_label, score_delta (int or None),
+        score_breakdown {pace, clarity, structure, confidence}, improvement_tip,
+        wpm, filler_pct.
+
+    Each subscore is capped at 25; the four sum to score 0..100. The
+    formula is deliberately simple and inspectable (no ML, no audio
+    decoding) so admins and reviewers can audit it.
+    """
+    sc_cfg = cfg.get("scoring") or {}
+    target_lo = int(sc_cfg.get("target_wpm_min", 100))
+    target_hi = int(sc_cfg.get("target_wpm_max", 160))
+    retry_bonus_cfg = int(sc_cfg.get("retry_improvement_bonus", 5))
+
+    dur = float(duration_seconds or 0.0)
+    wc = int(word_count or 0)
+    fc = int(filler_count or 0)
+
+    # ── PACE (0..25) ──────────────────────────────────────────────────
+    if dur >= 1.0 and wc > 0:
+        wpm = wc * 60.0 / dur
+    else:
+        wpm = 0.0
+
+    def _pace_score(wpm_val: float) -> int:
+        if wpm_val <= 0:
+            return 6
+        if target_lo <= wpm_val <= target_hi:
+            return 25
+        # graceful falloff around the target window
+        soft_lo = target_lo * 0.8
+        soft_hi = target_hi * 1.125
+        if soft_lo <= wpm_val < target_lo or target_hi < wpm_val <= soft_hi:
+            return 18
+        very_lo = target_lo * 0.6
+        very_hi = target_hi * 1.25
+        if very_lo <= wpm_val < soft_lo or soft_hi < wpm_val <= very_hi:
+            return 12
+        return 6
+
+    pace = _pace_score(wpm)
+
+    # ── CLARITY (0..25) ───────────────────────────────────────────────
+    fillers_pct = (fc * 100.0 / wc) if wc > 0 else 0.0
+    if duplicate_blocked:
+        clarity = 6
+    elif clarity_rating_1_to_5 and 1 <= int(clarity_rating_1_to_5) <= 5:
+        clarity = {1: 8, 2: 13, 3: 18, 4: 22, 5: 25}[int(clarity_rating_1_to_5)]
+    else:
+        # Fallback heuristic from filler density (used when Gemini hasn't run
+        # or returned 0). This keeps a Score available immediately on upload.
+        if fillers_pct < 3:
+            clarity = 22
+        elif fillers_pct < 6:
+            clarity = 18
+        elif fillers_pct < 10:
+            clarity = 14
+        elif fillers_pct < 15:
+            clarity = 10
+        else:
+            clarity = 6
+
+    # ── STRUCTURE (0..25) ─────────────────────────────────────────────
+    if passes_min_words and passes_min_duration:
+        structure = 22
+    elif passes_min_words:
+        structure = 17
+    elif passes_min_duration:
+        structure = 14
+    else:
+        structure = 8
+    # bonus for 2+ sentences (rough proxy for multi-idea structure)
+    sentence_bits = [s.strip() for s in re.split(r"[.?!]+", transcript or "") if s.strip()]
+    if len(sentence_bits) >= 2:
+        structure = min(25, structure + 3)
+
+    # ── CONFIDENCE (0..25) ────────────────────────────────────────────
+    if delivery_rating_1_to_5 and 1 <= int(delivery_rating_1_to_5) <= 5:
+        confidence = {1: 10, 2: 14, 3: 18, 4: 22, 5: 25}[int(delivery_rating_1_to_5)]
+    else:
+        confidence = 18  # neutral base when Gemini hasn't rated yet
+    # Filler-density penalty (configurable sensitivity).
+    sens = max(0, int(sc_cfg.get("filler_penalty_per_pct", 1) or 0))
+    penalty = min(8, int(fillers_pct) * sens)
+    confidence = max(6, confidence - penalty)
+
+    # ── Retry-improvement bonus (added to total, capped at 100) ──────
+    base_total = pace + clarity + structure + confidence  # 0..100
+    delta_bonus = 0
+    if attempt_number >= 2 and prev_score is not None and base_total > int(prev_score):
+        delta_bonus = max(0, retry_bonus_cfg)
+
+    total = min(100, max(0, base_total + delta_bonus))
+
+    # ── Improvement tip from weakest subscore ─────────────────────────
+    parts = {"pace": pace, "clarity": clarity, "structure": structure, "confidence": confidence}
+    weakest = min(parts, key=parts.get)
+    tip = _improvement_tip(weakest, fillers_pct=fillers_pct, wpm=wpm,
+                           target_lo=target_lo, target_hi=target_hi)
+
+    score_delta = (total - int(prev_score)) if prev_score is not None else None
+
+    return {
+        "speech_score": int(total),
+        "score_label": _score_label(int(total)),
+        "score_delta": score_delta,
+        "score_breakdown": {
+            "pace": int(pace),
+            "clarity": int(clarity),
+            "structure": int(structure),
+            "confidence": int(confidence),
+        },
+        "improvement_tip": tip,
+        "wpm": round(float(wpm), 1),
+        "filler_pct": round(float(fillers_pct), 1),
+        "retry_bonus_applied": int(delta_bonus),
+        # Scoring transparency for AUDIT_REPORT / future debugging.
+        "score_method": "transcript_timing_v1_1_0",
     }
 
 
@@ -639,10 +919,12 @@ async def _gemini_feedback(
             "delivery_tip": "Speak slowly and clearly.",
             "retry_instruction": "Record one more take.",
             "confidence_message": "Great effort — try again.",
+            "clarity_rating": 0,
+            "delivery_rating": 0,
         }
 
     # Coerce to all-strings, length-bounded.
-    out: dict[str, str] = {}
+    out: dict[str, Any] = {}
     for k in (
         "what_was_clear",
         "corrected_version",
@@ -652,6 +934,13 @@ async def _gemini_feedback(
         "confidence_message",
     ):
         out[k] = str(obj.get(k) or "").strip()[:1200]
+    # v1.1.0 — clamp 1..5 ratings; 0 means "unrated by Gemini, use heuristic".
+    for k in ("clarity_rating", "delivery_rating"):
+        try:
+            v = int(obj.get(k) or 0)
+        except (TypeError, ValueError):
+            v = 0
+        out[k] = max(0, min(5, v))
     return out
 
 
@@ -821,7 +1110,6 @@ def register_ai_assistant_voice_routes(
 
         fraud = cfg.get("fraud") or {}
         miss = cfg.get("missions") or {}
-        rew = cfg.get("rewards") or {}
 
         prompt = _norm(payload.prompt) or _pick_default_prompt(mode)
         mission_id = uuid.uuid4().hex
@@ -942,6 +1230,43 @@ def register_ai_assistant_voice_routes(
         thash = _transcript_hash(sid, str(mission.get("mode") or ""), transcript or "")
         attempt_number = int(mission.get("attempts_completed") or 0) + 1
 
+        # v1.1.0 — count fillers from the transcript only (no audio decode).
+        fillers = _count_fillers(transcript or "")
+
+        # v1.1.0 — compute an initial Speech Delivery Score from transcript
+        # + timing signals only. Final score is recomputed inside /analyze
+        # once Gemini provides clarity_rating / delivery_rating. We pull the
+        # previous attempt's score for retry-improvement delta.
+        prev_score = None
+        try:
+            prev = await db[COL_ATTEMPTS].find_one(
+                {"mission_id": mission_id, "student_id": sid},
+                sort=[("attempt_number", -1)],
+                projection={"speech_score": 1, "_id": 0},
+            )
+            if prev and isinstance(prev.get("speech_score"), int):
+                prev_score = int(prev["speech_score"])
+        except Exception:
+            prev_score = None
+
+        passes_words = wc >= int(fraud.get("min_words", 8))
+        passes_dur = float(duration_seconds or 0) >= float(fraud.get("min_duration_seconds", 10))
+
+        initial_score = _compute_speech_score(
+            transcript=transcript or "",
+            duration_seconds=float(duration_seconds or 0),
+            word_count=wc,
+            filler_count=int(fillers["total"]),
+            attempt_number=attempt_number,
+            passes_min_words=passes_words,
+            passes_min_duration=passes_dur,
+            duplicate_blocked=False,  # checked at /analyze time
+            clarity_rating_1_to_5=0,  # not rated yet
+            delivery_rating_1_to_5=0,
+            prev_score=prev_score,
+            cfg=cfg,
+        )
+
         record = {
             "_id": attempt_id,
             "attempt_id": attempt_id,
@@ -961,10 +1286,20 @@ def register_ai_assistant_voice_routes(
             "duplicate_hash": thash,
             "analysis_result": None,
             "created_at": _now_iso(),
-            "passes_min_words": wc >= int(fraud.get("min_words", 8)),
-            "passes_min_duration": float(duration_seconds or 0) >= float(
-                fraud.get("min_duration_seconds", 10)
-            ),
+            "passes_min_words": passes_words,
+            "passes_min_duration": passes_dur,
+            # v1.1.0 — initial score + filler stats stored at upload time.
+            "filler_count": int(fillers["total"]),
+            "filler_by_word": fillers["by_word"],
+            "speech_score": int(initial_score["speech_score"]),
+            "score_label": str(initial_score["score_label"]),
+            "score_breakdown": initial_score["score_breakdown"],
+            "score_delta": initial_score["score_delta"],
+            "wpm": initial_score["wpm"],
+            "filler_pct": initial_score["filler_pct"],
+            "improvement_tip": initial_score["improvement_tip"],
+            "score_method": initial_score["score_method"],
+            "prev_score": prev_score,
         }
         try:
             await db[COL_ATTEMPTS].insert_one(record)
@@ -991,6 +1326,17 @@ def register_ai_assistant_voice_routes(
             "audio_r2_key": r2_key if public_url else None,
             "passes_min_words": record["passes_min_words"],
             "passes_min_duration": record["passes_min_duration"],
+            # v1.1.0 — Speech Delivery Score + filler stats (initial, no Gemini).
+            "filler_count": int(fillers["total"]),
+            "filler_by_word": fillers["by_word"],
+            "speech_score": int(initial_score["speech_score"]),
+            "score_label": str(initial_score["score_label"]),
+            "score_delta": initial_score["score_delta"],
+            "score_breakdown": initial_score["score_breakdown"],
+            "improvement_tip": initial_score["improvement_tip"],
+            "wpm": initial_score["wpm"],
+            "filler_pct": initial_score["filler_pct"],
+            "score_method": initial_score["score_method"],
         }
 
     # ── Student: analyze (Gemini transcript feedback) ────────────────
@@ -1023,13 +1369,6 @@ def register_ai_assistant_voice_routes(
             log.info("voice: gemini feedback failed: %s", str(exc)[:160])
             feedback = _safe_feedback_fallback(str(mission.get("mode") or MODE_SPEAKING))
 
-        try:
-            await db[COL_ATTEMPTS].update_one(
-                {"_id": att_id}, {"$set": {"analysis_result": feedback, "analyzed_at": _now_iso()}}
-            )
-        except Exception:
-            pass
-
         # Compute eligibility (server-side only).
         fraud = cfg.get("fraud") or {}
         miss = cfg.get("missions") or {}
@@ -1054,11 +1393,80 @@ def register_ai_assistant_voice_routes(
             })
             duplicate_blocked = bool(dup)
 
+        # v1.1.0 — recompute Speech Delivery / Confidence Score using
+        # Gemini's clarity_rating + delivery_rating (when available) plus
+        # the duplicate_blocked flag now known. This is the final score
+        # shown to the student and stored on the attempt.
+        attempt_number = int(attempt.get("attempt_number") or 1)
+        prev_score: int | None = attempt.get("prev_score")
+        if not isinstance(prev_score, int):
+            # Fallback lookup if prev_score wasn't stamped at upload time.
+            try:
+                prev = await db[COL_ATTEMPTS].find_one(
+                    {
+                        "mission_id": payload.mission_id,
+                        "student_id": str(getattr(student, "student_id", "")),
+                        "attempt_number": {"$lt": attempt_number},
+                    },
+                    sort=[("attempt_number", -1)],
+                    projection={"speech_score": 1, "_id": 0},
+                )
+                if prev and isinstance(prev.get("speech_score"), int):
+                    prev_score = int(prev["speech_score"])
+                else:
+                    prev_score = None
+            except Exception:
+                prev_score = None
+
+        score_out = _compute_speech_score(
+            transcript=str(attempt.get("transcript") or ""),
+            duration_seconds=float(attempt.get("duration_seconds") or 0),
+            word_count=int(attempt.get("transcript_word_count") or 0),
+            filler_count=int(attempt.get("filler_count") or 0),
+            attempt_number=attempt_number,
+            passes_min_words=passes_words,
+            passes_min_duration=passes_dur,
+            duplicate_blocked=duplicate_blocked,
+            clarity_rating_1_to_5=int(feedback.get("clarity_rating") or 0),
+            delivery_rating_1_to_5=int(feedback.get("delivery_rating") or 0),
+            prev_score=prev_score,
+            cfg=cfg,
+        )
+
+        # Persist refined score + analysis on the attempt.
+        try:
+            await db[COL_ATTEMPTS].update_one(
+                {"_id": att_id},
+                {"$set": {
+                    "analysis_result": feedback,
+                    "analyzed_at": _now_iso(),
+                    "speech_score": int(score_out["speech_score"]),
+                    "score_label": str(score_out["score_label"]),
+                    "score_delta": score_out["score_delta"],
+                    "score_breakdown": score_out["score_breakdown"],
+                    "improvement_tip": score_out["improvement_tip"],
+                    "wpm": score_out["wpm"],
+                    "filler_pct": score_out["filler_pct"],
+                    "retry_bonus_applied": int(score_out["retry_bonus_applied"]),
+                    "duplicate_blocked": duplicate_blocked,
+                }},
+            )
+        except Exception:
+            pass
+
+        # v1.1.0 — optional reward gate by minimum score (default OFF).
+        sc_cfg = cfg.get("scoring") or {}
+        min_score_required = (
+            bool(sc_cfg.get("min_score_for_reward_enabled", False))
+            and int(score_out["speech_score"]) < int(sc_cfg.get("min_score_for_reward", 50))
+        )
+
         eligible = bool(
             (rew.get("enabled", True)) and
             attempts_completed >= attempts_required and
             passes_words and passes_dur and audio_ok and
             not duplicate_blocked and
+            not min_score_required and
             int(mission.get("reward_points") or 0) > 0
         )
 
@@ -1094,9 +1502,25 @@ def register_ai_assistant_voice_routes(
             "retry_required": retry_required,
             "reward_eligible": eligible,
             "reward_points": int(mission.get("reward_points") or 0),
+            # v1.1.0 — Speech Delivery / Confidence Score (refined with Gemini).
+            "speech_score": int(score_out["speech_score"]),
+            "score_label": str(score_out["score_label"]),
+            "score_delta": score_out["score_delta"],
+            "score_breakdown": score_out["score_breakdown"],
+            "improvement_tip": score_out["improvement_tip"],
+            "wpm": score_out["wpm"],
+            "filler_pct": score_out["filler_pct"],
+            "filler_count": int(attempt.get("filler_count") or 0),
+            "filler_by_word": attempt.get("filler_by_word") or {},
+            "retry_bonus_applied": int(score_out["retry_bonus_applied"]),
+            "prev_score": prev_score,
+            "min_score_for_reward_blocked": bool(min_score_required),
+            "score_method": str(score_out["score_method"]),
             "limitation_notice": (
-                "Feedback is based on the spoken transcript (Web Speech API). "
-                "Phoneme-level pronunciation scoring is NOT included in v1."
+                "Speech Delivery Score is computed from your transcript, timing, "
+                "filler-word count and Gemini's clarity rating. v1.1.0 does NOT "
+                "perform phoneme-level pronunciation scoring, accent detection, "
+                "or certified pronunciation grading."
             ),
         }
 
