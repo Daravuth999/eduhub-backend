@@ -6170,6 +6170,30 @@ except Exception as _ai_asst_err:  # noqa: BLE001
         _ai_asst_err,
     )
 
+# ── AI Assistant Voice Missions + Coach Rewards v1 ───────────────────────
+# Additive, isolated module. Adds /api/ai-assistant/voice/* (student) and
+# /api/admin/ai-assistant/voice-rewards/* (admin). Registers AI Assistant
+# Voice Missions + Coach Rewards routes. The module reuses the existing
+# R2 storage pattern (same five R2_* env vars consumed by
+# _upload_audio_to_r2() above) and credits rewards through the MongoDB
+# wallet_service.WalletService.credit path. It does NOT use GAS /
+# sendPoints for AI Assistant reward credits. The existing _fan_out_push
+# helper is reused for post-credit push notifications. EduTalk, Reader,
+# Premium AI, Login Reward, Referral and payment flows are NOT touched.
+# Failure is non-fatal: if the module fails to load, only voice missions
+# are disabled.
+try:
+    from ai_assistant_voice_tools import register_ai_assistant_voice_routes
+    register_ai_assistant_voice_routes(
+        api, db, require_admin, require_student,
+        fan_out_push=_fan_out_push,
+    )
+except Exception as _ai_voice_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "ai_assistant_voice_tools route registration failed (feature disabled): %s",
+        _ai_voice_err,
+    )
+
 # ── Referral System v1 (additive, isolated module, default OFF) ──────────
 # Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
 # require_admin/require_student, _norm_student_id, GAS treasury constants,
