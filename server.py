@@ -6315,6 +6315,27 @@ if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
         # so the frontend falls back to GAS polling until the flag is flipped.
         wallet_service.register_student_points_routes(api, db, require_student)
 
+        # Phase 5 v1.0.1 — Mongo Points Ledger + My Portal SoT.
+        # Registers GET /api/student/points/transactions (corrected to
+        # handle current shadow_writer records that use from_id/to_id
+        # instead of student_id), GET /api/student/points/latest, and
+        # GET /api/admin/points/transactions. Reads the same
+        # points_wallets / points_transactions collections owned by
+        # wallet_service. Failure is non-fatal — the previous
+        # /api/student/points/history route continues to serve as a
+        # working fallback.
+        try:
+            import points_ledger_api as _points_ledger_api
+            _points_ledger_api.register_points_ledger_routes(
+                api, db, require_student, require_admin,
+            )
+        except Exception as _ledger_err:
+            logging.getLogger(__name__).warning(
+                "points_ledger_api registration skipped/failed (non-fatal): %s",
+                _ledger_err,
+            )
+
+
         # Phase 2 — register shadow_writer with the live db handle.
         # This ensures shadow writes use the same Motor pool as the app.
         # Non-fatal: if shadow_writer import fails, only shadow writes
