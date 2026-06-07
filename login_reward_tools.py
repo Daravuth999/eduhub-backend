@@ -871,6 +871,64 @@ async def lrc_student_claim(
     except Exception as _ph_err:
         _LRC_LOG.warning("login_reward: points_history insert failed: %s", _ph_err)
 
+    # ── v1 (eduhub_portal_latest_bonus_glass_rewards_ui_v1) ──────────────
+    # Write a CONFIRMED row to the canonical Mongo ledger so the
+    # /api/student/points/latest endpoint and the My Portal Rewards box
+    # surface this reward as "Login reward · +N pts" — instead of the
+    # current incorrect "No confirmed reward yet" state observed in
+    # production. This is the missing source-of-truth piece:
+    #   • The GAS credit has already succeeded above (`credit.get("ok")`).
+    #   • The claim row is already finalised as `status: credited` so
+    #     no concurrent caller can produce a second credit.
+    #   • The ledger row is idempotent: a stable `idempotency_key`
+    #     keyed by `campaign_id + student_id_norm` collapses any retry
+    #     (browser refresh, network jitter, the "already_claimed"
+    #     branch) onto the SAME row via `$setOnInsert`. No duplicate
+    #     ledger record, no duplicate points.
+    #   • Failure is non-fatal — the wallet credit itself is owned by
+    #     GAS and the existing claim guard, so a ledger insert error
+    #     can never affect the student's actual balance or the success
+    #     response of this endpoint.
+    try:
+        _wallet_to_id = (
+            getattr(student, "student_id", "")
+            or _norm_student_id(sid_clean)
+            or sid_clean
+        )
+        _ledger_idem = f"login_reward:{campaign_id}:{sid_norm}"
+        await db.points_transactions.update_one(
+            {"idempotency_key": _ledger_idem},
+            {
+                "$setOnInsert": {
+                    "idempotency_key": _ledger_idem,
+                    "from_id":         "treasury",
+                    "to_id":           _wallet_to_id,
+                    "student_id":      _wallet_to_id,
+                    "clean_id":        sid_clean,
+                    "amount":          int(points),
+                    "type":            "credit",
+                    "operation":       "credit",
+                    "delta":           int(points),
+                    "source":          "login_reward",
+                    "source_ref":      campaign_id,
+                    "status":          "confirmed",
+                    "created_at":      finalize_iso,
+                    "payload": {
+                        "campaign_id":   campaign_id,
+                        "campaign_name": camp.get("name") or "",
+                        "clean_id":      sid_clean,
+                        "attempt_id":    attempt_id,
+                    },
+                },
+            },
+            upsert=True,
+        )
+    except Exception as _ledger_err:
+        _LRC_LOG.warning(
+            "login_reward: points_transactions confirmed insert failed (non-fatal): %s",
+            _ledger_err,
+        )
+
     # ── celebration push (best-effort, never raises into the response) ──
     try:
         await _lrc_send_celebration_push(
