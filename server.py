@@ -722,6 +722,88 @@ async def get_book(slug: str):
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4 — admin-only static CDN catalog export.                             #
+#                                                                             #
+# Generates the exact JSON payload an admin should paste into the frontend    #
+# repo at `public/books/index.json` so Vercel serves it as a same-origin      #
+# fast first-paint catalog for the student Library. The payload deliberately  #
+# OMITS every private/heavy field:                                            #
+#                                                                             #
+#   • chapters, content                  — full book content (gated)          #
+#   • _authoredAt, _authoredBy           — internal audit metadata            #
+#   • revision                           — internal version counter           #
+#   • ai_voice                           — internal voice config              #
+#   • format                             — content-engine detail              #
+#                                                                             #
+# Only the safe public-browsing metadata used by Library cards/shelves is     #
+# included:                                                                   #
+#                                                                             #
+#   slug, title, subtitle, author, section, coverEmoji, coverImage,           #
+#   coverGradient, accent, badge, level, readingMinutes, price, tier,         #
+#   newUntil, contentType                                                     #
+#                                                                             #
+# Same source of truth as /api/books: the latest published revision per slug. #
+# Does NOT modify /api/books — purely additive read-only export.              #
+# --------------------------------------------------------------------------- #
+_STATIC_CATALOG_PUBLIC_FIELDS = (
+    "slug", "title", "subtitle", "author", "section", "coverEmoji",
+    "coverImage", "coverGradient", "accent", "badge", "level",
+    "readingMinutes", "price", "tier", "newUntil", "contentType",
+)
+
+
+def _static_catalog_book(doc: dict) -> dict:
+    """Project a cleaned book document onto the Phase 4 catalog shape."""
+    cleaned = _clean_book(doc)
+    return {k: cleaned.get(k) for k in _STATIC_CATALOG_PUBLIC_FIELDS if k in cleaned}
+
+
+@api.get("/admin/books/static-catalog")
+async def admin_books_static_catalog(admin: User = Depends(require_admin)):
+    """Phase 4 — return the static CDN catalog JSON for `public/books/index.json`.
+
+    Source: same as /api/books (latest published revision per slug in
+    `db.books`). Admin-protected because even though every field is
+    public-browsing-safe, we want to avoid exposing a one-shot dump endpoint
+    to anonymous traffic. To refresh the static catalog:
+
+      1. Sign into Author Studio as an admin.
+      2. GET /api/admin/books/static-catalog
+      3. Paste the JSON body into `public/books/index.json` in the
+         frontend repo and redeploy Vercel.
+
+    Generated payload conforms to the documented Phase 4 schema:
+
+        {
+          "success": true,
+          "version": 1,
+          "generated_at": "<ISO-8601 UTC>",
+          "source": "eduhub-backend",
+          "books": [ ...public metadata only... ]
+        }
+    """
+    cursor = db.books.find(
+        {"published": True},
+        {"_id": 0},
+    ).sort([("slug", 1), ("revision", -1)])
+    seen: set[str] = set()
+    books: list[dict] = []
+    async for doc in cursor:
+        slug = doc.get("slug") or ""
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        books.append(_static_catalog_book(doc))
+    return {
+        "success": True,
+        "version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "eduhub-backend",
+        "books": books,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Studio   admin CRUD                                                         #
 # --------------------------------------------------------------------------- #
 @api.get("/studio/books")
