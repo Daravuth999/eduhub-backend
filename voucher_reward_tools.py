@@ -1,25 +1,25 @@
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ voucher_reward_tools.py — Student-facing Book Voucher LISTING layer        ║
-# ║ (reward-kind integration v1.0.2)                                          ║
-# ╠══════════════════════════════════════════════════════════════════════════╣
-# ║ DESIGN                                                                     ║
-# ║   • Vouchers are ISSUED by login_reward_tools.py as part of the Login     ║
-# ║     Reward campaign claim (reward_kind = "voucher" | "points_voucher").   ║
-# ║     That module owns the `student_vouchers` collection, the coupon        ║
-# ║     creation (via the EXISTING db.coupons schema + _generate_coupon_code) ║
-# ║     and the compose/status helpers. This module is a thin READ surface.   ║
-# ║   • Source of truth = MongoDB (`student_vouchers` + `db.coupons`). NEVER  ║
-# ║     localStorage.                                                          ║
-# ║   • Redemption uses the EXISTING /api/coupons/validate + /api/coupons/    ║
-# ║     redeem endpoints, which this module does NOT touch.                   ║
-# ║                                                                            ║
-# ║ LOADING                                                                    ║
-# ║   exec()'d into server.py's namespace immediately AFTER login_reward_     ║
-# ║   tools.py, so it reuses: api, db, require_student, Student, _norm_       ║
-# ║   student_id, and the login-reward helpers _lrc_student_vouchers /        ║
-# ║   _lrc_compose_voucher_payload / _lrc_iso / _lrc_now. Failure is non-     ║
-# ║   fatal (the loader wraps this in try/except).                            ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+﻿# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘ voucher_reward_tools.py â€” Student-facing Book Voucher LISTING layer        â•‘
+# â•‘ (reward-kind integration v1.0.2)                                          â•‘
+# â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
+# â•‘ DESIGN                                                                     â•‘
+# â•‘   â€¢ Vouchers are ISSUED by login_reward_tools.py as part of the Login     â•‘
+# â•‘     Reward campaign claim (reward_kind = "voucher" | "points_voucher").   â•‘
+# â•‘     That module owns the `student_vouchers` collection, the coupon        â•‘
+# â•‘     creation (via the EXISTING db.coupons schema + _generate_coupon_code) â•‘
+# â•‘     and the compose/status helpers. This module is a thin READ surface.   â•‘
+# â•‘   â€¢ Source of truth = MongoDB (`student_vouchers` + `db.coupons`). NEVER  â•‘
+# â•‘     localStorage.                                                          â•‘
+# â•‘   â€¢ Redemption uses the EXISTING /api/coupons/validate + /api/coupons/    â•‘
+# â•‘     redeem endpoints, which this module does NOT touch.                   â•‘
+# â•‘                                                                            â•‘
+# â•‘ LOADING                                                                    â•‘
+# â•‘   exec()'d into server.py's namespace immediately AFTER login_reward_     â•‘
+# â•‘   tools.py, so it reuses: api, db, require_student, Student, _norm_       â•‘
+# â•‘   student_id, and the login-reward helpers _lrc_student_vouchers /        â•‘
+# â•‘   _lrc_compose_voucher_payload / _lrc_iso / _lrc_now. Failure is non-     â•‘
+# â•‘   fatal (the loader wraps this in try/except).                            â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 import logging as _vrt_logging
 
@@ -28,7 +28,7 @@ _VRT_LOG = _vrt_logging.getLogger("eduhub")
 # Reuse the issuer module's collection handle + helpers (already present in
 # the shared exec namespace). Defensive fallbacks keep this importable even
 # if the names ever move.
-_vrt_student_vouchers = globals().get("_lrc_student_vouchers") or db["student_vouchers"]
+_vrt_student_vouchers = globals().get("_lrc_student_vouchers") if globals().get("_lrc_student_vouchers") is not None else db["student_vouchers"]
 
 
 def _vrt_norm(value) -> str:
