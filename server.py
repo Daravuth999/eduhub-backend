@@ -6235,6 +6235,20 @@ except Exception as _lrc_load_err:
         "login_reward_tools.py failed to load (feature disabled): %s",
         _lrc_load_err,
     )
+# ── Book Voucher listing layer (reward-kind v1.0.2, additive, isolated) ───
+# Loaded immediately AFTER login_reward_tools.py so it can reuse the issuer
+# helpers (_lrc_student_vouchers / _lrc_compose_voucher_payload) already in
+# this namespace. Adds /api/student/vouchers (GET, student). Vouchers are
+# ISSUED inside the login-reward claim itself; this module only lists them.
+# Redemption continues through the EXISTING /api/coupons/* flow. Failure is
+# non-fatal — only the voucher listing endpoint is skipped on load error.
+try:
+    exec(open(__import__("pathlib").Path(__file__).parent / "voucher_reward_tools.py").read())
+except Exception as _vrt_load_err:
+    logging.getLogger("eduhub").warning(
+        "voucher_reward_tools.py failed to load (feature disabled): %s",
+        _vrt_load_err,
+    )
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)

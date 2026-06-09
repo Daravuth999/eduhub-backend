@@ -46,6 +46,10 @@ _LRC_STALE_PENDING_SECONDS = 90
 # ── collections ──────────────────────────────────────────────────────────────
 _lrc_campaigns = db["login_reward_campaigns"]
 _lrc_claims    = db["login_reward_claims"]
+# Reward-kind v1.0.2 — single source of truth for issued vouchers (NEVER
+# localStorage). One row per (campaign_id, student_id_norm). The coupon
+# itself lives in the existing db.coupons collection.
+_lrc_student_vouchers = db["student_vouchers"]
 _LRC_LOG = log  # reuse server logger
 
 
@@ -175,6 +179,15 @@ async def _lrc_ensure_indexes() -> None:
         )
         await _lrc_claims.create_index("student_id_norm")
         await _lrc_claims.create_index("campaign_id")
+        # Reward-kind v1.0.2 — one voucher per student per campaign (the
+        # crucial double-issue guard). Plus lookup indexes for the hub.
+        await _lrc_student_vouchers.create_index(
+            [("campaign_id", 1), ("student_id_norm", 1)],
+            unique=True,
+            name="uniq_voucher_campaign_student",
+        )
+        await _lrc_student_vouchers.create_index("student_id_norm")
+        await _lrc_student_vouchers.create_index("coupon_code")
         _LRC_LOG.info("login_reward_tools: indexes ensured")
     except Exception as _e:
         _LRC_LOG.warning("login_reward_tools: startup index ensure failed: %s", _e)
@@ -229,6 +242,195 @@ class _LRCCampaignIn(BaseModel):
     countdown_label: str | None = ""
     urgency_text: str | None = ""
 
+    # ── Reward-kind integration v1.0.2 (additive, default-compatible) ─────
+    # A campaign can reward Points, a Book Voucher, or BOTH. Existing
+    # campaigns (and any client that omits these fields) default to
+    # reward_kind="points", which keeps the legacy points-only behaviour
+    # byte-identical: the points pipeline below is unchanged for "points".
+    #   • "points"          → credit points only (legacy path).
+    #   • "voucher"          → issue a Book Voucher only; reward_points is
+    #                          NOT required and is forced to 0 so the
+    #                          treasury credit path is never invoked.
+    #   • "points_voucher"   → credit points (legacy path) AND issue a
+    #                          Book Voucher as a best-effort follow-up.
+    reward_kind: Literal["points", "voucher", "points_voucher"] = "points"
+
+    # Voucher configuration. Only consumed when reward_kind includes a
+    # voucher. The voucher is materialised as a real coupon in db.coupons
+    # using the EXISTING coupon schema (uses_count / redemptions / max_uses
+    # / type / value / assigned_to / book_slugs / valid_from / expires_at /
+    # enabled) and redeemed through the EXISTING /api/coupons flow.
+    voucher_discount_type: Literal["percent", "fixed"] = "percent"
+    voucher_discount_value: float = 0
+    voucher_max_uses: int | None = 1          # per issued coupon; None = unlimited
+    voucher_valid_days: int | None = None     # expiry = claim time + N days
+    voucher_expires_at: str | None = None     # optional explicit ISO override
+    voucher_book_slugs: list[str] | str | None = None   # [] / empty = all books
+    voucher_title: str | None = "Book Voucher"
+    voucher_subtitle: str | None = ""
+    voucher_discount_label: str | None = ""   # auto-derived when blank
+    voucher_template: str | None = "royal_purple_gold"
+    voucher_accent_color: str | None = "#D4A843"
+    voucher_artwork_url: str | None = ""
+    voucher_cta_label: str | None = "Use Voucher"
+
+    # Reward-kind v1.0.3 — coupon source. "auto" mints a fresh unique
+    # single-use coupon per student on claim (default, unchanged). "existing"
+    # links an admin-provided coupon code that already exists in db.coupons;
+    # no new coupon is minted and the existing coupon's own config (discount,
+    # max_uses, expiry, assignment) governs redemption.
+    voucher_source: Literal["auto", "existing"] = "auto"
+    voucher_existing_code: str | None = ""
+
+
+# Built-in premium voucher templates (gradient identifiers shared with the
+# student VoucherHub / popup reveal). Anything outside this set falls back
+# to the first entry so a typo can never produce an unstyled card.
+_LRC_VOUCHER_TEMPLATES = (
+    "royal_purple_gold",
+    "ocean_blue_glass",
+    "emerald_learning_pass",
+    "black_diamond_premium",
+    "warm_ivory_gift_card",
+    "festival_celebration",
+)
+
+
+def _lrc_safe_artwork_url(value) -> str:
+    """Strict allow-list for admin-supplied voucher artwork URLs.
+
+    Mirrors the client-side `safeArtworkUrl` guard. Allows only https://…
+    or app-relative /paths. Rejects http://, javascript:, data:, blob:,
+    file:, about:, vbscript:, protocol-relative //host, any control char /
+    whitespace / quote / angle bracket / backtick, embedded <svg/<script,
+    and anything over 1000 chars. Returns "" on any failure so the caller
+    falls back to the built-in template gradient. Rendering is ALWAYS via
+    <img src=…> — never dangerouslySetInnerHTML.
+    """
+    raw = ("" if value is None else str(value)).strip()
+    if not raw or len(raw) > 1000:
+        return ""
+    for ch in raw:
+        o = ord(ch)
+        if o < 0x20 or ch in " \t\r\n\"'`<>":
+            return ""
+    low = raw.lower()
+    for bad in ("javascript:", "data:", "vbscript:", "file:", "blob:", "about:", "http://"):
+        if low.startswith(bad):
+            return ""
+    if "<svg" in low or "<script" in low:
+        return ""
+    if raw.startswith("//"):
+        return ""
+    if not (raw.startswith("https://") or raw.startswith("/")):
+        return ""
+    return raw
+
+
+def _lrc_voucher_discount_label(dtype: str, value) -> str:
+    """Human label for a voucher discount, e.g. '20% off' / '10 pts off'."""
+    try:
+        v = float(value)
+    except Exception:
+        return ""
+    vi = int(v) if float(v).is_integer() else v
+    if (dtype or "").lower() == "percent":
+        return f"{vi}% off"
+    return f"{vi} pts off"
+
+
+def _lrc_validate_voucher_fields(p: "_LRCCampaignIn") -> dict:
+    """Validate + normalise the voucher reward sub-config. Raises
+    HTTPException(400) on invalid input. Returns a Mongo-ready sub-dict
+    of voucher_* fields (always present so reads are uniform)."""
+    # Coupon source (v1.0.3). "existing" links an admin-provided coupon that
+    # already lives in db.coupons; that coupon's own discount/limits/expiry
+    # govern redemption, so the campaign discount fields are NOT required.
+    source = (p.voucher_source or "auto").strip().lower()
+    if source not in ("auto", "existing"):
+        source = "auto"
+    existing_code = (p.voucher_existing_code or "").strip().upper()
+    if source == "existing" and not existing_code:
+        raise HTTPException(status_code=400, detail="Select an existing coupon code, or use auto-create.")
+
+    dtype = (p.voucher_discount_type or "percent").strip().lower()
+    if dtype not in ("percent", "fixed"):
+        raise HTTPException(status_code=400, detail="voucher_discount_type must be 'percent' or 'fixed'")
+    try:
+        dval = float(p.voucher_discount_value or 0)
+    except Exception:
+        raise HTTPException(status_code=400, detail="voucher_discount_value must be a number")
+    if source == "auto":
+        # Auto-create mints a new coupon, so a valid discount IS required.
+        if dval <= 0:
+            raise HTTPException(status_code=400, detail="voucher_discount_value must be > 0")
+        if dtype == "percent" and dval > 100:
+            raise HTTPException(status_code=400, detail="voucher percent discount cannot exceed 100")
+    else:
+        # Existing coupon owns the real discount; campaign value is advisory.
+        if dval < 0:
+            dval = 0.0
+        if dtype == "percent" and dval > 100:
+            dval = 100.0
+
+    max_uses = p.voucher_max_uses
+    if max_uses in (None, "", 0):
+        max_uses = None
+    else:
+        try:
+            max_uses = int(max_uses)
+        except Exception:
+            raise HTTPException(status_code=400, detail="voucher_max_uses must be an integer or null")
+        if max_uses < 1:
+            max_uses = 1
+
+    valid_days = p.voucher_valid_days
+    if valid_days in (None, "", 0):
+        valid_days = None
+    else:
+        try:
+            valid_days = int(valid_days)
+        except Exception:
+            raise HTTPException(status_code=400, detail="voucher_valid_days must be an integer or null")
+        if valid_days < 1:
+            valid_days = None
+
+    expires_override = (p.voucher_expires_at or "").strip() or None
+    if expires_override and not _lrc_parse_iso(expires_override):
+        raise HTTPException(status_code=400, detail="voucher_expires_at must be an ISO datetime or null")
+
+    book_slugs = _lrc_norm_id_list(p.voucher_book_slugs)
+
+    template = (p.voucher_template or "royal_purple_gold").strip().lower()
+    if template not in _LRC_VOUCHER_TEMPLATES:
+        template = _LRC_VOUCHER_TEMPLATES[0]
+
+    accent = (p.voucher_accent_color or "#D4A843").strip() or "#D4A843"
+    artwork = _lrc_safe_artwork_url(p.voucher_artwork_url)
+
+    title = (p.voucher_title or "Book Voucher").strip()[:80] or "Book Voucher"
+    subtitle = (p.voucher_subtitle or "").strip()[:140]
+    cta = (p.voucher_cta_label or "Use Voucher").strip()[:40] or "Use Voucher"
+    label = (p.voucher_discount_label or "").strip()[:60] or _lrc_voucher_discount_label(dtype, dval)
+
+    return {
+        "voucher_discount_type": dtype,
+        "voucher_discount_value": dval,
+        "voucher_max_uses": max_uses,
+        "voucher_valid_days": valid_days,
+        "voucher_expires_at": expires_override,
+        "voucher_book_slugs": book_slugs,
+        "voucher_title": title,
+        "voucher_subtitle": subtitle,
+        "voucher_discount_label": label,
+        "voucher_template": template,
+        "voucher_accent_color": accent,
+        "voucher_artwork_url": artwork,
+        "voucher_cta_label": cta,
+        "voucher_source": source,
+        "voucher_existing_code": existing_code,
+    }
+
 
 def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
     """Convert + validate an inbound campaign body into a Mongo-ready dict."""
@@ -236,11 +438,53 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
     if len(name) > 200:
         raise HTTPException(status_code=400, detail="Name too long (max 200 chars)")
 
+    # ── Reward-kind aware validation (v1.0.2) ─────────────────────────────
+    # Default "points" preserves the exact legacy contract (1..1000 required).
+    # "voucher" is a voucher-only campaign: points are NOT required and are
+    # forced to 0 so the treasury/points pipeline is never entered for it.
+    # "points_voucher" requires valid points AND a valid voucher config.
+    reward_kind = (p.reward_kind or "points").strip().lower()
+    if reward_kind not in ("points", "voucher", "points_voucher"):
+        reward_kind = "points"
+
     points = int(p.reward_points or 0)
-    if points <= 0:
-        raise HTTPException(status_code=400, detail="reward_points must be > 0")
-    if points > 1000:
-        raise HTTPException(status_code=400, detail="reward_points must be <= 1000")
+    if reward_kind == "voucher":
+        # Voucher-only: never award points. Clamp silently to 0 instead of
+        # rejecting, so an admin who leaves the legacy default 20 in the
+        # points box can still save a voucher-only campaign.
+        points = 0
+    else:
+        if points <= 0:
+            raise HTTPException(status_code=400, detail="reward_points must be > 0")
+        if points > 1000:
+            raise HTTPException(status_code=400, detail="reward_points must be <= 1000")
+
+    # Validate the voucher sub-config only when the campaign issues a voucher.
+    voucher_fields: dict
+    if reward_kind in ("voucher", "points_voucher"):
+        voucher_fields = _lrc_validate_voucher_fields(p)
+    else:
+        # Persist inert defaults so every campaign doc has a uniform shape
+        # and an admin can switch a points campaign to a voucher later.
+        voucher_fields = {
+            "voucher_discount_type": (p.voucher_discount_type or "percent"),
+            "voucher_discount_value": float(p.voucher_discount_value or 0),
+            "voucher_max_uses": (int(p.voucher_max_uses) if p.voucher_max_uses else None),
+            "voucher_valid_days": (int(p.voucher_valid_days) if p.voucher_valid_days else None),
+            "voucher_expires_at": ((p.voucher_expires_at or "").strip() or None),
+            "voucher_book_slugs": _lrc_norm_id_list(p.voucher_book_slugs),
+            "voucher_title": (p.voucher_title or "Book Voucher").strip()[:80] or "Book Voucher",
+            "voucher_subtitle": (p.voucher_subtitle or "").strip()[:140],
+            "voucher_discount_label": (p.voucher_discount_label or "").strip()[:60],
+            "voucher_template": ((p.voucher_template or "royal_purple_gold").strip().lower()
+                                 if (p.voucher_template or "royal_purple_gold").strip().lower() in _LRC_VOUCHER_TEMPLATES
+                                 else _LRC_VOUCHER_TEMPLATES[0]),
+            "voucher_accent_color": (p.voucher_accent_color or "#D4A843").strip() or "#D4A843",
+            "voucher_artwork_url": _lrc_safe_artwork_url(p.voucher_artwork_url),
+            "voucher_cta_label": (p.voucher_cta_label or "Use Voucher").strip()[:40] or "Use Voucher",
+            "voucher_source": ((p.voucher_source or "auto").strip().lower() if (p.voucher_source or "auto").strip().lower() in ("auto", "existing") else "auto"),
+            "voucher_existing_code": (p.voucher_existing_code or "").strip().upper(),
+        }
 
     start_dt = _lrc_parse_iso(p.start_at) or _lrc_now()
     end_dt   = _lrc_parse_iso(p.end_at) or (start_dt + timedelta(days=7))
@@ -313,6 +557,7 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
         "end_at": _lrc_iso(end_dt),
         "timezone": (p.timezone or "Asia/Phnom_Penh").strip() or "Asia/Phnom_Penh",
         "reward_type": "fixed",
+        "reward_kind": reward_kind,
         "reward_points": points,
         "reward_label": (p.reward_label or "").strip(),
         "audience_type": aud,
@@ -334,6 +579,8 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
         "countdown_seconds": countdown_seconds,
         "countdown_label": countdown_label,
         "urgency_text": urgency_text,
+        # Reward-kind voucher sub-config v1.0.2 (additive).
+        **voucher_fields,
     }
 
 
@@ -493,9 +740,38 @@ async def _lrc_pick_active_for_student(student_norm_id: str) -> dict | None:
 def _lrc_public_view(camp: dict) -> dict:
     """Strip internal fields before returning to students."""
     out = _lrc_serialize(camp)
+
+    # Reward-kind v1.0.2 — expose the kind and a DISPLAY-ONLY voucher preview
+    # so the pre-claim popup can render a "+ Book Voucher" teaser without the
+    # actual coupon code (which only exists after a successful claim). The
+    # raw voucher config (max_uses, exact book slugs list, valid_days) stays
+    # server-side.
+    reward_kind = (out.get("reward_kind") or "points").strip().lower()
+    out["reward_kind"] = reward_kind
+    if reward_kind in ("voucher", "points_voucher"):
+        slugs = list(out.get("voucher_book_slugs") or [])
+        out["voucher_preview"] = {
+            "title": out.get("voucher_title") or "Book Voucher",
+            "subtitle": out.get("voucher_subtitle") or "",
+            "discount_label": out.get("voucher_discount_label")
+                or _lrc_voucher_discount_label(out.get("voucher_discount_type"), out.get("voucher_discount_value")),
+            "template": out.get("voucher_template") or "royal_purple_gold",
+            "accent_color": out.get("voucher_accent_color") or "#D4A843",
+            "artwork_url": _lrc_safe_artwork_url(out.get("voucher_artwork_url")),
+            "cta_label": out.get("voucher_cta_label") or "Use Voucher",
+            "applies_to_all_books": not bool(slugs),
+            "eligible_book_count": len(slugs),
+        }
+
     for k in (
         "include_student_ids", "exclude_student_ids", "notes",
         "created_by", "audience_type", "priority", "claim_limit_per_student",
+        # raw voucher config — not for the client
+        "voucher_discount_type", "voucher_discount_value", "voucher_max_uses",
+        "voucher_valid_days", "voucher_expires_at", "voucher_book_slugs",
+        "voucher_title", "voucher_subtitle", "voucher_discount_label",
+        "voucher_template", "voucher_accent_color", "voucher_artwork_url",
+        "voucher_cta_label", "voucher_source", "voucher_existing_code",
     ):
         out.pop(k, None)
     # v1.2 — surface the student's per-campaign claim state in stable,
@@ -566,6 +842,283 @@ async def _lrc_credit_via_treasury(*, student_clean_id: str, points: int,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
+
+
+# ── voucher issuance (reward-kind v1.0.2) ───────────────────────────────────
+# A voucher is materialised as a REAL coupon in the existing db.coupons
+# collection (exact existing schema) plus a row in student_vouchers (the
+# single source of truth for ownership — never localStorage). Redemption
+# happens through the EXISTING /api/coupons/validate + /api/coupons/redeem
+# flow, which is left completely untouched.
+def _lrc_gen_coupon_code(length: int = 8) -> str:
+    gen = globals().get("_generate_coupon_code")
+    if callable(gen):
+        return gen(length)
+    import string as _s
+    return "".join(_lrc_secrets.choice(_s.ascii_uppercase + _s.digits) for _ in range(length))
+
+
+def _lrc_voucher_status(row: dict, coupon: dict | None) -> str:
+    """Live status, reading the EXISTING coupon's `uses_count` (NOT `uses`)."""
+    if (row.get("status") or "") == "used" or row.get("used_at"):
+        return "used"
+    if not coupon or not coupon.get("enabled", True):
+        return "unavailable"
+    exp = _lrc_parse_iso(coupon.get("expires_at"))
+    if exp and _lrc_now() > exp:
+        return "expired"
+    mu = coupon.get("max_uses")
+    if mu is not None and int(coupon.get("uses_count") or 0) >= int(mu):
+        # A single-use personal voucher that has been redeemed reads as
+        # "used" (not "sold out"), even if the redemptions-id backfill missed.
+        return "used" if int(mu) == 1 else "exhausted"
+    return "active"
+
+
+async def _lrc_compose_voucher_payload(row: dict) -> dict:
+    """Build a student-facing voucher object from a student_vouchers row,
+    reading live discount/expiry/status from the linked coupon."""
+    coupon = None
+    code = (row.get("coupon_code") or "")
+    if code:
+        try:
+            coupon = await db.coupons.find_one({"code": code}, {"_id": 0})
+        except Exception:
+            coupon = None
+    coupon = coupon or {}
+    slugs = list(coupon.get("book_slugs") or row.get("eligible_books") or [])
+    dtype = coupon.get("type") or row.get("discount_type") or "percent"
+    dval = coupon.get("value") if coupon.get("value") is not None else row.get("discount_value")
+    return {
+        "voucher_id": row.get("id") or "",
+        "campaign_id": row.get("campaign_id"),
+        "campaign_name": row.get("campaign_name") or "",
+        "coupon_code": code,
+        "reward_kind": row.get("reward_kind") or "voucher",
+        "title": row.get("title") or "Book Voucher",
+        "subtitle": row.get("subtitle") or "",
+        "discount_label": row.get("discount_label") or _lrc_voucher_discount_label(dtype, dval),
+        "discount_type": dtype,
+        "discount_value": dval,
+        "expires_at": coupon.get("expires_at") or row.get("expires_at"),
+        "valid_from": coupon.get("valid_from") or row.get("valid_from"),
+        "status": _lrc_voucher_status(row, coupon if coupon else None),
+        "eligible_books": slugs,
+        "book_slugs": slugs,
+        "applies_to_all_books": not bool(slugs),
+        "template_style": row.get("template") or "royal_purple_gold",
+        "artwork_url": _lrc_safe_artwork_url(row.get("artwork_url")),
+        "artwork_mode": ("custom_url" if _lrc_safe_artwork_url(row.get("artwork_url")) else "template"),
+        "accent_color": row.get("accent_color") or "#D4A843",
+        "cta_label": row.get("cta_label") or "Use Voucher",
+        "claimed_at": row.get("claimed_at"),
+        "used_at": row.get("used_at"),
+        "redeemed_book_slug": row.get("redeemed_book_slug"),
+    }
+
+
+async def _lrc_issue_voucher_for_claim(camp: dict, sid_clean: str, sid_norm: str) -> dict | None:
+    """Idempotently issue (or return) the Book Voucher for a claimed campaign.
+
+    Safe to call multiple times: one coupon + one student_vouchers row per
+    (campaign, student). Returns the composed voucher payload, or None if
+    the campaign has no voucher discount configured (defensive)."""
+    campaign_id = camp.get("id") or camp.get("campaign_id")
+    if not campaign_id:
+        return None
+
+    # Already issued? Return it (idempotent).
+    existing = await _lrc_student_vouchers.find_one(
+        {"campaign_id": campaign_id, "student_id_norm": sid_norm}, {"_id": 0}
+    )
+    if existing:
+        return await _lrc_compose_voucher_payload(existing)
+
+    now = _lrc_now()
+    now_iso = _lrc_iso(now)
+    source = (camp.get("voucher_source") or "auto").strip().lower()
+
+    # ── "existing" source (v1.0.3): link an admin-provided coupon that ──────
+    # already exists in db.coupons. We do NOT mint a new coupon and we do NOT
+    # modify the existing one — its own discount / max_uses / expiry / assigned_to
+    # govern redemption. We only record a student_vouchers row that points at it,
+    # so the same code is shared across recipients (first-come within the
+    # coupon's own usage limits). The blocking redeem in the Library guarantees
+    # an exhausted/disabled coupon cannot grant a discounted unlock.
+    if source == "existing":
+        code = (camp.get("voucher_existing_code") or "").strip().upper()
+        if not code:
+            _LRC_LOG.warning("login_reward: existing-coupon source but no code campaign=%s", campaign_id)
+            return None
+        coupon = None
+        try:
+            coupon = await db.coupons.find_one({"code": code}, {"_id": 0})
+        except Exception:
+            coupon = None
+        if not coupon:
+            _LRC_LOG.warning("login_reward: existing coupon %s not found campaign=%s", code, campaign_id)
+            return None
+        c_slugs = list(coupon.get("book_slugs") or [])
+        c_label = (camp.get("voucher_discount_label") or "").strip() or _lrc_voucher_discount_label(
+            coupon.get("type"), coupon.get("value")
+        )
+        row = {
+            "id": "sv_" + _lrc_secrets.token_hex(8),
+            "campaign_id": campaign_id,
+            "campaign_name": camp.get("name") or "",
+            "student_id": sid_clean,
+            "student_id_norm": sid_norm,
+            "coupon_code": code,
+            "reward_kind": (camp.get("reward_kind") or "voucher"),
+            "title": camp.get("voucher_title") or "Book Voucher",
+            "subtitle": camp.get("voucher_subtitle") or "",
+            "discount_label": c_label,
+            "discount_type": coupon.get("type") or "percent",
+            "discount_value": coupon.get("value"),
+            "template": camp.get("voucher_template") or "royal_purple_gold",
+            "accent_color": camp.get("voucher_accent_color") or "#D4A843",
+            "artwork_url": _lrc_safe_artwork_url(camp.get("voucher_artwork_url")),
+            "cta_label": camp.get("voucher_cta_label") or "Use Voucher",
+            "eligible_books": c_slugs,
+            "applies_to_all_books": not bool(c_slugs),
+            "expires_at": coupon.get("expires_at"),
+            "valid_from": coupon.get("valid_from") or now_iso,
+            "claimed_at": now_iso,
+            "used_at": None,
+            "redeemed_book_slug": None,
+            "status": "active",
+            "source": "login_reward_voucher_existing",
+        }
+        try:
+            await _lrc_student_vouchers.insert_one(row)
+        except Exception:
+            winner = await _lrc_student_vouchers.find_one(
+                {"campaign_id": campaign_id, "student_id_norm": sid_norm}, {"_id": 0}
+            )
+            if winner:
+                return await _lrc_compose_voucher_payload(winner)
+            return None
+        _LRC_LOG.info("login_reward: linked existing coupon %s to %s campaign=%s", code, sid_clean, campaign_id)
+        return await _lrc_compose_voucher_payload(row)
+
+    # ── "auto" source (default): mint a fresh unique single-use coupon. ─────
+    dtype = (camp.get("voucher_discount_type") or "percent").strip().lower()
+    try:
+        dval = float(camp.get("voucher_discount_value") or 0)
+    except Exception:
+        dval = 0.0
+    if dval <= 0:
+        _LRC_LOG.warning("login_reward: voucher discount not configured for campaign=%s", campaign_id)
+        return None
+
+    # Generate a unique coupon code using the EXISTING generator.
+    code = _lrc_gen_coupon_code(8)
+    for _ in range(6):
+        if not await db.coupons.find_one({"code": code}, {"_id": 0}):
+            break
+        code = _lrc_gen_coupon_code(8)
+    else:
+        _LRC_LOG.error("login_reward: could not generate unique coupon code campaign=%s", campaign_id)
+        return None
+
+    now = _lrc_now()
+    now_iso = _lrc_iso(now)
+
+    # Expiry precedence: explicit override → valid_days → campaign end_at → none.
+    exp_iso = None
+    if camp.get("voucher_expires_at"):
+        d = _lrc_parse_iso(camp.get("voucher_expires_at"))
+        exp_iso = _lrc_iso(d) if d else None
+    elif camp.get("voucher_valid_days"):
+        try:
+            exp_iso = _lrc_iso(now + timedelta(days=int(camp.get("voucher_valid_days"))))
+        except Exception:
+            exp_iso = None
+    else:
+        d = _lrc_parse_iso(camp.get("end_at"))
+        exp_iso = _lrc_iso(d) if d else None
+
+    book_slugs = list(camp.get("voucher_book_slugs") or [])
+    raw_max = camp.get("voucher_max_uses")
+    try:
+        max_uses = int(raw_max) if raw_max not in (None, "", 0) else 1
+    except Exception:
+        max_uses = 1
+    if max_uses < 1:
+        max_uses = 1
+
+    # Coupon document — EXACT existing coupon schema (uses_count / redemptions
+    # / max_uses / type / value / assigned_to / book_slugs / valid_from /
+    # expires_at / enabled). assigned_to is intentionally [] (public): the
+    # code is single-use and only revealed to its owner, which avoids any
+    # redeem-time identity mismatch locking the owner out of their own reward.
+    coupon_doc = {
+        "code": code,
+        "type": dtype,
+        "value": dval,
+        "max_uses": max_uses,
+        "uses_count": 0,
+        "assigned_to": [],
+        "book_slugs": book_slugs,
+        "valid_from": now_iso,
+        "expires_at": exp_iso,
+        "enabled": True,
+        "created_by": "login_reward",
+        "created_at": now_iso,
+        "redemptions": [],
+        # additive provenance fields (ignored by the existing coupon flow)
+        "source": "login_reward_voucher",
+        "campaign_id": campaign_id,
+    }
+    try:
+        await db.coupons.insert_one(coupon_doc)
+    except Exception as _ce:
+        _LRC_LOG.warning("login_reward: coupon insert failed campaign=%s err=%s", campaign_id, _ce)
+        return None
+
+    label = (camp.get("voucher_discount_label") or "").strip() or _lrc_voucher_discount_label(dtype, dval)
+    row = {
+        "id": "sv_" + _lrc_secrets.token_hex(8),
+        "campaign_id": campaign_id,
+        "campaign_name": camp.get("name") or "",
+        "student_id": sid_clean,
+        "student_id_norm": sid_norm,
+        "coupon_code": code,
+        "reward_kind": (camp.get("reward_kind") or "voucher"),
+        "title": camp.get("voucher_title") or "Book Voucher",
+        "subtitle": camp.get("voucher_subtitle") or "",
+        "discount_label": label,
+        "discount_type": dtype,
+        "discount_value": dval,
+        "template": camp.get("voucher_template") or "royal_purple_gold",
+        "accent_color": camp.get("voucher_accent_color") or "#D4A843",
+        "artwork_url": _lrc_safe_artwork_url(camp.get("voucher_artwork_url")),
+        "cta_label": camp.get("voucher_cta_label") or "Use Voucher",
+        "eligible_books": book_slugs,
+        "applies_to_all_books": not bool(book_slugs),
+        "expires_at": exp_iso,
+        "valid_from": now_iso,
+        "claimed_at": now_iso,
+        "used_at": None,
+        "redeemed_book_slug": None,
+        "status": "active",
+        "source": "login_reward_voucher",
+    }
+    try:
+        await _lrc_student_vouchers.insert_one(row)
+    except Exception:
+        # Lost the unique-index race with a concurrent claim. The winner's row
+        # is authoritative; our just-created coupon becomes a harmless orphan
+        # (single-use, never revealed). Return the existing voucher.
+        winner = await _lrc_student_vouchers.find_one(
+            {"campaign_id": campaign_id, "student_id_norm": sid_norm}, {"_id": 0}
+        )
+        if winner:
+            return await _lrc_compose_voucher_payload(winner)
+        return None
+
+    _LRC_LOG.info("login_reward: issued voucher %s to %s campaign=%s", code, sid_clean, campaign_id)
+    return await _lrc_compose_voucher_payload(row)
 
 
 # ── celebration push (best-effort, never blocks the claim) ──────────────────
@@ -648,6 +1201,51 @@ async def lrc_student_claim(
     if not _lrc_eligible(camp, sid_norm):
         raise HTTPException(status_code=403, detail="Not eligible for this campaign")
 
+    # ── Reward-kind branch (v1.0.2) ───────────────────────────────────────
+    # Voucher-ONLY campaigns never enter the points/treasury pipeline below.
+    # We write a single idempotent "credited" claim row (so the campaign is
+    # correctly hidden after claim by _lrc_pick_active_for_student) and issue
+    # the Book Voucher. reward_points is irrelevant here. The existing
+    # points-only and points+voucher paths fall through unchanged.
+    reward_kind = (camp.get("reward_kind") or "points").strip().lower()
+    if reward_kind == "voucher":
+        v_now_iso = _lrc_iso(_lrc_now())
+        v_claim_doc = {
+            "campaign_id": campaign_id,
+            "student_id": sid_clean,
+            "student_id_norm": sid_norm,
+            "points_awarded": 0,
+            "claimed_at": v_now_iso,
+            "credited_at": v_now_iso,
+            "status": "credited",
+            "attempt_id": _lrc_secrets.token_hex(12),
+            "retry_count": 0,
+            "source": "login_reward_voucher_only",
+            "campaign_name": camp.get("name") or "",
+            "reward_kind": "voucher",
+        }
+        try:
+            await _lrc_claims.insert_one(v_claim_doc)
+        except Exception:
+            # Duplicate-key → the student already claimed; idempotent re-issue.
+            pass
+        voucher = None
+        try:
+            voucher = await _lrc_issue_voucher_for_claim(camp, sid_clean, sid_norm)
+        except Exception as _ve:
+            _LRC_LOG.warning("login_reward: voucher-only issue failed campaign=%s err=%s", campaign_id, _ve)
+        return {
+            "success": True,
+            "duplicate": False,
+            "status": "credited",
+            "reward_kind": "voucher",
+            "points_awarded": 0,
+            "campaign_id": campaign_id,
+            "claimed_at": v_now_iso,
+            "success_message": camp.get("success_message") or "Your voucher is ready!",
+            "voucher": voucher,
+        }
+
     points = int(camp.get("reward_points") or 0)
     if points <= 0:
         raise HTTPException(status_code=400, detail="Reward not configured")
@@ -720,7 +1318,7 @@ async def lrc_student_claim(
                 raise HTTPException(status_code=409, detail="Claim conflict, please try again")
             ex_status = (existing.get("status") or "").lower()
             if ex_status == "credited":
-                return {
+                _resp_ac = {
                     "success": True,
                     "duplicate": True,
                     "already_claimed": True,
@@ -730,6 +1328,15 @@ async def lrc_student_claim(
                     "campaign_id": campaign_id,
                     "success_message": camp.get("success_message") or "Reward already credited.",
                 }
+                # points_voucher: re-surface the (already-issued) voucher so a
+                # refresh/re-claim still reveals it. Idempotent + best-effort.
+                if reward_kind == "points_voucher":
+                    try:
+                        _resp_ac["reward_kind"] = "points_voucher"
+                        _resp_ac["voucher"] = await _lrc_issue_voucher_for_claim(camp, sid_clean, sid_norm)
+                    except Exception as _ve:
+                        _LRC_LOG.warning("login_reward: voucher re-surface failed campaign=%s err=%s", campaign_id, _ve)
+                return _resp_ac
             if ex_status == "pending":
                 # Another in-flight caller still owns the row. Tell client to retry shortly.
                 _LRC_LOG.info(
@@ -945,7 +1552,7 @@ async def lrc_student_claim(
         sid_clean, campaign_id, points, attempt_id,
     )
 
-    return {
+    _resp_ok = {
         "success": True,
         "duplicate": False,
         "status": "credited",
@@ -954,3 +1561,14 @@ async def lrc_student_claim(
         "claimed_at": finalize_iso,
         "success_message": camp.get("success_message") or "Reward credited.",
     }
+    # points_voucher: issue the Book Voucher as a best-effort follow-up AFTER
+    # the points credit has fully succeeded. Never raises into the response —
+    # the points credit is already finalised and owned by the claim guard, so
+    # a voucher hiccup can't affect the wallet or the success status.
+    if reward_kind == "points_voucher":
+        try:
+            _resp_ok["reward_kind"] = "points_voucher"
+            _resp_ok["voucher"] = await _lrc_issue_voucher_for_claim(camp, sid_clean, sid_norm)
+        except Exception as _ve:
+            _LRC_LOG.warning("login_reward: points_voucher issue failed campaign=%s err=%s", campaign_id, _ve)
+    return _resp_ok
