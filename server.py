@@ -6229,7 +6229,17 @@ register_premium_ai_routes(api, db, require_admin, require_student)
 #   /api/rewards/login-campaigns/{id}/claim    (POST, student)
 # All existing endpoints and wallet migration flags are untouched.
 try:
-    exec(open(__import__("pathlib").Path(__file__).parent / "login_reward_tools.py").read())
+    # My-Portal-Premium v1: read with utf-8-sig so an accidental BOM at the
+    # top of the file (saved by some Windows editors) is stripped, instead
+    # of making compile() raise SyntaxError on U+FEFF and silently disabling
+    # the feature.
+    _lrc_src_path = __import__("pathlib").Path(__file__).parent / "login_reward_tools.py"
+    with open(_lrc_src_path, "r", encoding="utf-8-sig") as _lrc_fh:
+        _lrc_src_text = _lrc_fh.read()
+    exec(compile(_lrc_src_text, str(_lrc_src_path), "exec"))
+    logging.getLogger("eduhub").info(
+        "login_reward_tools: routes registered (login campaigns + voucher claim)"
+    )
 except Exception as _lrc_load_err:
     logging.getLogger("eduhub").warning(
         "login_reward_tools.py failed to load (feature disabled): %s",
@@ -6243,7 +6253,20 @@ except Exception as _lrc_load_err:
 # Redemption continues through the EXISTING /api/coupons/* flow. Failure is
 # non-fatal — only the voucher listing endpoint is skipped on load error.
 try:
-    exec(open(__import__("pathlib").Path(__file__).parent / "voucher_reward_tools.py").read())
+    # My-Portal-Premium v1: same utf-8-sig hardening as login_reward_tools
+    # above. The previous v1.0.2 voucher_reward_tools.py shipped with a
+    # UTF-8 BOM which made compile() raise SyntaxError("invalid
+    # non-printable character U+FEFF") at line 1, the try/except below
+    # caught it silently, and /api/student/vouchers was never registered.
+    # Reading with utf-8-sig strips a leading BOM if present so this can
+    # never silently regress again.
+    _vrt_src_path = __import__("pathlib").Path(__file__).parent / "voucher_reward_tools.py"
+    with open(_vrt_src_path, "r", encoding="utf-8-sig") as _vrt_fh:
+        _vrt_src_text = _vrt_fh.read()
+    exec(compile(_vrt_src_text, str(_vrt_src_path), "exec"))
+    logging.getLogger("eduhub").info(
+        "voucher_reward_tools: routes registered (/api/student/vouchers)"
+    )
 except Exception as _vrt_load_err:
     logging.getLogger("eduhub").warning(
         "voucher_reward_tools.py failed to load (feature disabled): %s",

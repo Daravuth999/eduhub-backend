@@ -1,25 +1,38 @@
-﻿# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-# â•‘ voucher_reward_tools.py â€” Student-facing Book Voucher LISTING layer        â•‘
-# â•‘ (reward-kind integration v1.0.2)                                          â•‘
-# â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
-# â•‘ DESIGN                                                                     â•‘
-# â•‘   â€¢ Vouchers are ISSUED by login_reward_tools.py as part of the Login     â•‘
-# â•‘     Reward campaign claim (reward_kind = "voucher" | "points_voucher").   â•‘
-# â•‘     That module owns the `student_vouchers` collection, the coupon        â•‘
-# â•‘     creation (via the EXISTING db.coupons schema + _generate_coupon_code) â•‘
-# â•‘     and the compose/status helpers. This module is a thin READ surface.   â•‘
-# â•‘   â€¢ Source of truth = MongoDB (`student_vouchers` + `db.coupons`). NEVER  â•‘
-# â•‘     localStorage.                                                          â•‘
-# â•‘   â€¢ Redemption uses the EXISTING /api/coupons/validate + /api/coupons/    â•‘
-# â•‘     redeem endpoints, which this module does NOT touch.                   â•‘
-# â•‘                                                                            â•‘
-# â•‘ LOADING                                                                    â•‘
-# â•‘   exec()'d into server.py's namespace immediately AFTER login_reward_     â•‘
-# â•‘   tools.py, so it reuses: api, db, require_student, Student, _norm_       â•‘
-# â•‘   student_id, and the login-reward helpers _lrc_student_vouchers /        â•‘
-# â•‘   _lrc_compose_voucher_payload / _lrc_iso / _lrc_now. Failure is non-     â•‘
-# â•‘   fatal (the loader wraps this in try/except).                            â•‘
-# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ============================================================================
+# voucher_reward_tools.py -- Student-facing Book Voucher LISTING layer
+# (reward-kind integration v1.0.3)
+#
+# DESIGN
+#   * Vouchers are ISSUED by login_reward_tools.py as part of the Login
+#     Reward campaign claim (reward_kind = "voucher" | "points_voucher").
+#     That module owns the `student_vouchers` collection, the coupon
+#     creation (via the EXISTING db.coupons schema + _generate_coupon_code)
+#     and the compose/status helpers. This module is a thin READ surface.
+#   * Source of truth = MongoDB (`student_vouchers` + `db.coupons`). NEVER
+#     localStorage.
+#   * Redemption uses the EXISTING /api/coupons/validate + /api/coupons/
+#     redeem endpoints, which this module does NOT touch.
+#
+# LOADING
+#   exec()'d into server.py's namespace immediately AFTER login_reward_
+#   tools.py, so it reuses: api, db, require_student, Student, _norm_
+#   student_id, and the login-reward helpers _lrc_student_vouchers /
+#   _lrc_compose_voucher_payload / _lrc_iso / _lrc_now. Failure is non-
+#   fatal (the loader wraps this in try/except).
+#
+# v1.0.3 NOTES (My Portal premium reconstruction)
+#   * File saved as PLAIN UTF-8 (no BOM, no mojibake) so the
+#     `exec(open(...).read())` loader in server.py compiles cleanly under
+#     every Python locale. The previous v1.0.2 file shipped with a UTF-8
+#     BOM (0xEF 0xBB 0xBF) which made `compile()` raise
+#     `SyntaxError: invalid non-printable character U+FEFF` at line 1.
+#     The try/except in server.py silently swallowed that, so the
+#     /api/student/vouchers route was never registered -> the frontend
+#     VoucherHub fell back to its "Could not load vouchers" / 404 state.
+#   * Added a clear success log on module load AND a duplicate one after
+#     the route definition so production logs make the registration
+#     observable.
+# ============================================================================
 
 import logging as _vrt_logging
 
@@ -28,7 +41,11 @@ _VRT_LOG = _vrt_logging.getLogger("eduhub")
 # Reuse the issuer module's collection handle + helpers (already present in
 # the shared exec namespace). Defensive fallbacks keep this importable even
 # if the names ever move.
-_vrt_student_vouchers = globals().get("_lrc_student_vouchers") if globals().get("_lrc_student_vouchers") is not None else db["student_vouchers"]
+_vrt_student_vouchers = (
+    globals().get("_lrc_student_vouchers")
+    if globals().get("_lrc_student_vouchers") is not None
+    else db["student_vouchers"]  # noqa: F821 (db is provided by exec namespace)
+)
 
 
 def _vrt_norm(value) -> str:
@@ -58,8 +75,8 @@ async def _vrt_compose(row: dict) -> dict:
     }
 
 
-@api.get("/student/vouchers")
-async def vrt_list_student_vouchers(student: Student = Depends(require_student)):  # type: ignore[name-defined]
+@api.get("/student/vouchers")  # noqa: F821 (api provided by exec namespace)
+async def vrt_list_student_vouchers(student: Student = Depends(require_student)):  # type: ignore[name-defined]  # noqa: F821
     """List the logged-in student's vouchers. Status (active / used /
     expired / exhausted / unavailable) is computed by the backend from the
     EXISTING coupon doc (`uses_count`, `max_uses`, `expires_at`, `enabled`).
@@ -89,7 +106,7 @@ async def vrt_list_student_vouchers(student: Student = Depends(require_student))
         coupon = None
         if code:
             try:
-                coupon = await db.coupons.find_one({"code": code}, {"_id": 0})
+                coupon = await db.coupons.find_one({"code": code}, {"_id": 0})  # noqa: F821
             except Exception:
                 coupon = None
         # Opportunistic "used" backfill: if the EXISTING coupon already has a
@@ -121,4 +138,4 @@ async def vrt_list_student_vouchers(student: Student = Depends(require_student))
     return {"vouchers": out, "count": len(out)}
 
 
-_VRT_LOG.info("voucher_reward_tools: student voucher listing route registered")
+_VRT_LOG.info("voucher_reward_tools: routes registered (/api/student/vouchers)")
