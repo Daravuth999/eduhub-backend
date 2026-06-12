@@ -148,6 +148,51 @@ _DUPLICATE_SPEAK_DETAIL = (
     "Please wait a moment."
 )
 
+# ── Mystery Box EduTalk Pass hooks ─────────────────────────────────────────
+# Populated by mystery_box_tools.py at module load time (server boot). When
+# present, _ENTITLEMENT_RESERVE is called BEFORE each GAS debit; if it
+# returns a pass id the cost is forced to 0 and the pass is committed after
+# the EduTalk operation succeeds (or refunded on failure). When the hooks
+# are None (mystery_box_tools failed to load) every EduTalk charge falls
+# back to the existing GAS debit path verbatim.
+_ENTITLEMENT_RESERVE = None   # async (student_clean_id, feature, book_slug) -> str|None
+_ENTITLEMENT_COMMIT = None    # async (entitlement_id) -> bool
+_ENTITLEMENT_REFUND = None    # async (entitlement_id) -> bool
+
+
+async def _et_try_reserve_pass(student_clean_id: str, feature: str, book_slug: str):
+    """Best-effort reserve. Returns an entitlement_id or None.
+
+    Never raises — pass consumption MUST be transparent to the existing
+    EduTalk charge flow. Any error means: fall back to points."""
+    fn = _ENTITLEMENT_RESERVE
+    if not fn:
+        return None
+    try:
+        return await fn(student_clean_id, feature, book_slug)
+    except Exception:
+        return None
+
+
+async def _et_commit_pass(entitlement_id):
+    fn = _ENTITLEMENT_COMMIT
+    if not fn or not entitlement_id:
+        return False
+    try:
+        return await fn(entitlement_id)
+    except Exception:
+        return False
+
+
+async def _et_refund_pass(entitlement_id):
+    fn = _ENTITLEMENT_REFUND
+    if not fn or not entitlement_id:
+        return False
+    try:
+        return await fn(entitlement_id)
+    except Exception:
+        return False
+
 DEFAULT_CONFIG: dict = {
     "enabled": False,  # OFF by default — admin must explicitly enable
     "session_cost": 5,
@@ -3505,6 +3550,12 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
         if guard_key in ACTIVE_EDUTALK_STARTS:
             raise HTTPException(status_code=429, detail=_DUPLICATE_DETAIL)
         ACTIVE_EDUTALK_STARTS.add(guard_key)
+        # v1.2 SAFETY: declare pass-tracking vars at the OUTER try scope
+        # so the finally block can refund a reserved-but-not-committed
+        # pass even if an exception raises before the inner reservation
+        # block runs.
+        _pass_id_session = None
+        _session_pass_committed = False
         try:
             now = _now()
             existing = await sess_col.find_one({
@@ -3736,6 +3787,17 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                 upsert=True,
             )
 
+            # Mystery Box: try to reserve an EduTalk session pass FIRST.
+            # If a pass is reserved, the session is free this time.
+            # (_pass_id_session and _session_pass_committed are declared
+            #  at the outer try scope so the finally block can refund.)
+            if session_cost > 0:
+                _pass_id_session = await _et_try_reserve_pass(
+                    student.clean_id, "edutalk_session", payload.book_slug,
+                )
+                if _pass_id_session:
+                    session_cost = 0  # session is fully covered by the pass
+
             if session_cost > 0:
                 debit_ok, debit_err = await _gas_debit(
                     student.clean_id, payload.password, session_cost,
@@ -3757,6 +3819,17 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                         detail="Could not charge the session points. No points were taken.",
                     )
 
+            # Commit the pass now that the session row is final.
+            # If commit fails (extremely unlikely), refund so the student
+            # doesn't lose a pass to a transient database error.
+            if _pass_id_session:
+                _ok = await _et_commit_pass(_pass_id_session)
+                if _ok:
+                    _session_pass_committed = True
+                else:
+                    await _et_refund_pass(_pass_id_session)
+                    _pass_id_session = None
+
             await _log_usage(
                 student, "start", "success", session_cost,
                 payload.book_slug, payload.chapter_idx, session_id,
@@ -3766,6 +3839,7 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                 "resumed": False,
                 "session_id": session_id,
                 "points_deducted": session_cost,
+                "pass_consumed": _session_pass_committed,
                 "replies_remaining": reply_limit,
                 "reply_limit": reply_limit,
                 "expires_at": session_doc["expires_at"],
@@ -3781,6 +3855,18 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
             }
         finally:
             ACTIVE_EDUTALK_STARTS.discard(guard_key)
+            # v1.2 SAFETY: if a pass was reserved earlier but the request
+            # ended without a successful commit (any HTTPException raised
+            # before commit, including _gas_debit failures in code paths
+            # that don't run the commit), refund the reservation so the
+            # student never silently loses a pass to a transient error.
+            # Successful commit clears the local id, so this is a no-op
+            # on the happy path.
+            try:
+                if _pass_id_session and not _session_pass_committed:
+                    await _et_refund_pass(_pass_id_session)
+            except Exception:
+                pass
 
     # ---------------- Student: send message ----------------
     @api.post("/student/edutalk/message")
@@ -3995,6 +4081,14 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
         voice_id = (session.get("voice_id") or cfg.get("voice_id") or "").strip()
         resolved_voice = voice_id  # may be updated in ElevenLabs path below
         deducted = 0
+        # Mystery Box: try to reserve a voice-reply pass before charging.
+        _pass_id_voice = None
+        if voice_cost > 0:
+            _pass_id_voice = await _et_try_reserve_pass(
+                student.clean_id, "edutalk_voice", session.get("book_slug", ""),
+            )
+            if _pass_id_voice:
+                voice_cost = 0  # voice reply is fully covered by the pass
         try:
             # 1) Verify balance via GAS.
             if voice_cost > 0:
@@ -4397,16 +4491,47 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                 session.get("book_slug", ""), session.get("chapter_idx"),
                 payload.session_id,
             )
+            # Mystery Box: commit the voice pass now that the audio was
+            # generated successfully and the response is about to be sent.
+            _voice_pass_committed = False
+            if _pass_id_voice:
+                _ok_v = await _et_commit_pass(_pass_id_voice)
+                if _ok_v:
+                    _voice_pass_committed = True
+                else:
+                    await _et_refund_pass(_pass_id_voice)
+                # Clear the local reference either way so the finally
+                # block below doesn't double-refund (commit success) or
+                # double-refund (commit failure already refunded above).
+                _pass_id_voice = None
             return {
                 "success": True,
                 "audio_b64": audio_b64,
                 "mime_type": mime_type,       # NEW — tells frontend how to decode
                 "script_text": voice_script,
                 "points_used": deducted,
+                "pass_consumed": _voice_pass_committed,
                 "voice_id": resolved_voice if script_lang != "khmer" else "gemini-tts",
             }
         finally:
             ACTIVE_EDUTALK_SPEAKS.discard(guard_key)
+            # If we reserved a voice pass but did NOT commit it (any
+            # exception path above will leave it pending), refund the
+            # reservation so the student keeps their pass. Committed
+            # passes have _pass_id_voice cleared by the commit path
+            # above when commit succeeds — but we also tolerate a None
+            # safely here.
+            try:
+                if _pass_id_voice:
+                    # Check whether this pass was already committed by the
+                    # success path: if it was, we don't want to refund.
+                    # We use a small flag pattern: the commit path sets
+                    # _pass_id_voice to None on success. So the only
+                    # reason a non-None id reaches the finally is an
+                    # exception — refund.
+                    await _et_refund_pass(_pass_id_voice)
+            except Exception:
+                pass
 
     # ---------------- Student: voice-input transcription (free) ----------------
     @api.post("/student/edutalk/transcribe")

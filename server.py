@@ -6272,6 +6272,31 @@ except Exception as _vrt_load_err:
         "voucher_reward_tools.py failed to load (feature disabled): %s",
         _vrt_load_err,
     )
+# ── Mystery Box + EduTalk Pass system (Speaking Lab integration v1) ───────
+# Loaded AFTER voucher_reward_tools.py so it can reuse the existing
+# login-reward voucher issuer (_lrc_issue_voucher_for_claim) and the
+# treasury credit pipeline (_lrc_credit_via_treasury). Adds the new
+# /api/admin/mystery-box/*, /api/admin/edutalk-passes/*,
+# /api/speaking-lab/mystery-box/*, /api/student/edutalk-passes and
+# /api/student/mystery-box/history routes. Also wires EduTalk pass
+# consumption hooks into edutalk_tools.py module globals so a winning
+# Mystery Box student spends a pass instead of points when starting an
+# EduTalk session or requesting a voice reply. Failure is non-fatal —
+# only the Mystery Box feature is disabled, the existing EduTalk and
+# voucher flows continue unchanged.
+try:
+    _mbt_src_path = __import__("pathlib").Path(__file__).parent / "mystery_box_tools.py"
+    with open(_mbt_src_path, "r", encoding="utf-8-sig") as _mbt_fh:
+        _mbt_src_text = _mbt_fh.read()
+    exec(compile(_mbt_src_text, str(_mbt_src_path), "exec"))
+    logging.getLogger("eduhub").info(
+        "mystery_box_tools: routes registered (Speaking Lab Mystery Box + EduTalk Pass)"
+    )
+except Exception as _mbt_load_err:
+    logging.getLogger("eduhub").warning(
+        "mystery_box_tools.py failed to load (feature disabled): %s",
+        _mbt_load_err,
+    )
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
