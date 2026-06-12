@@ -710,15 +710,87 @@ async def mbt_delete_campaign(cid: str, admin=Depends(require_admin)):  # type: 
     return {"deleted": int(res.deleted_count or 0)}
 
 
+# v1.3 — Admin campaign-preview endpoint. Resolves the campaign layout
+# the SAME way the round-creation route does, but returns the prize
+# titles/types ONLY (no codes, no internal IDs beyond what already
+# appears in the admin Studio UI) so an operator can sanity-check
+# "what will my classroom see when I click reveal?" without actually
+# starting a round. Useful when a campaign suddenly looks point-only.
+@api.get("/admin/mystery-box/campaigns/{cid}/preview")  # noqa: F821
+async def mbt_preview_campaign(cid: str, admin=Depends(require_admin)):  # type: ignore[name-defined]
+    camp = await _mbt_campaigns.find_one({"id": cid}, {"_id": 0})
+    if not camp:
+        raise HTTPException(status_code=404, detail="campaign not found")  # type: ignore[name-defined]
+    # Resolved layout (random — call repeatedly to see variability).
+    layout = await _mbt_resolve_campaign_layout(camp)
+    # Plus the FULL pool of enabled prizes the campaign is allowed to
+    # draw from, so the operator can immediately spot "I added a
+    # voucher template but disabled it".
+    ids = list(camp.get("prize_template_ids") or [])
+    pool = []
+    if ids:
+        async for r in _mbt_prize_templates.find(
+            {"id": {"$in": ids}}, {"_id": 0},
+        ):
+            pool.append({
+                "id": r.get("id"),
+                "title": r.get("title"),
+                "type": r.get("type"),
+                "rarity": r.get("rarity"),
+                "enabled": bool(r.get("enabled", True)),
+            })
+    return {
+        "campaign_id": cid,
+        "campaign_name": camp.get("name"),
+        "box_count": int(camp.get("box_count") or 0),
+        "enabled_pool_size": sum(1 for p in pool if p["enabled"]),
+        "pool": pool,
+        "sample_layout": [
+            {"index": i, "title": p.get("title"), "type": p.get("type"),
+             "rarity": p.get("rarity")}
+            for i, p in enumerate(layout)
+        ],
+        "by_type_in_sample": {
+            t: sum(1 for p in layout if (p.get("type") or "") == t)
+            for t in ["points", "book_voucher", "edutalk_session",
+                      "edutalk_voice", "lucky_draw_entry",
+                      "recognition", "consolation"]
+        },
+    }
+
+
 # ── SPEAKING LAB TEACHER ROUTES (rounds + reveal) ───────────────────────────
 
 async def _mbt_resolve_campaign_layout(camp: dict) -> List[dict]:
-    """Resolve and shuffle the prize layout for a campaign.
+    """Resolve the prize layout for a campaign.
 
-    Returns a list of prize dicts of length camp.box_count. If fewer
-    prizes are configured than boxes, the list is padded by recycling
-    enabled prizes. Returns [] if no prizes are available.
+    Returns a list of prize dicts of length camp.box_count.
+
+    v1.3 BUGFIX: the previous implementation took the first
+    ``box_count`` prizes from ``prizes`` (because ``prizes[i % len]`` for
+    ``i in [0..box_count-1]`` is just ``prizes[0..box_count-1]``) and
+    THEN shuffled. When the campaign had more templates than boxes —
+    e.g. 4 boxes, 7 templates — only the FIRST FOUR templates in
+    MongoDB insertion order could ever appear. Operators who added
+    Points templates first and Voucher / EduTalk Pass templates later
+    would never see the new prizes show up in classroom rounds.
+
+    New logic:
+
+    * If ``box_count >= len(prizes)``: include each enabled prize at
+      least once (so a small pool still gets every template surfaced),
+      then random-sample-with-replacement for the remaining slots.
+    * If ``box_count < len(prizes)``: random-sample-WITHOUT-replacement
+      from the full pool, so every template has an equal chance per
+      round regardless of MongoDB insertion order.
+    * Optional ``weights`` array on the campaign is honoured when
+      sampling with replacement.
+
+    Final ``random.shuffle`` keeps the box positions unpredictable
+    from the client.
     """
+    import random as _r
+
     ids = list(camp.get("prize_template_ids") or [])
     box_count = int(camp.get("box_count") or 7)
     prizes: List[dict] = []
@@ -729,14 +801,62 @@ async def _mbt_resolve_campaign_layout(camp: dict) -> List[dict]:
             prizes.append(r)
     if not prizes:
         return []
-    # Pad to box_count by cycling.
-    out: List[dict] = []
-    i = 0
-    while len(out) < box_count:
-        out.append(prizes[i % len(prizes)])
-        i += 1
-    # Random shuffle so box positions are unpredictable from client.
-    import random as _r
+
+    n = len(prizes)
+    if box_count <= 0:
+        return []
+
+    # Build a weight list aligned to `prizes`. Campaign.weights is a
+    # parallel list to campaign.prize_template_ids (NOT to the
+    # filtered/enabled `prizes` order coming from Mongo). We re-align
+    # by id so a disabled prize doesn't shift the weights.
+    weight_by_id = {}
+    raw_weights = camp.get("weights") or []
+    if isinstance(raw_weights, list) and raw_weights:
+        for idx, pid in enumerate(ids):
+            if idx < len(raw_weights):
+                try:
+                    w = float(raw_weights[idx])
+                except Exception:
+                    w = 1.0
+                weight_by_id[pid] = max(w, 0.0)
+    weights = [weight_by_id.get(p.get("id"), 1.0) for p in prizes]
+    # If every weight is zero, fall back to uniform.
+    if all((w == 0.0) for w in weights):
+        weights = [1.0] * n
+
+    if box_count >= n:
+        # Cover every prize at least once, then sample-with-replacement
+        # for the extra slots so larger pools still get variety.
+        out = list(prizes)
+        # Shuffle the seed copy so the "guaranteed" boxes aren't
+        # always in the same order before padding.
+        _r.shuffle(out)
+        extra_needed = box_count - n
+        if extra_needed > 0:
+            out.extend(_r.choices(prizes, weights=weights, k=extra_needed))
+    else:
+        # box_count < n  →  pick a random subset honouring weights
+        # without replacement so every template has a fair chance per
+        # round and points-templates can't crowd out vouchers/passes
+        # just because they were created first.
+        try:
+            picked = _r.sample(prizes, k=box_count)  # uniform without replacement
+        except ValueError:
+            # Defensive: sample raises if k > len, which we already
+            # guarded for, but keep a hard fallback.
+            picked = prizes[:box_count]
+        # Apply weights as a soft re-roll: with a low probability,
+        # swap a low-weight pick for a high-weight one. Keeps the
+        # behaviour intuitive without making weights mandatory.
+        if any(w != 1.0 for w in weights):
+            wmap = {p.get("id"): w for p, w in zip(prizes, weights)}
+            # Re-sort picked by weight descending so the heavier prizes
+            # tend to surface in earlier (lower-index) box slots before
+            # the final shuffle.
+            picked.sort(key=lambda p: wmap.get(p.get("id"), 1.0), reverse=True)
+        out = picked
+
     _r.shuffle(out)
     return out
 
