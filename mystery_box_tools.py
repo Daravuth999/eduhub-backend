@@ -926,10 +926,47 @@ async def mbt_get_round(rid: str, admin=Depends(require_admin)):  # type: ignore
     row = await _mbt_rounds.find_one({"id": rid}, {"_id": 0})
     if not row:
         raise HTTPException(status_code=404, detail="round not found")  # type: ignore[name-defined]
-    # Strip the internal layout from open rounds.
-    if row.get("status") == "open":
-        row = {k: v for k, v in row.items() if k != "layout"}
+    # Privacy hardening (v1.4): ALWAYS strip the internal ``layout`` (which
+    # contains prize_id per box). Speaking Lab must never receive raw
+    # prize identifiers — even after reveal the public reveal payload
+    # is delivered through the reveal endpoint's `revealed_layout`
+    # (titles only), not through this generic round fetch.
+    row = {k: v for k, v in row.items() if k != "layout"}
     return {"round": row}
+
+
+# v1.4 — Speaking Lab sanitised "active campaigns" lookup. The generic
+# /api/admin/mystery-box/campaigns endpoint returns the full campaign
+# record including raw prize_template_ids, weights and admin meta. The
+# Speaking Lab teacher console only needs id / name / box_count /
+# prize_template_count / settings, so we expose a dedicated read-only
+# endpoint that omits anything private. The admin-only campaign list
+# stays untouched so Author Studio keeps working.
+@api.get("/speaking-lab/mystery-box/active-campaigns")  # noqa: F821
+async def mbt_speaking_lab_active_campaigns(admin=Depends(require_admin)):  # type: ignore[name-defined]
+    rows = []
+    async for r in _mbt_campaigns.find({"enabled": True}, {"_id": 0}).sort("created_at", -1).limit(200):
+        ids = list(r.get("prize_template_ids") or [])
+        # Compute how many of the referenced prize templates are still
+        # enabled so the teacher banner can show an accurate
+        # "X prize templates" count without exposing internal ids.
+        enabled_count = 0
+        if ids:
+            enabled_count = await _mbt_prize_templates.count_documents(
+                {"id": {"$in": ids}, "enabled": True},
+            )
+        rows.append({
+            "id": r.get("id"),
+            "name": r.get("name") or "",
+            "description": r.get("description") or "",
+            "box_count": int(r.get("box_count") or 0),
+            "prize_template_count": int(enabled_count),
+            "teacher_confirm_required": bool(r.get("teacher_confirm_required", True)),
+            "reveal_all_after_claim": bool(r.get("reveal_all_after_claim", True)),
+            "show_missed_prizes": bool(r.get("show_missed_prizes", True)),
+            "enabled": True,
+        })
+    return {"campaigns": rows, "count": len(rows)}
 
 
 @api.post("/speaking-lab/mystery-box/rounds/{rid}/select")  # noqa: F821
