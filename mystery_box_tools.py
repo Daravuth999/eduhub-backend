@@ -100,6 +100,199 @@ def _mbt_norm_id(value) -> str:
     return (value or "").strip().lower()
 
 
+# ── v1.7 EMERGENCY FIX: canonical student resolver ──────────────────────────
+#
+# Production root-cause: Speaking Lab was forwarding the wallet-style
+# student_id (e.g. ``stu_88185fad5202``) to /mystery-box/select +
+# /mystery-box/reveal, while My Portal (``/api/student/vouchers``,
+# ``/api/student/edutalk-passes``, ``/api/student/points/*``) reads by the
+# CLEAN id (e.g. ``stu094``). Rewards were therefore granted under a
+# different student_id_norm than the dashboard queries, producing
+# "reveal returned 200 but reward not visible" reports.
+#
+# This resolver maps ANY incoming identifier (clean_id, wallet_id, raw,
+# upper-case, whitespace-padded, zero-width-chars from sheets) to the
+# canonical clean_id used by every student dashboard endpoint.
+#
+# Safety:
+#   * Read-only — never writes to db.students.
+#   * Returns a fallback record when no Mongo row is found, so legacy
+#     students that exist only in GAS still get a deterministic grant
+#     target (their normalised raw id).
+#   * Never raises.
+async def _mbt_resolve_student(raw_id) -> dict:
+    """Return the canonical student record for any incoming identifier.
+
+    Output shape:
+        {
+            "ok":           bool,    # True only if a Mongo row was found
+            "clean_id":     str,     # USE THIS for grants + persistence
+            "student_id":   str,     # wallet form (db.students.student_id)
+            "norm":         str,     # _norm_student_id(clean_id)
+            "display_name": str,
+            "raw":          str,     # what the caller passed in
+        }
+    """
+    raw = ("" if raw_id is None else str(raw_id)).strip()
+    if not raw:
+        return {
+            "ok": False, "clean_id": "", "student_id": "",
+            "norm": "", "display_name": "", "raw": "",
+        }
+    norm = _mbt_norm_id(raw)
+    upper = raw.upper()
+    doc = None
+    try:
+        # Try every plausible field/case combination in ONE query.
+        doc = await db.students.find_one(  # type: ignore[name-defined]  # noqa: F821
+            {"$or": [
+                {"clean_id":   norm},
+                {"clean_id":   raw},
+                {"clean_id":   upper},
+                {"student_id": raw},
+                {"student_id": norm},
+                {"student_id": upper},
+            ]},
+            {"_id": 0, "clean_id": 1, "student_id": 1, "display_name": 1},
+        )
+    except Exception as exc:  # noqa: BLE001
+        _MBT_LOG.warning("mystery_box: resolve_student lookup failed: %s",
+                         str(exc)[:200])
+        doc = None
+
+    if doc and doc.get("clean_id"):
+        clean = str(doc.get("clean_id") or "").strip()
+        return {
+            "ok": True,
+            "clean_id": clean,
+            "student_id": str(doc.get("student_id") or ""),
+            "norm": _mbt_norm_id(clean),
+            "display_name": str(doc.get("display_name") or ""),
+            "raw": raw,
+        }
+    # Fallback: legacy students that exist only in GAS / Google Sheets.
+    # We still grant under their normalised id so a manual /admin lookup
+    # can audit the reward. The dashboard's clean-id query will only see
+    # the reward if the student is later linked to Mongo with the same
+    # clean_id (operator action).
+    return {
+        "ok": False,
+        "clean_id": raw,
+        "student_id": raw,
+        "norm": norm,
+        "display_name": "",
+        "raw": raw,
+    }
+
+
+# ── v1.7 EMERGENCY FIX: points-credit Mongo mirror ──────────────────────────
+#
+# Production root-cause: ``_lrc_credit_via_treasury`` posts a sendPoints
+# call to GAS but never writes the corresponding row into
+# ``points_transactions`` / ``points_wallets``. The student dashboard's
+# ``/api/student/points/latest`` and ``/transactions`` endpoints read
+# Mongo only (see points_ledger_api.py), so a successful GAS credit was
+# INVISIBLE in My Portal until the next manual reconciliation.
+#
+# This helper mirrors the GAS credit into the Mongo ledger using the
+# claim_id as the deterministic idempotency key. Independent of the
+# ``USE_MONGO_POINTS_WRITE`` shadow-flag (which is "off" in production),
+# so it is always-on for Speaking Lab Mystery Box rewards.
+#
+# Safety:
+#   * Idempotent via {"idempotency_key": ikey} on points_transactions
+#     and via the claim_id-derived ikey.
+#   * Never raises — a mirror failure does NOT revert the GAS credit
+#     (the reward is still valid; the operator can re-run a reconcile
+#     pass at any time).
+#   * Writes only to two well-known collections, never touches the
+#     wallet migration flags or the live shadow-writer reconciler.
+async def _mbt_mirror_points_credit(
+    *,
+    clean_id: str,
+    wallet_id: str,
+    amount: int,
+    claim_id: str,
+    source: str = "speaking_lab_mystery_box",
+) -> dict:
+    """Write a confirmed Speaking Lab Mystery Box points credit into the
+    Mongo points ledger + wallet. Returns a small status dict for audit."""
+    out = {"ok": False, "ledger": "skipped", "wallet": "skipped",
+           "ikey": "", "error": ""}
+    try:
+        amt = int(amount or 0)
+    except Exception:
+        amt = 0
+    if amt <= 0 or not (clean_id or wallet_id):
+        out["error"] = "no-op (amount<=0 or empty id)"
+        return out
+
+    # Wallet doc key: prefer the wallet-form id (matches premium_ai /
+    # payment_bridge writes); fall back to clean_id when unknown so a
+    # later admin link will pick it up.
+    sid_for_wallet = wallet_id or clean_id
+    ikey = f"sl_mb_credit:{claim_id}"
+    out["ikey"] = ikey
+    now_iso = _mbt_iso(_mbt_now())
+    db_h = globals().get("db")
+    if db_h is None:
+        out["error"] = "db handle unavailable"
+        return out
+
+    # 1) Append-only ledger row (idempotent on idempotency_key).
+    try:
+        r = await db_h.points_transactions.update_one(
+            {"idempotency_key": ikey},
+            {"$setOnInsert": {
+                "idempotency_key": ikey,
+                "from_id":   "treasury",
+                "to_id":     sid_for_wallet,
+                "to_clean_id": clean_id or "",
+                "amount":    amt,
+                "type":      "credit",
+                "operation": "credit",
+                "delta":     amt,
+                "student_id": sid_for_wallet,
+                "source":    source,
+                "source_ref": claim_id,
+                "created_at": now_iso,
+                "status":    "confirmed",
+            }},
+            upsert=True,
+        )
+        out["ledger"] = "inserted" if r.upserted_id is not None else "duplicate"
+    except Exception as exc:  # noqa: BLE001
+        out["ledger"] = "error"
+        out["error"] = (out["error"] + f" ledger:{str(exc)[:160]}").strip()
+
+    # 2) Wallet balance bump — only on a fresh insert (avoid double-credit).
+    if out["ledger"] == "inserted":
+        try:
+            await db_h.points_wallets.update_one(
+                {"student_id": sid_for_wallet},
+                {
+                    "$inc": {"balance": amt, "version": 1},
+                    "$set": {"updated_at": now_iso,
+                             "clean_id": clean_id or "",
+                             "last_source": source},
+                    "$setOnInsert": {
+                        "student_id": sid_for_wallet,
+                        "created_at": now_iso,
+                    },
+                },
+                upsert=True,
+            )
+            out["wallet"] = "updated"
+        except Exception as exc:  # noqa: BLE001
+            out["wallet"] = "error"
+            out["error"] = (out["error"] + f" wallet:{str(exc)[:160]}").strip()
+
+    out["ok"] = out["ledger"] in ("inserted", "duplicate") and (
+        out["wallet"] in ("updated", "skipped")
+    )
+    return out
+
+
 async def _mbt_ensure_indexes() -> None:
     """Create indexes lazily on first import. Safe to call repeatedly."""
     try:
@@ -980,13 +1173,29 @@ async def mbt_select_box(rid: str, payload: _SelectIn, admin=Depends(require_adm
     bc = int(row.get("box_count") or 0)
     if payload.box_index < 0 or payload.box_index >= bc:
         raise HTTPException(status_code=400, detail="box_index out of range")  # type: ignore[name-defined]
+
+    # v1.7 EMERGENCY FIX: normalise the incoming student_id to its
+    # canonical clean_id before we store the selection. Speaking Lab
+    # historically forwarded the wallet-style id, which then leaked into
+    # mbt_reveal_round and caused rewards to be granted under the wrong
+    # student_id_norm (invisible in My Portal).
+    resolved = await _mbt_resolve_student(payload.student_id)
+    sid_clean = resolved["clean_id"] or (payload.student_id or "").strip()
+    sid_name = (
+        (payload.student_name or "").strip()
+        or resolved.get("display_name") or ""
+    )[:80]
+
     now = _mbt_iso(_mbt_now())
     await _mbt_rounds.update_one(
         {"id": rid, "status": "open"},
         {"$set": {
             "selected_box_index": int(payload.box_index),
-            "selected_student_id": payload.student_id,
-            "selected_student_name": (payload.student_name or "")[:80],
+            "selected_student_id": sid_clean,
+            "selected_student_id_raw": payload.student_id or "",
+            "selected_student_id_norm": resolved["norm"],
+            "selected_student_name": sid_name,
+            "selected_student_resolved": bool(resolved.get("ok")),
             "updated_at": now,
         }},
     )
@@ -1001,8 +1210,18 @@ async def mbt_reveal_round(rid: str, payload: _RevealIn, admin=Depends(require_a
     if not row:
         raise HTTPException(status_code=404, detail="round not found")  # type: ignore[name-defined]
 
-    sid_clean = (payload.student_id or "").strip()
-    sid_norm = _mbt_norm_id(sid_clean)
+    # v1.7 EMERGENCY FIX: resolve the incoming identifier to its
+    # canonical clean_id BEFORE any reward persistence. Previously this
+    # function used payload.student_id verbatim, which meant rewards
+    # were granted under the wallet-form id (e.g. ``stu_88185fad5202``)
+    # while ``/api/student/vouchers`` etc. read by clean_id (``stu094``).
+    raw_id_in = (payload.student_id or "").strip()
+    if not raw_id_in:
+        raise HTTPException(status_code=400, detail="student_id required")  # type: ignore[name-defined]
+    resolved = await _mbt_resolve_student(raw_id_in)
+    sid_clean = resolved["clean_id"] or raw_id_in
+    sid_norm = resolved["norm"] or _mbt_norm_id(sid_clean)
+    sid_wallet = resolved.get("student_id") or ""
     if not sid_clean:
         raise HTTPException(status_code=400, detail="student_id required")  # type: ignore[name-defined]
 
@@ -1096,6 +1315,11 @@ async def mbt_reveal_round(rid: str, payload: _RevealIn, admin=Depends(require_a
             "campaign_id": row.get("campaign_id"),
             "student_id": sid_clean,
             "student_id_norm": sid_norm,
+            # v1.7: keep an audit trail of the raw incoming id so an
+            # operator can prove which form Speaking Lab sent.
+            "student_id_raw": raw_id_in,
+            "student_wallet_id": sid_wallet,
+            "student_resolved": bool(resolved.get("ok")),
             "student_name": (payload.student_name or row.get("selected_student_name") or "")[:80],
             "selected_box_index": box_index,
             "prize_id": prize.get("id"),
@@ -1188,6 +1412,46 @@ async def mbt_reveal_round(rid: str, payload: _RevealIn, admin=Depends(require_a
             "updated_at": _mbt_iso(_mbt_now()),
         }},
     )
+
+    # v1.7 EMERGENCY FIX: mirror a successful POINTS grant into the Mongo
+    # points ledger + wallet so it becomes visible in My Portal via the
+    # existing /api/student/points/latest and /transactions endpoints.
+    # The legacy `_lrc_credit_via_treasury` writes ONLY to GAS, which
+    # the dashboard does not read. This mirror is idempotent (keyed by
+    # claim_id) and never reverts the grant on failure.
+    try:
+        ptype_g = (prize.get("type") or "").strip().lower()
+        if ptype_g in ("points", "consolation"):
+            granted_obj = result.get("granted") or {}
+            credited = int(
+                granted_obj.get("points_credited")
+                or prize.get("points")
+                or 0
+            )
+            if credited > 0:
+                mirror = await _mbt_mirror_points_credit(
+                    clean_id=sid_clean,
+                    wallet_id=sid_wallet,
+                    amount=credited,
+                    claim_id=pending_id,
+                    source="speaking_lab_mystery_box",
+                )
+                # Stamp the mirror result on the claim for operator audit.
+                await _mbt_claims.update_one(
+                    {"id": pending_id},
+                    {"$set": {
+                        "points_mirror_ok": bool(mirror.get("ok")),
+                        "points_mirror_status_ledger": mirror.get("ledger"),
+                        "points_mirror_status_wallet": mirror.get("wallet"),
+                        "points_mirror_ikey": mirror.get("ikey"),
+                        "points_mirror_error": mirror.get("error") or None,
+                    }},
+                )
+    except Exception as _mirror_exc:  # noqa: BLE001
+        _MBT_LOG.warning(
+            "mystery_box points mirror failed claim=%s err=%s",
+            pending_id, str(_mirror_exc)[:200],
+        )
 
     # Mark round done — ONLY now that the grant succeeded. A failed
     # grant raised above and left the round status as "open" so the
@@ -1430,6 +1694,100 @@ async def mbt_admin_student_summary(
         "recent_claims": claims,
         "recent_reward_history": history,
     }
+
+
+# ── v1.7 EMERGENCY FIX: admin diagnostics + reconciliation ──────────────────
+#
+# These admin-only endpoints let an operator audit and recover today's
+# affected students without opening Mongo Atlas. None of them re-grant a
+# voucher / pass / points without a `dry_run=false` confirmation, and
+# all of them are idempotent.
+@api.get("/admin/mystery-box/claims/lookup")  # noqa: F821
+async def mbt_admin_claim_lookup(
+    student_id: str = "",
+    round_id: str = "",
+    limit: int = 20,
+    admin=Depends(require_admin),  # type: ignore[name-defined]
+):
+    """Find Mystery Box claims for a student / round (admin audit).
+    Internal ids ARE shown to the admin — but voucher codes are never
+    surfaced here (those live only in db.coupons)."""
+    q: dict = {}
+    if student_id:
+        resolved = await _mbt_resolve_student(student_id)
+        q["$or"] = [
+            {"student_id_norm": resolved["norm"]},
+            {"student_id": resolved["clean_id"]},
+            {"student_id_raw": resolved["raw"]},
+        ]
+    if round_id:
+        q["round_id"] = round_id
+    if not q:
+        raise HTTPException(status_code=400, detail="student_id or round_id required")  # type: ignore[name-defined]
+    rows = []
+    async for r in _mbt_claims.find(q, {"_id": 0}).sort("created_at", -1).limit(int(limit or 20)):
+        rows.append(r)
+    return {"claims": rows, "count": len(rows)}
+
+
+class _MBTReconcileIn(BaseModel):  # type: ignore[name-defined]
+    model_config = ConfigDict(extra="ignore")  # type: ignore[name-defined]
+    claim_id: str = Field(..., min_length=1)  # type: ignore[name-defined]
+    dry_run: bool = True
+
+
+@api.post("/admin/mystery-box/claims/reconcile-points")  # noqa: F821
+async def mbt_admin_reconcile_points(
+    payload: _MBTReconcileIn,
+    admin=Depends(require_admin),  # type: ignore[name-defined]
+):
+    """Re-mirror a successful POINTS grant into the Mongo ledger if the
+    initial mirror failed (e.g. transient Mongo error during reveal).
+    Idempotent: the mirror itself is keyed by the claim_id, so calling
+    this twice will not double-credit. Voucher / pass claims are NOT
+    handled here — those write directly to the dashboard-readable
+    collections and can be re-issued via the existing issuer functions
+    (out of scope for v1.7)."""
+    claim = await _mbt_claims.find_one({"id": payload.claim_id}, {"_id": 0})
+    if not claim:
+        raise HTTPException(status_code=404, detail="claim not found")  # type: ignore[name-defined]
+    if (claim.get("granted_status") or "").lower() != "granted":
+        raise HTTPException(status_code=400, detail="claim is not in granted status")  # type: ignore[name-defined]
+    ptype = (claim.get("prize_type") or "").strip().lower()
+    if ptype not in ("points", "consolation"):
+        return {"ok": True, "skipped": True,
+                "reason": f"prize_type={ptype} (not points)"}
+
+    safe = claim.get("safe_display_payload") or {}
+    pts = int(safe.get("points") or 0)
+    if pts <= 0:
+        return {"ok": True, "skipped": True, "reason": "no points to mirror"}
+
+    if payload.dry_run:
+        return {"ok": True, "dry_run": True,
+                "would_credit_clean_id": claim.get("student_id"),
+                "would_credit_amount": pts,
+                "ikey": f"sl_mb_credit:{claim.get('id')}"}
+
+    resolved = await _mbt_resolve_student(claim.get("student_id") or "")
+    mirror = await _mbt_mirror_points_credit(
+        clean_id=resolved["clean_id"] or claim.get("student_id"),
+        wallet_id=resolved.get("student_id") or "",
+        amount=pts,
+        claim_id=claim.get("id"),
+        source="speaking_lab_mystery_box_reconcile",
+    )
+    await _mbt_claims.update_one(
+        {"id": claim.get("id")},
+        {"$set": {
+            "points_mirror_ok": bool(mirror.get("ok")),
+            "points_mirror_status_ledger": mirror.get("ledger"),
+            "points_mirror_status_wallet": mirror.get("wallet"),
+            "points_mirror_reconciled_at": _mbt_iso(_mbt_now()),
+            "points_mirror_reconciled_by": getattr(admin, "email", "") or "",
+        }},
+    )
+    return {"ok": True, "mirror": mirror}
 
 
 # ── Player join the round (Speaking Lab passes the picked student) ──────────

@@ -127,6 +127,16 @@ async def _write_durable_event(
         result = await db.migration_sync_events.update_one(
             {"idempotency_key": idempotency_key},
             {"$setOnInsert": {
+                # v1.7 EMERGENCY FIX: legacy unique index `event_id_1`
+                # on db.migration_sync_events used to fire E11000
+                # duplicate-key errors with `event_id: null` because
+                # this $setOnInsert never wrote the field. We now stamp
+                # a deterministic, non-null `event_id` equal to the
+                # idempotency_key on FIRST insert only. The reconciler
+                # and the apply step continue to key off
+                # idempotency_key, so this is a zero-risk additive
+                # change. Existing rows are untouched.
+                "event_id":        idempotency_key,
                 "idempotency_key": idempotency_key,
                 "student_id":      student_id,
                 "operation":       operation,

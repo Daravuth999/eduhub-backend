@@ -5287,6 +5287,131 @@ async def sl_pool_diagnostics(
     }
 
 
+# ── v1.7 EMERGENCY FIX: pool ticket reconciliation ──────────────────────────
+#
+# Production root-cause: students sent points to stu092 but the
+# `/api/push/notify-credit` callback that drives ``_sl_try_auto_enter``
+# was occasionally not invoked (killswitch, browser closed before the
+# call finished, GAS rate-limit, schedule-mismatch). The transfer is
+# durable in ``push_credit_log`` (insert is the source-of-truth audit
+# row written ATOMICALLY before the push fan-out), so we can replay
+# any rows whose sender never reached SL_ENTRIES.
+#
+# Safety:
+#   * Admin-only.
+#   * Reuses the EXISTING ``_sl_try_auto_enter`` helper, which is
+#     already idempotent on (session_id, student_id) and (session_id,
+#     display_name_key). Duplicate reconcile calls cannot produce
+#     duplicate tickets — the helper short-circuits on existing rows
+#     and only generates a lucky code when one is missing.
+#   * Does NOT credit GAS / wallet / Mongo points — the credit already
+#     happened (we're only repairing the pool-entry surface).
+#   * Read-only on push_credit_log.
+class _SLPoolReconcileIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    look_back_minutes: int = Field(120, ge=1, le=24 * 60)
+    dry_run: bool = False
+
+
+@api.post("/speaking-lab/sessions/{session_id}/pool/reconcile")
+async def sl_pool_reconcile(
+    session_id: str,
+    payload: _SLPoolReconcileIn,
+    admin: User = Depends(require_admin),
+):
+    """Scan ``push_credit_log`` for credits to the Speaking Lab treasury
+    and replay any that never reached SL_ENTRIES. Idempotent.
+
+    Returns a per-sender breakdown. ``dry_run=true`` returns the
+    candidate list without calling ``_sl_try_auto_enter``."""
+    sess = await SL_SESSIONS.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    treasury_norm = _norm_student_id(SL_TREASURY_ID)
+    window_minutes = max(1, min(int(payload.look_back_minutes or 120), 24 * 60))
+    since_dt = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+
+    # 1) Pull recent treasury credits from push_credit_log. The
+    #    recipientStudentId field is stored case-sensitively but we
+    #    normalise for the comparison so STU092 / Stu092 / stu092 all
+    #    match.
+    candidate_rows: list[dict] = []
+    try:
+        cur = push_credit_log.find(
+            {"createdAt": {"$gte": since_dt}},
+            {"_id": 0, "senderStudentId": 1, "recipientStudentId": 1,
+             "amount": 1, "createdAt": 1, "transferId": 1},
+        ).sort("createdAt", -1).limit(500)
+        async for r in cur:
+            if _norm_student_id(r.get("recipientStudentId") or "") == treasury_norm:
+                candidate_rows.append(r)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sl.pool.reconcile: push_credit_log read failed: %s", str(exc)[:200])
+
+    # 2) For each candidate sender, check whether they are already in
+    #    SL_ENTRIES for this session. If not, call _sl_try_auto_enter.
+    candidates_out: list[dict] = []
+    seen_senders: set[str] = set()
+    for row in candidate_rows:
+        sender_raw = row.get("senderStudentId") or ""
+        sender_norm = _norm_student_id(sender_raw)
+        if not sender_norm or sender_norm == treasury_norm:
+            continue
+        if sender_norm in seen_senders:
+            continue  # already processed (we replay only the most-recent)
+        seen_senders.add(sender_norm)
+        try:
+            already = await SL_ENTRIES.find_one(
+                {"session_id": session_id, "student_id": sender_norm},
+                {"_id": 0, "student_id": 1},
+            )
+        except Exception:
+            already = None
+
+        record = {
+            "sender_student_id": sender_norm,
+            "amount": int(row.get("amount") or 0),
+            "transfer_id": (row.get("transferId") or "")[:64],
+            "created_at": (row.get("createdAt").isoformat()
+                           if hasattr(row.get("createdAt"), "isoformat")
+                           else str(row.get("createdAt") or "")),
+            "status": "already_in_pool" if already else "missing",
+            "result": None,
+        }
+        if not already and not payload.dry_run:
+            try:
+                result = await _sl_try_auto_enter(
+                    sender_raw,
+                    int(row.get("amount") or 0),
+                    source="pool_reconcile",
+                )
+                record["result"] = result
+                record["status"] = result.get("status") or "unknown"
+            except Exception as exc:  # noqa: BLE001
+                record["status"] = "error"
+                record["result"] = {"reason": str(exc)[:200]}
+        candidates_out.append(record)
+
+    summary = {
+        "dry_run": bool(payload.dry_run),
+        "session_id": session_id,
+        "treasury_id": treasury_norm,
+        "look_back_minutes": window_minutes,
+        "candidate_count": len(candidates_out),
+        "missing_before": sum(1 for c in candidates_out if c["status"] == "missing"),
+        "already_in_pool": sum(1 for c in candidates_out
+                               if c["status"] == "already_in_pool"),
+        "accepted": sum(1 for c in candidates_out if c["status"] == "accepted"),
+        "repaired": sum(1 for c in candidates_out if c["status"] == "repaired"),
+        "warned":   sum(1 for c in candidates_out if c["status"] == "warned"),
+        "duplicate": sum(1 for c in candidates_out if c["status"] == "duplicate"),
+        "rejected": sum(1 for c in candidates_out if c["status"] == "rejected"),
+        "errors":   sum(1 for c in candidates_out if c["status"] == "error"),
+    }
+    return {"ok": True, "summary": summary, "candidates": candidates_out}
+
+
 # ── LUCKY DRAW SURGERY ────────────────────────────────────────────────
 async def _lucky_draw_push_notify(student_id: str, amount: int, code: str) -> None:
     """Phase 3: send a Web Push to a Lucky Draw winner regardless of how
