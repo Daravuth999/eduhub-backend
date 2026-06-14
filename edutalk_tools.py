@@ -108,6 +108,16 @@ except Exception:  # noqa: BLE001
     _TC_VALID_TIERS = ("free", "standard", "premium", "limited_edition")
     _PHASE3_HELPERS_OK = False
 
+# v9.6 — Audio cache + per-student entitlement (quota-aware replay).
+# Failure-safe: if the module is missing, /speak falls back to the
+# legacy behaviour (every call re-generates and re-charges).
+try:
+    import edutalk_audio_cache as _et_audio  # type: ignore[import-not-found]
+    _AUDIO_CACHE_OK = True
+except Exception:  # noqa: BLE001
+    _et_audio = None  # type: ignore[assignment]
+    _AUDIO_CACHE_OK = False
+
 log = logging.getLogger("eduhub.edutalk")
 
 # --------------------------------------------------------------------------- #
@@ -3252,6 +3262,17 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
     msg_col = db[MONGO_MESSAGES_COLLECTION]
     usage_col = db[MONGO_USAGE_COLLECTION]
 
+    # v9.6 — fire-and-forget index creation for the audio cache + per-
+    # student entitlement collections. Failure here is non-fatal: the
+    # helpers themselves are wrapped in try/except, so an index miss
+    # just degrades lookups to full scans (rare in practice — both
+    # collections stay small thanks to content-hash deduplication).
+    if _AUDIO_CACHE_OK and _et_audio is not None:
+        try:
+            asyncio.get_event_loop().create_task(_et_audio.ensure_indexes(db))
+        except Exception as _idx_exc:  # noqa: BLE001
+            log.warning("edutalk: audio-cache index task spawn failed: %s", _idx_exc)
+
     async def _load_config() -> dict:
         doc = await cfg_col.find_one({"_id": CONFIG_DOC_ID})
         return _merge_config(doc.get("config") if isinstance(doc, dict) else None)
@@ -4081,6 +4102,107 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
         voice_id = (session.get("voice_id") or cfg.get("voice_id") or "").strip()
         resolved_voice = voice_id  # may be updated in ElevenLabs path below
         deducted = 0
+
+        # ── v9.6 quota-aware replay entitlement check ─────────────────────
+        # Build a stable content_hash that uniquely identifies the audio
+        # payload (book + chapter + message_index + normalised reply +
+        # support_lang + voice_id). When this student already holds an
+        # entitlement for the SAME hash → free replay, NO Gemini call,
+        # NO ElevenLabs / Gemini-TTS call, NO point deduction.
+        audio_support_lang_for_hash = _clamp_audio_support_lang(
+            cfg.get("audio_support_lang")
+        )
+        _content_hash_replay = None
+        if _AUDIO_CACHE_OK and _et_audio is not None:
+            try:
+                # We pre-compute under the "safe" assumption that this
+                # MIGHT be a replay; for replay lookup we always use the
+                # personalized=False hash variant if the original
+                # payment was generic, OR the personalized variant if it
+                # was personal. We try both — entitlement match wins.
+                _h_generic = _et_audio.compute_content_hash(
+                    book_slug=session.get("book_slug", "") or "",
+                    chapter_idx=session.get("chapter_idx") or 0,
+                    message_index=int(payload.message_index or 0),
+                    reply_text=payload.reply_text or "",
+                    audio_support_lang=audio_support_lang_for_hash,
+                    voice_id=voice_id or "",
+                    is_personalized=False,
+                    student_id=student.clean_id,
+                )
+                _h_personal = _et_audio.compute_content_hash(
+                    book_slug=session.get("book_slug", "") or "",
+                    chapter_idx=session.get("chapter_idx") or 0,
+                    message_index=int(payload.message_index or 0),
+                    reply_text=payload.reply_text or "",
+                    audio_support_lang=audio_support_lang_for_hash,
+                    voice_id=voice_id or "",
+                    is_personalized=True,
+                    student_id=student.clean_id,
+                )
+                for _candidate in (_h_personal, _h_generic):
+                    _ent = await _et_audio.lookup_entitlement(
+                        db, student_id=student.clean_id,
+                        content_hash=_candidate,
+                    )
+                    if not _ent:
+                        continue
+                    _cache_doc = await _et_audio.lookup_cache(
+                        db, content_hash=_candidate,
+                    )
+                    if not _cache_doc or not _cache_doc.get("r2_url"):
+                        continue
+                    # ── HIT: replay free of charge, no LLM, no TTS ──
+                    await _et_audio.bump_access(
+                        db, student_id=student.clean_id,
+                        content_hash=_candidate,
+                    )
+                    await _log_usage(
+                        student, "speak", "replay_cache_hit", 0,
+                        session.get("book_slug", ""),
+                        session.get("chapter_idx"),
+                        payload.session_id,
+                    )
+                    _audio_b64_replay = ""
+                    try:
+                        _audio_b64_replay = (
+                            await _et_audio.fetch_audio_b64_from_r2(
+                                object_key=_cache_doc["r2_object_key"],
+                            )
+                        ) or ""
+                    except Exception as _fexc:  # noqa: BLE001
+                        log.warning(
+                            "edutalk: replay b64 fetch failed (will rely "
+                            "on audio_url): %s", _fexc,
+                        )
+                    ACTIVE_EDUTALK_SPEAKS.discard(guard_key)
+                    return {
+                        "success": True,
+                        "audio_b64": _audio_b64_replay,
+                        "audio_url": _cache_doc["r2_url"],
+                        "mime_type": _cache_doc.get(
+                            "mime_type", "audio/mpeg",
+                        ),
+                        "script_text": _cache_doc.get("script_text", "")
+                        or "",
+                        "points_used": 0,
+                        "pass_consumed": False,
+                        "replay": True,
+                        "voice_id": (
+                            "gemini-tts"
+                            if (_cache_doc.get("mime_type") or "").endswith("wav")
+                            else (resolved_voice or "")
+                        ),
+                    }
+                # Keep the generic hash around for the post-payment
+                # cache-reuse path below.
+                _content_hash_replay = _h_generic
+            except Exception as _ent_exc:  # noqa: BLE001
+                log.warning(
+                    "edutalk: entitlement lookup failed (non-fatal): %s",
+                    _ent_exc,
+                )
+
         # Mystery Box: try to reserve a voice-reply pass before charging.
         _pass_id_voice = None
         if voice_cost > 0:
@@ -4135,6 +4257,92 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                         detail="Could not charge voice reply points. No points were taken.",
                     )
                 deducted = voice_cost
+
+            # ── v9.6 quota-aware GENERIC cache reuse (post-payment) ─────
+            # The student has now paid (or had a pass). If a safe-generic
+            # cached audio already exists for this exact content_hash we
+            # SKIP both Gemini script generation AND ElevenLabs/Gemini
+            # TTS, save the cached R2 URL, grant the entitlement, and
+            # return immediately. The student still paid fairly; we just
+            # spared ourselves a duplicate AI/billing round-trip.
+            if _AUDIO_CACHE_OK and _et_audio is not None and _content_hash_replay:
+                try:
+                    _cache_hit = await _et_audio.lookup_cache(
+                        db, content_hash=_content_hash_replay,
+                    )
+                    if (
+                        _cache_hit
+                        and _cache_hit.get("r2_url")
+                        and not _cache_hit.get("is_personalized")
+                    ):
+                        await _et_audio.bump_access(
+                            db, student_id=student.clean_id,
+                            content_hash=_content_hash_replay,
+                        )
+                        await _et_audio.grant_entitlement(
+                            db,
+                            student_id=student.clean_id,
+                            content_hash=_content_hash_replay,
+                            book_slug=session.get("book_slug", "") or "",
+                            chapter_idx=session.get("chapter_idx") or 0,
+                            message_index=int(payload.message_index or 0),
+                            paid_points=deducted,
+                            session_id=payload.session_id,
+                        )
+                        # Commit any reserved Mystery Box pass since
+                        # the student got their audio successfully.
+                        if _pass_id_voice:
+                            _ok_v_h = await _et_commit_pass(_pass_id_voice)
+                            if not _ok_v_h:
+                                await _et_refund_pass(_pass_id_voice)
+                            _pass_id_voice = None
+                        await _log_usage(
+                            student, "speak", "new_pay_cache_hit",
+                            deducted,
+                            session.get("book_slug", ""),
+                            session.get("chapter_idx"),
+                            payload.session_id,
+                        )
+                        _audio_b64_reuse = ""
+                        try:
+                            _audio_b64_reuse = (
+                                await _et_audio.fetch_audio_b64_from_r2(
+                                    object_key=_cache_hit["r2_object_key"],
+                                )
+                            ) or ""
+                        except Exception as _fexc:  # noqa: BLE001
+                            log.warning(
+                                "edutalk: generic-reuse b64 fetch "
+                                "failed (audio_url still returned): %s",
+                                _fexc,
+                            )
+                        return {
+                            "success": True,
+                            "audio_b64": _audio_b64_reuse,
+                            "audio_url": _cache_hit["r2_url"],
+                            "mime_type": _cache_hit.get(
+                                "mime_type", "audio/mpeg",
+                            ),
+                            "script_text": _cache_hit.get(
+                                "script_text", "",
+                            ) or "",
+                            "points_used": deducted,
+                            "pass_consumed": False,
+                            "replay": False,
+                            "cache_reused": True,
+                            "voice_id": (
+                                "gemini-tts"
+                                if (_cache_hit.get("mime_type") or "")
+                                .endswith("wav")
+                                else (resolved_voice or "")
+                            ),
+                        }
+                except Exception as _reuse_exc:  # noqa: BLE001
+                    log.warning(
+                        "edutalk: generic-cache reuse check failed "
+                        "(falling through to generation): %s",
+                        _reuse_exc,
+                    )
 
             # 3) Generate the voice script.
             #
@@ -4504,13 +4712,110 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
                 # block below doesn't double-refund (commit success) or
                 # double-refund (commit failure already refunded above).
                 _pass_id_voice = None
+
+            # ── v9.6 quota-aware cache write + entitlement grant ────────
+            # Uploads the freshly-generated audio to R2 under a stable
+            # content-hash key and records (a) a global cache row for
+            # safe-generic reuse and (b) a per-student entitlement so
+            # any future replay by THIS student is free + skips Gemini
+            # and ElevenLabs entirely.
+            #
+            # Strict failure-safety contract: every block is wrapped so
+            # a storage hiccup never propagates to the student — they
+            # still get the inline `audio_b64` they always did.
+            _audio_url_out = ""
+            if _AUDIO_CACHE_OK and _et_audio is not None and audio_b64:
+                try:
+                    _is_personal = _et_audio.detect_personalization(
+                        message_index=int(payload.message_index or 0),
+                        session=session,
+                        reply_text=payload.reply_text or "",
+                        voice_script=voice_script,
+                    )
+                    _final_hash = _et_audio.compute_content_hash(
+                        book_slug=session.get("book_slug", "") or "",
+                        chapter_idx=session.get("chapter_idx") or 0,
+                        message_index=int(payload.message_index or 0),
+                        reply_text=payload.reply_text or "",
+                        audio_support_lang=audio_support_lang_for_hash,
+                        voice_id=voice_id or "",
+                        is_personalized=_is_personal,
+                        student_id=student.clean_id,
+                    )
+                    try:
+                        _audio_bytes = base64.b64decode(audio_b64)
+                    except Exception:  # noqa: BLE001
+                        _audio_bytes = b""
+                    if _audio_bytes:
+                        _obj_key = _et_audio.object_key_for(
+                            _final_hash, mime_type,
+                        )
+                        _r2_url = await _et_audio.upload_audio_to_r2(
+                            audio_bytes=_audio_bytes,
+                            object_key=_obj_key,
+                            content_type=mime_type,
+                            metadata={
+                                "book_slug": (
+                                    session.get("book_slug", "") or ""
+                                )[:120],
+                                "chapter_idx": str(
+                                    session.get("chapter_idx") or 0
+                                ),
+                                "message_index": str(payload.message_index or 0),
+                                "support_lang": audio_support_lang_for_hash,
+                                "is_personalized": (
+                                    "1" if _is_personal else "0"
+                                ),
+                            },
+                        )
+                        if _r2_url:
+                            _audio_url_out = _r2_url
+                            await _et_audio.insert_cache(
+                                db,
+                                content_hash=_final_hash,
+                                r2_object_key=_obj_key,
+                                r2_url=_r2_url,
+                                mime_type=mime_type,
+                                script_text=voice_script,
+                                is_personalized=_is_personal,
+                                originator_student_id=student.clean_id,
+                                book_slug=session.get("book_slug", "") or "",
+                                chapter_idx=(
+                                    session.get("chapter_idx") or 0
+                                ),
+                                audio_support_lang=(
+                                    audio_support_lang_for_hash
+                                ),
+                                voice_id=voice_id or "",
+                                size_bytes=len(_audio_bytes),
+                            )
+                            await _et_audio.grant_entitlement(
+                                db,
+                                student_id=student.clean_id,
+                                content_hash=_final_hash,
+                                book_slug=session.get("book_slug", "") or "",
+                                chapter_idx=(
+                                    session.get("chapter_idx") or 0
+                                ),
+                                message_index=int(payload.message_index or 0),
+                                paid_points=deducted,
+                                session_id=payload.session_id,
+                            )
+                except Exception as _cache_write_exc:  # noqa: BLE001
+                    log.warning(
+                        "edutalk: audio-cache write failed (audio still "
+                        "served inline): %s", _cache_write_exc,
+                    )
+
             return {
                 "success": True,
                 "audio_b64": audio_b64,
+                "audio_url": _audio_url_out,
                 "mime_type": mime_type,       # NEW — tells frontend how to decode
                 "script_text": voice_script,
                 "points_used": deducted,
                 "pass_consumed": _voice_pass_committed,
+                "replay": False,
                 "voice_id": resolved_voice if script_lang != "khmer" else "gemini-tts",
             }
         finally:
@@ -4646,6 +4951,20 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
         if status == "active" and expires_at <= _now():
             status = "expired"
 
+        # v9.6 — return already-paid voice replay entitlements so the
+        # frontend can seed its replay-from-cache map (no extra cost
+        # on resume, refresh, device switch, or panel reopen).
+        voice_entitlements: list[dict] = []
+        if _AUDIO_CACHE_OK and _et_audio is not None:
+            try:
+                voice_entitlements = await _et_audio.list_session_entitlements(
+                    db,
+                    student_id=student.clean_id,
+                    session_id=session_id,
+                )
+            except Exception as _vex:  # noqa: BLE001
+                log.warning("edutalk: voice-entitlement list failed: %s", _vex)
+
         return {
             "success": True,
             "session_id": session_id,
@@ -4662,6 +4981,8 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
             # the speaker icon correctly.
             "voice_reply_enabled": bool(session.get("voice_reply_enabled", False)),
             "voice_cost": int(session.get("voice_cost", 1)),
+            # v9.6 — already-paid replay entitlements (free replay).
+            "voice_entitlements": voice_entitlements,
         }
 
     log.info(
