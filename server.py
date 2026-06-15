@@ -5540,6 +5540,17 @@ async def startup():
             _ref_idx_exc,
         )
 
+    # ── Coach Pack v3: ensure indexes during startup (non-fatal) ──
+    try:
+        _cp_idx_fn = globals().get("_coach_pack_ensure_indexes")
+        if _cp_idx_fn is not None:
+            await _cp_idx_fn(db)
+    except Exception as _cp_idx_exc:  # noqa: BLE001
+        log.warning(
+            "coach_pack: ensure_coach_pack_indexes failed (non-fatal): %s",
+            _cp_idx_exc,
+        )
+
     log.info("startup: indexes ready | admin emails=%s",
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
@@ -6425,6 +6436,53 @@ except Exception as _mbt_load_err:
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
+
+# ── COACH PACK v3 (isolated, additive, behind admin tier-config flags) ────
+# Mounts 9 additive student-facing modules under /api/student/* that turn
+# the Library into a personalised reading coach (SLP, Word Bank, Hard
+# Sentences, Chapter Review, Mini Quiz, Weakness Map, Study Path,
+# Roleplay, Progress + Badges). Every paid AI feature runs through the
+# `paid_action()` gate in coach_pack_shared.py which enforces the v3
+# cost-control contract:
+#   auth → tier → flag → entitlement → cache → daily_cap → cost → debit → LLM
+# Each registration is wrapped in try/except so a single feature failure
+# can never affect the rest of the app. Reader, EduTalk, Premium AI,
+# payment + wallet flows are NOT modified.
+try:
+    from student_learning_profile_tools import register_slp_routes
+    from student_vocab_tools import register_vocab_routes
+    from student_sentences_tools import register_sentences_routes
+    from chapter_review_tools import register_chapter_review_routes
+    from chapter_quiz_tools import register_quiz_routes
+    from weakness_map_tools import register_weakness_routes
+    from study_path_tools import register_study_path_routes
+    from roleplay_tools import register_roleplay_routes
+    from chapter_progress_tools import register_progress_routes
+    from coach_pack_shared import ensure_coach_pack_indexes as _coach_pack_ensure_indexes
+
+    for _cp_name, _cp_fn in (
+        ("slp", register_slp_routes),
+        ("vocab", register_vocab_routes),
+        ("sentences", register_sentences_routes),
+        ("chapter_review", register_chapter_review_routes),
+        ("quiz", register_quiz_routes),
+        ("weakness_map", register_weakness_routes),
+        ("study_path", register_study_path_routes),
+        ("roleplay", register_roleplay_routes),
+        ("progress", register_progress_routes),
+    ):
+        try:
+            _cp_fn(api, db, require_admin, require_student)
+        except Exception as _cp_reg_err:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "coach_pack: %s registration failed (feature disabled): %s",
+                _cp_name, _cp_reg_err,
+            )
+except Exception as _cp_import_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "coach_pack: import failed, Coach Pack disabled: %s", _cp_import_err,
+    )
+    _coach_pack_ensure_indexes = None  # type: ignore[assignment]
 
 # ── AI Assistant (isolated, additive) ────────────────────────────────────
 # Registers admin config + student chat routes for the rebuilt AI Assistant
