@@ -6433,6 +6433,38 @@ except Exception as _mbt_load_err:
         "mystery_box_tools.py failed to load (feature disabled): %s",
         _mbt_load_err,
     )
+# ── Login Mystery Box Rewards (additive, isolated, default OFF) ───────────
+# Loaded AFTER login_reward_tools.py AND mystery_box_tools.py so it can
+# reuse:
+#   * _lrc_credit_via_treasury     — existing points credit pipeline
+#   * _lrc_voucher_discount_label  — voucher label helper
+#   * _lrc_safe_artwork_url        — artwork URL allow-list
+#   * _lrc_gen_coupon_code / _lrc_compose_voucher_payload / _lrc_student_vouchers
+#   * _mbt_grant_edutalk_pass      — EduTalk pass entitlement issuer
+# Adds the new student popup endpoints:
+#   /api/student/login-mystery/status         (GET, student)
+#   /api/student/login-mystery/select         (POST, student)
+#   /api/student/login-mystery/history        (GET, student)
+# And the new Author Studio admin endpoints:
+#   /api/admin/login-mystery/campaigns        (GET / POST)
+#   /api/admin/login-mystery/campaigns/{id}   (GET / PUT / DELETE)
+#   /api/admin/login-mystery/claims           (GET)
+#   /api/admin/login-mystery/analytics        (GET)
+# Failure is non-fatal — only the Login Mystery Box feature is disabled
+# on load error; every existing route keeps working unchanged.
+try:
+    _lmb_src_path = __import__("pathlib").Path(__file__).parent / "login_mystery_box_tools.py"
+    with open(_lmb_src_path, "r", encoding="utf-8-sig") as _lmb_fh:
+        _lmb_src_text = _lmb_fh.read()
+    exec(compile(_lmb_src_text, str(_lmb_src_path), "exec"))
+    logging.getLogger("eduhub").info(
+        "login_mystery_box_tools: routes registered (admin + student)"
+    )
+except Exception as _lmb_load_err:
+    logging.getLogger("eduhub").warning(
+        "login_mystery_box_tools.py failed to load (feature disabled): %s",
+        _lmb_load_err,
+    )
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
