@@ -1540,6 +1540,47 @@ def _safe_session(session: dict) -> dict:
     return out
 
 
+def _build_greeting_kicker(session: dict) -> str:
+    """v1.4 — Server-side kicker that makes the AI coach speak FIRST.
+
+    Gemini Live with ``responseModalities=["AUDIO"]`` only emits audio after
+    it receives a turn. Without a kicker the coach sits silent until the
+    student talks, which felt awkward to early testers. We inject a SHORT
+    user turn that tells the coach to greet the student warmly using the
+    book context that's already in ``system_instruction``. The kicker text
+    itself is never spoken back: it's interpreted by the model as a turn
+    boundary that triggers an audio response, which goes through the
+    existing ``pump_gemini_to_client`` path unchanged.
+
+    Kept intentionally short: no rules, no lists, no schema — just a tiny
+    direction so the greeting feels personal, not scripted.
+    """
+    name = (session.get("display_name") or "").split(" ")[0] or "the student"
+    book = (session.get("book_title") or "").strip()
+    chapter = (session.get("chapter_title") or "").strip()
+    mode = (session.get("mode") or "").strip()
+
+    parts = [
+        "[SESSION_START]",
+        f"Greet {name} warmly in ONE or TWO short sentences (max ~25 words).",
+        f"Say hi using the name {name}.",
+    ]
+    if book and chapter:
+        parts.append(
+            f"Mention that you'll practise together using \"{book}\" — "
+            f"chapter \"{chapter}\"."
+        )
+    elif book:
+        parts.append(f"Mention the book \"{book}\" briefly.")
+    if mode:
+        parts.append(f"Frame the session as a '{mode}' practice.")
+    parts.append(
+        "Then ask ONE easy opening question to start the speaking practice. "
+        "Do not lecture. Do not list rules. Speak now."
+    )
+    return " ".join(parts)
+
+
 def _start_response(session: dict, cfg: dict) -> dict:
     mode_cfg = (cfg.get("modes") or {}).get(session.get("mode"), {})
     return {
@@ -1619,6 +1660,30 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
             )
             await _ws_send(client_ws, {"type": "ready"})
             await _ws_send(client_ws, {"type": "state", "value": "listening"})
+
+            # v1.4 — make the AI coach speak FIRST. Inject a single short
+            # "user" turn that tells Gemini to greet the student warmly
+            # using the book/chapter context already in system_instruction.
+            # The kicker text itself is never spoken back to the student;
+            # it's a turn-boundary trigger that produces an audio response
+            # which flows through pump_gemini_to_client unchanged. Wrapped
+            # in a try/except so a transient kicker failure NEVER aborts a
+            # session that has already been paid for — the session simply
+            # falls back to its previous behaviour (student speaks first).
+            try:
+                kicker = _build_greeting_kicker(session)
+                await gem.send(json.dumps({
+                    "clientContent": {
+                        "turns": [{
+                            "role": "user",
+                            "parts": [{"text": kicker}],
+                        }],
+                        "turnComplete": True,
+                    }
+                }))
+            except Exception:
+                # Greeting is a polish layer, not a correctness gate.
+                pass
 
             # Tracks WHY/HOW the session ended so finalization can choose the
             # correct outcome (completed vs cancelled vs failed) instead of
