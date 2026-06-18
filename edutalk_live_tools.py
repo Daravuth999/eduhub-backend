@@ -310,6 +310,22 @@ class StartSessionRequest(BaseModel):
     current_paragraph: str = Field("", max_length=2000)
     reading_progress: str = Field("", max_length=200)
     saved_words: list[str] = Field(default_factory=list)
+    # v1.5 — Khmer-Guided English Practice.
+    #   explain_language    : the student's PREFERRED language for the
+    #                         coach's explanations / corrections / tips.
+    #                         Practice sentences and the student's own
+    #                         speaking remain English regardless. Accepted
+    #                         values: "km" (default) or "en"; anything else
+    #                         is coerced to "km" server-side.
+    #   points_balance_hint : OPTIONAL display hint, used only in the
+    #                         opening greeting text the coach speaks. It
+    #                         is NEVER read by the billing / reserve /
+    #                         refund paths — those always go through the
+    #                         GAS balance source of truth. A malicious
+    #                         client passing a huge value here has zero
+    #                         effect on debits, charges, or refunds.
+    explain_language: str = Field("km", max_length=4)
+    points_balance_hint: Optional[int] = Field(None, ge=0, le=10_000_000)
     # Idempotency guard against a rapid double-tap on "Start".
     client_idempotency_key: str = Field("", max_length=80)
 
@@ -478,6 +494,7 @@ def _build_system_instruction(
     book_title: str, chapter_title: str, current_paragraph: str,
     reading_progress: str, saved_words: list[str],
     previous_reports: list[dict],
+    explain_language: str = "km",
 ) -> str:
     bc = cfg.get("book_context", {})
     method = _TEACHER_METHODS.get(
@@ -508,6 +525,43 @@ def _build_system_instruction(
     lines.append(f"Coaching focus areas for this session: {focus}.")
     lines.append(correction)
     lines.append(language)
+
+    # v1.5 — Khmer-Guided English Practice pillar.
+    #
+    # Core product rule the user explicitly locked: "Khmer guidance,
+    # English practice." The student CHOOSES the explanation language at
+    # session start; explanations / tips / corrections follow that
+    # choice, but every practice sentence the student must say and every
+    # answer the student must speak remain English. Without this rule
+    # the model tends to slip into full-Khmer conversation once it sees
+    # Khmer in the kicker, which would defeat the speaking-practice
+    # learning goal.
+    _lang = (explain_language or "km").strip().lower()
+    if _lang not in ("km", "en"):
+        _lang = "km"
+    if _lang == "km":
+        lines.append(
+            "LANGUAGE RULE (Khmer-guided English practice): The student "
+            "is a Khmer speaker. Explain meaning, grammar tips, "
+            "pronunciation tips (rhythm, ending sounds, linking, mouth / "
+            "tongue position), mistakes and encouragement IN KHMER. "
+            "However, every practice sentence you ask the student to "
+            "repeat, every model sentence you demonstrate, every reading "
+            "drill, and every example answer MUST be in ENGLISH. The "
+            "student's own speaking answers must also be in ENGLISH. "
+            "Never let the student switch the practice to Khmer — gently "
+            "ask them to try the English version again. Keep Khmer "
+            "sentences short and natural; do not lecture. Use simple "
+            "Khmer that a learner can understand."
+        )
+    else:
+        lines.append(
+            "LANGUAGE RULE: The student chose ENGLISH explanations. "
+            "Explain in simple, clear English (a learner can follow). "
+            "Practice sentences, model sentences, and the student's own "
+            "speaking answers are also in English. Keep explanations "
+            "short and warm; this is a speaking practice, not a lecture."
+        )
 
     if points_balance is not None:
         lines.append(
@@ -1293,6 +1347,18 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             ).sort("created_at", -1).limit(2)
             prev_reports = [r async for r in cur]
 
+        # v1.5 — sanitize the optional language preference + points hint.
+        # The hint is DISPLAY-ONLY for the greeting; never read by billing.
+        explain_language = (payload.explain_language or "km").strip().lower()
+        if explain_language not in ("km", "en"):
+            explain_language = "km"
+        points_hint = payload.points_balance_hint
+        if points_hint is not None:
+            try:
+                points_hint = max(0, min(int(points_hint), 10_000_000))
+            except Exception:
+                points_hint = None
+
         system_instruction = _build_system_instruction(
             cfg=cfg, mode_key=mode_key, mode_cfg=mode_cfg,
             student_name=(display_name or "the student").split(" ")[0],
@@ -1301,6 +1367,7 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             current_paragraph=payload.current_paragraph,
             reading_progress=payload.reading_progress,
             saved_words=payload.saved_words, previous_reports=prev_reports,
+            explain_language=explain_language,
         )
 
         now = _now()
@@ -1331,6 +1398,10 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             "duration_seconds": duration,
             "system_instruction": system_instruction,
             "client_idempotency_key": payload.client_idempotency_key,
+            # v1.5 — used by the greeting kicker only. NEVER touched by
+            # billing / reserve / refund / finalize logic.
+            "explain_language": explain_language,
+            "points_balance_hint": points_hint,
             "transcript": [],
             "day": _today_key(),
             "created_at": now.isoformat(),
@@ -1541,41 +1612,125 @@ def _safe_session(session: dict) -> dict:
 
 
 def _build_greeting_kicker(session: dict) -> str:
-    """v1.4 — Server-side kicker that makes the AI coach speak FIRST.
+    """v1.5 — Khmer-first greeting kicker for EduTalk Live Coach.
 
     Gemini Live with ``responseModalities=["AUDIO"]`` only emits audio after
     it receives a turn. Without a kicker the coach sits silent until the
-    student talks, which felt awkward to early testers. We inject a SHORT
-    user turn that tells the coach to greet the student warmly using the
-    book context that's already in ``system_instruction``. The kicker text
-    itself is never spoken back: it's interpreted by the model as a turn
-    boundary that triggers an audio response, which goes through the
-    existing ``pump_gemini_to_client`` path unchanged.
+    student talks. We inject a SHORT user-role turn that tells the coach
+    to greet the student warmly in the student's chosen explanation
+    language. The kicker text itself is never spoken back: it's
+    interpreted by the model as a turn boundary that triggers an audio
+    response which flows through the existing ``pump_gemini_to_client``
+    path unchanged.
 
-    Kept intentionally short: no rules, no lists, no schema — just a tiny
-    direction so the greeting feels personal, not scripted.
+    v1.5 behaviour:
+        * Default greeting language is KHMER (the vast majority of EduHub
+          students are Khmer speakers).
+        * The greeting uses the student's first name and — when a safe
+          display hint is available — the student's current points
+          balance. The hint is treated as DISPLAY-ONLY: if a malicious
+          client passed a wrong value, only the greeting text is wrong;
+          no money / debit / refund logic uses it.
+        * The greeting explicitly states "this is English speaking
+          practice from the book" and asks the student to confirm
+          whether they want explanations in Khmer or English. The
+          actual choice has already been sent via ``explain_language``;
+          the confirmation question is a friendly UX touch so the
+          student feels in control.
+        * If the student chose English explanations, the kicker greets
+          in English.
     """
     name = (session.get("display_name") or "").split(" ")[0] or "the student"
     book = (session.get("book_title") or "").strip()
     chapter = (session.get("chapter_title") or "").strip()
     mode = (session.get("mode") or "").strip()
+    lang = (session.get("explain_language") or "km").strip().lower()
+    if lang not in ("km", "en"):
+        lang = "km"
 
+    hint = session.get("points_balance_hint")
+    try:
+        hint_int = int(hint) if hint is not None else None
+    except Exception:
+        hint_int = None
+
+    if lang == "km":
+        # Khmer-first greeting. We give the model precise INSTRUCTIONS
+        # in English (Gemini follows English instructions reliably) and
+        # tell it to SPEAK the greeting in natural Khmer. We give the
+        # model an exact Khmer template it can shorten naturally — this
+        # avoids Unicode mojibake from over-creative paraphrasing.
+        parts: list[str] = [
+            "[SESSION_START]",
+            "Greet the student NOW in natural Khmer (ភាសាខ្មែរ). Do not "
+            "use English in the greeting except for proper nouns. Keep "
+            "it warm, short (~3 short sentences), and personal.",
+            f"The student's name is {name} — say hi using their name.",
+        ]
+        if hint_int is not None:
+            parts.append(
+                f"Tell them they currently have {hint_int} EduHub points "
+                "in their account (mention the points casually, not as a "
+                "sales pitch)."
+            )
+        if book and chapter:
+            parts.append(
+                f"Mention that today you will practise speaking English "
+                f"together using the book \"{book}\" — chapter \"{chapter}\"."
+            )
+        elif book:
+            parts.append(
+                f"Mention that today you will practise speaking English "
+                f"together using the book \"{book}\"."
+            )
+        else:
+            parts.append(
+                "Tell them today you will practise speaking English together."
+            )
+        if mode:
+            parts.append(f"Frame the session as a '{mode}' practice.")
+        parts.append(
+            "Then ask in Khmer whether they want explanations in Khmer or "
+            "in English. (Default in their UI was Khmer, so reassure them "
+            "Khmer is fine.) Also remind them CLEARLY in Khmer that the "
+            "practice sentences and their own speaking answers will still "
+            "be in English. End with one short English practice sentence "
+            "they can repeat to begin (taken from the current book "
+            "context if possible, otherwise something simple like "
+            "\"I am ready to practise.\")."
+        )
+        parts.append(
+            "Do not lecture. Do not list rules. Speak NOW in Khmer."
+        )
+        return " ".join(parts)
+
+    # explain_language == "en"
     parts = [
         "[SESSION_START]",
         f"Greet {name} warmly in ONE or TWO short sentences (max ~25 words).",
         f"Say hi using the name {name}.",
     ]
+    if hint_int is not None:
+        parts.append(
+            f"Mention casually that they have {hint_int} EduHub points in "
+            "their account."
+        )
     if book and chapter:
         parts.append(
-            f"Mention that you'll practise together using \"{book}\" — "
-            f"chapter \"{chapter}\"."
+            f"Mention that you'll practise English speaking together "
+            f"using \"{book}\" — chapter \"{chapter}\"."
         )
     elif book:
-        parts.append(f"Mention the book \"{book}\" briefly.")
+        parts.append(
+            f"Mention the book \"{book}\" briefly and frame it as English "
+            "speaking practice."
+        )
     if mode:
         parts.append(f"Frame the session as a '{mode}' practice.")
     parts.append(
-        "Then ask ONE easy opening question to start the speaking practice. "
+        "Then ask ONE easy opening English question (or give one short "
+        "English practice sentence) to start the speaking practice. "
+        "Remind them their speaking answers should be in English. "
         "Do not lecture. Do not list rules. Speak now."
     )
     return " ".join(parts)
