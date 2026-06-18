@@ -282,6 +282,27 @@ class _LRCCampaignIn(BaseModel):
     voucher_source: Literal["auto", "existing"] = "auto"
     voucher_existing_code: str | None = ""
 
+    # ── Smart Push Notification per-campaign config v1 (additive, all optional) ──
+    # Persists the admin's push notification settings for THIS campaign so the
+    # Author Studio can offer a "Send Push Now" action and the settings survive
+    # page reloads. Sending itself reuses the EXISTING /api/push/* fan-out
+    # infrastructure — these fields ONLY describe what the admin wants to send.
+    # Existing campaigns without these fields keep working unchanged because
+    # the model is `extra="ignore"` and every field below has a safe default.
+    #
+    #   push_enabled  — gate. False means the editor's push section is hidden
+    #                   on the campaign card and no auto-send ever happens.
+    #   push_title    — notification title (admin-editable before sending).
+    #   push_body     — notification body (admin-editable before sending).
+    #   push_target   — who receives the manual "Send Now" push:
+    #                     "eligible_unclaimed" → students who match the
+    #                       campaign's audience AND have NOT yet credited.
+    #                     "all_subscribers"    → every push subscription.
+    push_enabled: bool = False
+    push_title: str | None = ""
+    push_body: str | None = ""
+    push_target: Literal["eligible_unclaimed", "all_subscribers"] = "eligible_unclaimed"
+
 
 # Built-in premium voucher templates (gradient identifiers shared with the
 # student VoucherHub / popup reveal). Anything outside this set falls back
@@ -548,6 +569,17 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
     countdown_label = (p.countdown_label or "").strip()[:80]
     urgency_text = (p.urgency_text or "").strip()[:140]
 
+    # ── Smart Push Notification v1 — sanitise optional admin fields ────
+    # These fields persist what the admin wants to send when they click
+    # "Send Push Now" in the campaign editor. They never trigger an
+    # automatic send and never influence claim/credit logic.
+    push_enabled = bool(p.push_enabled) if p.push_enabled is not None else False
+    push_title = (p.push_title or "").strip()[:120]
+    push_body = (p.push_body or "").strip()[:500]
+    push_target = (p.push_target or "eligible_unclaimed").strip().lower()
+    if push_target not in ("eligible_unclaimed", "all_subscribers"):
+        push_target = "eligible_unclaimed"
+
     return {
         "name": name,
         "enabled": bool(p.enabled),
@@ -581,6 +613,13 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
         "urgency_text": urgency_text,
         # Reward-kind voucher sub-config v1.0.2 (additive).
         **voucher_fields,
+        # Smart Push Notification v1 (additive, all admin-only, never sent
+        # to students by the existing /api/rewards/login-campaigns/active
+        # public-view stripper).
+        "push_enabled": push_enabled,
+        "push_title": push_title,
+        "push_body": push_body,
+        "push_target": push_target,
     }
 
 
@@ -666,6 +705,156 @@ async def lrc_admin_claims(
     cur = _lrc_claims.find({"campaign_id": campaign_id}, {"_id": 0}).sort("claimed_at", -1).limit(500)
     out = [doc async for doc in cur]
     return {"campaign_id": campaign_id, "count": len(out), "claims": out}
+
+
+# ── Smart Push Notification v1 — admin-triggered manual "Send Now" ─────────
+# Reuses the EXISTING push infrastructure (push_subscriptions,
+# _fan_out_push, push_history) loaded into server.py's namespace. No
+# automatic / scheduled / background send — admin must press the button.
+# Deferred (see KNOWN_LIMITATIONS.md):
+#   * auto-send on campaign create/update
+#   * scheduled send when campaign becomes live
+#   * background per-eligibility-window push job
+class _LRCPushSendNowIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    # All three fields are OPTIONAL overrides. When omitted, the values
+    # persisted on the campaign (push_title / push_body / push_target)
+    # are used. An admin who wants to send a one-off with different copy
+    # can supply these without mutating the saved settings.
+    title: str | None = None
+    body: str | None = None
+    target: Literal["eligible_unclaimed", "all_subscribers"] | None = None
+    url: str | None = None
+
+
+@api.post("/admin/rewards/login-campaigns/{campaign_id}/push/send-now")
+async def lrc_admin_push_send_now(
+    campaign_id: str,
+    payload: _LRCPushSendNowIn,
+    admin: User = Depends(require_admin),
+):
+    """Send a push notification for THIS campaign right now (admin action).
+
+    Targets either every push subscriber (`all_subscribers`) or only the
+    students who match the campaign's audience AND have NOT yet credited
+    a claim for this campaign (`eligible_unclaimed`).
+
+    Idempotency: there is no DB-level lock on sending the same campaign
+    twice (push is a notification, not a credit). The frontend Studio
+    SHOULD show a confirmation modal before calling this endpoint to
+    avoid accidental duplicate spam. Each call writes a row to
+    `push_history` so duplicates are auditable.
+
+    This endpoint NEVER credits points, vouchers, or EduTalk passes.
+    Claim/credit logic is untouched.
+    """
+    doc = await _lrc_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    fan_out = globals().get("_fan_out_push")
+    if not callable(fan_out):
+        raise HTTPException(
+            status_code=500,
+            detail="_fan_out_push helper not loaded (push infrastructure unavailable)",
+        )
+
+    title = (payload.title if payload.title is not None else (doc.get("push_title") or "")).strip()
+    body  = (payload.body  if payload.body  is not None else (doc.get("push_body")  or "")).strip()
+    target = (payload.target or doc.get("push_target") or "eligible_unclaimed").strip().lower()
+    if target not in ("eligible_unclaimed", "all_subscribers"):
+        target = "eligible_unclaimed"
+    url = (payload.url or "/").strip() or "/"
+
+    if not title or not body:
+        raise HTTPException(
+            status_code=400,
+            detail="Push title and body must both be non-empty (set them in the campaign editor or in the request body).",
+        )
+
+    # Build the push_subscriptions query.
+    if target == "all_subscribers":
+        subs_query: dict = {}
+    else:
+        # eligible_unclaimed = (audience matches) AND (no credited claim row).
+        # We resolve this by enumerating push_subscriptions and intersecting
+        # in-memory because eligibility is computed by _lrc_eligible (which
+        # honours include/exclude lists). The subscriber set is small enough
+        # in production for this to be fine; if it ever grows we can swap
+        # to a precomputed audience cache.
+        credited_cur = _lrc_claims.find(
+            {"campaign_id": campaign_id, "status": "credited"},
+            {"_id": 0, "student_id_norm": 1},
+        )
+        credited_norm = {
+            (c.get("student_id_norm") or "").strip()
+            async for c in credited_cur
+        }
+        sub_ids: list[str] = []
+        seen_norm: set[str] = set()
+        ps = globals().get("push_subscriptions")
+        if ps is None:
+            raise HTTPException(status_code=500, detail="push_subscriptions collection not loaded")
+        sub_cur = ps.find({}, {"_id": 0, "studentId": 1})
+        async for sub in sub_cur:
+            sid_raw = (sub.get("studentId") or "").strip()
+            if not sid_raw:
+                continue
+            sid_norm = _norm_student_id(sid_raw)
+            if not sid_norm or sid_norm in seen_norm:
+                continue
+            seen_norm.add(sid_norm)
+            if sid_norm in credited_norm:
+                continue
+            if not _lrc_eligible(doc, sid_norm):
+                continue
+            sub_ids.append(sid_raw)
+        if not sub_ids:
+            return {
+                "sent": 0, "failed": 0, "target": target,
+                "matched_subscribers": 0,
+                "reason": "no_eligible_unclaimed_subscribers",
+            }
+        # Reuse the existing _build_target_query("students", ...) shape.
+        build_q = globals().get("_build_target_query")
+        if callable(build_q):
+            subs_query = build_q("students", sub_ids, None)
+        else:
+            subs_query = {"studentId": {"$in": sub_ids}}
+
+    try:
+        sent, failed = await fan_out(subs_query, title, body, url)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"push fan-out failed: {exc}")
+
+    # Audit row in the EXISTING push_history collection (admin-triggered).
+    ph = globals().get("push_history")
+    if ph is not None:
+        try:
+            await ph.insert_one({
+                "title": title,
+                "body": body,
+                "url": url,
+                "target": "students" if target == "eligible_unclaimed" else "everyone",
+                "studentIds": [],
+                "group": "",
+                "sentBy": getattr(admin, "email", "") or "",
+                "sentAt": _lrc_now(),
+                "sent": sent,
+                "failed": failed,
+                "source": "login_reward_campaign",
+                "campaign_id": campaign_id,
+                "campaign_name": doc.get("name") or "",
+                "push_target_mode": target,
+            })
+        except Exception as exc:
+            _LRC_LOG.warning("login_reward: push_history insert failed: %s", exc)
+
+    _LRC_LOG.info(
+        "login_reward: push send-now campaign=%s target=%s sent=%s failed=%s by=%s",
+        campaign_id, target, sent, failed, getattr(admin, "email", ""),
+    )
+    return {"sent": sent, "failed": failed, "target": target}
 
 
 # ── student-facing helpers ──────────────────────────────────────────────────
@@ -772,6 +961,8 @@ def _lrc_public_view(camp: dict) -> dict:
         "voucher_title", "voucher_subtitle", "voucher_discount_label",
         "voucher_template", "voucher_accent_color", "voucher_artwork_url",
         "voucher_cta_label", "voucher_source", "voucher_existing_code",
+        # Smart Push Notification v1 — admin-only fields, never leaked to students.
+        "push_enabled", "push_title", "push_body", "push_target",
     ):
         out.pop(k, None)
     # v1.2 — surface the student's per-campaign claim state in stable,
