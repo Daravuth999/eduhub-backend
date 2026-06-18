@@ -6469,6 +6469,31 @@ register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
 
+# ── EduTalk Live Coach (admin: "Live Voice Coach Beta") ──────────────────
+# NEW, fully isolated, additive real-time voice-to-voice speaking coach
+# powered by the Gemini Live API. Registers admin config routes
+# (/api/admin/edutalk-live/*), student routes
+# (/api/student/edutalk-live/*) and the live WebSocket proxy
+# (/api/student/edutalk-live/ws/{session_id}). The Gemini key stays
+# backend-only (env GEMINI_API_KEY). It reuses ONLY the read-only GAS
+# points helpers (_gas_get_balance / _gas_debit from premium_ai_tools) for
+# an isolated reserve/refund/finalize charging model — it does NOT touch
+# the existing EduTalk assistant, EduTalk audio cache, narration audio,
+# payment/top-up, ABA/KHQR/CamRapidPay or wallet logic. Failure is
+# non-fatal: if the module fails to load only Live Coach is disabled and
+# every existing route keeps working unchanged.
+try:
+    from edutalk_live_tools import register_edutalk_live_routes
+    register_edutalk_live_routes(api, db, require_admin, require_student)
+    logging.getLogger("eduhub").info(
+        "edutalk_live_tools: routes registered (Live Voice Coach Beta)"
+    )
+except Exception as _edutalk_live_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "edutalk_live_tools route registration failed (feature disabled): %s",
+        _edutalk_live_err,
+    )
+
 # ── COACH PACK v3 (isolated, additive, behind admin tier-config flags) ────
 # Mounts 9 additive student-facing modules under /api/student/* that turn
 # the Library into a personalised reading coach (SLP, Word Bank, Hard
