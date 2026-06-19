@@ -73,6 +73,63 @@ async def _cam_load_package(pkg_id):
 
 
 # ---------------------------------------------------------------------------
+# v1.6.1 hotfix: EMV TLV → PNG data URI
+# ---------------------------------------------------------------------------
+# CamRapidPay's ``qr_code`` response field returns the **raw KHQR EMV TLV
+# payload string** (e.g. ``00020101021230510016abaakhppxxx@abaa...6304XXXX``)
+# — NOT a base64 image or data URI. The v1.6 in-PWA checkout assumed the
+# field was already an image, so the student-facing modal correctly fell
+# through to "KHQR is temporarily unavailable" because the payload string
+# contains characters (``@``, ``:``, etc.) that are not valid base64.
+#
+# This helper renders the EMV TLV text into a small (1–2 KB) PNG and
+# returns a self-contained ``data:image/png;base64,...`` URI which is
+# what the frontend already knows how to display. The raw ``qr_code``
+# text is still returned unchanged so any other client/automation that
+# was already using it continues to work.
+#
+# ``segno`` is a pure-Python, zero-dependency QR encoder (~120 KB on
+# disk). Failure to import is non-fatal: the response simply omits
+# ``qr_image`` and the frontend can fall back to its existing handling
+# (or render the safe error). No money-movement logic is touched.
+# ---------------------------------------------------------------------------
+def _cam_emv_to_data_uri(emv_text: str) -> str:
+    """Render a KHQR EMV TLV payload into a data:image/png;base64 URI.
+
+    Returns an empty string when ``emv_text`` is empty or rendering fails;
+    the caller treats an empty string as "no image available".
+    """
+    if not emv_text or not isinstance(emv_text, str):
+        return ""
+    try:
+        import io as _qr_io
+        import base64 as _qr_base64
+        import segno as _qr_segno  # pure-Python, no compiled deps
+        # Error level "M" matches the recoverability level used by the
+        # major bank apps (ABA / Bakong) when generating their own KHQR.
+        # scale=8 gives a crisp ~210 px PNG on retina screens at 24-pt size
+        # and stays under 2 KB on the wire for typical KHQR payloads.
+        qr = _qr_segno.make(emv_text, error="m")
+        buf = _qr_io.BytesIO()
+        qr.save(buf, kind="png", scale=8, border=2)
+        b64 = _qr_base64.b64encode(buf.getvalue()).decode("ascii")
+        return "data:image/png;base64," + b64
+    except Exception as exc:  # noqa: BLE001
+        # Never break the payment flow on a rendering failure — the
+        # student can still scan from the raw EMV text via any wallet
+        # that supports paste-payload, and the frontend's safe error
+        # block will tell them another method is available.
+        try:
+            _CAM_LOG.warning(
+                "camrapidpay: qr image render failed type=%s",
+                type(exc).__name__,
+            )
+        except Exception:
+            pass
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # THE one-and-only credit function. Race-proof via atomic status flip.
 # ---------------------------------------------------------------------------
 async def verify_camrapidpay_payment_and_credit_once(reference: str) -> dict:
@@ -557,6 +614,13 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
         }},
     )
 
+    # v1.6.1 hotfix: CamRapidPay's ``qr_code`` is the raw KHQR EMV TLV
+    # payload text, not an image. Pre-render it into a tiny PNG data URI
+    # (``qr_image``) so the in-PWA checkout can simply <img src=...>. The
+    # raw text is preserved in ``qr_code`` for any consumer that wants it.
+    _qr_emv_text = created.get("qr_code", "") or ""
+    _qr_image_data_uri = _cam_emv_to_data_uri(_qr_emv_text)
+
     return {
         "success":            True,
         "payment_intent_id":  str(ins.inserted_id),
@@ -572,7 +636,11 @@ async def camrapidpay_create_intent(payload: _CamCreateIntent, student=Depends(r
         "amount_usd":         amount_usd,
         "currency":           "USD",
         "payment_url":        created.get("payment_url", ""),
-        "qr_code":            created.get("qr_code", ""),
+        "qr_code":            _qr_emv_text,
+        # v1.6.1: new fields for the in-PWA renderer.
+        "qr_image":           _qr_image_data_uri,
+        "qr_payload":         _qr_emv_text,
+        "qr_available":       bool(_qr_image_data_uri),
         "expires_at":         expires.isoformat(),
         "base_points":        base_points,
         "bonus_points":       bonus_points,
