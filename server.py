@@ -20,6 +20,10 @@ import json
 import httpx
 
 # â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+from teacher_admission import (
+    register_teacher_admission_routes,
+    ensure_teacher_admission_indexes,
+)
 from lucky_draw import (
     register_lucky_draw_routes,
     generate_and_publish_lucky_code,
@@ -5445,6 +5449,21 @@ register_lucky_draw_routes(
     require_admin=require_admin,
     push_notify=_lucky_draw_push_notify,
 )
+
+# ?? Speaking Lab Emergency Teacher Admit (v1.1.2) ?????????????????????????????
+# Additive, narrowly scoped recovery route. Does not modify student balances
+# or protected lucky-draw winner, finalize, claim, or payout behavior.
+register_teacher_admission_routes(
+    api,
+    db,
+    SL_SESSIONS,
+    SL_ENTRIES,
+    _sl_publish,
+    require_admin,
+    _norm_student_id,
+    generate_and_publish_lucky_code,
+    log=log,
+)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.add_middleware(
@@ -5507,6 +5526,8 @@ async def startup():
     await db.speaking_lab_attendance.create_index([("schedule", 1), ("date", 1)], unique=True)
     # â”€â”€ LUCKY DRAW SURGERY â”€â”€
     await ensure_lucky_draw_indexes(db)
+    # ?? Speaking Lab Emergency Teacher Admit indexes ??
+    await ensure_teacher_admission_indexes(db)
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Coupon system indexes
     await db.coupons.create_index("code", unique=True)
