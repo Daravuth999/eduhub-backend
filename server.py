@@ -6347,6 +6347,24 @@ exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").rea
 # so the existing ABA/manual fallback continues unchanged.
 exec(open(__import__("pathlib").Path(__file__).parent / "camrapidpay_payment_tools.py").read())
 
+# ── Payment Methods Display Config (v1.6, additive, isolated) ────────────
+# Loaded AFTER payment_bridge and camrapidpay_payment_tools so it can reuse
+# the shared ``api``/``db``/``require_admin`` globals and the CamRapidPay
+# provider helper for "provider_ready" diagnostics. Adds:
+#   GET   /api/payments/methods/public   (student-safe display config)
+#   GET   /api/admin/payments/methods    (admin diagnostic)
+#   PATCH /api/admin/payments/methods    (admin toggle)
+# Pure config layer — does NOT participate in payment verification,
+# crediting, or wallet movement. Failure to load is non-fatal: the existing
+# /payments/camrapidpay/config probe continues to gate KHQR visibility.
+try:
+    exec(open(__import__("pathlib").Path(__file__).parent / "payment_methods_config_tools.py").read())
+except Exception as _pm_load_err:
+    logging.getLogger("eduhub").warning(
+        "payment_methods_config_tools.py failed to load (display gate disabled): %s",
+        _pm_load_err,
+    )
+
 # ── Premium AI Tools (Phase 1) — register isolated routes onto /api ──────
 # Adds POST /api/student/premium/decode-block, POST /api/student/premium/
 # executive-upgrade, GET /api/student/premium/ai-config, plus admin routes
