@@ -35,6 +35,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+# NOTE: `from __future__ import annotations` (above) turns every annotation in
+# this module into a STRING that FastAPI/Pydantic must resolve against this
+# module's globals at request time. The multipart endpoint below annotates a
+# parameter as `UploadFile`, so that name MUST live in the module namespace —
+# importing it only inside register_*_routes() leaves the ForwardRef unresolved
+# and makes every /submit-attempt call 500 on Python 3.14. Keep this here.
+from fastapi import File, Form, UploadFile
+
 try:
     # pymongo>=4 ships ReturnDocument used for the atomic compare-and-set
     # claim below. Imported at module top so a missing pymongo fails fast
@@ -109,7 +117,10 @@ async def ensure_voice_treasure_attempt_indexes(db) -> None:
 
 
 def register_voice_treasure_attempt_routes(api, db, require_admin, require_student) -> None:
-    from fastapi import Depends, HTTPException, UploadFile, File, Form
+    from fastapi import Depends, HTTPException
+    # UploadFile/File/Form are imported at module level (see top-of-file note)
+    # so the string annotation `audio: UploadFile` resolves under
+    # `from __future__ import annotations`.
 
     def _sid(student) -> str:
         return str(getattr(student, "student_id", "") or "")
