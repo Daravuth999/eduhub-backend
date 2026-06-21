@@ -5528,6 +5528,46 @@ async def startup():
     await ensure_lucky_draw_indexes(db)
     # ?? Speaking Lab Emergency Teacher Admit indexes ??
     await ensure_teacher_admission_indexes(db)
+    # ── Voice Treasure (Phase 2) — seed default config doc if absent ──
+    try:
+        from voice_treasure_config_tools import ensure_voice_treasure_indexes
+        await ensure_voice_treasure_indexes(db)
+    except Exception as _vt_idx_err:  # noqa: BLE001 — never fatal at startup
+        logging.getLogger("eduhub").warning(
+            "voice_treasure: ensure indexes failed (non-fatal): %s", _vt_idx_err
+        )
+    try:
+        from voice_treasure_entry_tools import ensure_voice_treasure_entry_indexes
+        await ensure_voice_treasure_entry_indexes(db)
+    except Exception as _vt_entry_idx_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "voice_treasure: entry index ensure failed (non-fatal): %s",
+            _vt_entry_idx_err,
+        )
+    try:
+        from voice_treasure_attempt_tools import ensure_voice_treasure_attempt_indexes
+        await ensure_voice_treasure_attempt_indexes(db)
+    except Exception as _vt_attempt_idx_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "voice_treasure: attempt index ensure failed (non-fatal): %s",
+            _vt_attempt_idx_err,
+        )
+    try:
+        from voice_treasure_reward_tools import ensure_voice_treasure_reward_indexes
+        await ensure_voice_treasure_reward_indexes(db)
+    except Exception as _vt_reward_idx_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "voice_treasure: reward index ensure failed (non-fatal): %s",
+            _vt_reward_idx_err,
+        )
+    try:
+        from voice_treasure_media import ensure_voice_treasure_media_indexes
+        await ensure_voice_treasure_media_indexes(db)
+    except Exception as _vt_media_idx_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "voice_treasure: media index ensure failed (non-fatal): %s",
+            _vt_media_idx_err,
+        )
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Coupon system indexes
     await db.coupons.create_index("code", unique=True)
@@ -6615,6 +6655,82 @@ except Exception as _ai_voice_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "ai_assistant_voice_tools route registration failed (feature disabled): %s",
         _ai_voice_err,
+    )
+
+# ── Voice Treasure — Phase 2 config foundation (additive, isolated) ───────
+# New, self-contained module. Owns ONLY the voice_treasure_config collection
+# and adds:
+#   GET /api/admin/voice-treasure/config            (admin)
+#   PUT /api/admin/voice-treasure/config            (admin)
+#   GET /api/voice-treasure/config-public           (student, safe subset)
+# It does NOT touch wallet_service, gemini_engine, ai_assistant_voice_tools,
+# payments, vouchers, EduTalk passes, or any other feature. Master env
+# switches (VOICE_TREASURE_ENABLED / *_POINTS_REWARD_ENABLED /
+# *_IMAGE_GENERATION_ENABLED) default OFF, so the feature is disabled by
+# default. Failure is non-fatal: if the module fails to load, only Voice
+# Treasure config is unavailable; every other route keeps working.
+try:
+    from voice_treasure_config_tools import (
+        register_voice_treasure_config_routes as _register_vt_config_routes,
+    )
+    _register_vt_config_routes(api, db, require_admin, require_student)
+except Exception as _vt_cfg_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "voice_treasure_config_tools route registration failed "
+        "(feature disabled): %s",
+        _vt_cfg_err,
+    )
+
+# ── Voice Treasure — Phase 3 paid mission access (additive, isolated) ─────
+# Adds GET /api/voice-treasure/today, POST /api/voice-treasure/entry/confirm,
+# GET /api/voice-treasure/entry/{id}, and admin entries/reconciliation routes.
+# GAS is the authoritative Points store (via voice_treasure_points_adapter,
+# which does NOT import premium_ai_tools/wallet_service/payment_bridge). No
+# Mongo points_wallets, no recorder/Gemini/chest yet. Failure is non-fatal.
+try:
+    from voice_treasure_entry_tools import (
+        register_voice_treasure_entry_routes as _register_vt_entry_routes,
+    )
+    _register_vt_entry_routes(api, db, require_admin, require_student)
+except Exception as _vt_entry_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "voice_treasure_entry_tools route registration failed "
+        "(feature disabled): %s",
+        _vt_entry_err,
+    )
+
+# ── Voice Treasure — Core Game (mission image, recorder eval, results) ────
+# Adds mission image, POST submit-attempt (multimodal eval), GET attempt/{id},
+# and admin attempt views. Gemini image generation stays OFF by default
+# (fallback mission); evaluation uses voice_treasure_gemini and returns only
+# the fixed normalized contract. Raw audio is discarded after evaluation.
+try:
+    from voice_treasure_attempt_tools import (
+        register_voice_treasure_attempt_routes as _register_vt_attempt_routes,
+    )
+    _register_vt_attempt_routes(api, db, require_admin, require_student)
+except Exception as _vt_attempt_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "voice_treasure_attempt_tools route registration failed "
+        "(feature disabled): %s",
+        _vt_attempt_err,
+    )
+
+# ── Voice Treasure — Rewards / Chest / Collection / Progress (final) ──────
+# GAS-authoritative Points credit via the isolated adapter (treasury→student),
+# frozen reward decisions, First Voice Card collectible, chest state machine,
+# progress/collection, and admin reconciliation/analytics. Reward credit stays
+# OFF unless VOICE_TREASURE_POINTS_REWARD_ENABLED=1 AND admin enables it.
+try:
+    from voice_treasure_reward_tools import (
+        register_voice_treasure_reward_routes as _register_vt_reward_routes,
+    )
+    _register_vt_reward_routes(api, db, require_admin, require_student)
+except Exception as _vt_reward_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "voice_treasure_reward_tools route registration failed "
+        "(feature disabled): %s",
+        _vt_reward_err,
     )
 
 # ── Referral System v1 (additive, isolated module, default OFF) ──────────
