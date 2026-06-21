@@ -336,7 +336,15 @@ async def evaluate_speaking(
         async with httpx.AsyncClient(timeout=_TIMEOUT) as cli:
             r = await cli.post(url, params={"key": key}, json=body)
         if r.status_code != 200:
-            log.warning("vt-gemini: eval HTTP %s", r.status_code)
+            # Surface Google's explanation. The response body echoes the model
+            # name + method (e.g. "models/X is not found … for generateContent")
+            # and never contains the API key (key is a query param, not echoed)
+            # nor the audio bytes. Truncated + audio mime logged for diagnosis.
+            body_snippet = (r.text or "")[:500]
+            log.warning(
+                "vt-gemini: eval HTTP %s | model=%s audio_mime=%s | body=%s",
+                r.status_code, model, audio_mime, body_snippet,
+            )
             return {"ok": False, "reason": "provider_rejected"}
         j = r.json()
         text = (
