@@ -6721,11 +6721,64 @@ except Exception as _vt_attempt_err:  # noqa: BLE001
 # frozen reward decisions, First Voice Card collectible, chest state machine,
 # progress/collection, and admin reconciliation/analytics. Reward credit stays
 # OFF unless VOICE_TREASURE_POINTS_REWARD_ENABLED=1 AND admin enables it.
+# Voice Treasure real-value reward bridge: reuse the EXISTING grant paths
+# (Login-Reward voucher issuer + EduTalk pass granter) which live in THIS exec'd
+# namespace, injecting them into the imported VT reward module. This keeps VT
+# decoupled and the coupon/entitlement schemas owned by their original modules.
+# Both adapters are failure-safe and defend against a sibling module that didn't
+# load. VT's payout ledger + per-attempt idempotency guarantee exactly-once.
+async def _vt_grant_voucher(*, student_clean_id, attempt_id, policy):
+    issuer = globals().get("_lrc_issue_voucher_for_claim")
+    norm = globals().get("_norm_student_id")
+    if not callable(issuer):
+        return None
+    sid_norm = norm(student_clean_id) if callable(norm) else (student_clean_id or "").strip().lower()
+    # Synthetic per-attempt "campaign" so the issuer's (campaign_id, student)
+    # idempotency yields exactly one voucher per VT reward.
+    camp = {
+        "id": f"vt-voucher:{attempt_id}",
+        "campaign_id": f"vt-voucher:{attempt_id}",
+        "name": "Voice Treasure",
+        "reward_kind": "voucher",
+        "voucher_source": (policy or {}).get("voucher_source") or "existing",
+        "voucher_existing_code": (policy or {}).get("voucher_existing_code") or "",
+        "voucher_discount_type": (policy or {}).get("voucher_discount_type") or "percent",
+        "voucher_discount_value": (policy or {}).get("voucher_discount_value") or 0,
+        "voucher_title": (policy or {}).get("voucher_title") or "Voice Treasure Voucher",
+        "voucher_subtitle": (policy or {}).get("voucher_subtitle") or "",
+    }
+    return await issuer(camp, student_clean_id, sid_norm)
+
+
+async def _vt_grant_edutalk_pass(*, student_clean_id, attempt_id, policy):
+    granter = globals().get("_mbt_grant_edutalk_pass")
+    norm = globals().get("_norm_student_id")
+    if not callable(granter):
+        return None
+    sid_norm = norm(student_clean_id) if callable(norm) else (student_clean_id or "").strip().lower()
+    p = policy or {}
+    return await granter(
+        student_clean_id=student_clean_id,
+        student_id_norm=sid_norm,
+        feature=p.get("edutalk_pass_feature") or "edutalk_session",
+        title="Voice Treasure Pass",
+        quantity=int(p.get("edutalk_pass_quantity") or 1),
+        eligible_book_slugs=list(p.get("edutalk_pass_eligible_books") or []),
+        expires_in_days=int(p.get("edutalk_pass_expires_in_days") or 30),
+        source="voice_treasure",
+        campaign_id=f"vt-pass:{attempt_id}",
+        round_id=None,
+    )
+
+
 try:
     from voice_treasure_reward_tools import (
         register_voice_treasure_reward_routes as _register_vt_reward_routes,
     )
-    _register_vt_reward_routes(api, db, require_admin, require_student)
+    _register_vt_reward_routes(
+        api, db, require_admin, require_student,
+        grantors={"voucher": _vt_grant_voucher, "edutalk_pass": _vt_grant_edutalk_pass},
+    )
 except Exception as _vt_reward_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "voice_treasure_reward_tools route registration failed "

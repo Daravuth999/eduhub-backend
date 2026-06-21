@@ -35,13 +35,15 @@ def _match(doc, q):
         if isinstance(v, dict):
             if "$in" in v and dv not in v["$in"]:
                 return False
+            if "$ne" in v and dv == v["$ne"]:
+                return False
             if "$gte" in v and not (dv is not None and dv >= v["$gte"]):
                 return False
             if "$lte" in v and not (dv is not None and dv <= v["$lte"]):
                 return False
             if "$lt" in v and not (dv is not None and dv < v["$lt"]):
                 return False
-            if not any(k in v for k in ("$in", "$gte", "$lte", "$lt")) and dv != v:
+            if not any(op in v for op in ("$in", "$ne", "$gte", "$lte", "$lt")) and dv != v:
                 return False
         elif dv != v:
             return False
@@ -566,3 +568,88 @@ def test_reserved_never_negative_after_release(monkeypatch):
     _call(router, "POST", "/admin/voice-treasure/rewards/{reward_id}/reconcile",
           reward_id=rid, payload={"outcome": "resolved_failed", "evidence": "x"}, admin=_Admin())
     assert _daily_ledger(db).get("reserved", 0) >= 0
+
+
+# ── Voucher / EduTalk Pass reward integration ───────────────────────────────
+def _cfg_grants(voucher=True, vpass=True, vmin=70, pmin=70):
+    c = _cfg(points=False, card=False)
+    c["rewards"]["voucher_reward_enabled"] = voucher
+    c["rewards"]["voucher_minimum_score"] = vmin
+    c["rewards"]["voucher_source"] = "existing"
+    c["rewards"]["voucher_existing_code"] = "VTBOOK10"
+    c["rewards"]["edutalk_pass_reward_enabled"] = vpass
+    c["rewards"]["edutalk_pass_minimum_score"] = pmin
+    c["rewards"]["edutalk_pass_feature"] = "edutalk_session"
+    return c
+
+
+def _mk_grantors(counter):
+    async def voucher(*, student_clean_id, attempt_id, policy):
+        counter["voucher"] += 1
+        return {"id": "sv_x", "coupon_code": "VTBOOK10"}
+
+    async def epass(*, student_clean_id, attempt_id, policy):
+        counter["pass"] += 1
+        return {"id": "ent_x", "feature": policy.get("edutalk_pass_feature")}
+
+    return {"voucher": voucher, "edutalk_pass": epass}
+
+
+def _build_grants(monkeypatch, cfg, counter):
+    db = _DB(); router = _Router()
+    register_voice_treasure_reward_routes(
+        router, db, require_admin=_Admin(), require_student=object(),
+        grantors=_mk_grantors(counter))
+    monkeypatch.setattr(vt_cfg, "load_config", lambda _db: _aval(copy.deepcopy(cfg)))
+    return db, router
+
+
+def test_decision_includes_voucher_and_pass_eligibility():
+    cfg = _cfg_grants()
+    d = compute_reward_decision(cfg=cfg, attempt_result={"overall": 80},
+                                current_streak=1, paid_today_points=0, paid_week_points=0)
+    assert d["voucher_eligible"] is True
+    assert d["pass_eligible"] is True
+    assert d["eligible"] is True
+    below = compute_reward_decision(cfg=cfg, attempt_result={"overall": 50},
+                                    current_streak=1, paid_today_points=0, paid_week_points=0)
+    assert below["voucher_eligible"] is False
+    assert below["pass_eligible"] is False
+    assert below["eligible"] is False
+
+
+def test_claim_grants_voucher_and_pass_exactly_once(monkeypatch):
+    monkeypatch.setenv("VOICE_TREASURE_VOUCHER_REWARD_ENABLED", "1")
+    monkeypatch.setenv("VOICE_TREASURE_EDUTALK_PASS_REWARD_ENABLED", "1")
+    counter = {"voucher": 0, "pass": 0}
+    db, router = _build_grants(monkeypatch, _cfg_grants(), counter)
+    aid = "vt-attempt:stu_alice:e1"
+    _seed_evaluated(db, overall=85, aid=aid)
+    r1 = _call(router, "POST", "/voice-treasure/claim",
+               payload={"attempt_id": aid}, student=_Student())
+    assert r1["chest"]["chest_state"] == CHEST_COMPLETED
+    rw = r1["chest"]["reward"]
+    assert rw["voucher"] == "granted"
+    assert rw["edutalk_pass"] == "granted"
+    assert rw["edutalk_pass_feature"] == "edutalk_session"
+    assert counter == {"voucher": 1, "pass": 1}
+    # Re-claim must NOT re-grant (settled short-circuit + atomic pass guard).
+    r2 = _call(router, "POST", "/voice-treasure/claim",
+               payload={"attempt_id": aid}, student=_Student())
+    assert r2["chest"]["chest_state"] == CHEST_COMPLETED
+    assert counter == {"voucher": 1, "pass": 1}
+
+
+def test_master_off_skips_grant_but_completes_chest(monkeypatch):
+    # Voucher/pass env masters are unset ⇒ OFF ⇒ kill-switch: no grant issued,
+    # but the chest still completes (never stuck on a withdrawn reward).
+    counter = {"voucher": 0, "pass": 0}
+    db, router = _build_grants(monkeypatch, _cfg_grants(), counter)
+    aid = "vt-attempt:stu_alice:e1"
+    _seed_evaluated(db, overall=85, aid=aid)
+    r1 = _call(router, "POST", "/voice-treasure/claim",
+               payload={"attempt_id": aid}, student=_Student())
+    assert r1["chest"]["chest_state"] == CHEST_COMPLETED
+    assert counter == {"voucher": 0, "pass": 0}
+    assert r1["chest"]["reward"]["voucher"] == "skipped"
+    assert r1["chest"]["reward"]["edutalk_pass"] == "skipped"

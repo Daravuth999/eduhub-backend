@@ -78,6 +78,17 @@ def master_image_generation_enabled() -> bool:
     return _env_on("VOICE_TREASURE_IMAGE_GENERATION_ENABLED")
 
 
+# Real-value reward grants are DOUBLE-gated: an infra master env switch (below,
+# default OFF) AND the Author Studio toggle. Both must be ON before a voucher or
+# EduTalk pass is ever issued — mirroring the points-reward safety model.
+def master_voucher_reward_enabled() -> bool:
+    return _env_on("VOICE_TREASURE_VOUCHER_REWARD_ENABLED")
+
+
+def master_edutalk_pass_reward_enabled() -> bool:
+    return _env_on("VOICE_TREASURE_EDUTALK_PASS_REWARD_ENABLED")
+
+
 # Image MODEL name comes from backend config only (never the frontend).
 # The adapter (Phase 4) reads this; Phase 2 only stores/echoes it.
 def env_image_model_default() -> str:
@@ -143,11 +154,28 @@ def default_config() -> dict[str, Any]:
             "streak_bonus_points": 2,            # per extra consecutive day
             "streak_bonus_max": 10,
             "first_voice_card_enabled": True,     # VT-owned collectible: allowed
-            # The two below stay HARD-disabled until grant paths are verified.
-            "voucher_reward_enabled": False,
-            "edutalk_pass_reward_enabled": False,
             "daily_points_payout_cap": 100,
             "weekly_points_payout_cap": 500,
+            # ── Book Voucher reward (issued via the existing Login-Reward
+            #    coupon path; double-gated by VOICE_TREASURE_VOUCHER_REWARD_ENABLED) ──
+            "voucher_reward_enabled": False,
+            "voucher_minimum_score": 70,          # overall 0..100 to earn
+            "voucher_source": "existing",         # "existing" | "auto"
+            "voucher_existing_code": "",          # source=existing: link this coupon
+            "voucher_discount_type": "percent",   # source=auto: "percent" | "amount"
+            "voucher_discount_value": 0,          # source=auto: > 0 required
+            "voucher_title": "Voice Treasure Voucher",
+            "voucher_subtitle": "",
+            "voucher_daily_cap": 1,               # max vouchers/day per student
+            # ── EduTalk Pass reward (granted via the existing entitlement path;
+            #    double-gated by VOICE_TREASURE_EDUTALK_PASS_REWARD_ENABLED) ──
+            "edutalk_pass_reward_enabled": False,
+            "edutalk_pass_minimum_score": 70,     # overall 0..100 to earn
+            "edutalk_pass_feature": "edutalk_session",  # "edutalk_session" | "edutalk_voice"
+            "edutalk_pass_quantity": 1,
+            "edutalk_pass_expires_in_days": 30,
+            "edutalk_pass_eligible_books": [],    # [] = all eligible books
+            "edutalk_pass_daily_cap": 1,          # max passes/day per student
         },
         "safety": {
             "preserve_paid_entry_on_provider_failure": True,
@@ -160,10 +188,11 @@ def default_config() -> dict[str, Any]:
     }
 
 
-# Reward types whose backend issuance path is NOT yet verified. These are
-# surfaced to Author Studio as availability=False so the panel can render
-# them disabled/greyed with an explanation — and are force-disabled on save.
-REWARD_TYPES_UNAVAILABLE = ("voucher_reward_enabled", "edutalk_pass_reward_enabled")
+# Reward types are now integrated via the existing grant paths (Login-Reward
+# coupon issuer + EduTalk entitlement granter). They are double-gated by their
+# own master env switches (see apply_master_switch_ceiling) rather than being
+# unconditionally force-disabled. Kept as an (empty) tuple for back-compat.
+REWARD_TYPES_UNAVAILABLE: tuple[str, ...] = ()
 
 # Allowed enum values for validated string fields.
 _TECH_FAIL_POLICIES = {"preserve_entry", "refund", "none"}
@@ -285,6 +314,38 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if int(rw.get("streak_bonus_max", 0)) < 0:
         raise VTValidationError("streak_bonus_max must be >= 0")
 
+    # ── Voucher reward ─────────────────────────────────────────────────── #
+    if not (0 <= int(rw.get("voucher_minimum_score", 70)) <= 100):
+        raise VTValidationError("voucher_minimum_score must be 0..100")
+    if rw.get("voucher_source") not in {"existing", "auto"}:
+        raise VTValidationError("voucher_source must be 'existing' or 'auto'")
+    if rw.get("voucher_discount_type") not in {"percent", "amount"}:
+        raise VTValidationError("voucher_discount_type must be 'percent' or 'amount'")
+    if float(rw.get("voucher_discount_value", 0) or 0) < 0:
+        raise VTValidationError("voucher_discount_value must be >= 0")
+    if int(rw.get("voucher_daily_cap", 1)) < 0:
+        raise VTValidationError("voucher_daily_cap must be >= 0")
+    # NOTE: we intentionally do NOT hard-require voucher source config here.
+    # validate_config runs BEFORE the master-switch ceiling, so an admin may
+    # legitimately submit voucher_reward_enabled=True while the env master is
+    # OFF (it is clamped to False on store). The grantor is defensive: an
+    # unconfigured source simply yields no voucher (state "skipped"). Author
+    # Studio surfaces a soft warning instead.
+
+    # ── EduTalk Pass reward ────────────────────────────────────────────── #
+    if not (0 <= int(rw.get("edutalk_pass_minimum_score", 70)) <= 100):
+        raise VTValidationError("edutalk_pass_minimum_score must be 0..100")
+    if rw.get("edutalk_pass_feature") not in {"edutalk_session", "edutalk_voice"}:
+        raise VTValidationError("edutalk_pass_feature must be 'edutalk_session' or 'edutalk_voice'")
+    if int(rw.get("edutalk_pass_quantity", 1)) < 1:
+        raise VTValidationError("edutalk_pass_quantity must be >= 1")
+    if int(rw.get("edutalk_pass_expires_in_days", 30)) < 1:
+        raise VTValidationError("edutalk_pass_expires_in_days must be >= 1")
+    if int(rw.get("edutalk_pass_daily_cap", 1)) < 0:
+        raise VTValidationError("edutalk_pass_daily_cap must be >= 0")
+    if not isinstance(rw.get("edutalk_pass_eligible_books", []), list):
+        raise VTValidationError("edutalk_pass_eligible_books must be a list")
+
 
 def apply_master_switch_ceiling(cfg: dict[str, Any]) -> dict[str, Any]:
     """Force-disable anything a master env switch has turned OFF, and
@@ -295,7 +356,13 @@ def apply_master_switch_ceiling(cfg: dict[str, Any]) -> dict[str, Any]:
         out["images"]["image_generation_enabled"] = False
     if not master_points_reward_enabled():
         out["rewards"]["points_reward_enabled"] = False
-    # Unverified reward types are always off, regardless of admin intent.
+    # Real-value reward grants: clamp to their infra master switch so an admin
+    # toggle can never issue a voucher/pass while the env master is OFF.
+    if not master_voucher_reward_enabled():
+        out["rewards"]["voucher_reward_enabled"] = False
+    if not master_edutalk_pass_reward_enabled():
+        out["rewards"]["edutalk_pass_reward_enabled"] = False
+    # Back-compat: force-disable any still-unverified reward types (empty now).
     for key in REWARD_TYPES_UNAVAILABLE:
         out["rewards"][key] = False
     return out
@@ -324,10 +391,14 @@ def effective_state(cfg: dict[str, Any]) -> dict[str, Any]:
         "master_enabled": master_enabled(),
         "master_points_reward_enabled": master_points_reward_enabled(),
         "master_image_generation_enabled": master_image_generation_enabled(),
+        "master_voucher_reward_enabled": master_voucher_reward_enabled(),
+        "master_edutalk_pass_reward_enabled": master_edutalk_pass_reward_enabled(),
         "feature_available": feature_on,
         "show_home_tile": feature_on and bool(eff["access"]["show_home_tile"]),
         "image_generation_effective": bool(eff["images"]["image_generation_enabled"]),
         "points_reward_effective": bool(eff["rewards"]["points_reward_enabled"]),
+        "voucher_reward_effective": bool(eff["rewards"]["voucher_reward_enabled"]),
+        "edutalk_pass_reward_effective": bool(eff["rewards"]["edutalk_pass_reward_enabled"]),
     }
 
 
@@ -368,11 +439,12 @@ def public_projection(
             # NOTE: image_model, blocked_themes intentionally omitted.
         },
         "rewards": {
-            # Only advertise reward types that are actually deliverable.
+            # Only advertise reward types that are actually deliverable (post
+            # master-switch ceiling — these reflect infra master AND admin).
             "points_reward_enabled": bool(rw["points_reward_enabled"]),
             "first_voice_card_enabled": bool(rw["first_voice_card_enabled"]),
-            "voucher_reward_available": False,
-            "edutalk_pass_reward_available": False,
+            "voucher_reward_available": bool(rw["voucher_reward_enabled"]),
+            "edutalk_pass_reward_available": bool(rw["edutalk_pass_reward_enabled"]),
         },
     }
 
@@ -464,9 +536,10 @@ def register_voice_treasure_config_routes(
             "reward_availability": {
                 "points": True,
                 "first_voice_card": True,
-                # Surfaced as unavailable; UI renders these disabled.
-                "voucher": False,
-                "edutalk_pass": False,
+                # Available when their infra master switch is ON; the Author
+                # Studio toggle is the second gate.
+                "voucher": master_voucher_reward_enabled(),
+                "edutalk_pass": master_edutalk_pass_reward_enabled(),
             },
         }
 

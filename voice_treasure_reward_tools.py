@@ -146,7 +146,14 @@ def compute_reward_decision(
 
     card_eligible = bool(card_enabled)  # uniqueness enforced at grant time
 
-    any_reward = bool(points_eligible or card_eligible)
+    # Real-value grants — earned by score threshold, independent of points caps.
+    # One mission/day + per-attempt idempotency bounds these to one each per day.
+    voucher_enabled = bool(rw.get("voucher_reward_enabled"))
+    pass_enabled = bool(rw.get("edutalk_pass_reward_enabled"))
+    voucher_eligible = bool(voucher_enabled and overall >= int(rw.get("voucher_minimum_score", 70)))
+    pass_eligible = bool(pass_enabled and overall >= int(rw.get("edutalk_pass_minimum_score", 70)))
+
+    any_reward = bool(points_eligible or card_eligible or voucher_eligible or pass_eligible)
     return {
         "eligible": any_reward,
         "points_eligible": points_eligible,
@@ -156,6 +163,8 @@ def compute_reward_decision(
         "total_points": total_points,
         "cap_reason": cap_reason,
         "card_eligible": card_eligible,
+        "voucher_eligible": voucher_eligible,
+        "pass_eligible": pass_eligible,
         "overall_score": overall,
         "min_score": min_score,
         "current_streak": int(current_streak),
@@ -172,6 +181,21 @@ def compute_reward_decision(
             "first_voice_card_enabled": card_enabled,
             "daily_points_payout_cap": daily_cap,
             "weekly_points_payout_cap": weekly_cap,
+            # Voucher / EduTalk Pass params consumed by the injected grantors.
+            "voucher_reward_enabled": voucher_enabled,
+            "voucher_minimum_score": int(rw.get("voucher_minimum_score", 70)),
+            "voucher_source": rw.get("voucher_source", "existing"),
+            "voucher_existing_code": rw.get("voucher_existing_code", ""),
+            "voucher_discount_type": rw.get("voucher_discount_type", "percent"),
+            "voucher_discount_value": rw.get("voucher_discount_value", 0),
+            "voucher_title": rw.get("voucher_title", "Voice Treasure Voucher"),
+            "voucher_subtitle": rw.get("voucher_subtitle", ""),
+            "edutalk_pass_reward_enabled": pass_enabled,
+            "edutalk_pass_minimum_score": int(rw.get("edutalk_pass_minimum_score", 70)),
+            "edutalk_pass_feature": rw.get("edutalk_pass_feature", "edutalk_session"),
+            "edutalk_pass_quantity": int(rw.get("edutalk_pass_quantity", 1)),
+            "edutalk_pass_expires_in_days": int(rw.get("edutalk_pass_expires_in_days", 30)),
+            "edutalk_pass_eligible_books": list(rw.get("edutalk_pass_eligible_books", []) or []),
         },
         "policy_version": int(cfg.get("policy_version", 1)),
         "decided_at": _iso(),
@@ -206,7 +230,9 @@ def _fulfillment_settled(reward: dict) -> bool:
     points_ok = (not dec.get("points_eligible")) or bool(f.get("points_credited"))
     card_state = f.get("card_state", CARD_NONE)
     card_ok = card_state in (CARD_NEW, CARD_OWNED, CARD_NONE)
-    return points_ok and card_ok
+    voucher_ok = (not dec.get("voucher_eligible")) or f.get("voucher_state") in ("granted", "skipped")
+    pass_ok = (not dec.get("pass_eligible")) or f.get("pass_state") in ("granted", "skipped")
+    return points_ok and card_ok and voucher_ok and pass_ok
 
 
 def _public_reward_view(reward: dict | None, decision: dict | None) -> dict[str, Any]:
@@ -240,6 +266,12 @@ def _public_reward_view(reward: dict | None, decision: dict | None) -> dict[str,
             "streak_bonus": dec.get("streak_bonus", 0),
             "high_score_bonus": dec.get("high_score_bonus", 0),
             "first_voice_card": f.get("card_state", CARD_NONE),
+            "voucher": (f.get("voucher_state") if dec.get("voucher_eligible") else None),
+            "edutalk_pass": (f.get("pass_state") if dec.get("pass_eligible") else None),
+            "edutalk_pass_feature": (
+                (dec.get("policy_snapshot") or {}).get("edutalk_pass_feature")
+                if dec.get("pass_eligible") else None
+            ),
             "claimed_at": reward.get("completed_at"),
         }
         # Explicit balance contract — never leave it ambiguous and never invent
@@ -406,8 +438,16 @@ class _CapExceeded(Exception):
     pass
 
 
-def register_voice_treasure_reward_routes(api, db, require_admin, require_student) -> None:
+def register_voice_treasure_reward_routes(
+    api, db, require_admin, require_student, *, grantors=None
+) -> None:
     from fastapi import Depends, HTTPException, Body
+
+    # Injected real-value grant adapters (provided by server.py, which bridges
+    # the exec()'d Login-Reward voucher issuer + EduTalk pass granter into this
+    # imported module). Absent ⇒ those reward types simply never grant. Each is
+    # an async callable: (*, student_clean_id, attempt_id, policy) -> dict|None.
+    _grantors = grantors or {}
 
     def _sid(student) -> str:
         return str(getattr(student, "student_id", "") or "")
@@ -463,16 +503,92 @@ def register_voice_treasure_reward_routes(api, db, require_admin, require_studen
 
     async def _run_local_fulfillment(reward_id: str, sid: str, decision: dict,
                                      credited_points: int) -> dict:
-        """Grant card if eligible; return fulfillment dict. Never calls GAS."""
-        card_state = CARD_NONE
-        if decision.get("card_eligible"):
+        """Grant all eligible LOCAL rewards (card / voucher / EduTalk pass) and
+        return the fulfillment dict. Never calls GAS. Idempotent + retry-safe:
+
+          • card    — idempotent upsert (uniqueness enforced at grant time)
+          • voucher — the Login-Reward issuer is idempotent on (campaign, student)
+          • pass    — the entitlement granter is NOT idempotent, so we atomically
+                      claim the right to grant exactly once via the
+                      `fulfillment.pass_granted` flag before calling it.
+        """
+        current = await db[COLL_REWARDS].find_one({"_id": reward_id}, {"_id": 0}) or {}
+        prior = current.get("fulfillment") or {}
+        clean_id = current.get("clean_id") or sid
+        attempt_id = current.get("attempt_id") or ""
+        snap = decision.get("policy_snapshot", {}) or {}
+
+        # ── Card ────────────────────────────────────────────────────────────
+        # Retry the grant unless it already reached a terminal-good state, so a
+        # prior CARD_FAILED (storage outage) is re-attempted on the next claim.
+        card_state = prior.get("card_state") or CARD_NONE
+        if decision.get("card_eligible") and card_state not in (CARD_NEW, CARD_OWNED):
             card_state = await _grant_first_voice_card(db, sid)
+
+        # ── Voucher (idempotent issuer — safe to retry) ─────────────────────
+        # Re-check the live master switch so it acts as a kill-switch: if it is
+        # OFF at claim time we never issue, but we mark "skipped" so the chest
+        # still completes (we never leave it stuck on a withdrawn reward).
+        voucher_granted = bool(prior.get("voucher_granted"))
+        voucher_state = prior.get("voucher_state")
+        g_v = _grantors.get("voucher")
+        if decision.get("voucher_eligible") and not voucher_granted:
+            if g_v and vt_cfg.master_voucher_reward_enabled():
+                try:
+                    res = await g_v(student_clean_id=clean_id, attempt_id=attempt_id, policy=snap)
+                    voucher_granted = bool(res)
+                    voucher_state = "granted" if res else "skipped"
+                except Exception as exc:  # noqa: BLE001 — never block the chest
+                    log.warning("voice_treasure: voucher grant failed: %s", type(exc).__name__)
+                    voucher_state = "error"
+            else:
+                voucher_state = voucher_state or "skipped"  # master off / no bridge
+
+        # ── EduTalk Pass (NOT idempotent — claim-before-grant) ──────────────
+        pass_granted = bool(prior.get("pass_granted"))
+        pass_state = prior.get("pass_state")
+        g_p = _grantors.get("edutalk_pass")
+        if decision.get("pass_eligible") and not pass_granted:
+            if g_p and vt_cfg.master_edutalk_pass_reward_enabled():
+                # Claim the exclusive right to grant via a TOP-LEVEL flag (a
+                # nested fulfillment.* field is overwritten by the final $set
+                # below, so it must not double as the atomic guard).
+                won = await db[COLL_REWARDS].find_one_and_update(
+                    {"_id": reward_id, "pass_grant_claimed": {"$ne": True}},
+                    {"$set": {"pass_grant_claimed": True, "updated_at": _iso()}},
+                )
+                if won is not None:
+                    try:
+                        res = await g_p(student_clean_id=clean_id, attempt_id=attempt_id, policy=snap)
+                        pass_granted = True
+                        pass_state = "granted" if res else "skipped"
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("voice_treasure: pass grant failed: %s", type(exc).__name__)
+                        # Release the claim so a later retry can attempt the grant.
+                        await db[COLL_REWARDS].update_one(
+                            {"_id": reward_id}, {"$set": {"pass_grant_claimed": False}})
+                        pass_granted = False
+                        pass_state = "error"
+                else:
+                    pass_granted = True
+                    pass_state = pass_state or "granted"
+            else:
+                pass_state = pass_state or "skipped"  # master off / no bridge
+
         fulfillment = {
             "points_credited": credited_points > 0 or not decision.get("points_eligible"),
             "credited_points": int(credited_points),
             "card_state": card_state,
+            "voucher_granted": voucher_granted,
+            "voucher_state": voucher_state,
+            "pass_granted": pass_granted,
+            "pass_state": pass_state,
         }
-        settled = card_state in (CARD_NEW, CARD_OWNED, CARD_NONE)
+        settled = (
+            card_state in (CARD_NEW, CARD_OWNED, CARD_NONE)
+            and (not decision.get("voucher_eligible") or voucher_state in ("granted", "skipped"))
+            and (not decision.get("pass_eligible") or pass_state in ("granted", "skipped"))
+        )
         patch = {"fulfillment": fulfillment, "updated_at": _iso()}
         if settled:
             patch["completed_at"] = _iso()
@@ -519,7 +635,11 @@ def register_voice_treasure_reward_routes(api, db, require_admin, require_studen
                 "attempt_id": attempt_id, "entry_id": attempt.get("entry_id"),
                 "evaluation_ref": {"attempt_id": attempt_id, "overall": (attempt.get("result") or {}).get("overall")},
                 "decision": decision, "state": R_CREATED,
-                "fulfillment": {"points_credited": False, "credited_points": 0, "card_state": None},
+                "fulfillment": {
+                    "points_credited": False, "credited_points": 0, "card_state": None,
+                    "voucher_granted": False, "voucher_state": None,
+                    "pass_granted": False, "pass_state": None,
+                },
                 "initiation_count": 0, "last_operation_id": None,
                 "state_history": [{"state": R_CREATED, "at": _iso()}],
                 "created_at": _iso(), "updated_at": _iso(),
