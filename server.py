@@ -6775,6 +6775,27 @@ try:
     from voice_treasure_reward_tools import (
         register_voice_treasure_reward_routes as _register_vt_reward_routes,
     )
+    # Pass A — TRUTHFUL integration availability. We compute the booleans
+    # HERE, in the server/route composition layer, because the two grant
+    # adapters are visible in THIS namespace (they are exec'd above from
+    # login_reward_tools / mystery_box_tools). voice_treasure_config_tools
+    # must remain a pure configuration helper: it MUST NOT import server.py
+    # or call globals(), so we inject the booleans via its setter. The admin
+    # config endpoint reads them through `runtime_adapter_availability()`
+    # and reports `configured / integration_available / master_switch_enabled
+    # / effectively_active` to Author Studio.
+    try:
+        import voice_treasure_config_tools as _vt_cfg
+        _vt_cfg.set_runtime_adapter_availability(
+            voucher=callable(globals().get("_lrc_issue_voucher_for_claim")),
+            edutalk_pass=callable(globals().get("_mbt_grant_edutalk_pass")),
+        )
+    except Exception as _vt_avail_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "voice_treasure: failed to inject runtime adapter availability "
+            "(integration status will report False): %s",
+            _vt_avail_err,
+        )
     _register_vt_reward_routes(
         api, db, require_admin, require_student,
         grantors={"voucher": _vt_grant_voucher, "edutalk_pass": _vt_grant_edutalk_pass},

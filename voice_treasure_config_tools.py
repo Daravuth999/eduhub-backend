@@ -89,6 +89,46 @@ def master_edutalk_pass_reward_enabled() -> bool:
     return _env_on("VOICE_TREASURE_EDUTALK_PASS_REWARD_ENABLED")
 
 
+# --------------------------------------------------------------------------- #
+# Pass A — Runtime adapter availability (dependency-injected by server.py).    #
+#                                                                              #
+# IMPORTANT: this module is a PURE configuration helper. It MUST NOT import    #
+# server.py, MUST NOT call globals() on the server, and MUST NOT make any      #
+# schema/effective behavior depend on server import state. Adapter visibility  #
+# (the existence of _vt_grant_voucher / _vt_grant_edutalk_pass at runtime) is  #
+# computed in the server/route composition layer where those callables are    #
+# actually visible, and injected here through `set_runtime_adapter_availability`. #
+#                                                                              #
+# The five honest concepts the Author Studio surfaces (kept separate):         #
+#   • configured              — Author Studio toggle value                     #
+#   • integration_available   — the grant adapter is wired and callable        #
+#   • master_switch_enabled   — backend env master switch is ON                #
+#   • effectively_active      — all of the above ⇒ rewards may be granted      #
+#   • grant_confirmed         — per-attempt outcome (owned by reward_tools)    #
+# --------------------------------------------------------------------------- #
+_runtime_adapters: dict[str, bool] = {
+    "voucher": False,
+    "edutalk_pass": False,
+}
+
+
+def set_runtime_adapter_availability(*, voucher: bool, edutalk_pass: bool) -> None:
+    """Server.py calls this ONCE at startup, after binding the real grant
+    adapters into its namespace. Pure setter — no I/O, no side effects."""
+    _runtime_adapters["voucher"] = bool(voucher)
+    _runtime_adapters["edutalk_pass"] = bool(edutalk_pass)
+
+
+def runtime_adapter_availability() -> dict[str, bool]:
+    """Read-only view of the injected adapter availability. Used by the
+    admin /voice-treasure/config endpoint and student /config-public to
+    report TRUTHFUL integration status to Author Studio + students."""
+    return {
+        "voucher": bool(_runtime_adapters.get("voucher")),
+        "edutalk_pass": bool(_runtime_adapters.get("edutalk_pass")),
+    }
+
+
 # Image MODEL name comes from backend config only (never the frontend).
 # The adapter (Phase 4) reads this; Phase 2 only stores/echoes it.
 def env_image_model_default() -> str:
@@ -182,6 +222,29 @@ def default_config() -> dict[str, Any]:
             "allow_evaluation_retry": True,
             "manual_reconciliation_enabled": True,
         },
+        # ── Bilingual evaluation policy (English + Khmer) ────────────────
+        # All four enums are validated server-side. Clients cannot override
+        # this policy at attempt time; the persisted config is authoritative.
+        # The normalized score schema is unchanged — language affects
+        # ACCEPTED RESPONSE LANGUAGES and FEEDBACK PRESENTATION only, not
+        # what is scored.
+        "language": {
+            # Which response languages the student may use.
+            "response_language": "english",       # english|khmer|english_or_khmer|mixed
+            # Which language(s) the coaching feedback is rendered in.
+            "feedback_language": "english",       # english|khmer|match|bilingual
+            # Mission instruction display language.
+            "mission_instruction_language": "english",  # english|khmer|bilingual
+            # Admin-overridable text templates (English / Khmer).
+            "mission_instruction_text_en": "",
+            "mission_instruction_text_km": "",
+            "recording_guidance_text_en": "",
+            "recording_guidance_text_km": "",
+            "evaluation_unavailable_text_en": "",
+            "evaluation_unavailable_text_km": "",
+            "retry_message_text_en": "",
+            "retry_message_text_km": "",
+        },
         "updated_at": None,
         "updated_by": None,
         "policy_version": 1,
@@ -202,6 +265,12 @@ _ALLOWED_EVAL_CATEGORIES = {
     "relevance", "visual_grounding", "detail",
     "organization", "understandable_language",
 }
+# Bilingual policy enums — validated server-side, never client-overridable.
+_RESPONSE_LANGUAGES = {"english", "khmer", "english_or_khmer", "mixed"}
+_FEEDBACK_LANGUAGES = {"english", "khmer", "match", "bilingual"}
+_INSTRUCTION_LANGUAGES = {"english", "khmer", "bilingual"}
+# Bound any admin-supplied template text to a safe length.
+_TEMPLATE_MAX_LEN = 600
 
 
 # --------------------------------------------------------------------------- #
@@ -242,6 +311,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
     a, e, im, sp, rw = (
         cfg["access"], cfg["entry"], cfg["images"], cfg["speaking"], cfg["rewards"],
     )
+    lang = cfg.get("language") or {}
 
     # ── Entry ──────────────────────────────────────────────────────────── #
     if int(e["entry_cost_points"]) < 0:
@@ -346,6 +416,56 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if not isinstance(rw.get("edutalk_pass_eligible_books", []), list):
         raise VTValidationError("edutalk_pass_eligible_books must be a list")
 
+    # ── Bilingual evaluation policy ─────────────────────────────────────── #
+    if lang.get("response_language", "english") not in _RESPONSE_LANGUAGES:
+        raise VTValidationError(
+            f"language.response_language must be one of {sorted(_RESPONSE_LANGUAGES)}"
+        )
+    if lang.get("feedback_language", "english") not in _FEEDBACK_LANGUAGES:
+        raise VTValidationError(
+            f"language.feedback_language must be one of {sorted(_FEEDBACK_LANGUAGES)}"
+        )
+    if lang.get("mission_instruction_language", "english") not in _INSTRUCTION_LANGUAGES:
+        raise VTValidationError(
+            f"language.mission_instruction_language must be one of {sorted(_INSTRUCTION_LANGUAGES)}"
+        )
+    for key in (
+        "mission_instruction_text_en", "mission_instruction_text_km",
+        "recording_guidance_text_en", "recording_guidance_text_km",
+        "evaluation_unavailable_text_en", "evaluation_unavailable_text_km",
+        "retry_message_text_en", "retry_message_text_km",
+    ):
+        v = lang.get(key, "")
+        if not isinstance(v, str):
+            raise VTValidationError(f"language.{key} must be a string")
+        if len(v) > _TEMPLATE_MAX_LEN:
+            raise VTValidationError(
+                f"language.{key} must be <= {_TEMPLATE_MAX_LEN} characters"
+            )
+
+
+def evaluation_language_policy(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the SERVER-AUTHORITATIVE bilingual policy used when calling
+    the evaluator. Pure, side-effect-free. Caller MUST resolve this from the
+    persisted config — never from client input — so the student cannot
+    override the policy mid-attempt.
+
+    The shape is intentionally small and stable; the gemini adapter consumes
+    it directly when building a controlled, bounded prompt.
+    """
+    lang = (cfg or {}).get("language") or {}
+    return {
+        "response_language": lang.get("response_language", "english"),
+        "feedback_language": lang.get("feedback_language", "english"),
+        "mission_instruction_language": lang.get(
+            "mission_instruction_language", "english"
+        ),
+        # The score categories the evaluator may emit. The normalized schema
+        # is enforced at the evaluator output stage — never trust the
+        # provider to honour an unsupported category.
+        "score_categories": list(_ALLOWED_EVAL_CATEGORIES),
+    }
+
 
 def apply_master_switch_ceiling(cfg: dict[str, Any]) -> dict[str, Any]:
     """Force-disable anything a master env switch has turned OFF, and
@@ -439,13 +559,55 @@ def public_projection(
             # NOTE: image_model, blocked_themes intentionally omitted.
         },
         "rewards": {
-            # Only advertise reward types that are actually deliverable (post
-            # master-switch ceiling — these reflect infra master AND admin).
+            # Pass A — student public config advertises ONLY effectively
+            # active rewards. A reward type is effectively active when:
+            #   (Author Studio toggle) AND (master env switch) AND
+            #   (runtime grant adapter is wired, where applicable).
+            # The master-switch ceiling already gates Author Studio toggle
+            # × env master; we additionally AND with the runtime adapter so
+            # students never see a reward type whose grant path is absent.
             "points_reward_enabled": bool(rw["points_reward_enabled"]),
             "first_voice_card_enabled": bool(rw["first_voice_card_enabled"]),
-            "voucher_reward_available": bool(rw["voucher_reward_enabled"]),
-            "edutalk_pass_reward_available": bool(rw["edutalk_pass_reward_enabled"]),
+            "voucher_reward_available": bool(
+                rw["voucher_reward_enabled"]
+                and _runtime_adapters.get("voucher", False)
+            ),
+            "edutalk_pass_reward_available": bool(
+                rw["edutalk_pass_reward_enabled"]
+                and _runtime_adapters.get("edutalk_pass", False)
+            ),
         },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Pass A — Student-safe public projection of the server-authoritative          #
+# language policy. The student NEVER sends a language policy; this projection  #
+# is read by the Result component to render English / Khmer / match /          #
+# bilingual feedback correctly. Only the three policy SELECTORS are exposed —  #
+# NEVER the SAFE prompt fragment, NEVER admin override templates, NEVER any    #
+# provider details.                                                            #
+# --------------------------------------------------------------------------- #
+def public_language_policy(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Pass A.1 — student-safe projection of the server-authoritative
+    language policy. Internally the Studio uses `mission_instruction_language`
+    (the field name persisted in config); the public projection exposes the
+    stable student-facing key `instruction_language` for that selector,
+    while `response_language` / `feedback_language` keep their stable
+    student-facing names.
+
+    All three values pass through unchanged when valid. Legacy / default
+    fallback resolves to English when a field is missing or empty.
+    """
+    pol = evaluation_language_policy(cfg)
+    return {
+        "response_language": pol.get("response_language", "english") or "english",
+        "feedback_language": pol.get("feedback_language", "english") or "english",
+        # Pass A.1 FIX: read the real internal field
+        # (`mission_instruction_language`), not the public alias.
+        "instruction_language": pol.get(
+            "mission_instruction_language", "english"
+        ) or "english",
     }
 
 
@@ -530,16 +692,68 @@ def register_voice_treasure_config_routes(
     @api.get("/admin/voice-treasure/config")
     async def vt_admin_get_config(admin=Depends(require_admin)):
         cfg = await load_config(db)
+        # Pass A — truthful, runtime-detected integration availability.
+        # `runtime_adapter_availability()` reads only the booleans the server
+        # composition layer injected at startup via
+        # `set_runtime_adapter_availability(...)`. config_tools never imports
+        # server.py and never inspects server globals.
+        adapters = runtime_adapter_availability()
+        master_voucher = master_voucher_reward_enabled()
+        master_edutalk = master_edutalk_pass_reward_enabled()
+        rw = (cfg or {}).get("rewards", {}) or {}
         return {
             "config": cfg,
             "effective": effective_state(cfg),
+            # The 5 explicit truth states the Author Studio surfaces. Each
+            # reward type is reported across the orthogonal dimensions so a
+            # disabled adapter, a cleared master switch, and an unsaved
+            # toggle are all distinguishable in the UI.
             "reward_availability": {
                 "points": True,
                 "first_voice_card": True,
-                # Available when their infra master switch is ON; the Author
-                # Studio toggle is the second gate.
-                "voucher": master_voucher_reward_enabled(),
-                "edutalk_pass": master_edutalk_pass_reward_enabled(),
+                # `voucher`/`edutalk_pass`: kept for back-compat with the v1
+                # consumer; resolves to TRUE only when BOTH the master env
+                # switch AND the runtime grant adapter are present. Studio
+                # still saves voucher/pass config when this is FALSE.
+                "voucher": bool(master_voucher and adapters["voucher"]),
+                "edutalk_pass": bool(master_edutalk and adapters["edutalk_pass"]),
+            },
+            "integration_status": {
+                "voucher": {
+                    "configured": bool(rw.get("voucher_reward_enabled")),
+                    "integration_available": bool(adapters["voucher"]),
+                    "master_switch_enabled": bool(master_voucher),
+                    "effectively_active": bool(
+                        adapters["voucher"]
+                        and master_voucher
+                        and rw.get("voucher_reward_enabled")
+                    ),
+                },
+                "edutalk_pass": {
+                    "configured": bool(rw.get("edutalk_pass_reward_enabled")),
+                    "integration_available": bool(adapters["edutalk_pass"]),
+                    "master_switch_enabled": bool(master_edutalk),
+                    "effectively_active": bool(
+                        adapters["edutalk_pass"]
+                        and master_edutalk
+                        and rw.get("edutalk_pass_reward_enabled")
+                    ),
+                },
+                "points": {
+                    "configured": bool(rw.get("points_reward_enabled")),
+                    "integration_available": True,
+                    "master_switch_enabled": bool(master_points_reward_enabled()),
+                    "effectively_active": bool(
+                        master_points_reward_enabled()
+                        and rw.get("points_reward_enabled")
+                    ),
+                },
+                "first_voice_card": {
+                    "configured": bool(rw.get("first_voice_card_enabled")),
+                    "integration_available": True,
+                    "master_switch_enabled": True,
+                    "effectively_active": bool(rw.get("first_voice_card_enabled")),
+                },
             },
         }
 

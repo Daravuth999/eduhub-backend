@@ -235,6 +235,24 @@ def _fulfillment_settled(reward: dict) -> bool:
     return points_ok and card_ok and voucher_ok and pass_ok
 
 
+def _safe_voucher_discount_summary(snap: dict) -> str | None:
+    """Pass A.1 — render a student-safe discount summary string from the
+    persisted Author Studio voucher policy snapshot. We expose only what
+    the Studio captured (discount type + value, configured voucher title).
+    No provider payload, no internal stock/source ID, no auto-generated
+    coupon code value. Returns None when nothing safe is configured."""
+    try:
+        dtype = (snap.get("voucher_discount_type") or "").strip()
+        dval = snap.get("voucher_discount_value")
+        if dtype == "percent" and dval not in (None, ""):
+            return f"{int(dval)}% off"
+        if dtype == "amount" and dval not in (None, ""):
+            return f"${float(dval):g} off"
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 def _public_reward_view(reward: dict | None, decision: dict | None) -> dict[str, Any]:
     """Student-safe chest payload. Reveals confirmed reward ONLY when completed.
     Never invents a post-credit balance."""
@@ -260,17 +278,64 @@ def _public_reward_view(reward: dict | None, decision: dict | None) -> dict[str,
     if state == CHEST_COMPLETED:
         f = reward.get("fulfillment", {}) or {}
         dec = reward.get("decision", {}) or {}
+        snap = (dec.get("policy_snapshot") or {})
+        # Pass A.1 — student-safe voucher / EduTalk Pass detail blocks for
+        # the chest reveal. We populate them ONLY when fulfillment confirmed
+        # `granted` and we expose ONLY already-approved student-visible
+        # fields. We never expose internal voucher references, stock IDs,
+        # provider payloads, admin-only source codes, or auto-generated
+        # discount internals. The redemption code is included only if the
+        # existing student-safe contract explicitly marked it visible
+        # (`student_visible_code: True` on the fulfillment record). Expiry
+        # appears only if the fulfillment itself recorded an authoritative
+        # value.
+        voucher_state = f.get("voucher_state") if dec.get("voucher_eligible") else None
+        pass_state = f.get("pass_state") if dec.get("pass_eligible") else None
+        voucher_detail = None
+        if voucher_state == "granted":
+            discount_summary = _safe_voucher_discount_summary(snap)
+            voucher_detail = {
+                "title": snap.get("voucher_title") or "Voice Treasure Voucher",
+                "subtitle": snap.get("voucher_subtitle") or None,
+                "discount_summary": discount_summary,
+            }
+            # Redemption code: only when the existing fulfillment record
+            # marked it student-visible (the safe public contract).
+            if f.get("student_visible_code") and f.get("voucher_code_public"):
+                voucher_detail["redemption_code"] = f["voucher_code_public"]
+            if f.get("voucher_expires_at"):
+                voucher_detail["expires_at"] = f["voucher_expires_at"]
+        pass_detail = None
+        if pass_state == "granted":
+            pass_detail = {
+                "feature": snap.get("edutalk_pass_feature") or None,
+                "quantity": int(snap.get("edutalk_pass_quantity") or 1),
+            }
+            if f.get("pass_expires_at"):
+                pass_detail["expires_at"] = f["pass_expires_at"]
+            scope = snap.get("edutalk_pass_eligible_books")
+            if isinstance(scope, list) and scope:
+                # Eligible scope is already student-safe (book slugs the
+                # Author Studio configured); empty list means "all books"
+                # and stays implicit.
+                pass_detail["eligible_books"] = list(scope)
         out["reward"] = {
             "points_credited": int(f.get("credited_points", 0)) if dec.get("points_eligible") else 0,
             "base_points": dec.get("base_points", 0),
             "streak_bonus": dec.get("streak_bonus", 0),
             "high_score_bonus": dec.get("high_score_bonus", 0),
             "first_voice_card": f.get("card_state", CARD_NONE),
-            "voucher": (f.get("voucher_state") if dec.get("voucher_eligible") else None),
-            "edutalk_pass": (f.get("pass_state") if dec.get("pass_eligible") else None),
+            # Bounded enum states for the chest UI to gate the reveal on.
+            # Never expose pending / eligible / blocked / failed / absent as
+            # won — VoiceTreasureChest renders rows ONLY when state ==
+            # "granted".
+            "voucher": voucher_state,
+            "edutalk_pass": pass_state,
+            "voucher_detail": voucher_detail,
+            "edutalk_pass_detail": pass_detail,
             "edutalk_pass_feature": (
-                (dec.get("policy_snapshot") or {}).get("edutalk_pass_feature")
-                if dec.get("pass_eligible") else None
+                snap.get("edutalk_pass_feature")
+                if pass_state == "granted" else None
             ),
             "claimed_at": reward.get("completed_at"),
         }
@@ -758,12 +823,33 @@ def register_voice_treasure_reward_routes(
         async for r in cur:
             f = r.get("fulfillment") or {}
             dec = r.get("decision") or {}
-            rows.append({
+            snap = (dec.get("policy_snapshot") or {})
+            # Pass A — surface CONFIRMED voucher / EduTalk Pass alongside
+            # points + first voice card. Only fields already approved by the
+            # student-safe contract are exposed: state is reported as a
+            # bounded enum, and a public-facing TITLE is shown (never the
+            # internal voucher code, never the existing-code reference, never
+            # admin source identifiers, never provider payloads). The
+            # Rewards UI renders these rows ONLY when state == "granted".
+            voucher_state = f.get("voucher_state") if dec.get("voucher_eligible") else None
+            pass_state = f.get("pass_state") if dec.get("pass_eligible") else None
+            row = {
                 "attempt_id": r.get("attempt_id"),
                 "points_credited": int(f.get("credited_points", 0)) if dec.get("points_eligible") else 0,
                 "first_voice_card": f.get("card_state", CARD_NONE),
                 "claimed_at": r.get("completed_at"),
-            })
+                "voucher": {
+                    "state": voucher_state,        # granted | skipped | error | None
+                    "title": snap.get("voucher_title") or "Voice Treasure Voucher"
+                              if voucher_state == "granted" else None,
+                } if voucher_state else None,
+                "edutalk_pass": {
+                    "state": pass_state,           # granted | skipped | error | None
+                    "feature": snap.get("edutalk_pass_feature") if pass_state == "granted" else None,
+                    "quantity": int(snap.get("edutalk_pass_quantity") or 1) if pass_state == "granted" else None,
+                } if pass_state else None,
+            }
+            rows.append(row)
         return {"rewards": rows, "count": len(rows)}
 
     # ── GET /collection — collectibles owned ──

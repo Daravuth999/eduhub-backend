@@ -342,6 +342,26 @@ def register_voice_treasure_entry_routes(api, db, require_admin, require_student
         entry = await db[COLL_ENTRIES].find_one({"_id": ekey}, {"_id": 0})
         used_today = await _count_succeeded_today(db, sid, date)
         daily_limit = int(pub["limits"]["daily_play_limit"])
+        # Server-authoritative bilingual text. The student client NEVER
+        # decides what language to evaluate in — we only tell it what to
+        # display. Falls back gracefully if helpers are unavailable.
+        instruction_block: dict[str, Any] = {
+            "primary": mission.get("prompt") or "Describe the picture.",
+            "secondary": "",
+            "lang": "en",
+        }
+        unavailable_text = "Evaluation is temporarily unavailable. Your entry is preserved — please try again shortly."
+        retry_text = "You can try again. We won't charge you again."
+        try:
+            import voice_treasure_bilingual as vt_lang
+            policy = vt_cfg.evaluation_language_policy(cfg)
+            lang_cfg = (cfg or {}).get("language") or {}
+            instruction_block = vt_lang.resolve_instruction_text(policy, lang_cfg)
+            unavailable_text = vt_lang.localize_unavailable_text(policy, lang_cfg)
+            retry_text = vt_lang.localize_retry_text(policy, lang_cfg)
+            response_label = vt_lang.accepted_response_language_label(policy)
+        except Exception:  # noqa: BLE001
+            response_label = "English"
         return {
             "available": True,
             "mission": _mission_offer_view(mission),
@@ -356,6 +376,13 @@ def register_voice_treasure_entry_routes(api, db, require_admin, require_student
                 "limit_reached": daily_limit > 0 and used_today >= daily_limit,
             },
             "existing_entry": _entry_view(entry) if entry else None,
+            # Server-authoritative localized text (display only).
+            "language": {
+                "instruction": instruction_block,
+                "accepted_response_label": response_label,
+                "unavailable_text": unavailable_text,
+                "retry_text": retry_text,
+            },
         }
 
     # ── POST /entry/confirm : preview (confirm=false) OR debit (confirm=true)

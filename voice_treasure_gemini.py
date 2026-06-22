@@ -225,11 +225,15 @@ def mission_context_for(image_ref: str, generated_context: str | None = None) ->
 # --------------------------------------------------------------------------- #
 # Evaluation                                                                   #
 # --------------------------------------------------------------------------- #
-def _coach_prompt(mission_context: str, feedback_tone: str) -> str:
+def _coach_prompt(
+    mission_context: str,
+    feedback_tone: str,
+    language_clause: str | None = None,
+) -> str:
     tone = {"encouraging": "warm and encouraging", "neutral": "neutral and factual",
             "strict": "direct and rigorous"}.get(feedback_tone, "warm and encouraging")
     cats = ", ".join(EVAL_CATEGORIES)
-    return (
+    base = (
         "You are an English speaking coach. A student listened to / looked at a "
         "picture and recorded a spoken description. The picture shows: "
         f"{mission_context}\n\n"
@@ -245,6 +249,13 @@ def _coach_prompt(mission_context: str, feedback_tone: str) -> str:
         "Do NOT include pronunciation, fluency, vocabulary, pause, confidence, "
         "or any acoustic measures. Score only the five listed categories."
     )
+    # Server-authoritative bilingual language clause (never from client).
+    if language_clause:
+        # Hard-bound length so a malformed config can never balloon the prompt.
+        clause = str(language_clause)[:1200].strip()
+        if clause:
+            base = base + "\n\nLanguage policy: " + clause
+    return base
 
 
 def normalize_evaluation(raw: Any) -> dict[str, Any] | None:
@@ -308,11 +319,17 @@ async def evaluate_speaking(
     image_bytes: bytes | None = None,
     image_mime: str | None = None,
     eval_model: str | None = None,
+    language_policy: dict | None = None,
 ) -> dict[str, Any]:
     """Run Gemini multimodal evaluation. Returns:
         {"ok": True, "result": <normalized contract>}
         {"ok": False, "reason": "evaluation_unavailable"|"evaluation_failed"|"provider_rejected"}
     Never fabricates scores; never raises; never logs audio or keys.
+
+    ``language_policy`` is the SERVER-AUTHORITATIVE bilingual policy produced
+    by ``voice_treasure_config_tools.evaluation_language_policy(cfg)``. It is
+    converted to a short bounded clause and appended to the controlled prompt.
+    NEVER pass client-supplied policy here.
     """
     model = (eval_model or _env("VOICE_TREASURE_EVAL_MODEL"))
     key = _api_key()
@@ -321,7 +338,19 @@ async def evaluate_speaking(
     if not audio_bytes:
         return {"ok": False, "reason": "evaluation_failed"}
 
-    parts: list[dict[str, Any]] = [{"text": _coach_prompt(mission_context, feedback_tone)}]
+    language_clause: str | None = None
+    if language_policy:
+        try:
+            import voice_treasure_bilingual as vt_lang
+            language_clause = vt_lang.build_evaluator_language_clause(language_policy)
+        except Exception:  # noqa: BLE001
+            # A malformed/missing policy MUST NOT block evaluation — the
+            # default English prompt remains correct.
+            language_clause = None
+
+    parts: list[dict[str, Any]] = [
+        {"text": _coach_prompt(mission_context, feedback_tone, language_clause)}
+    ]
     if image_bytes and image_mime:
         parts.append({"inline_data": {"mime_type": image_mime,
                                       "data": base64.b64encode(image_bytes).decode("ascii")}})

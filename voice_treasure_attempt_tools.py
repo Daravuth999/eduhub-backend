@@ -108,6 +108,55 @@ def _attempt_view(a: dict) -> dict[str, Any]:
     return out
 
 
+# Pass A.1.1 — Approved enum sets for the public language-policy projection.
+# A stored snapshot may be corrupted (mid-flight schema change, partial write,
+# legacy migration). The resolver clamps each selector to its approved enum
+# and falls back safely. Internal Gemini prompts / templates / keys / model
+# settings are never exposed regardless of what the snapshot contains.
+_POLICY_ENUMS: dict[str, frozenset[str]] = {
+    "response_language": frozenset({"english", "khmer", "english_or_khmer", "mixed"}),
+    "feedback_language": frozenset({"english", "khmer", "match", "bilingual"}),
+    "instruction_language": frozenset({"english", "khmer", "bilingual"}),
+}
+
+
+def _clamp_policy_selector(key: str, value) -> str:
+    """Return `value` if it is a member of the approved enum for `key`,
+    otherwise fall back to `"english"`. Defensive against None, non-strings,
+    and stale/legacy values that no longer satisfy the contract."""
+    allowed = _POLICY_ENUMS.get(key)
+    if not allowed:
+        return "english"
+    if isinstance(value, str) and value in allowed:
+        return value
+    return "english"
+
+
+def _resolve_attempt_language_policy(a: dict, cfg: dict) -> dict[str, Any]:
+    """Pass A.1 — resolve the effective language policy for a stored attempt.
+    Always prefer the FROZEN snapshot persisted on the attempt document, so
+    later Studio configuration changes never retroactively change the
+    language of an already-evaluated attempt. Legacy attempts (created
+    before this snapshot field existed) fall back safely to the currently
+    resolved server-authoritative policy. The client cannot influence this.
+
+    Pass A.1.1 — every returned selector is clamped to its approved enum.
+    Invalid stored values silently fall back to English; missing keys do
+    the same; valid values pass through unchanged. A corrupted snapshot
+    cannot widen the public contract or surface internal prompts."""
+    snap = a.get("language_policy_snapshot")
+    if isinstance(snap, dict):
+        return {
+            key: _clamp_policy_selector(key, snap.get(key))
+            for key in ("response_language", "feedback_language", "instruction_language")
+        }
+    pub = vt_cfg.public_language_policy(cfg)
+    return {
+        key: _clamp_policy_selector(key, pub.get(key))
+        for key in ("response_language", "feedback_language", "instruction_language")
+    }
+
+
 async def ensure_voice_treasure_attempt_indexes(db) -> None:
     try:
         await db[COLL_ATTEMPTS].create_index([("student_id", 1), ("mission_date", 1)])
@@ -229,6 +278,11 @@ def register_voice_treasure_attempt_routes(api, db, require_admin, require_stude
     ):
         cfg, pub = await _gate(student)
         sid = _sid(student)
+        # Pass A — resolve the server-authoritative language policy ONCE for
+        # this request. The student NEVER provides a language policy; this is
+        # surfaced top-level on the response so the Result component can
+        # render bilingual / khmer / match / english output correctly.
+        lang_policy_public = vt_cfg.public_language_policy(cfg)
 
         # 1) Entry must exist, be owned by this student, and be PAID.
         entry = await db[vt_entry.COLL_ENTRIES].find_one({"_id": entry_id}, {"_id": 0})
@@ -307,12 +361,22 @@ def register_voice_treasure_attempt_routes(api, db, require_admin, require_stude
         # level, so under N concurrent submissions only ONE returns a
         # claimed doc; the others see `None` and short-circuit without
         # calling Gemini.
+        # Pass A.1 — FREEZE the effective language policy on the attempt
+        # document at seed time. We persist only the student-safe public
+        # projection (the three policy selectors); we never store internal
+        # Gemini clauses, prompts, templates, keys, or model settings.
+        # All later attempt/result responses prefer this frozen snapshot, so
+        # subsequent Studio configuration changes can never retroactively
+        # change the language of an already-evaluated attempt. The client
+        # cannot supply this — it is derived only from the persisted
+        # server-authoritative config.
         now = _utcnow_iso()
         seed = {
             "_id": akey, "attempt_id": akey, "student_id": sid,
             "entry_id": entry_id, "mission_id": mission_id, "mission_date": date,
             "state": A_CREATED, "result": None, "reason": None,
             "public_reason": None, "submit_count": 0,
+            "language_policy_snapshot": dict(lang_policy_public),
             "created_at": now, "updated_at": now,
         }
         await db[COLL_ATTEMPTS].update_one({"_id": akey}, {"$setOnInsert": seed}, upsert=True)
@@ -342,9 +406,13 @@ def register_voice_treasure_attempt_routes(api, db, require_admin, require_stude
             del data
             existing = await db[COLL_ATTEMPTS].find_one({"_id": akey}, {"_id": 0})
             if existing and existing.get("state") == A_EVALUATED:
-                return {"attempt": _attempt_view(existing), "already_evaluated": True}
+                return {"attempt": _attempt_view(existing),
+                        "language_policy": _resolve_attempt_language_policy(existing, cfg),
+                        "already_evaluated": True}
             if existing and existing.get("state") == A_EVALUATING:
-                return {"attempt": _attempt_view(existing), "in_progress": True}
+                return {"attempt": _attempt_view(existing),
+                        "language_policy": _resolve_attempt_language_policy(existing, cfg),
+                        "in_progress": True}
             # Any other state (manual reconciliation / unknown) — refuse,
             # but never re-charge and never call Gemini.
             raise HTTPException(status_code=409, detail="attempt_not_retryable")
@@ -361,12 +429,16 @@ def register_voice_treasure_attempt_routes(api, db, require_admin, require_stude
             )
             del data
             final = await db[COLL_ATTEMPTS].find_one({"_id": akey}, {"_id": 0})
-            return {"attempt": _attempt_view(final or {})}
+            return {"attempt": _attempt_view(final or {}),
+                    "language_policy": _resolve_attempt_language_policy(final or {}, cfg)}
 
         tone = (cfg.get("speaking") or {}).get("feedback_tone") or "encouraging"
+        # Server-authoritative bilingual policy — never accepts client input.
+        language_policy = vt_cfg.evaluation_language_policy(cfg)
         ev = await vt_gemini.evaluate_speaking(
             audio_bytes=data, audio_mime=ctype, mission_context=context,
             feedback_tone=tone, image_bytes=image_bytes, image_mime=image_mime,
+            language_policy=language_policy,
         )
         del data          # discard raw audio explicitly
         image_bytes = None  # discard raw image bytes explicitly (never persisted)
@@ -387,7 +459,8 @@ def register_voice_treasure_attempt_routes(api, db, require_admin, require_stude
             )
 
         final = await db[COLL_ATTEMPTS].find_one({"_id": akey}, {"_id": 0})
-        return {"attempt": _attempt_view(final or {})}
+        return {"attempt": _attempt_view(final or {}),
+                "language_policy": _resolve_attempt_language_policy(final or {}, cfg)}
 
     # ── Result recovery (ownership-checked) ──
     @api.get("/voice-treasure/attempt/{attempt_id}")
@@ -396,7 +469,15 @@ def register_voice_treasure_attempt_routes(api, db, require_admin, require_stude
         a = await db[COLL_ATTEMPTS].find_one({"_id": attempt_id}, {"_id": 0})
         if not a or a.get("student_id") != sid:
             raise HTTPException(status_code=404, detail="attempt_not_found")
-        return {"attempt": _attempt_view(a)}
+        # Pass A.1 — prefer the FROZEN per-attempt language policy snapshot.
+        # Falls back safely to the current resolved server-authoritative
+        # policy for legacy attempts created before this snapshot field
+        # existed. Client never supplies a policy.
+        cfg = await vt_cfg.load_config(db)
+        return {
+            "attempt": _attempt_view(a),
+            "language_policy": _resolve_attempt_language_policy(a, cfg),
+        }
 
     # ── Admin views ──
     @api.get("/admin/voice-treasure/attempts")
