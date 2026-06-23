@@ -6573,6 +6573,44 @@ except Exception as _edutalk_live_err:  # noqa: BLE001
         _edutalk_live_err,
     )
 
+# ── EDUTALK LIVE COACH SURPRISE REWARDS (Phase 1, corrected) ─────────────
+# Isolated, additive reward foundation for the Live Voice Coach. All reward
+# flags default OFF; pass / achievement / voucher remain unavailable. The
+# module is loaded AFTER edutalk_live_tools.py so the bridge import in the
+# reward module can find the existing treasury credit helper. A failure
+# here only disables the reward feature — the Live Coach continues to run
+# unchanged. Index creation now runs in a FastAPI ``startup`` event
+# (NOT at import time) so the unique indexes that protect
+# offer / cap / grant idempotency are deterministically ready before any
+# reward route accepts a request — operations fail closed otherwise.
+try:
+    from edutalk_coach_reward_tools import (
+        register_edutalk_coach_reward_routes,
+        setup_indexes as _edutalk_coach_reward_setup_indexes,
+    )
+    register_edutalk_coach_reward_routes(api, db, require_admin, require_student)
+    logging.getLogger("eduhub").info(
+        "edutalk_coach_reward_tools: routes registered (Phase 1 corrected)"
+    )
+
+    @app.on_event("startup")
+    async def _edutalk_coach_reward_indexes() -> None:
+        try:
+            res = await _edutalk_coach_reward_setup_indexes(db)
+            logging.getLogger("eduhub").info(
+                "edutalk_coach_reward_tools: indexes ready=%s details=%s",
+                res.get("ready"), res.get("details"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").error(
+                "edutalk_coach_reward_tools: index setup failed: %s", exc,
+            )
+except Exception as _edutalk_reward_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "edutalk_coach_reward_tools route registration failed "
+        "(feature disabled): %s", _edutalk_reward_err,
+    )
+
 # ── COACH PACK v3 (isolated, additive, behind admin tier-config flags) ────
 # Mounts 9 additive student-facing modules under /api/student/* that turn
 # the Library into a personalised reading coach (SLP, Word Bank, Hard

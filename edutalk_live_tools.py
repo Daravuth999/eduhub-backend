@@ -64,6 +64,18 @@ from pydantic import BaseModel, ConfigDict, Field
 log = logging.getLogger("eduhub.edutalk_live")
 
 # --------------------------------------------------------------------------- #
+# Optional reward module integration (Phase 1 SURPRISE REWARDS).              #
+# Imported lazily and safely — if the module is missing the Live Coach        #
+# bridge degrades to its previous behaviour with NO reward hooks running.     #
+# --------------------------------------------------------------------------- #
+try:
+    import edutalk_coach_reward_tools as _reward_mod  # type: ignore
+    _REWARD_MOD_OK = True
+except Exception:  # pragma: no cover
+    _reward_mod = None  # type: ignore[assignment]
+    _REWARD_MOD_OK = False
+
+# --------------------------------------------------------------------------- #
 # Environment (backend-only secrets)                                          #
 # --------------------------------------------------------------------------- #
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -616,6 +628,13 @@ def _build_system_instruction(
     }.get(mode_key, "")
     if mode_hint:
         lines.append(mode_hint)
+
+    # NOTE: The Phase 1 corrected build does NOT inject any reward-evidence
+    # protocol into the Gemini system instruction. When rewards are enabled
+    # the backend evaluates server-owned exercises against authoritative
+    # coach + student turn data (see edutalk_coach_reward_tools.py).
+    # Therefore the Gemini prompt remains identical to the original
+    # pristine implementation whether rewards are enabled or disabled.
 
     lines.append(
         "Keep your turns short so the student does most of the talking. End the "
@@ -1797,6 +1816,17 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
     transcript: list[dict] = []
     deadline = time.time() + max(30, duration)
 
+    # ── Phase 1 SURPRISE REWARDS: optional per-session reward context.
+    # Safe-degrade: if the reward module is missing or fails to wire, the
+    # bridge runs exactly as before with no reward events emitted.
+    reward_ctx = None
+    reward_services = None
+    if _REWARD_MOD_OK and _reward_mod is not None:
+        try:
+            reward_services = _reward_mod.get_services()
+        except Exception:
+            reward_services = None
+
     try:
         async with _ws_lib.connect(uri, max_size=None) as gem:
             await gem.send(json.dumps(setup_msg))
@@ -1815,6 +1845,70 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
             )
             await _ws_send(client_ws, {"type": "ready"})
             await _ws_send(client_ws, {"type": "state", "value": "listening"})
+
+            # ── Phase 1 corrected: gate reward wiring on the authoritative
+            # runtime-active check. When the master rewards feature is OFF
+            # (or indexes failed at startup) NO reward hook is installed —
+            # the bridge behaves exactly like the pristine implementation.
+            if reward_services is not None:
+                try:
+                    runtime_active = await reward_services[
+                        "coach_reward_runtime_active"]()
+                except Exception:
+                    runtime_active = False
+            else:
+                runtime_active = False
+
+            if runtime_active and reward_services is not None:
+                async def _client_send_cb(payload: dict):
+                    # Blocker F — TRUTHFUL delivery. Do NOT swallow the send
+                    # failure; let it propagate to
+                    # ``RewardSessionCtx.emit_to_client`` which records the
+                    # event as NOT delivered (returns False). The only
+                    # caller is the reward layer, which fails soft, so a
+                    # reward-delivery failure never aborts the paid live
+                    # session, microphone, audio, or billing.
+                    await _ws_send(client_ws, payload)
+
+                async def _gemini_inject_cb(text: str):
+                    if not text:
+                        return
+                    # Blocker F — TRUTHFUL delivery. A failed Gemini inject
+                    # must propagate so ``inject_gemini_text`` returns False
+                    # and the announcement is NOT marked delivered. It is
+                    # caught by the reward layer and never breaks the live
+                    # session.
+                    await gem.send(json.dumps({
+                        "clientContent": {
+                            "turns": [{"role": "user",
+                                       "parts": [{"text": text}]}],
+                            "turnComplete": True,
+                        }
+                    }))
+
+                try:
+                    reward_ctx = reward_services["RewardSessionCtx"](
+                        session_id=session_id,
+                        clean_id=session.get("clean_id") or "",
+                        display_name=session.get("display_name") or "",
+                        gemini_inject_cb=_gemini_inject_cb,
+                        client_send_cb=_client_send_cb,
+                    )
+                    # Finding 4 — make this live ctx discoverable from
+                    # the REST layer so a delayed-confirmed reward
+                    # (discovered by bounded polling after an earlier
+                    # pending claim) can route its Gemini
+                    # congratulations through the same guarded
+                    # exactly-once announcement lifecycle. Cleaned up
+                    # in the finally block when the WS bridge tears
+                    # down.
+                    try:
+                        reward_services["register_live_reward_ctx"](
+                            session_id, reward_ctx)
+                    except Exception:
+                        pass
+                except Exception:
+                    reward_ctx = None
 
             # v1.4 — make the AI coach speak FIRST. Inject a single short
             # "user" turn that tells Gemini to greet the student warmly
@@ -1892,6 +1986,49 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                     elif ftype == "end":
                         _set_end(frame.get("reason", "client_end"))
                         return
+                    elif ftype == "claim_reward":
+                        # Phase 1 SURPRISE REWARDS: WebSocket claim command.
+                        # Calls the SAME claim service the REST route uses
+                        # (no duplicate grant logic). Failures are surfaced
+                        # via reward_claim_failed and never end the live
+                        # session.
+                        offer_id = str(frame.get("offer_id") or "")[:64]
+                        if (offer_id and reward_ctx is not None
+                                and reward_services is not None):
+                            try:
+                                await reward_services[
+                                    "handle_ws_claim_command"](
+                                    offer_id, session, reward_ctx)
+                            except Exception as exc:  # noqa: BLE001
+                                log.warning(
+                                    "reward: ws claim error: %s", exc)
+                    elif ftype == "announce_confirmed_reward":
+                        # Correction 1 (final) — strict live-WebSocket
+                        # acknowledgement of a delayed-confirmed reward
+                        # announcement. The browser sends this over the
+                        # ALREADY-OPEN authenticated coach connection after
+                        # bounded polling discovers an authoritative granted
+                        # offer. The bridge owns the authenticated student,
+                        # session and live Gemini context, so the handler
+                        # delivers (or truthfully declines) through THIS
+                        # connection's ctx directly — no REST→registry hop.
+                        # A single reward_announce_ack frame is always sent
+                        # back so the client marks the offer completed ONLY
+                        # on proven delivery and keeps it retryable
+                        # otherwise. Never ends the live session.
+                        offer_id = str(frame.get("offer_id") or "")[:64]
+                        claimed_sid = str(
+                            frame.get("session_id") or "")[:128]
+                        if (offer_id and reward_ctx is not None
+                                and reward_services is not None):
+                            try:
+                                await reward_services[
+                                    "handle_ws_announce_confirmed"](
+                                    offer_id, claimed_sid, session,
+                                    reward_ctx)
+                            except Exception as exc:  # noqa: BLE001
+                                log.warning(
+                                    "reward: ws announce error: %s", exc)
 
             async def pump_gemini_to_client():
                 while True:
@@ -1912,7 +2049,11 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                         msg = json.loads(raw)
                     except Exception:
                         continue
-                    await _handle_gemini_message(msg, client_ws, transcript)
+                    await _handle_gemini_message(
+                        msg, client_ws, transcript,
+                        reward_ctx=reward_ctx,
+                        reward_services=reward_services,
+                        session=session)
 
             done, pending = await asyncio.wait(
                 {asyncio.create_task(pump_client_to_gemini()),
@@ -1948,30 +2089,79 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
         # Gemini failed to come up — refund (failed) so the student is not charged.
         await _ws_send(client_ws, {"type": "error", "reason": str(exc)})
         await finalize(session_id, outcome="failed", error_reason=str(exc))
+    finally:
+        # Correction 1 (final) — drop the live reward ctx from the
+        # registry so a later recovery call cannot fire a Gemini
+        # announcement into a torn-down bridge. Identity-safe: a fast
+        # reconnect that registered a NEWER ctx under the same session_id
+        # must not be evicted by this older bridge's teardown.
+        try:
+            if reward_services is not None:
+                reward_services["unregister_live_reward_ctx"](
+                    session_id, reward_ctx)
+        except Exception:
+            pass
+        try:
+            if reward_ctx is not None:
+                reward_ctx.close()
+        except Exception:
+            pass
 
 
 async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
-                                 transcript: list[dict]) -> None:
-    """Translate a Gemini Live server message into client frames + transcript."""
+                                 transcript: list[dict],
+                                 *, reward_ctx=None, reward_services=None,
+                                 session: dict | None = None) -> None:
+    """Translate a Gemini Live server message into client frames + transcript.
+
+    Phase 1 corrected SURPRISE REWARDS: coach output is NEVER modified.
+    Instead the bridge buffers the latest coach text / latest student
+    input transcript and the reward module owns:
+
+      * opening an exercise (when a coach turn completes);
+      * evaluating an exercise (when student input transcription arrives);
+      * deciding whether the cumulative state qualifies for an offer.
+
+    Nothing reward-related runs unless ``reward_services`` is wired AND
+    the reward runtime is currently active (the bridge gates this at
+    setup time so a disabled feature has no effect here).
+    """
     server_content = msg.get("serverContent")
     if not server_content:
         return
 
-    # Input (student) transcription.
+    def _buffer_coach(text: str) -> None:
+        if reward_ctx is not None and text:
+            reward_ctx.last_coach_text = (
+                (reward_ctx.last_coach_text + " " + text).strip()[-1024:]
+            )
+
+    def _buffer_student(text: str) -> None:
+        if reward_ctx is not None and text:
+            reward_ctx.last_student_text = (
+                (reward_ctx.last_student_text + " " + text).strip()[-1024:]
+            )
+
+    # Input (student) transcription. Buffer the latest student text so the
+    # reward module can evaluate the open exercise when the turn completes.
     in_tx = server_content.get("inputTranscription")
     if in_tx and in_tx.get("text"):
         transcript.append({"role": "student", "text": in_tx["text"],
                            "ts": _iso()})
         await _ws_send(client_ws, {"type": "transcript", "role": "student",
                                    "text": in_tx["text"]})
+        _buffer_student(in_tx["text"])
 
-    # Output (coach) transcription.
+    # Output (coach) transcription. Coach text is forwarded UNMODIFIED —
+    # the corrected Phase 1 build does not embed any control markers in
+    # the model's response stream.
     out_tx = server_content.get("outputTranscription")
     if out_tx and out_tx.get("text"):
         transcript.append({"role": "coach", "text": out_tx["text"],
                            "ts": _iso()})
         await _ws_send(client_ws, {"type": "transcript", "role": "coach",
                                    "text": out_tx["text"]})
+        _buffer_coach(out_tx["text"])
 
     model_turn = server_content.get("modelTurn")
     if model_turn:
@@ -1987,10 +2177,40 @@ async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
                 })
             txt = part.get("text")
             if txt:
-                transcript.append({"role": "coach", "text": txt, "ts": _iso()})
+                transcript.append({"role": "coach", "text": txt,
+                                   "ts": _iso()})
                 await _ws_send(client_ws, {"type": "transcript",
                                            "role": "coach", "text": txt})
+                _buffer_coach(txt)
 
     if server_content.get("turnComplete"):
         await _ws_send(client_ws, {"type": "turn_complete"})
         await _ws_send(client_ws, {"type": "state", "value": "listening"})
+        # ── Phase 1 corrected reward hooks. The bridge ONLY calls these
+        # when ``reward_services`` is wired AND the runtime-active gate
+        # passed at session start.
+        if (reward_services is not None and reward_ctx is not None
+                and session is not None):
+            sid = session.get("session_id") or ""
+            clean_id = session.get("clean_id") or ""
+            # 1) Evaluate any open exercise against the latest student
+            #    response. The reward module owns the success decision.
+            if reward_ctx.current_exercise_id and reward_ctx.last_student_text:
+                try:
+                    await reward_services["evaluate_exercise"](
+                        sid, clean_id, reward_ctx,
+                        reward_ctx.last_student_text)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("reward: evaluate_exercise failed: %s", exc)
+                reward_ctx.last_student_text = ""
+            # 2) Open a new exercise from the just-completed coach turn so
+            #    the next student response has a server-issued exercise to
+            #    evaluate against.
+            if reward_ctx.last_coach_text:
+                try:
+                    await reward_services["register_exercise"](
+                        sid, clean_id, reward_ctx,
+                        reward_ctx.last_coach_text)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("reward: register_exercise failed: %s", exc)
+                reward_ctx.last_coach_text = ""
