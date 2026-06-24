@@ -168,6 +168,77 @@ ENV_POINTS_ENABLED = _env_flag("EDUTALK_COACH_POINTS_REWARDS_ENABLED", "0")
 # Provider-boundary truth flag — see top-of-file rationale.
 REAL_GRANT_ENABLED = _env_flag("EDUTALK_COACH_REAL_GRANT_ENABLED", "0")
 
+
+# --------------------------------------------------------------------------- #
+# Finding A — DISTINCT, FAIL-CLOSED environment kill switches.                 #
+# --------------------------------------------------------------------------- #
+# Prior to this hotfix ``ENV_REWARDS_ENABLED`` and ``ENV_POINTS_ENABLED`` were
+# computed but NEVER consulted anywhere in the runtime — only
+# ``REAL_GRANT_ENABLED`` was enforced. That meant the operator-facing master
+# and points env kill switches did nothing: the Studio (MongoDB) config could
+# run the feature even with ``EDUTALK_COACH_REWARDS_ENABLED=0``.
+#
+# These helpers restore the intended, DISTINCT responsibilities and make every
+# gate FAIL CLOSED. The Studio config can only ever turn a capability further
+# OFF — it can never override a server kill switch that is OFF.
+#
+#   * master gate   = EDUTALK_COACH_REWARDS_ENABLED        (whole feature)
+#   * points gate   = EDUTALK_COACH_POINTS_REWARDS_ENABLED (points offers)
+#   * real-grant    = EDUTALK_COACH_REAL_GRANT_ENABLED     (wallet credit)
+#
+# The constants are read through these helpers at CALL TIME (not captured) so a
+# test / future hot-reload that flips the module attribute is honoured, and so
+# the gate reflects the truth at the moment a decision is made.
+def _env_master_gate() -> bool:
+    """Server master kill switch (EDUTALK_COACH_REWARDS_ENABLED)."""
+    return bool(ENV_REWARDS_ENABLED)
+
+
+def _env_points_gate() -> bool:
+    """Server points-offer kill switch (EDUTALK_COACH_POINTS_REWARDS_ENABLED)."""
+    return bool(ENV_POINTS_ENABLED)
+
+
+def _effective_master_enabled(cfg: dict | None) -> bool:
+    """Master is operational only when BOTH the env gate is ON and the
+    Studio config has ``enabled`` True. Fail closed on missing config."""
+    return bool(_env_master_gate() and (cfg or {}).get("enabled"))
+
+
+def _effective_points_enabled(cfg: dict | None) -> bool:
+    """Points offers are operational only when BOTH the env points gate is
+    ON and the Studio config has ``points_enabled`` True."""
+    return bool(_env_points_gate() and (cfg or {}).get("points_enabled"))
+
+
+# --------------------------------------------------------------------------- #
+# Finding C — rate-limited, info-level eligibility diagnostics.               #
+# --------------------------------------------------------------------------- #
+# A tiny per-key throttle so the eligibility tracker can emit useful,
+# secret-free diagnostics ("reward tracking session=... exercises=1
+# required=3 correction=False") without flooding the log. NEVER logs
+# transcripts, provider keys, tokens, student PII, or reward amounts.
+_DIAG_LAST: dict[str, float] = {}
+_DIAG_MIN_INTERVAL_S = 20.0
+
+
+def _diag(key: str, message: str, *, every: float = _DIAG_MIN_INTERVAL_S) -> None:
+    try:
+        now = time.time()
+        last = _DIAG_LAST.get(key, 0.0)
+        if (now - last) < every:
+            return
+        _DIAG_LAST[key] = now
+        # Bound the throttle map so a long-running process cannot grow it
+        # without limit (one entry per active session/reason key).
+        if len(_DIAG_LAST) > 4096:
+            _DIAG_LAST.clear()
+            _DIAG_LAST[key] = now
+        log.info("coach_reward.diag %s", message)
+    except Exception:  # pragma: no cover — diagnostics must never raise
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Stable provider idempotency key                                             #
 # --------------------------------------------------------------------------- #
@@ -304,6 +375,78 @@ _PAT_CONVERSATION_ONLY = re.compile(
     re.IGNORECASE,
 )
 
+# ──────────────────────────────────────────────────────────────────────────
+# Finding B — language-independent coach-turn evidence (Khmer + mixed).
+# ──────────────────────────────────────────────────────────────────────────
+# The Live Voice Coach frequently EXPLAINS in Khmer while the practice TARGET
+# stays English (the student repeats an English phrase). The English-only
+# patterns above never matched a Khmer-guided instruction, so in Khmer mode
+# NO exercise was ever registered → eligibility (min 3) was never reached →
+# no offer → no reward button (the reported defect).
+#
+# These Khmer patterns mirror the four supported coach-directed tasks. Khmer
+# script has no inter-word spaces, so we match on contiguous substrings
+# (no ``\b`` boundaries). They are deliberately conservative: a Khmer turn
+# that is only praise / greeting / explanation must still NOT register an
+# exercise (see ``_PAT_KM_CONVERSATION_ONLY``). English behaviour is
+# unchanged — these only add Khmer/mixed matches.
+#
+# Khmer glosses (for reviewers):
+#   និយាយ = say/speak   ថា = say        អាន = read       សូម = please
+#   តាម = follow/after  ខ្ញុំ = me/I      ម្ដងទៀត/ម្តងទៀត = again
+#   ព្យាយាម = try        សាក/សា កល្បង = try   កែ = correct    ត្រឹមត្រូវ = correct/right
+#   ប្រាប់ = tell        អំពី/ពី = about    ឆ្លើយ = answer    សំណួរ = question
+#   ប្រយោគ/ឃ្លា = sentence  បន្ទាប់ = next   សៀវភៅ = book
+_PAT_KM_REPEAT = re.compile(
+    r"(និយាយតាម|ថាតាម|អានតាម|និយាយម្ដងទៀត|និយាយម្តងទៀត|ថាម្ដងទៀត|ថាម្តងទៀត|"
+    r"សូមនិយាយ|សូមថា|និយាយថា|ថាពាក្យ|អានពាក្យ|អានឃ្លានេះ|អានប្រយោគនេះ)"
+)
+_PAT_KM_CORRECTION = re.compile(
+    r"(ព្យាយាមម្ដងទៀត|ព្យាយាមម្តងទៀត|សាកម្ដងទៀត|សាកម្តងទៀត|ល្បងម្ដងទៀត|"
+    r"ល្បងម្តងទៀត|ធ្វើម្ដងទៀត|ធ្វើម្តងទៀត|កែតម្រូវ|"
+    r"និយាយឱ្យបានត្រឹមត្រូវ|និយាយឲ្យបានត្រឹមត្រូវ|"
+    r"ថាឱ្យបានត្រឹមត្រូវ|ថាឲ្យបានត្រឹមត្រូវ|មិនទាន់ត្រឹមត្រូវ)"
+)
+_PAT_KM_GUIDED = re.compile(
+    r"(ប្រាប់ខ្ញុំ|ប្រាប់ខ្ញុំអំពី|ប្រាប់ខ្ញុំពី|និយាយអំពី|និយាយពី|ឆ្លើយសំណួរ|"
+    r"ឆ្លើយនឹង|ឆ្លើយ|ពិពណ៌នា|តើអ្នកនិយាយ|តើអ្នកគិត)"
+)
+_PAT_KM_BOOK = re.compile(
+    r"(អានប្រយោគបន្ទាប់|អានឃ្លាបន្ទាប់|ប្រយោគបន្ទាប់|ឃ្លាបន្ទាប់|"
+    r"ពីសៀវភៅ|ក្នុងសៀវភៅ|អានបន្ទាត់បន្ទាប់)"
+)
+# Khmer praise / greeting / pure-explanation guard. When a turn matches one of
+# these AND none of the Khmer/English task patterns above, it must NOT
+# register an exercise (mirrors the English ``_PAT_CONVERSATION_ONLY`` ban so
+# Gemini praise alone never qualifies — e.g. "អស្ចារ្យណាស់" = "amazing").
+_PAT_KM_CONVERSATION_ONLY = re.compile(
+    r"(អស្ចារ្យ|ល្អណាស់|ល្អមែនទែន|ពូកែ|ធ្វើបានល្អ|បានល្អ|សួស្ដី|សួស្តី|"
+    r"ជំរាបសួរ|អបអរ|សាទរ|ខិតខំ|ត្រូវហើយ)"
+)
+# Latin-script imperative target found inside a Khmer instruction, e.g. the
+# coach says (Khmer) "say after me" then quotes an English phrase. A quoted
+# segment is extracted by ``classify_coach_turn`` regardless of language.
+
+
+def _has_km_task(s: str) -> tuple[str | None, str | None]:
+    """Khmer/mixed task classification. Correction is most specific and
+    wins over repeat. Returns ``(kind, correction_target)`` or
+    ``(None, None)``. ``correction_target`` is populated only for
+    ``correction_retry`` (prefer a quoted English/Khmer segment)."""
+    if _PAT_KM_CORRECTION.search(s):
+        target = ""
+        m_quote = re.search(r'["“”\']([^"“”\']{3,140})["“”\']', s)
+        if m_quote:
+            target = m_quote.group(1).strip()
+        return "correction_retry", target or None
+    if _PAT_KM_REPEAT.search(s):
+        return "repeat_after_coach", None
+    if _PAT_KM_BOOK.search(s):
+        return "book_shadow_sentence", None
+    if _PAT_KM_GUIDED.search(s):
+        return "guided_short_answer", None
+    return None, None
+
 
 def classify_coach_turn(text: str) -> tuple[str | None, str | None]:
     """Return ``(exercise_kind, correction_target)``.
@@ -312,7 +455,13 @@ def classify_coach_turn(text: str) -> tuple[str | None, str | None]:
     ``(None, None)`` and the caller MUST NOT register an exercise. The
     correction_target string is extracted only when the turn is classified
     as ``correction_retry`` — it carries the target phrase the student is
-    expected to reproduce."""
+    expected to reproduce.
+
+    Finding B — the classifier is language-independent: it accepts Khmer
+    and mixed Khmer/English coach instructions in addition to the original
+    English forms, because the Live Voice Coach explains in Khmer while the
+    practice target stays English. Praise / greeting / explanation in EITHER
+    language still never registers an exercise."""
     if not text:
         return None, None
     s = text.strip()
@@ -344,7 +493,14 @@ def classify_coach_turn(text: str) -> tuple[str | None, str | None]:
         # this?``) must NOT register as exercises.
         if not _PAT_CONVERSATION_ONLY.match(s):
             return "guided_short_answer", None
+    # 2) Finding B — Khmer / mixed-language task detection. Only reached when
+    # no English task pattern matched. A Khmer turn that is purely praise /
+    # greeting / explanation (and carries no Khmer task verb) is rejected.
+    km_kind, km_target = _has_km_task(s)
+    if km_kind is not None:
+        return km_kind, km_target
     return None, None
+
 
 DEFAULT_REWARD_CONFIG: dict[str, Any] = {
     "schema_version": CONFIG_SCHEMA_VERSION,
@@ -825,6 +981,56 @@ def indexes_ready() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# v2 Blocker 1 — single AUTHORITATIVE reward-gate evaluator.                   #
+# --------------------------------------------------------------------------- #
+# This is the ONE gate evaluator consulted by every lifecycle decision that
+# could issue NEW credit-bearing activity:
+#   * reward status (clickable eligibility);
+#   * offer creation (eligibility);
+#   * claim acceptance;
+#   * provider dispatch;
+#   * grant_retryable reconciliation resend.
+#
+# It FAILS CLOSED and the Studio (MongoDB) config can only ever close a gate
+# FURTHER — it can never re-open a gate the server env has closed. All of the
+# following must be open for a NEW offer / dispatch / resend:
+#   indexes_ready · env master · config master · env points · config points
+#   · REAL_GRANT_ENABLED · provider available
+#
+# IMPORTANT — what this gate does NOT govern (so confirmed truth is preserved
+# even after a gate is later disabled):
+#   * read-only display of an ALREADY granted/confirmed/terminal/expired offer;
+#   * ledger-lookup confirmation/finalization of an already-SENT ambiguous
+#     provider request (no new provider call is made).
+def _reward_gates_open(cfg: dict | None) -> tuple[bool, str | None]:
+    cfg = cfg or {}
+    if not indexes_ready():
+        return False, "indexes_unavailable"
+    if not _env_master_gate():
+        return False, "server_master_gate_off"
+    if not cfg.get("enabled"):
+        return False, "config_disabled"
+    if not _env_points_gate():
+        return False, "points_gate_off"
+    if not cfg.get("points_enabled"):
+        return False, "points_disabled"
+    if not REAL_GRANT_ENABLED:
+        return False, "real_grant_gate_off"
+    if not _provider_grant_available():
+        return False, "provider_unavailable"
+    return True, None
+
+
+# Reasons that mean "the whole feature is administratively/operationally OFF"
+# (panel should present a calm disabled state) vs warm-up/provider issues
+# (unavailable). Used by the status endpoint to choose disabled vs unavailable.
+_GATE_DISABLED_REASONS = frozenset(
+    {"server_master_gate_off", "config_disabled",
+     "points_gate_off", "points_disabled"}
+)
+
+
+# --------------------------------------------------------------------------- #
 # Route registration                                                          #
 # --------------------------------------------------------------------------- #
 def register_edutalk_coach_reward_routes(
@@ -879,22 +1085,59 @@ def register_edutalk_coach_reward_routes(
         return clean
 
     def _public_status(cfg: dict) -> dict[str, Any]:
+        cfg = cfg or {}
+        idx_ok = indexes_ready()
+        env_master = _env_master_gate()
+        env_points = _env_points_gate()
+        provider_ok = _provider_grant_available()
+        cfg_master = bool(cfg.get("enabled"))
+        cfg_points = bool(cfg.get("points_enabled"))
+        rewards_active = bool(
+            idx_ok and env_master and cfg_master
+            and env_points and cfg_points and provider_ok
+        )
+        # Finding D — distinct, truthful inactive reasons (precedence-ordered)
+        # so the Studio never shows a single generic "master or reward type is
+        # off" message for every failure. ``inactive_reason`` is the primary
+        # (first) reason; ``inactive_reasons`` lists every concurrent reason.
+        inactive_reasons: list[str] = []
+        if not idx_ok:
+            inactive_reasons.append("indexes_unavailable")
+        if not env_master:
+            inactive_reasons.append("server_master_gate_off")
+        elif not cfg_master:
+            inactive_reasons.append("config_disabled")
+        if not env_points:
+            inactive_reasons.append("points_gate_off")
+        elif not cfg_points:
+            inactive_reasons.append("points_disabled")
+        if not REAL_GRANT_ENABLED:
+            inactive_reasons.append("real_grant_gate_off")
+        elif not provider_ok:
+            inactive_reasons.append("provider_unavailable")
         return {
             "grant_helper_ok": bool(_GRANT_HELPER_OK),
             "policy_version": POLICY_VERSION,
             "grant_adapter_version": GRANT_ADAPTER_VERSION,
-            "rewards_active": bool(
-                indexes_ready() and cfg.get("enabled")
-                and cfg.get("points_enabled")
-                and _provider_grant_available()
-            ),
-            "indexes_ready": indexes_ready(),
+            "rewards_active": rewards_active,
+            "indexes_ready": idx_ok,
             "voucher_available": False,
             "pass_available": False,
             "achievement_available": False,
-            "provider_grant_available": _provider_grant_available(),
+            "provider_grant_available": provider_ok,
             "wallet_service_ok": bool(_WALLET_SERVICE_OK),
-            "grant_adapter_version": GRANT_ADAPTER_VERSION,
+            # Finding A/D — explicit, distinct gate visibility. The env gates
+            # are server kill switches; the config flags are the Studio
+            # toggles. The Live Voice Coach VISIBILITY control is separate
+            # from Coach Rewards activation (env+config+provider).
+            "env_master_enabled": env_master,
+            "env_points_enabled": env_points,
+            "env_real_grant_enabled": bool(REAL_GRANT_ENABLED),
+            "config_enabled": cfg_master,
+            "config_points_enabled": cfg_points,
+            "inactive_reasons": inactive_reasons,
+            "inactive_reason": (inactive_reasons[0]
+                                if inactive_reasons else None),
             "reconcile_last_run": _RECON_STATE.get("last_run"),
             "reconcile_resolved": _RECON_STATE.get("resolved", 0),
         }
@@ -919,7 +1162,11 @@ def register_edutalk_coach_reward_routes(
         if not indexes_ready():
             return None
         cfg = await _load_config()
-        if not (cfg.get("enabled") and cfg.get("points_enabled")):
+        if not (_effective_master_enabled(cfg)
+                and _effective_points_enabled(cfg)):
+            # Finding A — fail closed when either the env kill switch or the
+            # Studio config has the feature OFF. Studio can never override an
+            # env gate that is OFF.
             return None
         classified, correction_target = classify_coach_turn(
             instruction_text or "")
@@ -987,7 +1234,8 @@ def register_edutalk_coach_reward_routes(
         if not indexes_ready():
             return None
         cfg = await _load_config()
-        if not (cfg.get("enabled") and cfg.get("points_enabled")):
+        if not (_effective_master_enabled(cfg)
+                and _effective_points_enabled(cfg)):
             return None
         exid = ctx.current_exercise_id
         if not exid:
@@ -1019,6 +1267,14 @@ def register_edutalk_coach_reward_routes(
         # removed; a single shared content word can no longer pass any
         # exercise, and ``correction_resolved`` now requires ≥ 2 target
         # content tokens AND coverage ≥ 0.6.
+        #
+        # v3 Blocker 2 — the QUALIFYING student EVIDENCE is ENGLISH-only. The
+        # coach may EXPLAIN in Khmer (classification is unchanged), but the
+        # practice target and the student's qualifying response must be
+        # English. ``_content_words`` / ``_norm`` therefore measure ENGLISH
+        # tokens only, so Khmer-only speaking can never progress eligibility
+        # and Khmer text surrounding a quoted English target cannot dilute
+        # (or inflate) the English evaluation.
         from difflib import SequenceMatcher
 
         _STOPWORDS = {"the", "and", "but", "for", "nor", "yet", "with",
@@ -1032,12 +1288,25 @@ def register_edutalk_coach_reward_routes(
                       "done", "got", "get", "say", "said", "tell"}
 
         def _content_words(s: str) -> set[str]:
+            # v3 Blocker 2 — ENGLISH-only qualifying evidence. Only Latin
+            # content tokens (≥3 chars, stopword-filtered) count toward
+            # coverage. Khmer script is deliberately NOT counted, so a
+            # Khmer-target / Khmer-response repetition can never qualify and
+            # Khmer explanation around a quoted English target adds nothing.
+            # English behaviour is unchanged (a Latin-only string is parsed
+            # exactly as before). Khmer *instruction* classification is
+            # untouched — see ``classify_coach_turn``.
             return {w.lower() for w in re.findall(r"[A-Za-z]{3,}", s)
                     if w.lower() not in _STOPWORDS}
 
         def _norm(s: str) -> str:
+            # v3 Blocker 2 — normalise to LATIN alphanumerics only so the
+            # sequence-similarity ratio reflects ENGLISH evidence. Khmer
+            # script is stripped, so Khmer explanation surrounding a quoted
+            # English target cannot dilute or inflate the similarity score.
             return re.sub(r"\s+", " ",
-                          re.sub(r"[^A-Za-z0-9 ]+", " ", (s or "").lower())
+                          re.sub(r"[^A-Za-z0-9 ]+", " ",
+                                 (s or "").lower())
                           ).strip()
 
         def _target_phrase(kind: str, instr: str,
@@ -1218,17 +1487,17 @@ def register_edutalk_coach_reward_routes(
         snapshot: dict[str, Any] = {
             "policy_version": POLICY_VERSION, "evaluated_at": _iso(),
         }
-        if not indexes_ready():
-            return False, "indexes_not_ready", snapshot
-        if not cfg.get("enabled"):
-            return False, "master_disabled", snapshot
-        if not cfg.get("points_enabled"):
-            return False, "no_reward_type_enabled", snapshot
-        # B1 (audit) — capability gate: fail closed BEFORE creating any
-        # offer / WS event / Gemini announcement / claim-start notif when
-        # the upstream stable-nonce provider is not actually available.
-        if not _provider_grant_available():
-            return False, "provider_unavailable", snapshot
+        # v2 Blocker 1 — gate via the SINGLE authoritative evaluator so offer
+        # creation, status, claim, dispatch and reconciliation all agree.
+        sdiag = str(session_id)[-8:]
+        gates_ok, gate_reason = _reward_gates_open(cfg)
+        if not gates_ok:
+            if gate_reason in ("server_master_gate_off", "points_gate_off",
+                               "real_grant_gate_off", "provider_unavailable"):
+                _diag(f"inact:{sdiag}:{gate_reason}",
+                      "reward runtime inactive "
+                      f"reason={gate_reason} session={sdiag}")
+            return False, gate_reason, snapshot
         session = await sess_col.find_one({"session_id": session_id})
         if not session or session.get("clean_id") != clean_id:
             return False, "wrong_session", snapshot
@@ -1241,6 +1510,9 @@ def register_edutalk_coach_reward_routes(
             elapsed = 0
         snapshot["elapsed_seconds"] = int(elapsed)
         if elapsed < int(cfg.get("min_session_seconds", 45)):
+            _diag(f"withheld:{sdiag}:session_too_short",
+                  "reward offer withheld reason=session_too_short "
+                  f"session={sdiag} elapsed={int(elapsed)}")
             return False, "session_too_short", snapshot
 
         distinct_ids = await ex_col.distinct(
@@ -1249,7 +1521,12 @@ def register_edutalk_coach_reward_routes(
              "state": "terminal", "result": "successful",
              "consumed_by_offer": None})
         snapshot["distinct_exercises"] = len(distinct_ids)
-        if len(distinct_ids) < int(cfg.get("min_successful_exercises", 3)):
+        required_ex = int(cfg.get("min_successful_exercises", 3))
+        if len(distinct_ids) < required_ex:
+            _diag(f"track:{sdiag}:{len(distinct_ids)}",
+                  f"reward tracking session={sdiag} "
+                  f"exercises={len(distinct_ids)} required={required_ex} "
+                  f"correction={bool(cfg.get('require_resolved_correction'))}")
             return False, "insufficient_exercises", snapshot
 
         if cfg.get("require_resolved_correction"):
@@ -1259,6 +1536,9 @@ def register_edutalk_coach_reward_routes(
                 "correction_resolved": True, "consumed_by_offer": None,
             })
             if resolved < 1:
+                _diag(f"withheld:{sdiag}:no_resolved_correction",
+                      "reward offer withheld reason=no_resolved_correction "
+                      f"session={sdiag} exercises={len(distinct_ids)}")
                 return False, "no_resolved_correction", snapshot
 
         # One offer per session is also enforced by the unique
@@ -1511,6 +1791,10 @@ def register_edutalk_coach_reward_routes(
             })
         except Exception:
             pass
+        # Finding C — secret-free creation diagnostic (no amount, no PII).
+        _diag(f"created:{offer_id}",
+              f"reward offer created session={str(session_id)[-8:]} "
+              f"offer_id={offer_id}", every=0.0)
         return offer_doc
 
     async def _emit_offer_available(
@@ -1836,18 +2120,25 @@ def register_edutalk_coach_reward_routes(
             return "pending", "grant_unknown_pending_reconcile", tx_id
 
         # ── Step 3: Capability gate + resolve the credit callable ────────
-        # REAL_GRANT_ENABLED must be True for any dispatch attempt.
-        if not REAL_GRANT_ENABLED:
+        # v2 Blocker 1 — ALL required gates (not only REAL_GRANT_ENABLED) must
+        # be open for a NEW provider dispatch. When ANY gate is OFF we must NOT
+        # call the provider and must NOT terminalize the grant — terminalising
+        # here was the audited defect (a tap during gate-off produced a false
+        # terminal failure and destroyed the offer). Instead PARK the grant as
+        # grant_retryable (same stable idempotency key) so it can resume via
+        # reconciliation once the gates are re-enabled.
+        cfg_dispatch = await _load_config()
+        _gates_ok, _gate_reason = _reward_gates_open(cfg_dispatch)
+        if not _gates_ok:
             await grant_col.update_one(
                 {"tx_id": tx_id,
                  "state": {"$in": ["grant_prepared", "grant_retryable"]}},
                 {"$set": {
-                    "state": "grant_terminal_failed",
-                    "failed_at": _iso(),
-                    "last_error": "real_grant_not_enabled",
-                    "laboratory_mode": True,
+                    "state": "grant_retryable",
+                    "retryable_at": _iso(),
+                    "last_error": f"reward_gate_closed:{_gate_reason}",
                 }})
-            return "grant_terminal_failed", "real_grant_not_enabled", ""
+            return "grant_retryable", f"reward_gate_closed:{_gate_reason}", ""
 
         # Resolve the callable that will actually be invoked via the shared
         # resolver. _resolve_stable_grant_helper() checks module-globals
@@ -2031,7 +2322,14 @@ def register_edutalk_coach_reward_routes(
         # For grant_retryable (proven pre-send) retry with the same key.
         # Use the shared resolver — _credit_fn_to_call is never borrowed
         # from _dispatch_grant's local scope.
-        if state == "grant_retryable" and REAL_GRANT_ENABLED:
+        # v2 Blocker 1 — a retryable RESEND is a NEW provider call; it is
+        # permitted ONLY while ALL required gates are open. The ledger lookup
+        # above already ran (and can confirm an already-sent credit even while
+        # a gate is OFF). When a gate is OFF, fall through WITHOUT resending —
+        # the lease is released below and the row stays retryable for a later
+        # cycle once the gates are re-enabled.
+        _recon_gates_ok = _reward_gates_open(await _load_config())[0]
+        if state == "grant_retryable" and _recon_gates_ok:
             _recon_credit_fn = _resolve_stable_grant_helper()
             if _recon_credit_fn is None:
                 # Provider not available — release lease and come back later.
@@ -2443,6 +2741,25 @@ def register_edutalk_coach_reward_routes(
             existing["state"] = "expired"
             # Expired ⇒ no claim-start notification fires (audit 4.6).
             return _safe_claim_result(existing, replayed=True)
+        # v2 Blocker 1 — claim acceptance gate. If ANY required gate is OFF,
+        # reject SAFELY: do NOT reserve the offer, do NOT create a claim-start
+        # notification, do NOT call the provider, and do NOT terminalize. The
+        # unexpired claimable offer is PRESERVED so it can be claimed again once
+        # the gates are re-enabled. (Already granted/confirmed/terminal replays
+        # handled above are unaffected — confirmed truth is preserved.)
+        cfg_claim = await _load_config()
+        gates_ok, gate_reason = _reward_gates_open(cfg_claim)
+        if not gates_ok:
+            _diag(f"claim_blocked:{offer_id}",
+                  f"reward claim blocked reason={gate_reason} "
+                  f"offer_id={offer_id}", every=0.0)
+            return {
+                "success": False,
+                "state": "unavailable",
+                "reason": gate_reason,
+                "offer_id": offer_id,
+                "retryable": True,
+            }
         # claimable → claiming swap. ONLY after this atomic transition
         # (or a verified concurrent claiming-state replay) do we record
         # the claim-start notification.
@@ -3394,6 +3711,191 @@ def register_edutalk_coach_reward_routes(
             "persisted_claim_result": persisted,
         }}
 
+    # ─────────── Finding E — persistent panel: session reward status ─────── #
+    @api.get("/edutalk/reward-status")
+    async def student_reward_status(
+        session_id: str = Query(..., min_length=4, max_length=64),
+        student=Depends(require_student),
+    ):
+        """Backend-truth-driven, session-facing reward status for the
+        PERSISTENT live-coach reward panel. The frontend NEVER infers
+        eligibility from Gemini praise or local counters — it renders only
+        what this endpoint reports.
+
+        ``state`` is one of the authoritative contract values:
+          disabled | unavailable | tracking | progressing |
+          eligible | claiming | confirmed | terminal | expired
+
+        Safe-to-expose presentation data only. NEVER exposes the provider
+        idempotency key, wallet internals, scoring details, the future
+        reward amount (the amount is revealed ONLY after a confirmed
+        grant), internal DB ids the client does not need, or rejection
+        secrets. Exact raw exercise counts are intentionally withheld — the
+        client receives a generic progress stage plus boolean hints.
+        """
+        clean_id = str(getattr(student, "clean_id", ""))
+        cfg = await _load_config()
+        now_iso = _iso()
+        button_label = cfg.get(
+            "button_label", DEFAULT_REWARD_CONFIG["button_label"])
+
+        def _base(extra: dict) -> dict:
+            out = {
+                "success": True,
+                "session_id": session_id,
+                "operational": False,
+                "state": "unavailable",
+                "offer_id": None,
+                "expires_at": None,
+                "needs_more_practice": False,
+                "correction_goal_pending": False,
+                "reward_summary": None,
+                "confirmed_message": None,
+                "pre_claim_message": None,
+                "button_label": button_label,
+                "inactive_reason": None,
+            }
+            out.update(extra)
+            return out
+
+        # v2 Blocker 1 — evaluate the authoritative gates ONCE up-front.
+        gates_ok, gate_reason = _reward_gates_open(cfg)
+        gate_off_state = (
+            "disabled" if gate_reason in _GATE_DISABLED_REASONS
+            else "unavailable"
+        )
+
+        # 1) An authoritative offer for THIS session takes priority.
+        #    Confirmed / granted / terminal / expired records are STABLE TRUTH
+        #    and are shown regardless of the current gates (a real grant is
+        #    never retroactively hidden). A still-claimable / in-flight offer is
+        #    only shown as clickable-eligible when the gates are OPEN; while a
+        #    gate is OFF the offer is PRESERVED (never destroyed) and reported
+        #    as a calm disabled/unavailable state so it can become available
+        #    again once the gates are re-enabled.
+        doc = await off_col.find_one(
+            {"clean_id": clean_id, "session_id": session_id,
+             "state": "claimable", "expires_at": {"$gte": now_iso}})
+        if not doc:
+            doc = await off_col.find_one({
+                "clean_id": clean_id, "session_id": session_id,
+                "state": {"$in": [
+                    "claimable", "granted", "confirmed",
+                    "pending_confirmation", "claim_reserved",
+                    "grant_dispatching", "grant_terminal_failed",
+                    "failed_terminal", "expired",
+                ]},
+            })
+        if doc:
+            raw = doc.get("state")
+            expires_at = doc.get("expires_at")
+            expired = bool(expires_at and expires_at < now_iso)
+            # --- Stable confirmed truth: ALWAYS visible, gates notwithstanding.
+            if raw in ("granted", "confirmed"):
+                persisted = doc.get("claim_result") or {}
+                summary = (
+                    persisted.get("reward_summary")
+                    or (doc.get("reward_spec") or {}).get("summary")
+                    or f"{int(doc.get('reward_amount') or 0)} EduHub Points"
+                )
+                return _base({
+                    "operational": True, "state": "confirmed",
+                    "offer_id": doc["offer_id"],
+                    "reward_summary": summary,
+                    "confirmed_message": _render_student_confirmed(doc, cfg),
+                })
+            if raw in ("grant_terminal_failed", "failed_terminal"):
+                return _base({
+                    "operational": bool(gates_ok), "state": "terminal",
+                    "offer_id": doc["offer_id"],
+                })
+            if raw == "expired" or (raw == "claimable" and expired):
+                return _base({
+                    "operational": bool(gates_ok), "state": "expired",
+                    "offer_id": doc["offer_id"],
+                })
+            # --- A claim already accepted / in-flight. It may still finalize
+            #     via ledger lookup even while a gate is OFF, so present a calm
+            #     claiming state (never falsely eligible, never terminal). ---
+            if raw in ("claim_reserved", "grant_dispatching",
+                       "pending_confirmation"):
+                return _base({
+                    "operational": True, "state": "claiming",
+                    "offer_id": doc["offer_id"],
+                })
+            # --- Still claimable & unexpired. Clickable-eligible ONLY when the
+            #     gates are open; otherwise PRESERVE the offer and report a calm
+            #     disabled/unavailable state (no clickable offer advertised). ---
+            if raw == "claimable":
+                if not gates_ok:
+                    return _base({
+                        "operational": False, "state": gate_off_state,
+                        "offer_id": None,
+                        "inactive_reason": gate_reason,
+                    })
+                return _base({
+                    "operational": True, "state": "eligible",
+                    "offer_id": doc["offer_id"], "expires_at": expires_at,
+                    "pre_claim_message": _render_student_pre_claim(doc, cfg),
+                })
+            # Unknown lifecycle state — fail safe to a calm expired view.
+            return _base({
+                "operational": bool(gates_ok), "state": "expired",
+                "offer_id": doc["offer_id"],
+            })
+
+        # 2) No offer — derive disabled / unavailable / tracking / progressing
+        #    strictly from the SAME authoritative gate evaluator.
+        if not gates_ok:
+            return _base({"state": gate_off_state,
+                          "inactive_reason": gate_reason})
+
+        # Operational, no offer yet → tracking / progressing from real
+        # server-owned exercise evidence (NEVER from Gemini praise).
+        session = await sess_col.find_one({"session_id": session_id})
+        if not session or session.get("clean_id") != clean_id:
+            # Feature is operational but this session is not (yet) the
+            # caller's active session — keep tracking (no promise broken).
+            return _base({"operational": True, "state": "tracking",
+                          "needs_more_practice": True})
+        distinct_ids = await ex_col.distinct(
+            "exercise_id",
+            {"session_id": session_id, "clean_id": clean_id,
+             "state": "terminal", "result": "successful",
+             "consumed_by_offer": None})
+        n_ex = len(distinct_ids)
+        required = max(1, int(cfg.get("min_successful_exercises", 3)))
+        correction_required = bool(cfg.get("require_resolved_correction"))
+        resolved = 0
+        if correction_required:
+            resolved = await ex_col.count_documents({
+                "session_id": session_id, "clean_id": clean_id,
+                "state": "terminal", "result": "successful",
+                "correction_resolved": True, "consumed_by_offer": None,
+            })
+        active_ts = session.get("active_ts")
+        try:
+            elapsed = (time.time() - float(active_ts)) if active_ts else 0
+        except Exception:
+            elapsed = 0
+        min_seconds = int(cfg.get("min_session_seconds", 45))
+        correction_pending = bool(correction_required and resolved < 1)
+        # Generic progress stage — "almost ready" when the practice bar is
+        # met and only a short-session wait or a correction goal remains, or
+        # when the student is at least halfway. Exact counts are NOT exposed.
+        ratio = (n_ex / required) if required else 0.0
+        progressing = (
+            (n_ex >= required and (correction_pending or elapsed < min_seconds))
+            or ratio >= 0.5
+        )
+        state = "progressing" if progressing else "tracking"
+        return _base({
+            "operational": True,
+            "state": state,
+            "needs_more_practice": True,
+            "correction_goal_pending": correction_pending,
+        })
+
     @api.get("/edutalk/reward-notifications")
     async def student_reward_notifications(
         student=Depends(require_student), limit: int = 10,
@@ -3619,11 +4121,8 @@ def register_edutalk_coach_reward_routes(
         if not indexes_ready():
             return False
         cfg = await _load_config()
-        return bool(
-            cfg.get("enabled")
-            and cfg.get("points_enabled")
-            and _provider_grant_available()
-        )
+        # v2 Blocker 1 — single authoritative gate evaluator.
+        return _reward_gates_open(cfg)[0]
 
     # Register reconcile worker factory at module level.
     global _RECON_WORKER_FACTORY

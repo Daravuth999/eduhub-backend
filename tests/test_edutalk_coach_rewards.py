@@ -272,18 +272,28 @@ def env():
     saved_real = rwd.REAL_GRANT_ENABLED
     saved_helper = rwd.__dict__.get("_gas_treasury_credit_with_nonce")
     saved_helper_ok = rwd._GRANT_HELPER_OK
+    # Finding A — the env master + points kill switches are now ENFORCED at
+    # runtime (effective = env AND config). The Render deployment sets both
+    # to 1, so the standard fixture enables them; tests that exercise the
+    # fail-closed behaviour flip them explicitly via monkeypatch.
+    saved_env_master = rwd.ENV_REWARDS_ENABLED
+    saved_env_points = rwd.ENV_POINTS_ENABLED
 
     async def _default_credit(_clean_id, _amount, _nonce):
         return {"outcome": "granted", "provider_ref": "mock_txn_ref",
                 "balance_after": 100, "duplicate": False, "error": None}
 
     rwd.REAL_GRANT_ENABLED = True
+    rwd.ENV_REWARDS_ENABLED = True
+    rwd.ENV_POINTS_ENABLED = True
     rwd._GRANT_HELPER_OK = True
     rwd.__dict__["_gas_treasury_credit_with_nonce"] = _default_credit
     try:
         yield api, db, services
     finally:
         rwd.REAL_GRANT_ENABLED = saved_real
+        rwd.ENV_REWARDS_ENABLED = saved_env_master
+        rwd.ENV_POINTS_ENABLED = saved_env_points
         rwd._GRANT_HELPER_OK = saved_helper_ok
         if saved_helper is None:
             rwd.__dict__.pop("_gas_treasury_credit_with_nonce", None)
@@ -2162,8 +2172,13 @@ def test_runtime_active_all_conditions_mocked_active(monkeypatch):
 
     saved_real = rwd.REAL_GRANT_ENABLED
     saved_helper_ok = rwd._GRANT_HELPER_OK
+    saved_env_master = rwd.ENV_REWARDS_ENABLED
+    saved_env_points = rwd.ENV_POINTS_ENABLED
     rwd.REAL_GRANT_ENABLED = True
     rwd._GRANT_HELPER_OK = True
+    # Finding A — runtime now also requires the env master + points gates.
+    rwd.ENV_REWARDS_ENABLED = True
+    rwd.ENV_POINTS_ENABLED = True
     rwd.__dict__["_gas_treasury_credit_with_nonce"] = _stub_credit
     put_route = api.routes[("PUT", "/admin/edutalk-live/rewards/config")]
     run(put_route({"config": {"enabled": True, "points_enabled": True,
@@ -2174,6 +2189,8 @@ def test_runtime_active_all_conditions_mocked_active(monkeypatch):
     finally:
         rwd.REAL_GRANT_ENABLED = saved_real
         rwd._GRANT_HELPER_OK = saved_helper_ok
+        rwd.ENV_REWARDS_ENABLED = saved_env_master
+        rwd.ENV_POINTS_ENABLED = saved_env_points
         rwd.__dict__.pop("_gas_treasury_credit_with_nonce", None)
 
 
@@ -4109,3 +4126,577 @@ def test_announceA_rejections_unchanged_and_wallet_never_called(
         "off-pend", sid, sess, _FakeWsCtx(sid, cid)))
     assert r["reason"] == "not_granted"
     assert ctx.injects == [] and ctx_i.injects == []
+
+
+# =========================================================================== #
+# HOTFIX v1 — Persistent Surprise Reward Panel                                 #
+#   A. Distinct, fail-closed env gates (Studio cannot override)                #
+#   B. Language-independent (Khmer / mixed) exercise evidence                  #
+#   E. Session-facing reward-status contract                                   #
+# =========================================================================== #
+
+# ── A. Env kill switches ──────────────────────────────────────────────────
+def test_env_master_gate_off_blocks_exercise_and_offer(env, monkeypatch):
+    """EDUTALK_COACH_REWARDS_ENABLED=0 → no exercise, no offer, runtime
+    inactive — even though the Studio config + provider are fully ON."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    exid = run(services["register_exercise"](
+        "sid1", "stu123", ctx, "Please repeat after me: the brown fox jumps."))
+    assert exid is None, "master env gate OFF must block exercise registration"
+    assert db["edutalk_coach_rewards_offers"].docs == []
+    assert run(services["coach_reward_runtime_active"]()) is False
+
+
+def test_env_points_gate_off_blocks_offer(env, monkeypatch):
+    """EDUTALK_COACH_POINTS_REWARDS_ENABLED=0 → points offers blocked."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    monkeypatch.setattr(rwd, "ENV_POINTS_ENABLED", False)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    exid = run(services["register_exercise"](
+        "sid1", "stu123", ctx, "Please repeat after me: the brown fox jumps."))
+    assert exid is None, "points env gate OFF must block exercise registration"
+    assert db["edutalk_coach_rewards_offers"].docs == []
+    assert run(services["coach_reward_runtime_active"]()) is False
+
+
+def test_studio_config_cannot_override_env_master_kill_switch(env, monkeypatch):
+    """Studio config enabled=points_enabled=True but env master OFF →
+    still completely dark. Studio must never override a server kill switch."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1)  # Studio toggles fully ON
+    _seed_session(db)
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    cfg = run(services["load_config"]())
+    assert cfg["enabled"] is True and cfg["points_enabled"] is True
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    exid = run(services["register_exercise"](
+        "sid1", "stu123", ctx, "Please repeat after me: the brown fox jumps."))
+    assert exid is None
+    assert db["edutalk_coach_rewards_offers"].docs == [], (
+        "Studio config must not override the env master kill switch")
+
+
+def test_env_gate_distinct_reasons_in_public_status(env, monkeypatch):
+    """_public_status reports DISTINCT inactive reasons (Finding D)."""
+    api, db, _services = env
+    _enable_points(api, exercises_required=1)
+    get_status = api.routes[("GET", "/admin/edutalk-live/rewards/config")]
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    st = run(get_status(_Admin()))["status"]
+    assert st["rewards_active"] is False
+    assert st["env_master_enabled"] is False
+    assert st["inactive_reason"] == "server_master_gate_off"
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", True)
+    monkeypatch.setattr(rwd, "ENV_POINTS_ENABLED", False)
+    st2 = run(get_status(_Admin()))["status"]
+    assert st2["inactive_reason"] == "points_gate_off"
+    assert "points_gate_off" in st2["inactive_reasons"]
+
+
+# ── B. Language-independent exercise evidence (Khmer / mixed) ───────────────
+def test_classifier_accepts_khmer_repeat():
+    kind, _t = rwd.classify_coach_turn(
+        'និយាយតាមខ្ញុំ: "I would like a glass of water."')
+    assert kind == "repeat_after_coach"
+
+
+def test_classifier_accepts_khmer_guided():
+    kind, _t = rwd.classify_coach_turn("ប្រាប់ខ្ញុំអំពី ដំណើរ​កម្សាន្ត​របស់​អ្នក")
+    assert kind == "guided_short_answer"
+
+
+def test_classifier_accepts_khmer_correction_with_quoted_target():
+    kind, target = rwd.classify_coach_turn(
+        'សាកនិយាយឱ្យបានត្រឹមត្រូវ: "the cat sat on the mat".')
+    assert kind == "correction_retry"
+    assert target and "cat" in target.lower()
+
+
+def test_classifier_rejects_khmer_praise_only():
+    for txt in ("អស្ចារ្យណាស់ Admin!", "ល្អណាស់! ពូកែ​មែនទែន!",
+                "សួស្ដី! ថ្ងៃនេះ​យើង​នឹង​ហាត់​និយាយ"):
+        kind, _t = rwd.classify_coach_turn(txt)
+        assert kind is None, f"Khmer praise must NOT register: {txt!r}"
+
+
+def test_khmer_guided_repeat_exercise_end_to_end(env):
+    """Coach explains in Khmer, target+practice are English → the exercise
+    registers AND evaluates successfully (the core Khmer-mode defect fix)."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    exid = run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        'និយាយតាមខ្ញុំ: "I would like a glass of water."'))
+    assert exid is not None, "Khmer-guided repeat must register an exercise"
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "I would like a glass of water."))
+    doc = db["edutalk_coach_rewards_exercises"].docs[-1]
+    assert doc["state"] == "terminal" and doc["result"] == "successful"
+    # Eligibility reached → an offer is created in Khmer mode.
+    assert len([o for o in db["edutalk_coach_rewards_offers"].docs
+                if o["session_id"] == "sid1"]) == 1
+
+
+def test_khmer_correction_resolved_retry(env):
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        'សាកនិយាយឱ្យបានត្រឹមត្រូវ: "the cat sat on the mat".'))
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "The cat sat on the mat quietly."))
+    doc = db["edutalk_coach_rewards_exercises"].docs[-1]
+    assert doc["correction_required"] is True
+    assert doc["correction_resolved"] is True
+
+
+def test_english_regression_after_khmer_support(env):
+    """English-guided exercises still classify + evaluate unchanged."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.7)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    _open_and_evaluate(
+        services, ctx, "sid1", "stu123",
+        instruction="Please repeat after me: I would like a glass of water.",
+        response="I would like a glass of water.")
+    doc = db["edutalk_coach_rewards_exercises"].docs[-1]
+    assert doc["result"] == "successful"
+
+
+def test_gemini_praise_alone_does_not_qualify(env):
+    """Generic praise ('perfect', 'great job') registers NO exercise in
+    either language — eligibility cannot be inferred from praise."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    for txt in ("Perfect! Great job, that was amazing!",
+                "អស្ចារ្យណាស់! ល្អណាស់! Keep practicing!"):
+        assert run(services["register_exercise"](
+            "sid1", "stu123", ctx, txt)) is None
+    assert db["edutalk_coach_rewards_exercises"].docs == []
+    assert db["edutalk_coach_rewards_offers"].docs == []
+
+
+# ── B(v3). Reward evidence must require ENGLISH student speech ──────────────
+# The coach may explain in Khmer, but practice targets are English and the
+# student's QUALIFYING response must contain English evidence. Khmer-only
+# speaking can never progress reward eligibility.
+def test_v3_khmer_instruction_english_target_english_response_succeeds(env):
+    """Khmer instruction + English target + correct English response → the
+    exercise evaluates successfully and an offer is created."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    exid = run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        'សូមនិយាយតាមខ្ញុំ: "I would like a glass of water."'))
+    assert exid is not None
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "I would like a glass of water."))
+    doc = db["edutalk_coach_rewards_exercises"].docs[-1]
+    assert doc["state"] == "terminal" and doc["result"] == "successful"
+    assert len([o for o in db["edutalk_coach_rewards_offers"].docs
+                if o["session_id"] == "sid1"]) == 1
+
+
+def test_v3_khmer_only_target_and_response_fails_no_offer(env):
+    """Khmer instruction + Khmer-only target + Khmer-only response → the
+    response carries NO English evidence, so the exercise must NOT succeed and
+    NO offer may be created."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        "សូមនិយាយតាមខ្ញុំ: ខ្ញុំចង់បានទឹកមួយកែវ"))
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "ខ្ញុំចង់បានទឹកមួយកែវ បាទ ល្អ អរគុណ"))
+    assert [d for d in db["edutalk_coach_rewards_exercises"].docs
+            if d.get("result") == "successful"] == []
+    assert [o for o in db["edutalk_coach_rewards_offers"].docs
+            if o["session_id"] == "sid1"] == []
+
+
+def test_v3_khmer_instruction_english_target_khmer_response_fails_no_offer(env):
+    """Khmer instruction + quoted English target + Khmer-only response → no
+    English evidence in the response → fails, no offer."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        'សូមនិយាយតាមខ្ញុំ: "I would like a glass of water."'))
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "ខ្ញុំចង់បានទឹកមួយកែវ បាទ អរគុណ"))
+    assert [d for d in db["edutalk_coach_rewards_exercises"].docs
+            if d.get("result") == "successful"] == []
+    assert [o for o in db["edutalk_coach_rewards_offers"].docs
+            if o["session_id"] == "sid1"] == []
+
+
+def test_v3_mixed_response_insufficient_english_fails_no_offer(env):
+    """A mixed response with insufficient English evidence (a single English
+    content word amid Khmer filler) fails a repeat task — English coverage is
+    too low — and creates no offer."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        'សូមនិយាយតាមខ្ញុំ: "I would like a glass of water."'))
+    # Only "water" overlaps in English; the remainder is Khmer filler.
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "water ខ្ញុំ មិន ច្បាស់ ទេ"))
+    assert [d for d in db["edutalk_coach_rewards_exercises"].docs
+            if d.get("result") == "successful"] == []
+    assert [o for o in db["edutalk_coach_rewards_offers"].docs
+            if o["session_id"] == "sid1"] == []
+
+
+def test_v3_khmer_explanation_english_correction_retry_resolves(env):
+    """Khmer corrective explanation + quoted English target + valid English
+    correction retry → the correction is resolved on English evidence."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    run(services["register_exercise"](
+        "sid1", "stu123", ctx,
+        'សាកនិយាយឱ្យបានត្រឹមត្រូវ: "the cat sat on the mat".'))
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "The cat sat on the mat quietly."))
+    doc = db["edutalk_coach_rewards_exercises"].docs[-1]
+    assert doc["correction_required"] is True
+    assert doc["correction_resolved"] is True
+
+
+def test_v3_guided_khmer_only_response_rejected_no_offer(env):
+    """Guided answer: a Khmer-only response carries no English evidence and
+    must be rejected (no successful exercise, no offer)."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1, min_conf=0.5)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    run(services["register_exercise"](
+        "sid1", "stu123", ctx, "ប្រាប់ខ្ញុំអំពី ដំណើរកម្សាន្តរបស់អ្នក"))
+    run(services["evaluate_exercise"](
+        "sid1", "stu123", ctx, "ខ្ញុំ ទៅ ផ្សារ ជាមួយ ម្តាយ របស់ ខ្ញុំ"))
+    assert [d for d in db["edutalk_coach_rewards_exercises"].docs
+            if d.get("result") == "successful"] == []
+    assert [o for o in db["edutalk_coach_rewards_offers"].docs
+            if o["session_id"] == "sid1"] == []
+
+
+# ── E. Session-facing reward-status contract ───────────────────────────────
+def _status(api, sid="sid1", student=None):
+    route = api.routes[("GET", "/edutalk/reward-status")]
+    return run(route(session_id=sid, student=student or _Student()))
+
+
+def test_reward_status_disabled_when_env_master_off(env, monkeypatch):
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    r = _status(api)
+    assert r["state"] == "disabled"
+    assert r["inactive_reason"] == "server_master_gate_off"
+    assert r["reward_summary"] is None and r["offer_id"] is None
+
+
+def test_reward_status_tracking_when_no_evidence(env):
+    api, db, services = env
+    _enable_points(api, exercises_required=3)
+    _seed_session(db)
+    r = _status(api)
+    assert r["state"] in ("tracking", "progressing")
+    assert r["operational"] is True
+    assert r["needs_more_practice"] is True
+    assert r["reward_summary"] is None  # never reveal amount while tracking
+
+
+def test_reward_status_eligible_hides_amount(env):
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    _open_and_evaluate(services, ctx, "sid1", "stu123")
+    r = _status(api)
+    assert r["state"] == "eligible"
+    assert r["offer_id"] is not None
+    assert r["expires_at"] is not None
+    assert r["reward_summary"] is None, (
+        "the exact reward amount must be hidden before a confirmed claim")
+
+
+def test_reward_status_confirmed_reveals_only_after_grant(env, monkeypatch):
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    grant_log: list = []
+    _install_stable_nonce_helper(monkeypatch, grant_log)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    _open_and_evaluate(services, ctx, "sid1", "stu123")
+    offer_id = db["edutalk_coach_rewards_offers"].docs[0]["offer_id"]
+    run(services["claim_offer"](offer_id, "stu123", "rest"))
+    r = _status(api)
+    assert r["state"] == "confirmed"
+    assert r["reward_summary"] == "5 EduHub Points"
+    assert r["confirmed_message"]
+
+
+def test_reward_status_claiming_while_pending(env, monkeypatch):
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+
+    async def slow_credit(_c, _a, _n):
+        return {"outcome": "grant_unknown", "error": "transport:slow",
+                "provider_ref": None, "balance_after": None, "duplicate": False}
+    monkeypatch.setattr(rwd, "REAL_GRANT_ENABLED", True)
+    monkeypatch.setitem(rwd.__dict__, "_gas_treasury_credit_with_nonce",
+                        slow_credit)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    _open_and_evaluate(services, ctx, "sid1", "stu123")
+    offer_id = db["edutalk_coach_rewards_offers"].docs[0]["offer_id"]
+    run(services["claim_offer"](offer_id, "stu123", "rest"))
+    r = _status(api)
+    assert r["state"] == "claiming"
+    assert r["reward_summary"] is None
+
+
+def test_reward_status_expired_offer(env):
+    api, db, services = env
+    _enable_points(api, exercises_required=1, ttl=120)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    _open_and_evaluate(services, ctx, "sid1", "stu123")
+    db["edutalk_coach_rewards_offers"].docs[0]["expires_at"] = (
+        "1970-01-01T00:00:00+00:00")
+    r = _status(api)
+    assert r["state"] == "expired"
+    assert r["reward_summary"] is None
+
+
+def test_reward_status_session_ownership_no_leak(env):
+    """A different student's session id must not leak an offer/amount."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db, sid="sidA", clean_id="owner1")
+    ctx = services["RewardSessionCtx"]("sidA", "owner1", display_name="Owner")
+    _open_and_evaluate(services, ctx, "sidA", "owner1")
+    # A DIFFERENT student queries the same session id.
+    route = api.routes[("GET", "/edutalk/reward-status")]
+    r = run(route(session_id="sidA", student=_Student(clean_id="intruder")))
+    assert r["offer_id"] is None
+    assert r["reward_summary"] is None
+    assert r["state"] in ("tracking", "progressing", "disabled", "unavailable")
+
+
+# =========================================================================== #
+# HOTFIX v2 — Blocker 1: enforce ALL gates throughout the FULL lifecycle.      #
+#   Shared evaluator _reward_gates_open() is consulted by status, offer        #
+#   creation, claim acceptance, provider dispatch, and grant_retryable         #
+#   reconciliation. Gate-OFF must NOT terminalize/destroy an offer, must make  #
+#   ZERO provider calls, must preserve confirmed truth, and must restore       #
+#   claimability on re-enable. Ledger confirmation of an already-sent          #
+#   ambiguous request may still finalize without a new provider call.          #
+# =========================================================================== #
+
+def _make_live_offer(env):
+    """Create a real, authoritative claimable offer (gates ON) and return its
+    offer_id."""
+    api, db, services = env
+    _enable_points(api, exercises_required=1)
+    _seed_session(db)
+    ctx = services["RewardSessionCtx"]("sid1", "stu123", display_name="Dara")
+    _open_and_evaluate(services, ctx, "sid1", "stu123")
+    offers = db["edutalk_coach_rewards_offers"].docs
+    assert len(offers) == 1 and offers[0]["state"] == "claimable"
+    return offers[0]["offer_id"]
+
+
+# ── status: still-claimable offer is NOT clickable while a gate is OFF ──────
+def test_v2_status_disabled_when_master_off_after_offer(env, monkeypatch):
+    api, db, services = env
+    _make_live_offer(env)
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    r = _status(api)
+    assert r["state"] == "disabled"
+    assert r["offer_id"] is None, "must not advertise a clickable offer"
+    assert r["operational"] is False
+    assert r["inactive_reason"] == "server_master_gate_off"
+    # The offer row itself is PRESERVED (not destroyed / not terminal).
+    assert db["edutalk_coach_rewards_offers"].docs[0]["state"] == "claimable"
+
+
+def test_v2_status_disabled_when_points_off_after_offer(env, monkeypatch):
+    api, db, services = env
+    _make_live_offer(env)
+    monkeypatch.setattr(rwd, "ENV_POINTS_ENABLED", False)
+    r = _status(api)
+    assert r["state"] == "disabled"
+    assert r["offer_id"] is None
+    assert r["inactive_reason"] == "points_gate_off"
+    assert db["edutalk_coach_rewards_offers"].docs[0]["state"] == "claimable"
+
+
+def test_v2_status_unavailable_when_real_grant_off_after_offer(env, monkeypatch):
+    api, db, services = env
+    _make_live_offer(env)
+    monkeypatch.setattr(rwd, "REAL_GRANT_ENABLED", False)
+    r = _status(api)
+    assert r["state"] == "unavailable", "real-grant off => unavailable, not eligible"
+    assert r["offer_id"] is None
+    assert r["inactive_reason"] == "real_grant_gate_off"
+    assert db["edutalk_coach_rewards_offers"].docs[0]["state"] == "claimable"
+
+
+# ── claim acceptance: ZERO provider calls + no terminal while a gate is OFF ──
+def test_v2_claim_blocked_master_off_zero_provider_calls(env, monkeypatch):
+    api, db, services = env
+    offer_id = _make_live_offer(env)
+    grant_log: list = []
+    _install_stable_nonce_helper(monkeypatch, grant_log)
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    r = run(services["claim_offer"](offer_id, "stu123", "rest"))
+    assert r["state"] not in ("granted", "confirmed"), "no false success"
+    assert r["state"] == "unavailable"
+    assert grant_log == [], "claim during gate-off must make ZERO provider calls"
+    # Offer not terminally destroyed, no grant row created.
+    assert db["edutalk_coach_rewards_offers"].docs[0]["state"] == "claimable"
+    assert db["edutalk_coach_rewards_grants"].docs == []
+
+
+def test_v2_claim_blocked_real_grant_off_not_terminal(env, monkeypatch):
+    api, db, services = env
+    offer_id = _make_live_offer(env)
+    grant_log: list = []
+    _install_stable_nonce_helper(monkeypatch, grant_log)
+    # This is the exact audited repro: tap with REAL_GRANT off previously
+    # produced a TERMINAL failure. It must now reject safely.
+    monkeypatch.setattr(rwd, "REAL_GRANT_ENABLED", False)
+    r = run(services["claim_offer"](offer_id, "stu123", "rest"))
+    assert r["state"] == "unavailable"
+    assert grant_log == []
+    off = db["edutalk_coach_rewards_offers"].docs[0]
+    assert off["state"] == "claimable", "must NOT become terminal failure"
+    assert not any(g["state"] in ("grant_terminal_failed", "failed_terminal")
+                   for g in db["edutalk_coach_rewards_grants"].docs)
+
+
+# ── re-enable restores claimability for an unexpired offer ──────────────────
+def test_v2_offer_restored_after_gate_reenabled(env, monkeypatch):
+    api, db, services = env
+    offer_id = _make_live_offer(env)
+    grant_log: list = []
+    _install_stable_nonce_helper(monkeypatch, grant_log)
+    # Gate OFF: status disabled, claim blocked, offer preserved.
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    assert _status(api)["state"] == "disabled"
+    assert run(services["claim_offer"](offer_id, "stu123", "rest"))["state"] == "unavailable"
+    # Re-enable: the SAME unexpired offer becomes eligible + claimable again.
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", True)
+    r = _status(api)
+    assert r["state"] == "eligible"
+    assert r["offer_id"] == offer_id
+    claim = run(services["claim_offer"](offer_id, "stu123", "rest"))
+    assert claim["state"] in ("granted", "confirmed")
+    assert len(grant_log) == 1, "exactly one provider call after re-enable"
+
+
+# ── confirmed truth survives a later gate-off ───────────────────────────────
+def test_v2_confirmed_remains_confirmed_after_gate_off(env, monkeypatch):
+    api, db, services = env
+    offer_id = _make_live_offer(env)
+    grant_log: list = []
+    _install_stable_nonce_helper(monkeypatch, grant_log)
+    claim = run(services["claim_offer"](offer_id, "stu123", "rest"))
+    assert claim["state"] in ("granted", "confirmed")
+    # Now turn the master gate OFF — the confirmed record must stay confirmed.
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    r = _status(api)
+    assert r["state"] == "confirmed"
+    assert r["reward_summary"] == "5 EduHub Points"
+    # And claiming again replays the confirmed truth (no new provider call).
+    replay = run(services["claim_offer"](offer_id, "stu123", "ws"))
+    assert replay["state"] in ("granted", "confirmed")
+    assert len(grant_log) == 1
+
+
+# ── reconciliation: ledger confirms grant_unknown WITHOUT a new call, even
+#    while a gate is OFF (confirms an already-sent ambiguous request) ─────────
+def test_v2_grant_unknown_ledger_confirms_during_gate_off(env, monkeypatch):
+    api, db, services = env
+    calls: list = []
+
+    async def credit_should_not_run(c, a, n):
+        calls.append(n)
+        return {"outcome": "granted", "provider_ref": n[:8],
+                "balance_after": 100, "duplicate": False, "error": None}
+    monkeypatch.setattr(rwd, "REAL_GRANT_ENABLED", True)
+    monkeypatch.setitem(rwd.__dict__, "_gas_treasury_credit_with_nonce",
+                        credit_should_not_run)
+    _enable_points(api, exercises_required=1)
+    stored_key = "f" * 64
+    tx_id, offer_id = "v2-ul-001", "offer-v2-ul-001"
+    _make_offer_row(db, offer_id=offer_id)
+    _make_grant_row(db, tx_id=tx_id, offer_id=offer_id,
+                    state="grant_unknown", stored_key=stored_key)
+    db["points_transactions"].docs.append({
+        "_id": "txn-v2-ul-001", "idempotency_key": stored_key,
+        "balance_after": 100, "status": "confirmed",
+        "source": "edutalk_coach_reward",
+    })
+    # Gate OFF — ledger confirmation of an ALREADY-sent request is still allowed.
+    monkeypatch.setattr(rwd, "ENV_REWARDS_ENABLED", False)
+    result = run(rwd._call_reconcile_one(db, _get_grant(db, tx_id)))
+    assert result == "resolved_granted"
+    assert _get_grant(db, tx_id)["state"] == "granted"
+    assert calls == [], "ledger confirmation must NOT issue a new provider call"
+
+
+# ── reconciliation: grant_retryable cannot RESEND while a gate is OFF ────────
+def test_v2_grant_retryable_no_resend_while_gate_off(env, monkeypatch):
+    api, db, services = env
+    calls: list = []
+
+    async def credit_ok(c, a, n):
+        calls.append(n)
+        return {"outcome": "granted", "provider_ref": n[:8],
+                "balance_after": 100, "duplicate": False, "error": None}
+    monkeypatch.setattr(rwd, "REAL_GRANT_ENABLED", True)
+    monkeypatch.setitem(rwd.__dict__, "_gas_treasury_credit_with_nonce", credit_ok)
+    _enable_points(api, exercises_required=1)
+    stored_key = "1" * 64
+    tx_id, offer_id = "v2-rt-001", "offer-v2-rt-001"
+    _make_offer_row(db, offer_id=offer_id)
+    _make_grant_row(db, tx_id=tx_id, offer_id=offer_id,
+                    state="grant_retryable", stored_key=stored_key)
+    # Gate OFF — NO resend; row preserved as retryable.
+    monkeypatch.setattr(rwd, "ENV_POINTS_ENABLED", False)
+    result = run(rwd._call_reconcile_one(db, _get_grant(db, tx_id)))
+    assert result == "still_unknown"
+    assert calls == [], "no provider resend while a gate is OFF"
+    assert _get_grant(db, tx_id)["state"] == "grant_retryable"
+    # Re-enable — the retryable resends (same stored key) and resolves.
+    monkeypatch.setattr(rwd, "ENV_POINTS_ENABLED", True)
+    result2 = run(rwd._call_reconcile_one(db, _get_grant(db, tx_id)))
+    assert result2 == "resolved_granted"
+    assert calls == [stored_key], "exactly one resend with the SAME stored key"
