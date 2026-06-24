@@ -211,6 +211,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Minimum seconds of useful interaction before a completed session keeps
     # its charge. Below this, an early-ended session is auto-refunded.
     "min_useful_seconds": 20,
+    # ── Phase 1 Smart Top-Up Nudge (additive; default OFF) ──────────────────
+    # With topup_nudge_enabled false this feature produces ZERO visible /
+    # behavioural change. threshold = the post-reservation / settled balance
+    # at or below which a (non-numeric) nudge is authorized; max_per_week =
+    # per student, across all their sessions, rolling 7 days.
+    "topup_nudge_enabled": False,
+    "topup_nudge_threshold": 15,
+    "topup_nudge_max_per_week": 3,
     "teacher_method": "friendly_beginner",
     "correction_style": "finish_then_correct",
     "focus_areas": ["pronunciation", "confidence", "natural_flow"],
@@ -385,6 +393,18 @@ def _sanitise_config(raw: dict | None) -> dict[str, Any]:
     out["min_useful_seconds"] = _clamp_int(
         raw.get("min_useful_seconds", out["min_useful_seconds"]), 0, 300, 20)
 
+    # ── Phase 1 Smart Top-Up Nudge. The admin PUT route REJECTS invalid
+    # input up-front via _validate_topup_nudge_fields() (no silent clamping);
+    # here we only pass valid values through (defensive defaults otherwise).
+    if "topup_nudge_enabled" in raw:
+        out["topup_nudge_enabled"] = bool(raw["topup_nudge_enabled"])
+    _tn_thr = _topup_strict_int(raw.get("topup_nudge_threshold"))
+    if _tn_thr is not None and 0 <= _tn_thr <= 100000:
+        out["topup_nudge_threshold"] = _tn_thr
+    _tn_cap = _topup_strict_int(raw.get("topup_nudge_max_per_week"))
+    if _tn_cap is not None and 0 <= _tn_cap <= 1000:
+        out["topup_nudge_max_per_week"] = _tn_cap
+
     lm = str(raw.get("default_language_mode", out["default_language_mode"]))
     if lm in _LANGUAGE_MODES:
         out["default_language_mode"] = lm
@@ -507,6 +527,7 @@ def _build_system_instruction(
     reading_progress: str, saved_words: list[str],
     previous_reports: list[dict],
     explain_language: str = "km",
+    voice_authorized: bool = False,
 ) -> str:
     bc = cfg.get("book_context", {})
     method = _TEACHER_METHODS.get(
@@ -629,6 +650,13 @@ def _build_system_instruction(
     if mode_hint:
         lines.append(mode_hint)
 
+    # ── Phase 1 Smart Top-Up Nudge — the SINGLE authorized line. Added ONLY
+    # when voice_authorized. It NEVER contains a numeric balance (exact
+    # figures appear only in the Stage 1 preview and the Stage 3 report,
+    # never spoken). No WebSocket injection, no deterministic-delivery claim.
+    if voice_authorized:
+        lines.append(_TOPUP_NUDGE_INSTRUCTION_LINE)
+
     # NOTE: The Phase 1 corrected build does NOT inject any reward-evidence
     # protocol into the Gemini system instruction. When rewards are enabled
     # the backend evaluates server-owned exercises against authoritative
@@ -738,6 +766,339 @@ async def _generate_report(transcript: list[dict], mode_label: str) -> dict:
 
 
 # =========================================================================== #
+# Phase 1 — EduTalk Live Coach "Smart Top-Up Nudge" (ADDITIVE, default OFF).  #
+# --------------------------------------------------------------------------- #
+# This block is a self-contained, additive extension. With                     #
+# ``topup_nudge_enabled`` false it produces ZERO behavioural change. It        #
+# introduces NO new session-extension, continuation, pause/resume,            #
+# live-payment, payment-provider, wallet-crediting, or Surprise Reward code   #
+# path. It only:                                                              #
+#   * exposes a read-only, mode-specific PREVIEW (Stage 1),                    #
+#   * records an immutable AUTHORIZATION after the EXISTING reservation        #
+#     succeeds (Stage 2),                                                      #
+#   * records a FINALIZATION after _finalize_session settles (Stage 3),        #
+#   * adds ONE non-numeric line to the Gemini system instruction.             #
+# Stage 2 and Stage 3 share ONE concurrency-safe weekly-cap helper.           #
+# =========================================================================== #
+
+# Optional, READ-ONLY reuse of the existing pure-Mongo wallet read methods.
+# We NEVER mutate the wallet, never touch GAS, never store a password. If the
+# import fails the preview/finalization balance simply degrades to
+# "wallet_unavailable" without affecting anything else.
+try:
+    from wallet_service import WalletService as _WalletService  # type: ignore
+    _WALLET_SERVICE_OK = True
+except Exception:  # pragma: no cover
+    _WalletService = None  # type: ignore[assignment]
+    _WALLET_SERVICE_OK = False
+
+# ONE new narrow collection (this module's existing ``edutalk_live_*`` naming
+# convention). Holds exactly one cap document per ``clean_id``; that document
+# carries the rolling array of recent authorization records used for the
+# weekly-cap accounting AND the concurrency-safe claim lock.
+TOPUP_NUDGE_LOG_COLLECTION = "edutalk_live_topup_nudge_log"
+
+# Rolling window is a CONTINUOUS 7 x 24h, evaluated as ``now - 7d .. now``
+# (never a fixed calendar bucket).
+TOPUP_NUDGE_WINDOW_SECONDS = 7 * 24 * 60 * 60
+
+# Stale-lock recovery threshold for the cap document's claim lock — mirrors the
+# crash-recovery semantics of ``_do_refund``'s ``_REFUND_STALE_SECONDS``.
+_TOPUP_NUDGE_LOCK_STALE_SECONDS = 30
+# Bounded spin to let a real-Mongo lock loser re-evaluate after the winner
+# releases (so a true race resolves to weekly_cap_reached, not a lock error).
+_TOPUP_NUDGE_LOCK_RETRIES = 12
+_TOPUP_NUDGE_LOCK_RETRY_SLEEP = 0.05
+
+# The SINGLE Gemini instruction line for an authorized nudge. It contains NO
+# numeric balance under any condition (a session-start figure can be
+# contradicted by the settled figure before the model's closing remark).
+_TOPUP_NUDGE_INSTRUCTION_LINE = (
+    "Near the natural end of this session, and only once, warmly mention "
+    "that the student may want to top up for a future practice session. "
+    "Keep it brief, informational, and non-urgent. Do not interrupt an "
+    "exercise or correction. Do not say or imply that topping up extends "
+    "or adds time to the current session."
+)
+
+
+def _topup_strict_int(value: Any) -> Optional[int]:
+    """Return an int ONLY for genuinely integral input (rejects 1.5, "x",
+    None, bools-as-numbers handled explicitly). Used so admin validation can
+    REJECT bad input instead of silently clamping it."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        s = value.strip()
+        try:
+            f = float(s)
+        except Exception:
+            return None
+        return int(f) if f.is_integer() else None
+    return None
+
+
+def _validate_topup_nudge_fields(raw: dict | None) -> tuple[bool, str]:
+    """Validate ONLY the three Smart Top-Up Nudge admin fields. REJECTS
+    invalid input (no silent clamping) with feature-specific reason codes.
+    Returns (ok, reason_code). reason_code is "" on success."""
+    raw = raw or {}
+    if "topup_nudge_enabled" in raw and not isinstance(
+            raw["topup_nudge_enabled"], bool):
+        return False, "config_disabled"
+    if "topup_nudge_threshold" in raw:
+        thr = _topup_strict_int(raw["topup_nudge_threshold"])
+        if thr is None or thr < 0 or thr > 100000:
+            return False, "threshold_invalid"
+    if "topup_nudge_max_per_week" in raw:
+        cap = _topup_strict_int(raw["topup_nudge_max_per_week"])
+        if cap is None or cap < 0 or cap > 1000:
+            return False, "weekly_cap_invalid"
+    return True, ""
+
+
+def _topup_nudge_event_key(clean_id: str, session_id: str) -> str:
+    """Stable idempotency key: clean_id + session_id + the feature tag."""
+    return f"{clean_id}{session_id}live_coach_topup_nudge"
+
+
+def _topup_parse_iso(value: Any) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _topup_records_in_window(records: list, window_start: datetime) -> list:
+    """Prune to the records whose authorized_at is within the rolling window
+    (>= window_start). Records without a parseable timestamp are dropped."""
+    out = []
+    for r in records or []:
+        ts = _topup_parse_iso((r or {}).get("authorized_at"))
+        if ts is not None and ts >= window_start:
+            out.append(r)
+    return out
+
+
+def _topup_preview_for_mode(
+    *, enabled: bool, flag_on: bool, balance: Optional[int],
+    mode_cost: int, threshold: int, weekly_cap_available: bool,
+) -> dict:
+    """PURE per-mode preview. The frontend selects the matching entry on mode
+    change and NEVER recomputes balance-minus-cost itself.
+
+    Flag-aware balance source (USE_MONGO_POINTS_READ):
+      * flag OFF (today's default): no numeric fields, reason
+        ``balance_unavailable_for_preview`` (an accepted degraded state, not a
+        defect — Stage 2/3 are unaffected).
+      * flag ON: real numbers from the public WalletService read.
+    """
+    if not enabled:
+        return {"enabled": False, "eligible": False, "reason": "config_disabled"}
+    if threshold is None or threshold < 0:
+        return {"enabled": False, "eligible": False, "reason": "threshold_invalid"}
+    if not flag_on:
+        return {"enabled": False, "eligible": False,
+                "reason": "balance_unavailable_for_preview"}
+    if balance is None:
+        return {"enabled": False, "eligible": False, "reason": "wallet_unavailable"}
+    projected = int(balance) - int(mode_cost)
+    eligible = projected <= int(threshold)
+    return {
+        "enabled": True,
+        "eligible": bool(eligible),
+        "reason": ("projected_balance_at_or_below_threshold" if eligible
+                   else "balance_above_threshold"),
+        "verified_current_balance": int(balance),
+        "mode_cost": int(mode_cost),
+        "projected_post_reservation_balance": int(projected),
+        "threshold": int(threshold),
+        "weekly_cap_available": bool(weekly_cap_available),
+    }
+
+
+def _topup_settlement_reason(final_state: str) -> str:
+    """Map a finalized session state to a settlement reason."""
+    return {
+        "completed_charged": "completed_charged",
+        "cancelled_partial": "early_refund",
+        "failed_refunded": "failed_refunded",
+        "expired": "expired",
+    }.get(final_state or "", final_state or "unknown")
+
+
+async def _wallet_balance_via_public_method(
+    db, student_id: str,
+) -> tuple[Optional[int], bool]:
+    """Read the student's authoritative wallet balance via the EXISTING public
+    WalletService read method (``get_wallet``) — NO wallet internals touched,
+    NO GAS, NO password. Returns (balance_int|None, available_bool).
+
+    The caller invokes this EXACTLY ONCE per stage. It works regardless of the
+    ``USE_MONGO_POINTS_READ`` flag (the flag only gates the student-facing
+    route, not this pure-Mongo read method)."""
+    if not (_WALLET_SERVICE_OK and student_id):
+        return None, False
+    try:
+        svc = _WalletService(db)
+        wallet = await svc.get_wallet(student_id)  # one public read
+        if not wallet:
+            return None, False
+        status = wallet.get("status")
+        if status is not None and status != "active":
+            return None, False
+        bal = wallet.get("balance")
+        if bal is None:
+            return None, False
+        return int(round(float(bal))), True
+    except Exception:
+        return None, False
+
+
+async def _topup_cap_availability(
+    col, *, clean_id: str, cap: int, now: datetime | None = None,
+) -> bool:
+    """READ-ONLY check of whether the student has a weekly-cap slot available.
+    NEVER writes — Stage 1 (preview) must never consume a cap slot."""
+    if cap is None or cap <= 0:
+        return False
+    now = now or _now()
+    window_start = now - timedelta(seconds=TOPUP_NUDGE_WINDOW_SECONDS)
+    try:
+        doc = await col.find_one({"clean_id": clean_id})
+    except Exception:
+        return False
+    used = len(_topup_records_in_window((doc or {}).get("authorizations"),
+                                        window_start))
+    return used < int(cap)
+
+
+async def _consume_topup_nudge_slot(
+    col, *, clean_id: str, session_id: str, authorization_source: str,
+    cap: int, now: datetime | None = None,
+) -> dict:
+    """CONCURRENCY-SAFE rolling 7x24h weekly-cap claim — shared by Stage 2
+    (session_start) and Stage 3 (post_settlement).
+
+    Mirrors ``_do_refund``'s proven atomic CLAIM-then-act lock
+    (``find_one_and_update`` with stale-lock recovery) instead of a racy
+    count-then-insert. Sequence (all under the claimed lock):
+      1. atomically claim a short-lived lock on the student's cap document;
+      2. load the recent authorization records;
+      3. idempotent retry — an entry for this session_id (same event_key)
+         returns unchanged (no re-count, no re-append);
+      4. prune entries older than 7x24h, check the remaining count vs cap;
+      5. if under cap append a new record + save; if at cap leave unchanged;
+      6. release the lock;
+      7. return the result.
+
+    Returns {"record": <record|None>, "reason": <code>, "count": <int>}.
+    reason in {"authorized","idempotent","weekly_cap_reached","cap_disabled",
+    "lock_unavailable"}.
+    """
+    now = now or _now()
+    event_key = _topup_nudge_event_key(clean_id, session_id)
+    if cap is None or cap <= 0:
+        return {"record": None, "reason": "cap_disabled", "count": 0}
+
+    # Ensure the per-student cap document exists (idempotent; safe under
+    # concurrent creation thanks to the unique clean_id index + setOnInsert).
+    try:
+        await col.update_one(
+            {"clean_id": clean_id},
+            {"$setOnInsert": {"clean_id": clean_id, "authorizations": [],
+                              "nudge_lock_state": "idle"}},
+            upsert=True,
+        )
+    except Exception:
+        # A concurrent upsert may collide on the unique index — that is fine,
+        # the document now exists either way.
+        pass
+
+    stale_cutoff = (now - timedelta(
+        seconds=_TOPUP_NUDGE_LOCK_STALE_SECONDS)).isoformat()
+
+    claimed = None
+    for _attempt in range(_TOPUP_NUDGE_LOCK_RETRIES):
+        # ── ATOMIC CAP LOCK ── (claim-then-act; never count-then-insert)
+        claimed = await col.find_one_and_update(
+            {"clean_id": clean_id,
+             "$or": [
+                 {"nudge_lock_state": {"$ne": "locked"}},
+                 # reclaim a STALE processing lock (crash recovery)
+                 {"nudge_lock_state": "locked",
+                  "nudge_lock_at": {"$lt": stale_cutoff}},
+             ]},
+            {"$set": {"nudge_lock_state": "locked",
+                      "nudge_lock_at": now.isoformat()}},
+        )
+        if claimed is not None:
+            break
+        # Another caller holds a fresh lock — wait briefly and re-evaluate so a
+        # true race loser still sees the up-to-date (possibly full) count.
+        await asyncio.sleep(_TOPUP_NUDGE_LOCK_RETRY_SLEEP)
+    if claimed is None:
+        return {"record": None, "reason": "lock_unavailable", "count": 0}
+
+    authorizations = list((claimed or {}).get("authorizations") or [])
+
+    # (3) Idempotent retry — return the existing record unchanged.
+    for rec in authorizations:
+        if (rec or {}).get("event_key") == event_key:
+            await _topup_release_lock(col, clean_id)
+            window_start = now - timedelta(seconds=TOPUP_NUDGE_WINDOW_SECONDS)
+            return {"record": rec, "reason": "idempotent",
+                    "count": len(_topup_records_in_window(authorizations,
+                                                          window_start))}
+
+    # (4) Prune to the rolling window, then check the count.
+    window_start = now - timedelta(seconds=TOPUP_NUDGE_WINDOW_SECONDS)
+    kept = _topup_records_in_window(authorizations, window_start)
+
+    if len(kept) >= int(cap):
+        # At cap — persist the pruned array (keeps the doc bounded) + release.
+        await col.update_one(
+            {"clean_id": clean_id},
+            {"$set": {"authorizations": kept, "nudge_lock_state": "idle"},
+             "$unset": {"nudge_lock_at": ""}})
+        return {"record": None, "reason": "weekly_cap_reached",
+                "count": len(kept)}
+
+    # (5) Under cap — append the new record and save atomically + release.
+    record = {
+        "event_key": event_key,
+        "clean_id": clean_id,
+        "session_id": session_id,
+        "authorization_source": authorization_source,
+        "authorized_at": now.isoformat(),
+    }
+    kept.append(record)
+    await col.update_one(
+        {"clean_id": clean_id},
+        {"$set": {"authorizations": kept, "nudge_lock_state": "idle"},
+         "$unset": {"nudge_lock_at": ""}})
+    return {"record": record, "reason": "authorized", "count": len(kept)}
+
+
+async def _topup_release_lock(col, clean_id: str) -> None:
+    try:
+        await col.update_one(
+            {"clean_id": clean_id},
+            {"$set": {"nudge_lock_state": "idle"},
+             "$unset": {"nudge_lock_at": ""}})
+    except Exception:  # pragma: no cover
+        pass
+
+
+
+# =========================================================================== #
 # Route registration                                                          #
 # =========================================================================== #
 def register_edutalk_live_routes(api, db, require_admin, require_student) -> None:
@@ -750,6 +1111,8 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
     sess_col = db["edutalk_live_sessions"]
     report_col = db["edutalk_live_reports"]
     usage_col = db["edutalk_live_usage_logs"]
+    # Phase 1 Smart Top-Up Nudge — the ONE new narrow collection (cap log).
+    nudge_col = db[TOPUP_NUDGE_LOG_COLLECTION]
 
     _CFG_ID = "singleton"
 
@@ -877,6 +1240,95 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
                       session_id, err)
         return ok
 
+    async def _finalize_topup_nudge(session: dict, final_state: str,
+                                    cfg: dict) -> None:
+        """Phase 1 Smart Top-Up Nudge — STAGE 3 FINALIZATION.
+
+        Writes the finalization record the report pill renders from (ONLY
+        from this finalized balance — never the session-start figure). It
+        either reuses an existing Stage 2 authorization (consuming NO extra
+        weekly slot) or, when Stage 2 never qualified and the settled balance
+        is now at/under threshold, attempts ONE idempotent report-only
+        authorization through the SAME Section 3 helper
+        (authorization_source="post_settlement"). With the feature disabled it
+        writes nothing (zero change)."""
+        if not bool(cfg.get("topup_nudge_enabled")):
+            return
+        clean_id = session.get("clean_id", "")
+        session_id = session.get("session_id")
+        threshold = int(cfg.get("topup_nudge_threshold", 0))
+        cap = int(cfg.get("topup_nudge_max_per_week", 0))
+        existing_tn = session.get("topup_nudge") or {}
+        already_authorized = bool(
+            (existing_tn.get("authorization") or {}).get("voice_authorized"))
+        settlement_reason = _topup_settlement_reason(final_state)
+
+        # Read the SETTLED balance EXACTLY ONCE via the public WalletService
+        # method, keyed by this file's established identifier ``clean_id``
+        # (works regardless of USE_MONGO_POINTS_READ).
+        settled_balance, bal_ok = await _wallet_balance_via_public_method(
+            db, clean_id)
+
+        fin = {
+            "settled_balance": settled_balance if bal_ok else None,
+            "settlement_reason": settlement_reason,
+            "finalized_at": _iso(),
+        }
+        report_authorized = False
+
+        if final_state in ("failed_refunded", "expired"):
+            # No kept reservation → nothing to nudge about.
+            fin.update({"report_eligible": False,
+                        "reason": "reservation_not_completed"})
+        elif not bal_ok:
+            fin.update({"report_eligible": False, "reason": "wallet_unavailable"})
+        elif already_authorized:
+            # Reuse Stage 2 — consume NO additional weekly slot. A refund that
+            # pushed the balance back above threshold suppresses the pill.
+            if settled_balance <= threshold:
+                fin.update({"report_eligible": True,
+                            "reason": "balance_at_or_below_threshold_after_settlement"})
+                report_authorized = True
+            else:
+                fin.update({"report_eligible": False,
+                            "reason": "balance_above_threshold_after_settlement"})
+        else:
+            # Stage 2 did NOT authorize. Attempt ONE report-only authorization
+            # only when the settled balance is now at/under threshold.
+            if settled_balance <= threshold:
+                slot = await _consume_topup_nudge_slot(
+                    nudge_col, clean_id=clean_id, session_id=session_id,
+                    authorization_source="post_settlement", cap=cap)
+                if slot["reason"] in ("authorized", "idempotent"):
+                    fin.update({"report_eligible": True,
+                                "reason": "balance_at_or_below_threshold_after_settlement"})
+                    report_authorized = True
+                else:
+                    # Cap reached → suppress the report pill.
+                    fin.update({"report_eligible": False,
+                                "reason": "weekly_cap_reached"})
+            else:
+                fin.update({"report_eligible": False,
+                            "reason": "balance_above_threshold_after_settlement"})
+
+        tn = dict(existing_tn)
+        tn.setdefault("event_key", _topup_nudge_event_key(clean_id, session_id))
+        tn.setdefault("clean_id", clean_id)
+        tn.setdefault("session_id", session_id)
+        tn["finalization"] = fin
+        tn["report_authorized"] = report_authorized
+        if report_authorized and not already_authorized:
+            # Stage-3-only authorization: Gemini already ran; only the report
+            # pill reflects it (voice_authorized stays false).
+            auth = dict(tn.get("authorization") or {})
+            auth["voice_authorized"] = False
+            auth["report_authorized"] = True
+            tn["authorization"] = auth
+            tn.setdefault("authorization_source", "post_settlement")
+        await sess_col.update_one(
+            {"session_id": session_id}, {"$set": {"topup_nudge": tn}})
+
+
     async def _finalize_session(session_id: str, *, outcome: str,
                                 transcript: list[dict] | None = None,
                                 error_reason: str = "") -> dict:
@@ -991,6 +1443,15 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             mode=session.get("mode", ""), session_id=session_id,
             error_reason=error_reason)
 
+        # ── Phase 1 Smart Top-Up Nudge — STAGE 3 FINALIZATION ──
+        # Runs once (only the finalize-claim winner reaches here). The EXISTING
+        # debit/refund logic above is unchanged; this only reads the settled
+        # balance once and writes the report-pill finalization record.
+        try:
+            await _finalize_topup_nudge(session, final_state, cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("live: topup nudge stage3 failed (non-fatal): %s", exc)
+
         stored_report = await report_col.find_one(
             {"session_id": session_id}, {"_id": 0})
         return {"session": _safe_session(session), "report": stored_report}
@@ -1082,6 +1543,8 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             await report_col.create_index([("student_id", 1), ("created_at", -1)])
             await usage_col.create_index("ts")
             await usage_col.create_index([("student_id", 1), ("ts", -1)])
+            # Phase 1 Smart Top-Up Nudge — one cap document per student.
+            await nudge_col.create_index("clean_id", unique=True)
             log.info("edutalk_live: indexes ensured")
         except Exception as exc:  # noqa: BLE001
             log.warning("live: ensure_indexes failed (non-fatal): %s", exc)
@@ -1131,7 +1594,15 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
     @api.put("/admin/edutalk-live/config")
     async def admin_put_live_config(payload: dict, admin=Depends(require_admin)):
         admin_email = str(getattr(admin, "email", "") or getattr(admin, "username", ""))
-        cfg = await _save_config(payload.get("config", payload), admin_email)
+        incoming = payload.get("config", payload)
+        # Phase 1 Smart Top-Up Nudge — REJECT invalid input (no silent
+        # clamping), mirroring edutalkLiveRewardSchema.js's reject pattern and
+        # using feature-specific reason codes.
+        ok, reason = _validate_topup_nudge_fields(
+            incoming if isinstance(incoming, dict) else {})
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
+        cfg = await _save_config(incoming, admin_email)
         return {"success": True, "config": cfg, "status": _public_status()}
 
     @api.get("/admin/edutalk-live/usage")
@@ -1227,6 +1698,38 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
         # UI must not guess). Computed against the student's own consumed trials.
         trial = await _trial_status(clean_id, cfg, {}) if feature_live else {
             "available": False, "remaining": 0, "consumed": 0}
+
+        # ── Phase 1 Smart Top-Up Nudge — STAGE 1: read-only, mode-specific
+        # PREVIEW. Never consumes a weekly slot, never written to storage,
+        # never reaches Gemini. Keyed by the SAME stable mode key as
+        # ``modes_out``. The frontend selects the matching entry on mode
+        # change and never recomputes balance-minus-cost itself.
+        topup_previews: dict[str, Any] = {}
+        nudge_enabled = bool(cfg.get("topup_nudge_enabled"))
+        if feature_live and nudge_enabled:
+            threshold = int(cfg.get("topup_nudge_threshold", 0))
+            cap = int(cfg.get("topup_nudge_max_per_week", 0))
+            # Migration-aware balance source. USE_MONGO_POINTS_READ gates the
+            # student-facing balance read (default OFF = GAS source of truth →
+            # NO numeric preview; ON = Mongo authoritative via the public
+            # WalletService method). Stage 2/3 are unaffected by this flag.
+            _flag = (os.environ.get("USE_MONGO_POINTS_READ") or "").strip().lower()
+            flag_on = _flag in ("true", "1", "yes")
+            preview_balance = None
+            if flag_on:
+                preview_balance, _bal_ok = await _wallet_balance_via_public_method(
+                    db, clean_id)
+                if not _bal_ok:
+                    preview_balance = None
+            # Read-only weekly-cap availability (NEVER consumes a slot).
+            cap_available = await _topup_cap_availability(
+                nudge_col, clean_id=clean_id, cap=cap)
+            for m in modes_out:
+                topup_previews[m["key"]] = _topup_preview_for_mode(
+                    enabled=True, flag_on=flag_on, balance=preview_balance,
+                    mode_cost=int(m["cost_points"]), threshold=threshold,
+                    weekly_cap_available=cap_available)
+
         return {
             "success": True,
             "available": feature_live,
@@ -1240,6 +1743,9 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             "daily_session_limit": int(cfg.get("daily_session_limit", 0)),
             "max_session_seconds": int(cfg.get("max_session_seconds", 300)),
             "language_mode": cfg.get("default_language_mode"),
+            # Phase 1 Smart Top-Up Nudge — empty {} when disabled (zero change).
+            "topup_nudge_enabled": nudge_enabled,
+            "topup_nudge_previews_by_mode": topup_previews,
         }
 
     @api.post("/student/edutalk-live/session/start")
@@ -1378,7 +1884,10 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             except Exception:
                 points_hint = None
 
-        system_instruction = _build_system_instruction(
+        # Captured as kwargs so the SAME builder can be re-invoked with
+        # voice_authorized=True after a successful Stage 2 authorization
+        # (the nudge line is added BY _build_system_instruction).
+        _si_kwargs = dict(
             cfg=cfg, mode_key=mode_key, mode_cfg=mode_cfg,
             student_name=(display_name or "the student").split(" ")[0],
             points_balance=None,
@@ -1388,6 +1897,7 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             saved_words=payload.saved_words, previous_reports=prev_reports,
             explain_language=explain_language,
         )
+        system_instruction = _build_system_instruction(**_si_kwargs)
 
         now = _now()
         doc = {
@@ -1512,6 +2022,54 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
 
         doc["state"] = "pending_reserved"
         doc["charged_amount"] = charged
+
+        # ── Phase 1 Smart Top-Up Nudge — STAGE 2 AUTHORIZATION ──
+        # Created ONLY after the EXISTING reservation succeeded. Reuses `bal`
+        # (the pre-reservation balance captured at step 7) and `charged`
+        # (step 8) — NEVER re-fetched or re-subtracted. Eligible only when the
+        # post-reservation balance is at/under threshold AND a weekly-cap slot
+        # is available via the shared, concurrency-safe Section 3 helper. On
+        # success ONE non-numeric line is added to Gemini's system instruction.
+        # Wrapped so an additive-feature failure NEVER affects billing/session.
+        if charged > 0 and bool(cfg.get("topup_nudge_enabled")):
+            try:
+                threshold = int(cfg.get("topup_nudge_threshold", 0))
+                post_reservation_balance = int(bal) - int(charged)
+                if threshold >= 0 and post_reservation_balance <= threshold:
+                    cap = int(cfg.get("topup_nudge_max_per_week", 0))
+                    slot = await _consume_topup_nudge_slot(
+                        nudge_col, clean_id=clean_id, session_id=session_id,
+                        authorization_source="session_start", cap=cap)
+                    if slot["reason"] in ("authorized", "idempotent"):
+                        auth_block = {
+                            "balance_before_reservation": int(bal),
+                            "points_reserved": int(charged),
+                            "post_reservation_balance": post_reservation_balance,
+                            "threshold": threshold,
+                            "voice_authorized": True,
+                            "authorized_at": _iso(),
+                        }
+                        await sess_col.update_one(
+                            {"session_id": session_id},
+                            {"$set": {"topup_nudge": {
+                                "event_key": _topup_nudge_event_key(
+                                    clean_id, session_id),
+                                "clean_id": clean_id,
+                                "session_id": session_id,
+                                "authorization_source": "session_start",
+                                "authorization": auth_block,
+                            }}})
+                        # Add the SINGLE non-numeric nudge line to Gemini's
+                        # system instruction (rebuilt via the same builder).
+                        new_si = _build_system_instruction(
+                            **_si_kwargs, voice_authorized=True)
+                        await sess_col.update_one(
+                            {"session_id": session_id},
+                            {"$set": {"system_instruction": new_si}})
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "live: topup nudge stage2 failed (non-fatal): %s", exc)
+
         await _log_usage(student, "session_start", "pending_reserved", charged,
                          mode=mode_key, session_id=session_id)
 
@@ -1560,6 +2118,36 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
         return {"success": True, "report": report}
+
+    @api.get("/student/edutalk-live/topup-nudge/{session_id}")
+    async def student_topup_nudge(session_id: str,
+                                  student=Depends(require_student)):
+        """Phase 1 Smart Top-Up Nudge — report-pill data for ONE session.
+
+        Returns ONLY the Stage 3 ``finalization`` block (the report pill
+        renders solely from the finalized balance — never Stage 1/Stage 2
+        numbers, never the session-start balance). Owned by the requesting
+        student. Safe to call before finalization completes (returns
+        report_eligible=false until the record is written)."""
+        clean_id = str(getattr(student, "clean_id", ""))
+        cfg = await _load_config()
+        if not bool(cfg.get("topup_nudge_enabled")):
+            return {"success": True, "enabled": False, "report_eligible": False,
+                    "reason": "config_disabled", "finalization": None}
+        session = await sess_col.find_one(
+            {"session_id": session_id, "clean_id": clean_id})
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        tn = session.get("topup_nudge") or {}
+        fin = tn.get("finalization")
+        return {
+            "success": True,
+            "enabled": True,
+            "session_id": session_id,
+            "report_eligible": bool((fin or {}).get("report_eligible")),
+            "reason": (fin or {}).get("reason", "pending"),
+            "finalization": fin,
+        }
 
     # ----------------------------- WebSocket ------------------------------ #
     @api.websocket("/student/edutalk-live/ws/{session_id}")
