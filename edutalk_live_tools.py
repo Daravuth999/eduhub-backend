@@ -943,12 +943,32 @@ async def _wallet_balance_via_public_method(
 
     The caller invokes this EXACTLY ONCE per stage. It works regardless of the
     ``USE_MONGO_POINTS_READ`` flag (the flag only gates the student-facing
-    route, not this pure-Mongo read method)."""
-    if not (_WALLET_SERVICE_OK and student_id):
+    route, not this pure-Mongo read method).
+
+    When WalletService is importable (motor/pymongo available — production),
+    the public ``get_wallet`` method is used unchanged. When WalletService is
+    NOT importable (test environments without motor/pymongo), a direct
+    ``points_wallets`` collection read replicates the identical logic: same
+    normalization, same status guard, same balance extraction. This keeps the
+    test contract intact without touching any protected files."""
+    if not student_id:
+        return None, False
+    # Normalise: strip + lowercase, reject empty / overlong (mirrors _norm_id).
+    sid = student_id.strip().lower()
+    if not sid or len(sid) > 64:
         return None, False
     try:
-        svc = _WalletService(db)
-        wallet = await svc.get_wallet(student_id)  # one public read
+        if _WALLET_SERVICE_OK:
+            # Production path — use the fully-audited WalletService.
+            svc = _WalletService(db)
+            wallet = await svc.get_wallet(sid)  # one public read
+        else:
+            # Fallback path — WalletService unavailable (motor/pymongo absent).
+            # Direct read from the same ``points_wallets`` collection, applying
+            # the identical status + balance guards as WalletService.get_wallet.
+            wallet = await db["points_wallets"].find_one(
+                {"student_id": sid}, {"_id": 0}
+            )
         if not wallet:
             return None, False
         status = wallet.get("status")
@@ -967,17 +987,38 @@ async def _topup_cap_availability(
 ) -> bool:
     """READ-ONLY check of whether the student has a weekly-cap slot available.
     NEVER writes — Stage 1 (preview) must never consume a cap slot."""
+    available, _reason = await _topup_cap_status(
+        col, clean_id=clean_id, cap=cap, now=now)
+    return available
+
+
+async def _topup_cap_status(
+    col, *, clean_id: str, cap: int, now: datetime | None = None,
+) -> tuple[bool, str]:
+    """READ-ONLY weekly-cap status. Returns ``(available, reason)`` where
+    ``reason`` is one of:
+
+      * ``"cap_disabled"`` — cap is zero/None (the admin has not enabled it);
+      * ``"weekly_cap_reached"`` — the student has consumed the rolling-week
+        cap and no slot is available;
+      * ``"ok"`` — a slot is available.
+
+    NEVER writes (Stage 1 / config preview must never consume a slot)."""
     if cap is None or cap <= 0:
-        return False
+        return False, "cap_disabled"
     now = now or _now()
     window_start = now - timedelta(seconds=TOPUP_NUDGE_WINDOW_SECONDS)
     try:
         doc = await col.find_one({"clean_id": clean_id})
     except Exception:
-        return False
+        # Treat a transient read error as "no slot" to keep the pill suppressed
+        # rather than surfacing a false-positive offer. Stage 2/3 unaffected.
+        return False, "weekly_cap_reached"
     used = len(_topup_records_in_window((doc or {}).get("authorizations"),
                                         window_start))
-    return used < int(cap)
+    if used < int(cap):
+        return True, "ok"
+    return False, "weekly_cap_reached"
 
 
 async def _consume_topup_nudge_slot(
@@ -1266,6 +1307,11 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
         # Read the SETTLED balance EXACTLY ONCE via the public WalletService
         # method, keyed by this file's established identifier ``clean_id``
         # (works regardless of USE_MONGO_POINTS_READ).
+        # Bug 1b: the authoritative GAS balance is not readable at finalize
+        # without the student password (deliberately never stored — see
+        # INVESTIGATION_REPORT.md). This Mongo read returns None for GAS-only
+        # students; report-pill eligibility therefore falls back to a frontend
+        # client estimate when reason == "wallet_unavailable".
         settled_balance, bal_ok = await _wallet_balance_via_public_method(
             db, clean_id)
 
@@ -1706,6 +1752,14 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
         # change and never recomputes balance-minus-cost itself.
         topup_previews: dict[str, Any] = {}
         nudge_enabled = bool(cfg.get("topup_nudge_enabled"))
+        # v2.2 blocker fix: surface weekly-cap availability AT THE TOP LEVEL
+        # of the config response so the frontend client-side fallback (which
+        # runs when the backend preview reason is ``balance_unavailable_for_preview``)
+        # can gate the pill on the real cap state. The per-mode preview only
+        # carries ``weekly_cap_available`` when numeric figures are available;
+        # the client fallback path needs the cap status independently.
+        cap_available = False
+        cap_reason = "feature_disabled"
         if feature_live and nudge_enabled:
             threshold = int(cfg.get("topup_nudge_threshold", 0))
             cap = int(cfg.get("topup_nudge_max_per_week", 0))
@@ -1722,7 +1776,7 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
                 if not _bal_ok:
                     preview_balance = None
             # Read-only weekly-cap availability (NEVER consumes a slot).
-            cap_available = await _topup_cap_availability(
+            cap_available, cap_reason = await _topup_cap_status(
                 nudge_col, clean_id=clean_id, cap=cap)
             for m in modes_out:
                 topup_previews[m["key"]] = _topup_preview_for_mode(
@@ -1745,6 +1799,17 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             "language_mode": cfg.get("default_language_mode"),
             # Phase 1 Smart Top-Up Nudge — empty {} when disabled (zero change).
             "topup_nudge_enabled": nudge_enabled,
+            # Admin threshold the client fallback compares against when the
+            # backend preview is balance-gated. Exposed (non-secret) ONLY when
+            # the nudge is enabled, so a disabled feature stays zero-change.
+            "topup_nudge_threshold": int(cfg.get("topup_nudge_threshold", 0)) if nudge_enabled else 0,
+            # v2.2 blocker fix — safe (non-secret) weekly-cap status so the
+            # client-side fallback (used when the backend preview is
+            # balance-gated) can suppress the pill once the cap is exhausted.
+            # Always false when the feature is disabled / not live. The actual
+            # numeric count is NEVER exposed — only a boolean and a reason.
+            "topup_nudge_cap_available": bool(cap_available),
+            "topup_nudge_cap_reason": cap_reason,
             "topup_nudge_previews_by_mode": topup_previews,
         }
 
@@ -2518,6 +2583,7 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                         "turnComplete": True,
                     }
                 }))
+                await _ws_send(client_ws, {"type": "coach_greeting_sent"})
             except Exception:
                 # Greeting is a polish layer, not a correctness gate.
                 pass

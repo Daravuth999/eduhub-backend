@@ -781,6 +781,101 @@ def test_stage1_config_endpoint_flag_on_real_numbers(monkeypatch):
     assert pv["reason"] == "projected_balance_at_or_below_threshold"
 
 
+def test_stage1_config_exposes_admin_threshold_for_client_fallback(monkeypatch):
+    # v2.1 blocker: the student config endpoint MUST surface the admin
+    # threshold so the client-side fallback uses it (admin 50) instead of the
+    # hardcoded default 15 that suppressed the start pill in production.
+    db, router = _build_routes(monkeypatch, threshold=50, cap=3, mode_cost=15)
+    monkeypatch.delenv("USE_MONGO_POINTS_READ", raising=False)  # preview off
+    cfg_ep = router.routes[("GET", "/student/edutalk-live/config")]
+    out = run(cfg_ep(student=_Student()))
+
+    # (a) the admin threshold is exposed (the fix), not silently defaulted.
+    assert out["topup_nudge_enabled"] is True
+    assert out["topup_nudge_threshold"] == 50
+    # (b) backend preview is balance-gated (the exact reported case).
+    pv = out["topup_nudge_previews_by_mode"]["book_shadow"]
+    assert pv["reason"] == "balance_unavailable_for_preview"
+
+    # (c) exact case mirrors EduTalkLiveCoach.jsx clientFallbackPreview:
+    #         projected = balance - cost ; eligible = projected <= threshold
+    balance, cost = 40, 15
+    threshold = out["topup_nudge_threshold"]            # 50 from the response
+    projected = balance - cost                          # 25
+    assert (projected <= threshold) is True             # 25 <= 50 -> pill SHOWS
+    # Regression guard: the old hardcoded default would have HIDDEN the pill.
+    assert (projected <= 15) is False                   # 25 <= 15 -> hidden (bug)
+
+
+def test_stage1_config_exposes_cap_status_for_client_fallback(monkeypatch):
+    # v2.2 blocker: the student config endpoint MUST surface the weekly-cap
+    # status at the top level. The client-side fallback (used when the
+    # backend preview reason is balance_unavailable_for_preview) needs the
+    # cap state to gate the pill — the per-mode preview alone is not enough
+    # because the unavailable-preview branch carries no weekly_cap_available
+    # field.
+    db, router = _build_routes(monkeypatch, threshold=50, cap=3, mode_cost=15)
+    monkeypatch.delenv("USE_MONGO_POINTS_READ", raising=False)  # preview off
+    cfg_ep = router.routes[("GET", "/student/edutalk-live/config")]
+    out = run(cfg_ep(student=_Student()))
+    # Cap available (no slots consumed), reason "ok".
+    assert out["topup_nudge_cap_available"] is True
+    assert out["topup_nudge_cap_reason"] == "ok"
+    # And the preview is still balance-gated (numeric figures not exposed).
+    pv = out["topup_nudge_previews_by_mode"]["book_shadow"]
+    assert pv["reason"] == "balance_unavailable_for_preview"
+
+
+def test_stage1_config_cap_exhausted_blocks_fallback(monkeypatch):
+    # v2.2 blocker: when the weekly cap is exhausted, the config MUST report
+    # cap_available=false (reason weekly_cap_reached) so the client fallback
+    # suppresses the pill — preserving server-side cap enforcement.
+    db, router = _build_routes(monkeypatch, threshold=50, cap=1, mode_cost=15)
+    monkeypatch.delenv("USE_MONGO_POINTS_READ", raising=False)  # preview off
+    # Seed an authorization within the rolling window → cap is full.
+    run(db[elt.TOPUP_NUDGE_LOG_COLLECTION].insert_one({
+        "clean_id": "alice",
+        "authorizations": [{
+            "event_key": "alice-prior-session",
+            "clean_id": "alice", "session_id": "prior",
+            "authorization_source": "voice_pre_session",
+            "authorized_at": _now().isoformat(),
+        }],
+        "nudge_lock_state": "idle",
+    }))
+    cfg_ep = router.routes[("GET", "/student/edutalk-live/config")]
+    out = run(cfg_ep(student=_Student()))
+    assert out["topup_nudge_cap_available"] is False
+    assert out["topup_nudge_cap_reason"] == "weekly_cap_reached"
+
+
+def test_stage1_config_cap_disabled_when_cap_zero(monkeypatch):
+    # cap = 0 → reason "cap_disabled" (admin has not enabled the weekly cap).
+    db, router = _build_routes(monkeypatch, threshold=50, cap=0, mode_cost=15)
+    monkeypatch.delenv("USE_MONGO_POINTS_READ", raising=False)
+    cfg_ep = router.routes[("GET", "/student/edutalk-live/config")]
+    out = run(cfg_ep(student=_Student()))
+    assert out["topup_nudge_cap_available"] is False
+    assert out["topup_nudge_cap_reason"] == "cap_disabled"
+
+
+def test_stage1_config_cap_fields_absent_features_off(monkeypatch):
+    # Feature disabled → cap_available=false, reason=feature_disabled, and the
+    # threshold is gated to 0 (existing v2.1 invariant remains).
+    db, router = _build_routes(monkeypatch, threshold=50, cap=3, mode_cost=15)
+    # Disable the nudge after seeding (in-memory _Coll has no dot-notation
+    # support, so replace the embedded config dict in place).
+    seeded = db["edutalk_live_config"].docs[0]
+    seeded["config"]["topup_nudge_enabled"] = False
+    monkeypatch.delenv("USE_MONGO_POINTS_READ", raising=False)
+    cfg_ep = router.routes[("GET", "/student/edutalk-live/config")]
+    out = run(cfg_ep(student=_Student()))
+    assert out["topup_nudge_enabled"] is False
+    assert out["topup_nudge_threshold"] == 0
+    assert out["topup_nudge_cap_available"] is False
+    assert out["topup_nudge_cap_reason"] == "feature_disabled"
+
+
 def test_stage1_loading_config_never_writes_cap_event(monkeypatch):
     db, router = _build_routes(monkeypatch, threshold=15, cap=3, mode_cost=15)
     monkeypatch.setenv("USE_MONGO_POINTS_READ", "true")

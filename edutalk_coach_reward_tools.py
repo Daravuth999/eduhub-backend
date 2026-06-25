@@ -512,7 +512,7 @@ DEFAULT_REWARD_CONFIG: dict[str, Any] = {
     "voucher_enabled": False,           # locked OFF (Phase 1 lock)
     # Performance eligibility.
     "min_successful_exercises": 3,
-    "require_resolved_correction": True,
+    "require_resolved_correction": False,
     "min_confidence": 0.70,
     "min_session_seconds": 45,
     "max_offers_per_session": 1,
@@ -1535,7 +1535,15 @@ def register_edutalk_coach_reward_routes(
                 "state": "terminal", "result": "successful",
                 "correction_resolved": True, "consumed_by_offer": None,
             })
-            if resolved < 1:
+            # Alternate path: >= 1 exercise with confidence >= 0.90 (excellent clean performance)
+            has_excellent_clean = await ex_col.count_documents({
+                "session_id": session_id, "clean_id": clean_id,
+                "state": "terminal", "result": "successful",
+                "consumed_by_offer": None,
+                "kind": {"$in": ["repeat_after_coach", "book_shadow_sentence"]},
+                "confidence": {"$gte": 0.90},
+            })
+            if resolved < 1 and has_excellent_clean < 1:
                 _diag(f"withheld:{sdiag}:no_resolved_correction",
                       "reward offer withheld reason=no_resolved_correction "
                       f"session={sdiag} exercises={len(distinct_ids)}")
