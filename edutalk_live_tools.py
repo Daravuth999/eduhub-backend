@@ -54,12 +54,13 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 from fastapi import Depends, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 log = logging.getLogger("eduhub.edutalk_live")
 
@@ -219,6 +220,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "topup_nudge_enabled": False,
     "topup_nudge_threshold": 15,
     "topup_nudge_max_per_week": 3,
+    # ── Phase 1 Teacher Daravuth persona (additive; DARK by default) ─────────
+    # The master gate `teacher_persona_enabled` defaults False → ZERO behaviour
+    # change. When false, neither the system-instruction block nor any greeting
+    # mention is produced; the name/mention values are retained but inert.
+    "teacher_persona_enabled": False,
+    "teacher_display_name": "Teacher Daravuth",
+    "mention_teacher_in_greeting": True,
     "teacher_method": "friendly_beginner",
     "correction_style": "finish_then_correct",
     "focus_areas": ["pronunciation", "confidence", "natural_flow"],
@@ -359,6 +367,53 @@ class EndSessionRequest(BaseModel):
     transcript: list[dict] = Field(default_factory=list)
 
 
+# Phase 0B — allowlists shared by the visibility endpoint (mirrored by the
+# frontend liveCoachTopupNudgeLogic.js NUDGE_* maps). Module-level so they are
+# importable by tests.
+NUDGE_DIAGNOSTIC_REASONS = frozenset({
+    "eligible", "config_disabled", "feature_unavailable", "threshold_invalid",
+    "balance_temporarily_unavailable", "balance_above_threshold",
+    "weekly_cap_reached", "cap_disabled", "cap_lock_unavailable",
+    "reservation_not_completed", "pending", "snoozed",
+})
+NUDGE_BALANCE_SOURCES = frozenset({
+    "mongo_wallet", "mongo_wallet_unavailable",
+    "client_display_snapshot_required", "client_display_snapshot",
+    "gas_verified_pre_reservation", "gas_verified_post_reservation",
+    "unavailable",
+})
+MAX_VISIBILITY_DECISIONS = 100
+
+
+class TopupVisibilityRequest(BaseModel):
+    """Phase 0B — bounded request for the Top-Up pill VISIBILITY decision log.
+    Diagnostics ONLY: this endpoint never alters eligibility, cap, wallet,
+    payment, or session charging. Unknown fields are ignored; reason/source are
+    validated against the allowlists."""
+    model_config = ConfigDict(extra="ignore")
+    phase: str = Field(..., pattern="^(start|report)$")
+    session_id: Optional[str] = Field(None, max_length=80)
+    mode: Optional[str] = Field(None, max_length=40)
+    pill_shown: bool = Field(...)
+    reason: str = Field(..., max_length=48)
+    balance_source: str = Field(..., max_length=48)
+    client_event_id: str = Field(..., min_length=1, max_length=120)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_allowed(cls, v: str) -> str:
+        if v not in NUDGE_DIAGNOSTIC_REASONS:
+            raise ValueError("invalid_reason")
+        return v
+
+    @field_validator("balance_source")
+    @classmethod
+    def _source_allowed(cls, v: str) -> str:
+        if v not in NUDGE_BALANCE_SOURCES:
+            raise ValueError("invalid_balance_source")
+        return v
+
+
 # --------------------------------------------------------------------------- #
 # Config sanitiser (admin PUT)                                                #
 # --------------------------------------------------------------------------- #
@@ -404,6 +459,21 @@ def _sanitise_config(raw: dict | None) -> dict[str, Any]:
     _tn_cap = _topup_strict_int(raw.get("topup_nudge_max_per_week"))
     if _tn_cap is not None and 0 <= _tn_cap <= 1000:
         out["topup_nudge_max_per_week"] = _tn_cap
+
+    # ── Phase 1 Teacher Daravuth persona. The admin PUT route REJECTS invalid
+    # input up-front via _validate_teacher_persona_fields() (no silent
+    # clamping). Here we pass valid values through and PRESERVE saved
+    # name/mention values even while the master gate is off, so toggling the
+    # gate back on restores them (never deleted).
+    if "teacher_persona_enabled" in raw:
+        out["teacher_persona_enabled"] = bool(raw["teacher_persona_enabled"])
+    if "mention_teacher_in_greeting" in raw:
+        out["mention_teacher_in_greeting"] = bool(raw["mention_teacher_in_greeting"])
+    _tname = raw.get("teacher_display_name")
+    if isinstance(_tname, str):
+        _name_ok, _ = _teacher_name_ok(_tname)
+        if _name_ok:
+            out["teacher_display_name"] = _tname.strip()
 
     lm = str(raw.get("default_language_mode", out["default_language_mode"]))
     if lm in _LANGUAGE_MODES:
@@ -657,6 +727,38 @@ def _build_system_instruction(
     if voice_authorized:
         lines.append(_TOPUP_NUDGE_INSTRUCTION_LINE)
 
+    # ── Phase 1 Teacher Daravuth persona — DELIMITED stewardship block, added
+    # ONLY when the master gate (`teacher_persona_enabled`) is on. Defaults
+    # dark → zero behaviour change. The coach never impersonates the teacher
+    # and never fabricates a teacher quote/request (no `teacher_note` exists in
+    # this phase, so no quote path is added). The name is re-validated here
+    # defensively and falls back to a neutral label if somehow unsafe.
+    if cfg.get("teacher_persona_enabled"):
+        _raw_name = str(cfg.get("teacher_display_name") or "").strip()
+        _name_ok, _ = _teacher_name_ok(_raw_name)
+        teacher_name = _raw_name if _name_ok else "your EduHub teacher"
+        tlines = [
+            "<<TEACHER_PERSONA>>",
+            f"You are EduTalk Live Coach, an AI speaking coach supporting "
+            f"{student_name}'s learning under the guidance of their teacher, "
+            f"{teacher_name}. You are NOT {teacher_name}; you are the AI coach "
+            f"that helps the student practise between classes.",
+            "Never claim the teacher said, asked, requested, or instructed "
+            "anything specific. You have no message or quote from the teacher.",
+        ]
+        if bool(cfg.get("mention_teacher_in_greeting")):
+            tlines.append(
+                f"At the very start of the session ONLY, you may mention "
+                f"{teacher_name} once, naturally and briefly (for example, "
+                f"that you are helping the student practise for "
+                f"{teacher_name}'s class). Do not mention the teacher again "
+                f"after the greeting.")
+        else:
+            tlines.append(
+                "Do not mention the teacher by name during this session.")
+        tlines.append("<<END_TEACHER_PERSONA>>")
+        lines.append("\n".join(tlines))
+
     # NOTE: The Phase 1 corrected build does NOT inject any reward-evidence
     # protocol into the Gemini system instruction. When rewards are enabled
     # the backend evaluates server-owned exercises against authoritative
@@ -861,6 +963,60 @@ def _validate_topup_nudge_fields(raw: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
+# Phase 1 — Teacher Daravuth display-name character policy. Allow Unicode
+# letters + combining marks (so Khmer ្ stacking marks pass), plus a SMALL
+# punctuation allowlist. Everything else (digits, braces/brackets, prompt
+# delimiters, control characters, tabs, line breaks, other punctuation) is
+# rejected to keep the name safe to interpolate into a Gemini instruction.
+_TEACHER_NAME_ALLOWED_PUNCT = frozenset({
+    " ",         # space
+    ".",         # period
+    "'",         # straight apostrophe (U+0027)
+    "\u2019",    # right single quotation mark
+    "-",         # hyphen-minus (U+002D)
+    "\u2011",    # non-breaking hyphen
+})
+
+
+def _teacher_name_ok(name: Any) -> tuple[bool, str]:
+    """Validate a teacher display name. Returns (ok, reason_code)."""
+    if not isinstance(name, str):
+        return False, "teacher_name_invalid"
+    trimmed = name.strip()
+    if len(trimmed) < 1:
+        return False, "teacher_name_empty"
+    if len(trimmed) > 80:
+        return False, "teacher_name_too_long"
+    for ch in trimmed:
+        if ch in _TEACHER_NAME_ALLOWED_PUNCT:
+            continue
+        cat = unicodedata.category(ch)
+        # Letters (L*) and combining marks (M*) are allowed — this covers Khmer
+        # consonants, vowels and the coeng (្) stacking marks.
+        if cat and cat[0] in ("L", "M"):
+            continue
+        return False, "teacher_name_invalid_char"
+    return True, ""
+
+
+def _validate_teacher_persona_fields(raw: dict | None) -> tuple[bool, str]:
+    """Phase 1 — validate ONLY the three teacher-persona admin fields. REJECTS
+    invalid input (no silent clamping) with stable feature-specific reason
+    codes. Booleans must be actual booleans. Returns (ok, reason_code)."""
+    raw = raw or {}
+    if "teacher_persona_enabled" in raw and not isinstance(
+            raw["teacher_persona_enabled"], bool):
+        return False, "teacher_persona_enabled_invalid"
+    if "mention_teacher_in_greeting" in raw and not isinstance(
+            raw["mention_teacher_in_greeting"], bool):
+        return False, "mention_teacher_invalid"
+    if "teacher_display_name" in raw:
+        ok, reason = _teacher_name_ok(raw["teacher_display_name"])
+        if not ok:
+            return False, reason
+    return True, ""
+
+
 def _topup_nudge_event_key(clean_id: str, session_id: str) -> str:
     """Stable idempotency key: clean_id + session_id + the feature tag."""
     return f"{clean_id}{session_id}live_coach_topup_nudge"
@@ -890,6 +1046,7 @@ def _topup_records_in_window(records: list, window_start: datetime) -> list:
 def _topup_preview_for_mode(
     *, enabled: bool, flag_on: bool, balance: Optional[int],
     mode_cost: int, threshold: int, weekly_cap_available: bool,
+    cap_reason: str | None = None,
 ) -> dict:
     """PURE per-mode preview. The frontend selects the matching entry on mode
     change and NEVER recomputes balance-minus-cost itself.
@@ -899,23 +1056,74 @@ def _topup_preview_for_mode(
         ``balance_unavailable_for_preview`` (an accepted degraded state, not a
         defect — Stage 2/3 are unaffected).
       * flag ON: real numbers from the public WalletService read.
+
+    Phase 0B (additive, observability only): every branch ALSO returns a
+    normalized ``diagnostic_reason`` (allowlist) and a truthful
+    ``balance_source`` (allowlist).
+
+    Bug 3 (v2 correction): the legacy ``eligible`` field now FAILS CLOSED when
+    the read-only weekly cap is exhausted/disabled (``weekly_cap_reached`` /
+    ``cap_disabled``), matching ``diagnostic_reason``. This is preview
+    visibility only — it NEVER changes ``_consume_topup_nudge_slot`` cap
+    consumption timing, authorization semantics, or atomic locking. All numeric
+    fields are preserved for the existing frontend/tests.
     """
     if not enabled:
-        return {"enabled": False, "eligible": False, "reason": "config_disabled"}
+        return {"enabled": False, "eligible": False, "reason": "config_disabled",
+                "diagnostic_reason": "config_disabled",
+                "balance_source": "unavailable"}
     if threshold is None or threshold < 0:
-        return {"enabled": False, "eligible": False, "reason": "threshold_invalid"}
+        return {"enabled": False, "eligible": False, "reason": "threshold_invalid",
+                "diagnostic_reason": "threshold_invalid",
+                "balance_source": "unavailable"}
     if not flag_on:
+        # USE_MONGO_POINTS_READ off → no server numeric preview; the client
+        # display snapshot path is required. Accepted degraded state.
         return {"enabled": False, "eligible": False,
-                "reason": "balance_unavailable_for_preview"}
+                "reason": "balance_unavailable_for_preview",
+                "diagnostic_reason": "balance_temporarily_unavailable",
+                "balance_source": "client_display_snapshot_required"}
     if balance is None:
-        return {"enabled": False, "eligible": False, "reason": "wallet_unavailable"}
+        return {"enabled": False, "eligible": False, "reason": "wallet_unavailable",
+                "diagnostic_reason": "balance_temporarily_unavailable",
+                "balance_source": "mongo_wallet_unavailable"}
     projected = int(balance) - int(mode_cost)
-    eligible = projected <= int(threshold)
+    balance_eligible = projected <= int(threshold)
+    # Normalized diagnostic: fail closed on cap exhaustion/disabled regardless
+    # of the projected balance (preview visibility only).
+    if cap_reason == "weekly_cap_reached" or (
+            cap_reason is None and not weekly_cap_available):
+        diagnostic_reason = "weekly_cap_reached"
+    elif cap_reason == "cap_disabled":
+        diagnostic_reason = "cap_disabled"
+    elif balance_eligible:
+        diagnostic_reason = "eligible"
+    else:
+        diagnostic_reason = "balance_above_threshold"
+    # Bug 3 (v2 correction) — the legacy ``eligible`` field MUST now fail closed
+    # whenever the read-only weekly cap blocks the nudge. This is preview
+    # visibility only: it NEVER changes ``_consume_topup_nudge_slot`` cap
+    # consumption timing, authorization semantics, or atomic locking. A nudge
+    # that the cap will block must not be advertised as eligible.
+    cap_blocks = diagnostic_reason in ("weekly_cap_reached", "cap_disabled")
+    eligible = bool(balance_eligible and not cap_blocks)
+    # V3 item 6 — restore the full legacy ``reason`` contract from pristine
+    # 241. ``reason`` is derived from ``projected`` vs ``threshold`` ALONE
+    # (six pristine values) and MUST NEVER be set to a cap-specific
+    # diagnostic string. The cap-blocked signal lives in ``diagnostic_reason``
+    # (``weekly_cap_reached`` / ``cap_disabled``) and ``eligible`` (``False``)
+    # — already set above. This restores legacy parity with pristine 241
+    # while keeping the v2 fail-closed ``eligible`` correction intact.
+    if balance_eligible:
+        reason = "projected_balance_at_or_below_threshold"
+    else:
+        reason = "balance_above_threshold"
     return {
         "enabled": True,
-        "eligible": bool(eligible),
-        "reason": ("projected_balance_at_or_below_threshold" if eligible
-                   else "balance_above_threshold"),
+        "eligible": eligible,
+        "reason": reason,
+        "diagnostic_reason": diagnostic_reason,
+        "balance_source": "mongo_wallet",
         "verified_current_balance": int(balance),
         "mode_cost": int(mode_cost),
         "projected_post_reservation_balance": int(projected),
@@ -1357,6 +1565,23 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
                 fin.update({"report_eligible": False,
                             "reason": "balance_above_threshold_after_settlement"})
 
+        # ── Phase 0B (additive, observability only) — normalized report
+        # diagnostics. The legacy ``reason`` above is preserved unchanged; we
+        # ADD a normalized ``diagnostic_reason`` (allowlist) and a truthful
+        # ``balance_source`` so the report-pill decision is auditable. This
+        # never alters eligibility, cap, wallet, or settlement.
+        fin["balance_source"] = (
+            "mongo_wallet" if bal_ok else "mongo_wallet_unavailable")
+        _report_diag_map = {
+            "reservation_not_completed": "reservation_not_completed",
+            "wallet_unavailable": "balance_temporarily_unavailable",
+            "balance_at_or_below_threshold_after_settlement": "eligible",
+            "balance_above_threshold_after_settlement": "balance_above_threshold",
+            "weekly_cap_reached": "weekly_cap_reached",
+        }
+        fin["diagnostic_reason"] = _report_diag_map.get(
+            fin.get("reason"), "pending")
+
         tn = dict(existing_tn)
         tn.setdefault("event_key", _topup_nudge_event_key(clean_id, session_id))
         tn.setdefault("clean_id", clean_id)
@@ -1648,6 +1873,12 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             incoming if isinstance(incoming, dict) else {})
         if not ok:
             raise HTTPException(status_code=400, detail=reason)
+        # Phase 1 Teacher Daravuth persona — REJECT invalid input BEFORE save
+        # (no silent clamping), with stable feature-specific reason codes.
+        ok_t, reason_t = _validate_teacher_persona_fields(
+            incoming if isinstance(incoming, dict) else {})
+        if not ok_t:
+            raise HTTPException(status_code=400, detail=reason_t)
         cfg = await _save_config(incoming, admin_email)
         return {"success": True, "config": cfg, "status": _public_status()}
 
@@ -1782,7 +2013,7 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
                 topup_previews[m["key"]] = _topup_preview_for_mode(
                     enabled=True, flag_on=flag_on, balance=preview_balance,
                     mode_cost=int(m["cost_points"]), threshold=threshold,
-                    weekly_cap_available=cap_available)
+                    weekly_cap_available=cap_available, cap_reason=cap_reason)
 
         return {
             "success": True,
@@ -2088,6 +2319,46 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
         doc["state"] = "pending_reserved"
         doc["charged_amount"] = charged
 
+        # ── Phase 0A — server-owned greeting context snapshot. ADDITIVE and
+        # DISPLAY-ONLY: it is NEVER read by debit/reserve/refund/finalize. It
+        # captures the four greeting facts at start so the greeting script is
+        # built from server truth (not a re-fetch). For a paid session the
+        # points figure is `bal - charged` (post-reservation, GAS-verified);
+        # otherwise the existing validated client display hint is used; if
+        # neither exists the points category is explicitly "unavailable".
+        try:
+            _g_points = None
+            _g_points_source = "unavailable"
+            if charged > 0 and bal is not None:
+                _g_points = int(bal) - int(charged)
+                _g_points_source = "gas_verified_post_reservation"
+            elif points_hint is not None:
+                _g_points = int(points_hint)
+                _g_points_source = "client_display_hint"
+            greeting_context = {
+                "student_first_name": (display_name or "").split(" ")[0] or "",
+                "points_value": _g_points,
+                "points_source": _g_points_source,
+                "book_title": payload.book_title or "",
+                "book_slug": payload.book_slug or "",
+                "chapter_title": payload.chapter_title or "",
+                "mode": mode_key,
+                "explain_language": explain_language,
+                # Phase 1 (Bug 5) — teacher persona facts captured at start so
+                # the single validated greeting script (not a second path) owns
+                # the at-most-once natural teacher mention.
+                "teacher_persona_enabled": bool(cfg.get("teacher_persona_enabled")),
+                "teacher_display_name": str(cfg.get("teacher_display_name") or ""),
+                "mention_teacher_in_greeting": bool(
+                    cfg.get("mention_teacher_in_greeting")),
+            }
+            doc["greeting_context"] = greeting_context
+            await sess_col.update_one(
+                {"session_id": session_id},
+                {"$set": {"greeting_context": greeting_context}})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("live: greeting context snapshot failed: %s", exc)
+
         # ── Phase 1 Smart Top-Up Nudge — STAGE 2 AUTHORIZATION ──
         # Created ONLY after the EXISTING reservation succeeded. Reuses `bal`
         # (the pre-reservation balance captured at step 7) and `charged`
@@ -2214,6 +2485,55 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             "finalization": fin,
         }
 
+    @api.post("/student/edutalk-live/topup-nudge/visibility")
+    async def student_topup_nudge_visibility(
+            payload: TopupVisibilityRequest,
+            student=Depends(require_student)):
+        """Phase 0B — record ONE normalized Top-Up pill VISIBILITY decision.
+
+        DIAGNOSTICS ONLY. This endpoint NEVER alters eligibility, cap, wallet,
+        payment, or session charging — it appends a bounded
+        ``pill_visibility_decision`` row to the student's EXISTING unique
+        ``edutalk_live_topup_nudge_log`` document (one document per student, so
+        we append to a ``visibility_decisions`` array rather than insert new
+        documents that would violate the unique index). Only the newest
+        ``MAX_VISIBILITY_DECISIONS`` rows are kept via ``$push/$each/$slice``.
+        Validated allowlists already guarantee no internal strings are stored.
+        """
+        clean_id = str(getattr(student, "clean_id", ""))
+        if not clean_id:
+            raise HTTPException(status_code=401, detail="Unauthenticated")
+        event = {
+            "event_type": "pill_visibility_decision",
+            "clean_id": clean_id,
+            "session_id": payload.session_id or "",
+            "phase": payload.phase,
+            "mode": payload.mode or "",
+            "pill_shown": bool(payload.pill_shown),
+            "reason": payload.reason,
+            "balance_source": payload.balance_source,
+            "client_event_id": payload.client_event_id,
+            "client_reported": True,
+            "timestamp": _iso(),
+        }
+        try:
+            await nudge_col.update_one(
+                {"clean_id": clean_id},
+                {
+                    "$setOnInsert": {"clean_id": clean_id},
+                    "$push": {"visibility_decisions": {
+                        "$each": [event],
+                        "$slice": -MAX_VISIBILITY_DECISIONS,
+                    }},
+                },
+                upsert=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Diagnostics must never break the client; report a soft failure.
+            log.warning("live: topup visibility log failed: %s", exc)
+            return {"success": False, "recorded": False}
+        return {"success": True, "recorded": True}
+
     # ----------------------------- WebSocket ------------------------------ #
     @api.websocket("/student/edutalk-live/ws/{session_id}")
     async def live_ws(websocket: WebSocket, session_id: str):
@@ -2283,129 +2603,444 @@ def _safe_session(session: dict) -> dict:
     return out
 
 
-def _build_greeting_kicker(session: dict) -> str:
-    """v1.5 — Khmer-first greeting kicker for EduTalk Live Coach.
+def _build_greeting_kicker(session: dict, greeting_script: str | None = None) -> str:
+    """v2 (Bug 5) — turn-boundary kicker that EMBEDS the validated server-built
+    greeting script exactly once.
 
     Gemini Live with ``responseModalities=["AUDIO"]`` only emits audio after
     it receives a turn. Without a kicker the coach sits silent until the
-    student talks. We inject a SHORT user-role turn that tells the coach
-    to greet the student warmly in the student's chosen explanation
-    language. The kicker text itself is never spoken back: it's
-    interpreted by the model as a turn boundary that triggers an audio
-    response which flows through the existing ``pump_gemini_to_client``
-    path unchanged.
+    student talks. This kicker is a SHORT user-role turn-boundary instruction
+    that tells the coach to SPEAK the provided validated greeting script.
 
-    v1.5 behaviour:
-        * Default greeting language is KHMER (the vast majority of EduHub
-          students are Khmer speakers).
-        * The greeting uses the student's first name and — when a safe
-          display hint is available — the student's current points
-          balance. The hint is treated as DISPLAY-ONLY: if a malicious
-          client passed a wrong value, only the greeting text is wrong;
-          no money / debit / refund logic uses it.
-        * The greeting explicitly states "this is English speaking
-          practice from the book" and asks the student to confirm
-          whether they want explanations in Khmer or English. The
-          actual choice has already been sent via ``explain_language``;
-          the confirmation question is a friendly UX touch so the
-          student feels in control.
-        * If the student chose English explanations, the kicker greets
-          in English.
+    Bug 5 contract:
+        * The validated server-built ``greeting_script`` (from
+          ``_build_greeting_script`` + field assertion / safe fallback) is the
+          SINGLE factual source for the spoken greeting.
+        * This function does NOT independently re-derive the student name,
+          points, book, chapter, or teacher mention. Those facts live ONLY in
+          the embedded script, so the validated input reaches ``gem.send``
+          exactly once.
+        * Honest limitation preserved: embedding the script guarantees the
+          validated INPUT to Gemini, not verified spoken OUTPUT.
+
+    If ``greeting_script`` is omitted (defensive), it is built + validated here
+    from the same server-owned snapshot so the kicker still carries the four
+    factual categories exactly once.
     """
-    name = (session.get("display_name") or "").split(" ")[0] or "the student"
-    book = (session.get("book_title") or "").strip()
-    chapter = (session.get("chapter_title") or "").strip()
-    mode = (session.get("mode") or "").strip()
     lang = (session.get("explain_language") or "km").strip().lower()
     if lang not in ("km", "en"):
         lang = "km"
 
-    hint = session.get("points_balance_hint")
-    try:
-        hint_int = int(hint) if hint is not None else None
-    except Exception:
-        hint_int = None
+    script = (greeting_script or "").strip()
+    if not script:
+        built, ctx = _build_greeting_script(session)
+        ok, _missing = _assert_greeting_fields(built, ctx)
+        script = built if ok else _safe_fallback_greeting_script(ctx)
 
     if lang == "km":
-        # Khmer-first greeting. We give the model precise INSTRUCTIONS
-        # in English (Gemini follows English instructions reliably) and
-        # tell it to SPEAK the greeting in natural Khmer. We give the
-        # model an exact Khmer template it can shorten naturally — this
-        # avoids Unicode mojibake from over-creative paraphrasing.
-        parts: list[str] = [
-            "[SESSION_START]",
-            "Greet the student NOW in natural Khmer (ភាសាខ្មែរ). Do not "
-            "use English in the greeting except for proper nouns. Keep "
-            "it warm, short (~3 short sentences), and personal.",
-            f"The student's name is {name} — say hi using their name.",
-        ]
-        if hint_int is not None:
-            parts.append(
-                f"Tell them they currently have {hint_int} EduHub points "
-                "in their account (mention the points casually, not as a "
-                "sales pitch)."
-            )
-        if book and chapter:
-            parts.append(
-                f"Mention that today you will practise speaking English "
-                f"together using the book \"{book}\" — chapter \"{chapter}\"."
-            )
-        elif book:
-            parts.append(
-                f"Mention that today you will practise speaking English "
-                f"together using the book \"{book}\"."
-            )
-        else:
-            parts.append(
-                "Tell them today you will practise speaking English together."
-            )
-        if mode:
-            parts.append(f"Frame the session as a '{mode}' practice.")
-        parts.append(
-            "Then ask in Khmer whether they want explanations in Khmer or "
-            "in English. (Default in their UI was Khmer, so reassure them "
-            "Khmer is fine.) Also remind them CLEARLY in Khmer that the "
-            "practice sentences and their own speaking answers will still "
-            "be in English. End with one short English practice sentence "
-            "they can repeat to begin (taken from the current book "
-            "context if possible, otherwise something simple like "
-            "\"I am ready to practise.\")."
+        instruction = (
+            "[SESSION_START] Greet the student NOW by speaking the greeting "
+            "below in natural, warm Khmer (ភាសាខ្មែរ). Keep every fact exactly "
+            "as written — the student's name, their points, the book and "
+            "chapter, and the teacher if named. Do not add, remove, or invent "
+            "any fact. You may keep proper nouns (names, the book title) in "
+            "their original form. Speak it as ONE short, friendly spoken "
+            "greeting (about three short sentences), then warmly invite the "
+            "student to begin practising speaking English (their own answers "
+            "stay in English). Do not read this instruction aloud."
         )
-        parts.append(
-            "Do not lecture. Do not list rules. Speak NOW in Khmer."
+    else:
+        instruction = (
+            "[SESSION_START] Greet the student NOW by speaking the greeting "
+            "below warmly in natural English. Keep every fact exactly as "
+            "written — the student's name, their points, the book and chapter, "
+            "and the teacher if named. Do not add, remove, or invent any fact. "
+            "Speak it as ONE short, friendly spoken greeting, then warmly "
+            "invite the student to begin practising speaking English. Do not "
+            "read this instruction aloud."
         )
-        return " ".join(parts)
+    # The script is embedded EXACTLY ONCE after the instruction marker.
+    return f"{instruction}\n\nGREETING SCRIPT:\n{script}"
 
-    # explain_language == "en"
+
+def _build_validated_greeting_payload(session: dict) -> tuple[dict, str, dict]:
+    """Bug 5 — build the SINGLE Gemini greeting turn payload that carries the
+    validated greeting script exactly once.
+
+    Returns ``(payload, validated_script, context)`` where ``payload`` is the
+    exact ``clientContent`` dict that ``_run_live_bridge`` passes to
+    ``gem.send``. The validated script is built once via
+    ``_build_greeting_script``, field-asserted, and (only on failure) replaced
+    by the safe fallback — then embedded by ``_build_greeting_kicker`` without
+    any second re-derivation path.
+    """
+    g_script, g_context = _build_greeting_script(session)
+    ok, _missing = _assert_greeting_fields(g_script, g_context)
+    if not ok:
+        g_script = _safe_fallback_greeting_script(g_context)
+    kicker = _build_greeting_kicker(session, g_script)
+    payload = {
+        "clientContent": {
+            "turns": [{"role": "user", "parts": [{"text": kicker}]}],
+            "turnComplete": True,
+        }
+    }
+    return payload, g_script, g_context
+
+
+# --------------------------------------------------------------------------- #
+# Phase 0A — server-owned greeting facts + attempt-scoped lifecycle.           #
+#                                                                              #
+# These are ADDITIVE. `_build_greeting_kicker` above remains the Gemini turn   #
+# trigger/wrapper (unchanged). The helpers below build the FACTUAL server-side #
+# script used for a mandatory field assertion + telemetry, and drive an        #
+# attempt-scoped greeting state machine over the existing WS frames. None of    #
+# this verifies spoken audio output — it only guarantees the server emitted    #
+# truthful greeting facts and lifecycle events the frontend gate relies on.    #
+# --------------------------------------------------------------------------- #
+
+# Allowlists mirrored by the frontend (liveCoachTopupNudgeLogic.js).
+GREETING_POINTS_UNAVAILABLE_PHRASE = (
+    "your current points balance could not be confirmed right now"
+)
+
+
+def _humanize_slug(slug: str | None) -> str:
+    s = (slug or "").replace("-", " ").replace("_", " ").strip()
+    return s.title() if s else ""
+
+
+def _make_greeting_attempt_id() -> str:
+    """Unguessable per-attempt id (hex). Distinct from session/ws tokens."""
+    return secrets.token_hex(12)
+
+
+def _resolve_greeting_context(session: dict | None) -> dict:
+    """Resolve the four factual greeting categories from the server-owned
+    snapshot persisted at session start, falling back to live session fields
+    for resumed sessions that predate the snapshot. Uses EXISTING data only —
+    never a fabricated points value."""
+    session = session or {}
+    snap = session.get("greeting_context") or {}
+
+    name = str(snap.get("student_first_name") or "").strip()
+    if not name:
+        name = ((session.get("display_name") or "").split(" ")[0] or "").strip()
+    student_label = name or "there"
+
+    points_value = snap.get("points_value", None)
+    points_source = str(snap.get("points_source") or "unavailable")
+    if points_value is None and points_source == "unavailable":
+        hint = session.get("points_balance_hint")
+        if hint is not None:
+            try:
+                points_value = int(hint)
+                points_source = "client_display_hint"
+            except Exception:
+                points_value = None
+                points_source = "unavailable"
+
+    book_title = str(snap.get("book_title") or session.get("book_title") or "").strip()
+    book_slug = str(snap.get("book_slug") or session.get("book_slug") or "").strip()
+    if book_title:
+        book_label = book_title
+    elif book_slug:
+        book_label = _humanize_slug(book_slug) or "your current EduHub book"
+    else:
+        book_label = "your current EduHub book"
+
+    chapter_title = str(
+        snap.get("chapter_title") or session.get("chapter_title") or "").strip()
+    chapter_label = chapter_title if chapter_title else "your current chapter"
+
+    # Phase 1 (Bug 5) — teacher persona facts from the server-owned snapshot.
+    # The single validated greeting script owns the AT-MOST-ONCE natural
+    # teacher mention; the kicker never re-derives it. Resumed sessions that
+    # predate the snapshot simply carry no teacher mention (honest limitation).
+    teacher_persona_enabled = bool(snap.get("teacher_persona_enabled"))
+    mention_teacher = bool(snap.get("mention_teacher_in_greeting"))
+    teacher_name_raw = str(snap.get("teacher_display_name") or "").strip()
+    teacher_name_ok = False
+    if teacher_name_raw:
+        teacher_name_ok, _ = _teacher_name_ok(teacher_name_raw)
+    teacher_mention = bool(
+        teacher_persona_enabled and mention_teacher and teacher_name_ok)
+    teacher_name = teacher_name_raw if teacher_name_ok else ""
+
+    return {
+        "student_label": student_label,
+        "points_value": points_value,
+        "points_source": points_source,
+        "book_label": book_label,
+        "chapter_label": chapter_label,
+        "teacher_mention": teacher_mention,
+        "teacher_name": teacher_name,
+    }
+
+
+def _greeting_points_phrase(points_value) -> str:
+    if points_value is not None:
+        return f"You currently have {int(points_value)} EduHub points"
+    return f"For now, {GREETING_POINTS_UNAVAILABLE_PHRASE}"
+
+
+def _build_greeting_script(session: dict | None):
+    """Build the deterministic FACTUAL greeting script (separate from the
+    Gemini instruction wrapper). Always contains the four factual categories:
+    student name, points (real number OR explicit unavailable phrase), book
+    label, chapter label. Returns (script, context)."""
+    ctx = _resolve_greeting_context(session)
     parts = [
-        "[SESSION_START]",
-        f"Greet {name} warmly in ONE or TWO short sentences (max ~25 words).",
-        f"Say hi using the name {name}.",
+        f"Hi {ctx['student_label']}!",
+        _greeting_points_phrase(ctx["points_value"]) + ".",
+        f"Today we will practise speaking English together using "
+        f"{ctx['book_label']}.",
+        f"We are on {ctx['chapter_label']}.",
     ]
-    if hint_int is not None:
+    # Phase 1 (Bug 5) — at-most-once natural teacher mention. The validated
+    # script is the SOLE owner of the spoken teacher mention; the kicker embeds
+    # this script verbatim and never re-derives the teacher name in a second
+    # path. (The system instruction may separately name the teacher as policy.)
+    if ctx.get("teacher_mention") and ctx.get("teacher_name"):
         parts.append(
-            f"Mention casually that they have {hint_int} EduHub points in "
-            "their account."
-        )
-    if book and chapter:
-        parts.append(
-            f"Mention that you'll practise English speaking together "
-            f"using \"{book}\" — chapter \"{chapter}\"."
-        )
-    elif book:
-        parts.append(
-            f"Mention the book \"{book}\" briefly and frame it as English "
-            "speaking practice."
-        )
-    if mode:
-        parts.append(f"Frame the session as a '{mode}' practice.")
-    parts.append(
-        "Then ask ONE easy opening English question (or give one short "
-        "English practice sentence) to start the speaking practice. "
-        "Remind them their speaking answers should be in English. "
-        "Do not lecture. Do not list rules. Speak now."
+            f"We are practising for {ctx['teacher_name']}'s class today.")
+    return " ".join(parts), ctx
+
+
+def _assert_greeting_fields(script: str | None, context: dict | None):
+    """Mandatory script-field assertion. Returns (ok, missing). Verifies the
+    server-built script text contains the four factual categories. Does NOT
+    claim spoken-output verification."""
+    missing: list[str] = []
+    s = script or ""
+    ctx = context or {}
+
+    label = str(ctx.get("student_label") or "")
+    if label and label not in s:
+        missing.append("student_name")
+
+    pv = ctx.get("points_value")
+    if pv is not None:
+        if str(int(pv)) not in s:
+            missing.append("points")
+    else:
+        if GREETING_POINTS_UNAVAILABLE_PHRASE not in s:
+            missing.append("points")
+
+    bl = str(ctx.get("book_label") or "")
+    if bl and bl not in s:
+        missing.append("book")
+
+    cl = str(ctx.get("chapter_label") or "")
+    if cl and cl not in s:
+        missing.append("chapter")
+
+    return (len(missing) == 0, missing)
+
+
+def _safe_fallback_greeting_script(context: dict | None) -> str:
+    """Minimal safe factual greeting used when the primary script fails the
+    field assertion. Still contains all four factual categories."""
+    ctx = context or {}
+    label = ctx.get("student_label") or "there"
+    book = ctx.get("book_label") or "your current EduHub book"
+    chapter = ctx.get("chapter_label") or "your current chapter"
+    out = (
+        f"Hi {label}! {_greeting_points_phrase(ctx.get('points_value'))}. "
+        f"Today we will practise speaking English together using {book}. "
+        f"We are on {chapter}."
     )
-    return " ".join(parts)
+    # Mirror the at-most-once teacher mention so the safe fallback still carries
+    # the single natural teacher reference when the persona is enabled.
+    if ctx.get("teacher_mention") and ctx.get("teacher_name"):
+        out += f" We are practising for {ctx['teacher_name']}'s class today."
+    return out
+
+
+async def _send_greeting_state(client_ws: WebSocket, attempt_id: str,
+                               state: str, *, reason: str | None = None) -> None:
+    """Emit one attempt-scoped greeting_state frame to the browser."""
+    frame = {
+        "type": "greeting_state",
+        "value": state,
+        "greeting_attempt_id": attempt_id,
+        "ts": _iso(),
+    }
+    if reason:
+        frame["reason"] = reason
+    await _ws_send(client_ws, frame)
+
+
+async def _persist_greeting_state(sess_col, session_id: str, state: str, *,
+                                  attempt_id: str | None = None,
+                                  reason: str | None = None,
+                                  extra: dict | None = None) -> None:
+    """Persist greeting lifecycle markers. Best-effort: a persistence failure
+    must never break the paid live session."""
+    if sess_col is None or not session_id:
+        return
+    upd: dict = {"greeting_state": state, f"greeting_state_at.{state}": _iso()}
+    if attempt_id is not None:
+        upd["greeting_attempt_id"] = attempt_id
+    if reason is not None:
+        upd["greeting_fallback_reason"] = reason
+    if extra:
+        upd.update(extra)
+    try:
+        await sess_col.update_one({"session_id": session_id}, {"$set": upd})
+    except Exception:
+        pass
+
+
+async def _emit_greeting_requested(client_ws: WebSocket, sess_col,
+                                   session_id: str, attempt_id: str) -> None:
+    """On a SUCCESSFUL kicker send: emit the authoritative
+    `greeting_state=requested` frame AND the legacy `coach_greeting_sent`
+    compatibility frame (now carrying the attempt id), and persist the
+    requested marker."""
+    await _send_greeting_state(client_ws, attempt_id, "requested")
+    # Legacy compatibility frame — the new frontend treats it only as
+    # "requested" and never arms the mic from it.
+    await _ws_send(client_ws, {
+        "type": "coach_greeting_sent",
+        "greeting_attempt_id": attempt_id,
+    })
+    await _persist_greeting_state(
+        sess_col, session_id, "requested", attempt_id=attempt_id)
+
+
+async def _emit_greeting_failed(client_ws: WebSocket, sess_col,
+                                session_id: str, attempt_id: str, *,
+                                reason: str = "kicker_send_failed") -> None:
+    """On a FAILED kicker send: emit + persist `failed`. The paid session
+    bridge MUST continue (the frontend enters a controlled fallback)."""
+    await _send_greeting_state(client_ws, attempt_id, "failed", reason=reason)
+    await _persist_greeting_state(
+        sess_col, session_id, "failed", attempt_id=attempt_id, reason=reason)
+
+
+def _greeting_completed_ack(session: dict | None) -> dict | None:
+    """Bug 6 — reconnect skip contract. Return the persisted COMPLETED greeting
+    acknowledgement for a prior attempt, or ``None``.
+
+    A greeting may be skipped on reconnect ONLY when the session carries a
+    persisted CLIENT acknowledgement proving interaction already began:
+      * ``greeting_client_ack_at.playback_complete`` (playback finished), or
+      * ``greeting_mic_armed_at`` / ``greeting_client_ack_at.mic_armed`` (mic
+        armed through the explicit arm path).
+
+    A prior ``requested`` / ``first_audio`` / ``turn_complete`` WITHOUT a client
+    acknowledgement is INCOMPLETE — it must restart with a fresh attempt id and
+    a normal greeting (handled by the caller returning ``None`` here).
+
+    Returns ``{"attempt_id": <id>, "via": "mic_armed"|"playback_complete"}``.
+    """
+    session = session or {}
+    ack_at = session.get("greeting_client_ack_at")
+    ack_at = ack_at if isinstance(ack_at, dict) else {}
+    has_mic = bool(session.get("greeting_mic_armed_at")) or bool(
+        ack_at.get("mic_armed"))
+    has_playback = bool(ack_at.get("playback_complete"))
+    if not (has_mic or has_playback):
+        return None
+    aid = str(session.get("greeting_attempt_id") or "")
+    if not aid:
+        return None
+    return {"attempt_id": aid,
+            "via": "mic_armed" if has_mic else "playback_complete"}
+
+
+async def _emit_greeting_skipped(client_ws: WebSocket, sess_col,
+                                 session_id: str, attempt_id: str, *,
+                                 reason: str = "already_completed") -> None:
+    """Bug 6 — emit + persist the explicit reconnect-skip frame. The frame
+    carries BOTH ``attempt_id`` (the addendum contract) and
+    ``greeting_attempt_id`` (existing frontend convention) with the same
+    persisted completed-attempt id so the frontend adopts the authoritative
+    id, cancels watchdogs, and arms the mic once through the skip path —
+    never via a timeout."""
+    frame = {
+        "type": "greeting_state",
+        "value": "skipped",
+        "greeting_attempt_id": attempt_id,
+        "attempt_id": attempt_id,
+        "reason": reason,
+        "ts": _iso(),
+    }
+    await _ws_send(client_ws, frame)
+    await _persist_greeting_state(
+        sess_col, session_id, "skipped", attempt_id=attempt_id, reason=reason)
+
+
+_GREETING_CLIENT_ACK_VALUES = frozenset(
+    {"playback_complete", "mic_armed", "fallback_requested"})
+
+
+async def _handle_greeting_client_ack(frame: dict, greeting_ctx: dict | None,
+                                      client_ws: WebSocket, sess_col,
+                                      session_id: str) -> None:
+    """Handle a client `greeting_client_ack` frame. Mismatched attempt ids are
+    ignored. Matching acks are persisted. A matching `fallback_requested` marks
+    the attempt cancelled (so later greeting audio is suppressed) and returns an
+    attempt-scoped `greeting_state=cancelled`. A failing ack NEVER terminates
+    the paid session.
+
+    V3 item 3 — allowlist greeting acknowledgements. The ``value`` MUST be one
+    of the three legitimate lifecycle ACKs; any other value (empty, unknown,
+    containing a Mongo path delimiter ``.``, or starting with ``$``) is
+    silently dropped BEFORE any Mongo field path is constructed. ``trigger``
+    and ``reason`` are bounded to 128 characters; ``client_ts`` is validated
+    as ISO 8601 (a malformed value is dropped — the frame is not written)."""
+    if greeting_ctx is None:
+        return
+    aid = str(frame.get("greeting_attempt_id") or "")
+    if not aid or aid != str(greeting_ctx.get("attempt_id") or ""):
+        return  # ignore mismatched attempt ids
+    value = str(frame.get("value") or "")
+    # V3 item 3 — strict allowlist BEFORE any string formatting into a Mongo
+    # field path. Empty / unknown / dotted / ``$``-prefixed values are dropped
+    # silently (no write, no cancel, no greeting-state change).
+    if value not in _GREETING_CLIENT_ACK_VALUES:
+        return
+    if "." in value or value.startswith("$"):
+        return
+    # V3 item 3 — validate client_ts as parseable ISO 8601; reject (no write)
+    # if not. ``_iso()`` is substituted only when the client omitted the field
+    # entirely.
+    client_ts_raw = frame.get("client_ts")
+    if client_ts_raw is None:
+        client_ts = _iso()
+    else:
+        try:
+            datetime.fromisoformat(str(client_ts_raw).replace("Z", "+00:00"))
+        except Exception:
+            return
+        client_ts = str(client_ts_raw)
+    # V3 item 3 — bound trigger/reason to a reasonable length. Truncate (not
+    # reject) so a long but well-formed trigger does not silently lose the
+    # whole ack.
+    extra = {f"greeting_client_ack_at.{value}": client_ts}
+    if value == "mic_armed":
+        extra["greeting_mic_armed_at"] = client_ts
+        trig = frame.get("trigger")
+        if trig:
+            extra["greeting_mic_armed_trigger"] = str(trig)[:128]
+    if value == "fallback_requested":
+        greeting_ctx["cancelled"] = True
+        reason = str(frame.get("reason") or "fallback_requested")[:128]
+        await _persist_greeting_state(
+            sess_col, session_id, "cancelled", attempt_id=aid, reason=reason,
+            extra=extra)
+        await _send_greeting_state(client_ws, aid, "cancelled", reason=reason)
+        return
+    # playback_complete / mic_armed → persist only.
+    if sess_col is not None and session_id:
+        try:
+            await sess_col.update_one(
+                {"session_id": session_id}, {"$set": extra})
+        except Exception:
+            pass
+
 
 
 def _start_response(session: dict, cfg: dict) -> dict:
@@ -2499,10 +3134,140 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
             await _ws_send(client_ws, {"type": "ready"})
             await _ws_send(client_ws, {"type": "state", "value": "listening"})
 
+            # v1.4 — make the AI coach speak FIRST. Inject a single short
+            # "user" turn that tells Gemini to greet the student warmly
+            # using the book/chapter context already in system_instruction.
+            # The kicker text itself is never spoken back to the student;
+            # it's a turn-boundary trigger that produces an audio response
+            # which flows through pump_gemini_to_client unchanged. Wrapped
+            # in a try/except so a transient kicker failure NEVER aborts a
+            # session that has already been paid for — the session simply
+            # falls back to its previous behaviour (student speaks first).
+            #
+            # Phase 0A — attempt-scoped greeting lifecycle. We allocate an
+            # unguessable greeting_attempt_id, build the FACTUAL server script
+            # (separate from the Gemini wrapper) and assert it carries the four
+            # factual categories (falling back to a minimal safe script if not).
+            # On a successful kicker send we emit `greeting_state=requested`
+            # plus the legacy compatibility frame; on failure we emit
+            # `greeting_state=failed` and CONTINUE the paid session.
+            #
+            # V3 item 5 — deterministic `ready` boundary. The greeting
+            # request/skip block runs IMMEDIATELY after `ready` /
+            # `state=listening`, BEFORE the reward-runtime check and reward
+            # context construction below. The greeting block depends only on
+            # ``session``, ``sess_col``, ``gem``, and ``client_ws`` — it does
+            # not need ``reward_ctx`` or ``reward_services`` — so this is a
+            # reorder of a self-contained block. A slow / hung reward-runtime
+            # check can therefore no longer push the greeting request past
+            # the client's 5-second request watchdog and trigger a spurious
+            # ``request_timeout`` fallback.
+            greeting_attempt_id = _make_greeting_attempt_id()
+            greeting_ctx = {
+                "attempt_id": greeting_attempt_id,
+                "first_audio_seen": False,
+                "turn_complete": False,
+                "cancelled": False,
+            }
+            # ── Bug 6 — reconnect skip contract. If THIS session already has a
+            # persisted CLIENT acknowledgement that interaction began
+            # (mic_armed / playback_complete), the greeting was completed on a
+            # prior connection. Skip replay: adopt the persisted attempt id,
+            # mark the local greeting boundary already complete (so no greeting
+            # audio/turn handling or duplicate kicker runs and the first real
+            # turn drives rewards unchanged), and emit the explicit skipped
+            # frame. NEVER send a new kicker or `requested`.
+            #
+            # V3 item 4 — fresh reconnect completion read. Immediately before
+            # the skip decision, read the four authoritative fields from
+            # ``sess_col`` so an ack persisted by the client AFTER bridge
+            # entry but BEFORE this decision runs is observed. The read
+            # follows this file's existing dominant pattern (``find_one``
+            # with no projection argument). On any exception / timeout /
+            # ``None`` return we fail soft to the original ``session``
+            # snapshot — never block or fail the connection.
+            try:
+                _fresh = await sess_col.find_one(
+                    {"session_id": session_id})
+                if _fresh:
+                    _ack_at = _fresh.get("greeting_client_ack_at")
+                    _fresh_for_ack = {
+                        "greeting_client_ack_at": (
+                            _ack_at if isinstance(_ack_at, dict) else {}),
+                        "greeting_mic_armed_at":
+                            _fresh.get("greeting_mic_armed_at"),
+                        "greeting_attempt_id":
+                            _fresh.get("greeting_attempt_id"),
+                    }
+                else:
+                    _fresh_for_ack = session
+            except Exception:
+                _fresh_for_ack = session
+            completed_ack = _greeting_completed_ack(_fresh_for_ack)
+            if completed_ack is not None:
+                greeting_attempt_id = completed_ack["attempt_id"]
+                greeting_ctx["attempt_id"] = greeting_attempt_id
+                greeting_ctx["turn_complete"] = True
+                greeting_ctx["cancelled"] = True
+                try:
+                    await _emit_greeting_skipped(
+                        client_ws, sess_col, session_id, greeting_attempt_id,
+                        reason="already_completed")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    payload, g_script, _g_ctx = (
+                        _build_validated_greeting_payload(session))
+                    await sess_col.update_one(
+                        {"session_id": session_id},
+                        {"$set": {"greeting_script": g_script,
+                                  "greeting_attempt_id": greeting_attempt_id}})
+                except Exception as exc:  # noqa: BLE001
+                    payload = None
+                    log.warning(
+                        "live: greeting script build failed sid=%s exc=%s",
+                        session_id, exc)
+
+                kicker_sent = False
+                try:
+                    if payload is None:
+                        # Defensive: build a minimal valid payload so the
+                        # validated script still reaches gem.send exactly once.
+                        payload = {
+                            "clientContent": {
+                                "turns": [{"role": "user", "parts": [{
+                                    "text": _build_greeting_kicker(session)}]}],
+                                "turnComplete": True,
+                            }
+                        }
+                    await gem.send(json.dumps(payload))
+                    kicker_sent = True
+                except Exception:
+                    # Greeting is a polish layer, not a correctness gate.
+                    kicker_sent = False
+                try:
+                    if kicker_sent:
+                        await _emit_greeting_requested(
+                            client_ws, sess_col, session_id,
+                            greeting_attempt_id)
+                    else:
+                        await _emit_greeting_failed(
+                            client_ws, sess_col, session_id,
+                            greeting_attempt_id, reason="kicker_send_failed")
+                except Exception:
+                    pass
+
             # ── Phase 1 corrected: gate reward wiring on the authoritative
             # runtime-active check. When the master rewards feature is OFF
             # (or indexes failed at startup) NO reward hook is installed —
             # the bridge behaves exactly like the pristine implementation.
+            #
+            # V3 item 5 — Surprise Rewards initialization runs unchanged in
+            # behaviour and arguments, only LATER in execution order (after
+            # the greeting block above). The ``coach_reward_runtime_active``
+            # check, ``RewardSessionCtx`` construction, and
+            # ``register_live_reward_ctx`` call are byte-identical.
             if reward_services is not None:
                 try:
                     runtime_active = await reward_services[
@@ -2563,31 +3328,6 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                 except Exception:
                     reward_ctx = None
 
-            # v1.4 — make the AI coach speak FIRST. Inject a single short
-            # "user" turn that tells Gemini to greet the student warmly
-            # using the book/chapter context already in system_instruction.
-            # The kicker text itself is never spoken back to the student;
-            # it's a turn-boundary trigger that produces an audio response
-            # which flows through pump_gemini_to_client unchanged. Wrapped
-            # in a try/except so a transient kicker failure NEVER aborts a
-            # session that has already been paid for — the session simply
-            # falls back to its previous behaviour (student speaks first).
-            try:
-                kicker = _build_greeting_kicker(session)
-                await gem.send(json.dumps({
-                    "clientContent": {
-                        "turns": [{
-                            "role": "user",
-                            "parts": [{"text": kicker}],
-                        }],
-                        "turnComplete": True,
-                    }
-                }))
-                await _ws_send(client_ws, {"type": "coach_greeting_sent"})
-            except Exception:
-                # Greeting is a polish layer, not a correctness gate.
-                pass
-
             # Tracks WHY/HOW the session ended so finalization can choose the
             # correct outcome (completed vs cancelled vs failed) instead of
             # always assuming "completed". Mutated by whichever pump returns.
@@ -2618,6 +3358,20 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                     except Exception:
                         continue
                     ftype = frame.get("type")
+                    if ftype == "greeting_client_ack":
+                        # Phase 0A — greeting lifecycle acknowledgements. Handled
+                        # BEFORE any forwarding so a control frame can never be
+                        # relayed to Gemini. Mismatched attempt ids are ignored;
+                        # a matching fallback marks the attempt cancelled and
+                        # returns greeting_state=cancelled. NEVER ends the paid
+                        # session.
+                        try:
+                            await _handle_greeting_client_ack(
+                                frame, greeting_ctx, client_ws, sess_col,
+                                session_id)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("greeting: client ack failed: %s", exc)
+                        continue
                     if ftype == "audio":
                         await gem.send(json.dumps({
                             "realtimeInput": {
@@ -2707,7 +3461,10 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                         msg, client_ws, transcript,
                         reward_ctx=reward_ctx,
                         reward_services=reward_services,
-                        session=session)
+                        session=session,
+                        greeting_ctx=greeting_ctx,
+                        sess_col=sess_col,
+                        session_id=session_id)
 
             done, pending = await asyncio.wait(
                 {asyncio.create_task(pump_client_to_gemini()),
@@ -2765,7 +3522,10 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
 async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
                                  transcript: list[dict],
                                  *, reward_ctx=None, reward_services=None,
-                                 session: dict | None = None) -> None:
+                                 session: dict | None = None,
+                                 greeting_ctx: dict | None = None,
+                                 sess_col=None,
+                                 session_id: str | None = None) -> None:
     """Translate a Gemini Live server message into client frames + transcript.
 
     Phase 1 corrected SURPRISE REWARDS: coach output is NEVER modified.
@@ -2817,18 +3577,39 @@ async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
                                    "text": out_tx["text"]})
         _buffer_coach(out_tx["text"])
 
+    # Resolve the session id for greeting persistence (works without it too).
+    _sid = session_id or (session.get("session_id") if session else "") or ""
+    _greeting_active = (
+        greeting_ctx is not None and not greeting_ctx.get("turn_complete"))
+
     model_turn = server_content.get("modelTurn")
     if model_turn:
         await _ws_send(client_ws, {"type": "state", "value": "speaking"})
         for part in model_turn.get("parts", []):
             inline = part.get("inlineData")
             if inline and inline.get("data"):
-                # Forward Gemini's 24 kHz PCM audio straight to the browser.
-                await _ws_send(client_ws, {
+                # Phase 0A — while a greeting attempt is pending, suppress audio
+                # if the attempt was cancelled (controlled fallback) so late
+                # greeting audio never plays over the armed mic.
+                if _greeting_active and greeting_ctx.get("cancelled"):
+                    continue
+                audio_frame = {
                     "type": "audio",
                     "data": inline["data"],
                     "mimeType": inline.get("mimeType", "audio/pcm;rate=24000"),
-                })
+                }
+                # Tag greeting audio with the attempt id and emit `first_audio`
+                # exactly once for the attempt.
+                if _greeting_active:
+                    aid = greeting_ctx.get("attempt_id")
+                    audio_frame["greeting_attempt_id"] = aid
+                    if not greeting_ctx.get("first_audio_seen"):
+                        greeting_ctx["first_audio_seen"] = True
+                        await _send_greeting_state(client_ws, aid, "first_audio")
+                        await _persist_greeting_state(
+                            sess_col, _sid, "first_audio", attempt_id=aid)
+                # Forward Gemini's 24 kHz PCM audio straight to the browser.
+                await _ws_send(client_ws, audio_frame)
             txt = part.get("text")
             if txt:
                 transcript.append({"role": "coach", "text": txt,
@@ -2840,6 +3621,19 @@ async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
     if server_content.get("turnComplete"):
         await _ws_send(client_ws, {"type": "turn_complete"})
         await _ws_send(client_ws, {"type": "state", "value": "listening"})
+        # ── Phase 0A — greeting turn boundary. The FIRST turn completion while
+        # a greeting attempt is pending is the greeting turn. We emit a PARALLEL
+        # attempt-scoped greeting_state=turn_complete (in addition to the generic
+        # frame above, which stays for legacy compatibility) and must NOT run the
+        # Surprise Reward hooks for this greeting turn.
+        if greeting_ctx is not None and not greeting_ctx.get("turn_complete"):
+            greeting_ctx["turn_complete"] = True
+            if not greeting_ctx.get("cancelled"):
+                aid = greeting_ctx.get("attempt_id")
+                await _send_greeting_state(client_ws, aid, "turn_complete")
+                await _persist_greeting_state(
+                    sess_col, _sid, "turn_complete", attempt_id=aid)
+            return  # greeting turn never registers/evaluates a reward exercise
         # ── Phase 1 corrected reward hooks. The bridge ONLY calls these
         # when ``reward_services`` is wired AND the runtime-active gate
         # passed at session start.

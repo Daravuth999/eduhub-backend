@@ -43,6 +43,10 @@ from edutalk_live_tools import (
     EndSessionRequest,
     TOPUP_NUDGE_WINDOW_SECONDS,
     _TOPUP_NUDGE_INSTRUCTION_LINE,
+    TopupVisibilityRequest,
+    NUDGE_DIAGNOSTIC_REASONS,
+    NUDGE_BALANCE_SOURCES,
+    MAX_VISIBILITY_DECISIONS,
 )
 from datetime import datetime, timedelta, timezone
 import time
@@ -148,6 +152,21 @@ class _Coll:
         if "$unset" in up:
             for k in up["$unset"].keys():
                 doc.pop(k, None)
+        if "$push" in up:
+            # Phase 0B — support $push with optional $each/$slice (used by the
+            # bounded visibility_decisions array). Minimal but faithful.
+            for k, spec in up["$push"].items():
+                arr = doc.get(k)
+                if not isinstance(arr, list):
+                    arr = []
+                if isinstance(spec, dict) and "$each" in spec:
+                    arr = arr + list(spec["$each"])
+                    slc = spec.get("$slice")
+                    if isinstance(slc, int):
+                        arr = arr[slc:] if slc < 0 else arr[:slc]
+                else:
+                    arr = arr + [spec]
+                doc[k] = arr
         return doc
 
     async def find_one(self, q, p=None):
@@ -979,3 +998,159 @@ def test_stage3_unmocked_real_wallet_settled_balance(monkeypatch):
         ("GET", "/student/edutalk-live/topup-nudge/{session_id}")]
     out = run(nudge_ep(sid, student=_Student()))
     assert out["finalization"]["settled_balance"] == 12
+
+
+
+# --------------------------------------------------------------------------- #
+# Phase 0B — normalized Top-Up diagnostics (additive; legacy reasons kept).    #
+# --------------------------------------------------------------------------- #
+def test_preview_adds_diagnostic_reason_and_balance_source():
+    # flag OFF → degraded; client snapshot required.
+    off = _topup_preview_for_mode(
+        enabled=True, flag_on=False, balance=None, mode_cost=15,
+        threshold=15, weekly_cap_available=True)
+    assert off["reason"] == "balance_unavailable_for_preview"  # legacy unchanged
+    assert off["diagnostic_reason"] == "balance_temporarily_unavailable"
+    assert off["balance_source"] == "client_display_snapshot_required"
+
+    # flag ON, eligible → mongo_wallet + eligible.
+    elig = _topup_preview_for_mode(
+        enabled=True, flag_on=True, balance=20, mode_cost=15,
+        threshold=15, weekly_cap_available=True)
+    assert elig["eligible"] is True
+    assert elig["reason"] == "projected_balance_at_or_below_threshold"  # legacy
+    assert elig["diagnostic_reason"] == "eligible"
+    assert elig["balance_source"] == "mongo_wallet"
+
+    # flag ON, wallet missing → mongo_wallet_unavailable.
+    miss = _topup_preview_for_mode(
+        enabled=True, flag_on=True, balance=None, mode_cost=15,
+        threshold=15, weekly_cap_available=True)
+    assert miss["reason"] == "wallet_unavailable"
+    assert miss["diagnostic_reason"] == "balance_temporarily_unavailable"
+    assert miss["balance_source"] == "mongo_wallet_unavailable"
+
+
+def test_preview_fails_closed_on_cap_even_when_balance_low():
+    # Projected balance is low (would be eligible on balance) BUT the weekly
+    # cap is exhausted → Bug 3 (v2): the legacy ``eligible`` MUST now fail
+    # closed (was incorrectly True in v1) AND diagnostic_reason fails closed so
+    # the pill is suppressed. Preview visibility only — cap consumption timing
+    # and atomic locking are untouched.
+    #
+    # V3 item 6 — the legacy ``reason`` MUST keep its pristine-241 value (one
+    # of the six legacy values, derived from projected/threshold alone). The
+    # cap-blocked signal lives in ``diagnostic_reason`` + ``eligible``, never
+    # in ``reason``. balance=10, mode_cost=15 → projected=-5; threshold=15 →
+    # projected<=threshold → legacy reason is
+    # ``projected_balance_at_or_below_threshold``.
+    p = _topup_preview_for_mode(
+        enabled=True, flag_on=True, balance=10, mode_cost=15,
+        threshold=15, weekly_cap_available=False, cap_reason="weekly_cap_reached")
+    assert p["eligible"] is False                      # Bug 3 — fails closed
+    assert p["diagnostic_reason"] == "weekly_cap_reached"
+    assert p["reason"] == "projected_balance_at_or_below_threshold"
+    cap_off = _topup_preview_for_mode(
+        enabled=True, flag_on=True, balance=10, mode_cost=15,
+        threshold=15, weekly_cap_available=False, cap_reason="cap_disabled")
+    assert cap_off["eligible"] is False                # Bug 3 — fails closed
+    assert cap_off["diagnostic_reason"] == "cap_disabled"
+    assert cap_off["reason"] == "projected_balance_at_or_below_threshold"
+    # Sanity: when the cap is AVAILABLE and the balance is low the nudge is
+    # still eligible (no regression to the happy path).
+    ok = _topup_preview_for_mode(
+        enabled=True, flag_on=True, balance=10, mode_cost=15,
+        threshold=15, weekly_cap_available=True)
+    assert ok["eligible"] is True
+    assert ok["diagnostic_reason"] == "eligible"
+
+
+def test_all_preview_diagnostics_in_allowlist():
+    samples = [
+        _topup_preview_for_mode(enabled=False, flag_on=True, balance=1,
+                                mode_cost=1, threshold=1, weekly_cap_available=True),
+        _topup_preview_for_mode(enabled=True, flag_on=True, balance=1,
+                                mode_cost=1, threshold=-1, weekly_cap_available=True),
+        _topup_preview_for_mode(enabled=True, flag_on=False, balance=None,
+                                mode_cost=1, threshold=1, weekly_cap_available=True),
+        _topup_preview_for_mode(enabled=True, flag_on=True, balance=None,
+                                mode_cost=1, threshold=1, weekly_cap_available=True),
+        _topup_preview_for_mode(enabled=True, flag_on=True, balance=100,
+                                mode_cost=1, threshold=1, weekly_cap_available=True),
+    ]
+    for s in samples:
+        assert s["diagnostic_reason"] in NUDGE_DIAGNOSTIC_REASONS
+        assert s["balance_source"] in NUDGE_BALANCE_SOURCES
+
+
+# --------------------------------------------------------------------------- #
+# Phase 0B — visibility endpoint: bounded, diagnostics-only, allowlisted.      #
+# (§D backend topup tests 7, 8, 9 + no cap_slot_consumed field.)              #
+# --------------------------------------------------------------------------- #
+def test_visibility_model_rejects_invalid_reason_and_source():
+    with pytest.raises(Exception):
+        TopupVisibilityRequest(
+            phase="start", pill_shown=True, reason="HACKED",
+            balance_source="mongo_wallet", client_event_id="e1")
+    with pytest.raises(Exception):
+        TopupVisibilityRequest(
+            phase="start", pill_shown=True, reason="eligible",
+            balance_source="not_a_source", client_event_id="e1")
+    with pytest.raises(Exception):
+        TopupVisibilityRequest(
+            phase="weird", pill_shown=True, reason="eligible",
+            balance_source="mongo_wallet", client_event_id="e1")
+
+
+def test_visibility_endpoint_appends_without_changing_authorizations(monkeypatch):
+    db, router = _build_routes(monkeypatch, threshold=15, cap=3, mode_cost=15)
+    # Seed an existing nudge-log doc WITH an authorization slot.
+    run(db[elt.TOPUP_NUDGE_LOG_COLLECTION].insert_one({
+        "clean_id": "alice",
+        "authorizations": [{
+            "event_key": "alice-prior", "clean_id": "alice",
+            "session_id": "prior", "authorization_source": "voice_pre_session",
+            "authorized_at": _now().isoformat()}],
+        "nudge_lock_state": "idle",
+    }))
+    vis = router.routes[("POST", "/student/edutalk-live/topup-nudge/visibility")]
+    out = run(vis(TopupVisibilityRequest(
+        phase="start", session_id="s1", mode="book_shadow", pill_shown=True,
+        reason="eligible", balance_source="mongo_wallet",
+        client_event_id="evt-1"), student=_Student()))
+    assert out["recorded"] is True
+    doc = run(db[elt.TOPUP_NUDGE_LOG_COLLECTION].find_one({"clean_id": "alice"}))
+    # Authorizations are untouched (no cap effect).
+    assert len(doc["authorizations"]) == 1
+    # One bounded visibility row appended with the exact event_type.
+    vd = doc["visibility_decisions"]
+    assert len(vd) == 1
+    assert vd[0]["event_type"] == "pill_visibility_decision"
+    assert vd[0]["reason"] == "eligible"
+    assert vd[0]["pill_shown"] is True
+    assert vd[0]["client_reported"] is True
+    # The cap-claim ledger gained no "cap_slot_consumed" field anywhere.
+    assert "cap_slot_consumed" not in doc
+    assert all("cap_slot_consumed" not in a for a in doc["authorizations"])
+
+
+def test_visibility_endpoint_keeps_only_newest_100(monkeypatch):
+    db, router = _build_routes(monkeypatch)
+    vis = router.routes[("POST", "/student/edutalk-live/topup-nudge/visibility")]
+    for i in range(MAX_VISIBILITY_DECISIONS + 7):
+        run(vis(TopupVisibilityRequest(
+            phase="report", pill_shown=bool(i % 2), reason="pending",
+            balance_source="unavailable", client_event_id=f"evt-{i}"),
+            student=_Student()))
+    doc = run(db[elt.TOPUP_NUDGE_LOG_COLLECTION].find_one({"clean_id": "alice"}))
+    vd = doc["visibility_decisions"]
+    assert len(vd) == MAX_VISIBILITY_DECISIONS
+    # Newest retained; oldest dropped.
+    assert vd[-1]["client_event_id"] == f"evt-{MAX_VISIBILITY_DECISIONS + 6}"
+    assert vd[0]["client_event_id"] == "evt-7"
+
+
+def test_no_cap_slot_consumed_field_in_module_or_claim(monkeypatch):
+    import inspect
+    src = inspect.getsource(elt._consume_topup_nudge_slot)
+    assert "cap_slot_consumed" not in src
