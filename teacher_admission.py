@@ -163,6 +163,10 @@ class TeacherAdmitRequest(BaseModel):
     verification_method: str = Field(..., min_length=1, max_length=64)
     teacher_explanation: str = Field(..., min_length=1, max_length=1024)
     teacher_confirmed: bool
+    # v4 (FIX 5): explicit human-authorized external-verification override for
+    # empty-group admission when automatic authoritative ledger verification is
+    # unavailable. Defaults False (no override).
+    confirm_external_verification: bool = False
 
     @field_validator(
         "student_id", "transfer_reference", "transfer_datetime",
@@ -343,6 +347,7 @@ def register_teacher_admission_routes(
     norm_student_id: Callable[[Any], str],
     generate_and_publish_lucky_code: Callable[..., Awaitable[Optional[dict]]],
     log: Optional[logging.Logger] = None,
+    verify_pool_payment: Optional[Callable[..., Awaitable[Optional[dict]]]] = None,
 ) -> None:
     L = log or logger
 
@@ -445,22 +450,155 @@ def register_teacher_admission_routes(
         )
         display_name_key = display_name.lower()
 
-        # ── 4. Enrollment policy — FAIL CLOSED (Correction 8) ──────────────
+        # ── 4. Enrollment policy ───────────────────────────────────────────
+        # Default: FAIL CLOSED. v4 (FIX 5) replaces the v3 push_credit_log
+        # heuristic with SESSION-BOUND authoritative provider verification and
+        # binds the authorization to the verified transfer reference (which
+        # becomes the admission's unique reference, so one authoritative
+        # transfer cannot admit into two sessions). When authoritative ledger
+        # verification is unavailable, admission fails closed unless a human
+        # operator supplies an explicit, audited external-verification override.
         session_schedule = (sess.get("schedule") or "").strip().upper()
         student_schedule = (
             (student_doc.get("group") or student_doc.get("schedule") or "")
             .strip()
             .upper()
         )
+        session_treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        enrollment_override: Optional[dict] = None
         if session_schedule:
             if not student_schedule:
-                raise HTTPException(
-                    403,
-                    {"detail": "student_enrollment_unverified",
-                     "reason": "session requires a schedule/group but the "
-                               "student has no verifiable enrollment metadata."},
-                )
-            if session_schedule != student_schedule:
+                # Same-session supporting records (necessary but NOT sufficient).
+                code_doc = await db[COLLECTION_CODES].find_one(
+                    {"session_id": session_id,
+                     "student_id": canonical_student_id},
+                    {"_id": 0, "code": 1})
+                entry_doc = await SL_ENTRIES.find_one(
+                    {"session_id": session_id,
+                     "student_id": canonical_student_id},
+                    {"_id": 0, "student_id": 1})
+
+                if body.confirm_external_verification:
+                    # ── Human-authorized, audited override (NOT automated
+                    # payment verification). Requires reason + an explicit
+                    # verified transfer reference, which becomes the unique
+                    # admission reference.
+                    if not (body.teacher_explanation or "").strip():
+                        raise HTTPException(422, "External-verification "
+                                            "override requires a reason.")
+                    if not normalized_ref:
+                        raise HTTPException(422, "External-verification "
+                                            "override requires a verified "
+                                            "transfer reference.")
+                    # v5.1 (FIX 1): same-session evidence is a HARD
+                    # requirement for the human-authorized override too.
+                    # Without a same-session pool entry AND a same-session
+                    # lucky code, the operator cannot demonstrate that this
+                    # student participated in THIS session — the override
+                    # would otherwise admit a stranger.
+                    if not entry_doc:
+                        raise HTTPException(
+                            403,
+                            {"detail": "student_enrollment_unverified",
+                             "reason": "human-authorized override requires "
+                                       "a same-session pool entry; none "
+                                       "found for this student."})
+                    if not (code_doc and code_doc.get("code")):
+                        raise HTTPException(
+                            403,
+                            {"detail": "student_enrollment_unverified",
+                             "reason": "human-authorized override requires "
+                                       "a same-session lucky code; none "
+                                       "found for this student."})
+                    enrollment_override = {
+                        "enrollment_override":           True,
+                        "enrollment_override_basis":     "human_authorized_external_verification",
+                        "human_authorized_override":     True,
+                        "student_group_at_admission":    "",
+                        "session_schedule_at_admission": session_schedule,
+                        "session_treasury_at_admission": session_treasury_id,
+                        "verified_transfer_reference":   normalized_ref,
+                        "override_reason":               body.teacher_explanation,
+                        "authenticated_teacher":         (getattr(admin, "email", None)
+                                                          or getattr(admin, "user_id", None)
+                                                          or "unknown_admin"),
+                        "override_timestamp":            utcnow().isoformat(),
+                        # v5.1 (FIX 1): record the same-session evidence
+                        # consulted for the override (audit trail).
+                        "same_session_entry_present":    True,
+                        "same_session_lucky_code":       code_doc.get("code"),
+                    }
+                    L.warning(
+                        "teacher_admit HUMAN-AUTHORIZED enrollment override: "
+                        "student=%s session=%s ref=%s teacher=%s code=%s",
+                        canonical_student_id, session_id, normalized_ref,
+                        enrollment_override["authenticated_teacher"],
+                        code_doc.get("code"))
+                else:
+                    if verify_pool_payment is None:
+                        raise HTTPException(
+                            403,
+                            {"detail": "authoritative_payment_verification_unavailable",
+                             "reason": "automatic authoritative ledger "
+                                       "verification is not configured; use an "
+                                       "audited external-verification override."})
+                    if not (code_doc and code_doc.get("code")) or not entry_doc:
+                        raise HTTPException(
+                            403,
+                            {"detail": "student_enrollment_unverified",
+                             "reason": "missing same-session pool entry / lucky "
+                                       "code supporting records."})
+                    try:
+                        evidence = await verify_pool_payment(
+                            canonical_student_id=canonical_student_id,
+                            session_id=session_id,
+                            entry_fee=entry_fee,
+                            session_treasury_id=session_treasury_id,
+                        )
+                    except Exception as _vexc:  # noqa: BLE001
+                        L.warning("teacher_admit: verify_pool_payment error: %s",
+                                  str(_vexc)[:200])
+                        evidence = {"unavailable": True}
+                    if isinstance(evidence, dict) and evidence.get("unavailable"):
+                        raise HTTPException(
+                            403,
+                            {"detail": "authoritative_payment_verification_unavailable",
+                             "reason": "authoritative ledger verification could "
+                                       "not be performed; failing closed."})
+                    if not evidence:
+                        raise HTTPException(
+                            403,
+                            {"detail": "student_enrollment_unverified",
+                             "reason": "no authoritative session-bound payment "
+                                       "evidence was found for this student."})
+                    verified_ref = (evidence.get("verified_transfer_reference")
+                                    or "").strip()
+                    if not verified_ref:
+                        raise HTTPException(
+                            403,
+                            {"detail": "student_enrollment_unverified",
+                             "reason": "authoritative evidence missing a "
+                                       "transfer reference."})
+                    # Bind authorization + dedup to the VERIFIED reference.
+                    normalized_ref = normalize_reference(verified_ref)
+                    enrollment_override = {
+                        "enrollment_override":           True,
+                        "enrollment_override_basis":     "authoritative_session_bound_verification",
+                        "student_group_at_admission":    "",
+                        "session_schedule_at_admission": session_schedule,
+                        "session_treasury_at_admission": session_treasury_id,
+                        "verified_transfer_reference":   verified_ref,
+                        "verified_amount":               evidence.get("verified_amount"),
+                        "verified_sender_id":            evidence.get("verified_sender_id"),
+                        "verified_recipient_id":         evidence.get("verified_recipient_id"),
+                        "override_timestamp":            utcnow().isoformat(),
+                    }
+                    L.info(
+                        "teacher_admit enrollment_gap_override (authoritative): "
+                        "student=%s session=%s treasury=%s transfer=%s amount=%s",
+                        canonical_student_id, session_id, session_treasury_id,
+                        verified_ref, evidence.get("verified_amount"))
+            elif session_schedule != student_schedule:
                 raise HTTPException(
                     403,
                     f"Student schedule '{student_schedule}' does not match "
@@ -474,7 +612,7 @@ def register_teacher_admission_routes(
                 L, sess, session_id, entry_fee,
                 body, normalized_ref, transfer_time_iso,
                 canonical_student_id, display_name, display_name_key,
-                admin,
+                admin, enrollment_override,
             )
 
 
@@ -486,6 +624,7 @@ async def _admit_serialised(
     sess, session_id, entry_fee,
     body, normalized_ref, transfer_time_iso,
     canonical_student_id, display_name, display_name_key, admin,
+    enrollment_override=None,
 ) -> TeacherAdmitResponse:
 
     teacher_identity = (
@@ -552,6 +691,10 @@ async def _admit_serialised(
             "linked_synthetic_entry":        False,
             "linked_from_synthetic_id":      None,
         }
+        if enrollment_override:
+            # FIX 1: persist authoritative empty-group recovery audit fields.
+            audit_doc.update(enrollment_override)
+            audit_doc["authenticated_teacher"] = teacher_identity
         try:
             await db[COLLECTION_ADMISSIONS].insert_one(audit_doc)
         except Exception as exc:  # noqa: BLE001

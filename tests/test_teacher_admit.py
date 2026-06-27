@@ -241,7 +241,7 @@ async def _fake_generate_and_publish(db, sl_publish, session_id, student_id,
 URL = "/api/speaking-lab/sessions/{sid}/teacher-admit"
 
 
-def _make_app(db, code_helper=None, set_index_ok=True):
+def _make_app(db, code_helper=None, set_index_ok=True, verify_pool_payment=None):
     api = APIRouter(prefix="/api")
     PUBLISHED.clear()
     _CODE_COUNTER["n"] = 0
@@ -263,6 +263,7 @@ def _make_app(db, code_helper=None, set_index_ok=True):
         require_admin_dep=_require_admin,
         norm_student_id=_norm_student_id,
         generate_and_publish_lucky_code=helper,
+        verify_pool_payment=verify_pool_payment,
     )
     app = FastAPI()
     app.include_router(api)
@@ -525,20 +526,48 @@ def test_39_sse_event_shapes(db, client):
 
 
 def test_40_protected_lucky_draw_unchanged():
+    """v3: focused, AST-based protection of the Lucky Draw CORE logic.
+
+    The fragile whole-file SHA test was REPLACED (per the v3 mandate) with a
+    region-level guard. We extract the exact source of the protected functions
+    via `ast` and compare against frozen baseline hashes captured from the
+    original eduhub-backend-master source. Edits elsewhere in lucky_draw.py
+    (the additive v3 payout state machine) do NOT trip this test; any change to
+    the protected regions WILL.
+    """
+    import ast as _ast
+
+    PROTECTED = ("_weighted_pick", "_normalize_split", "_run_draw")
+    BASELINE = {
+        "_weighted_pick":
+            "871c5ad4d2cc3d721ed309e8dc2930e55053fdd9ac53d5a2a3fb815d6ccd461a",
+        "_normalize_split":
+            "077c2583249d28118a489a47ad00fa669f14375e8db6b7a153837bff6fa9a359",
+        "_run_draw":
+            "65ecec65bcd07a0fad9023e8b3b91f73a801c6ec551e93d63b989ef164825aac",
+    }
     p = pathlib.Path(__file__).resolve().parent.parent / "lucky_draw.py"
-    data = p.read_bytes()
-    sha = hashlib.sha256(data).hexdigest()
-    assert sha == \
-        "207c74df7a94f5ed3ad9d0761c6846d6ee38e619144d23cfa94861816471935c", \
-        f"lucky_draw.py drift: {sha}"
-    src = data.decode("utf-8")
+    source = p.read_text(encoding="utf-8")
+    tree = _ast.parse(source)
+    found = {}
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) \
+                and node.name in PROTECTED:
+            seg = _ast.get_source_segment(source, node)
+            found[node.name] = hashlib.sha256(seg.encode("utf-8")).hexdigest()
+    for name in PROTECTED:
+        assert name in found, f"protected region missing: {name}"
+        assert found[name] == BASELINE[name], (
+            f"PROTECTED REGION CHANGED: {name} "
+            f"(got {found[name]}, expected {BASELINE[name]})")
+    # The full payout/route surface must still be present.
     for sig in ("async def generate_and_publish_lucky_code",
                 "async def _run_draw",
                 "async def _finalize_draw",
                 "async def _gas_send_points",
                 "def _weighted_pick",
                 "def register_lucky_draw_routes"):
-        assert sig in src
+        assert sig in source
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -935,7 +964,10 @@ def test_c8_missing_enrollment_blocked(db, client):
     _seed_student_sync(db, group="")  # no enrollment metadata
     r = client.post(URL.format(sid="sl_test_1"), json=_body())
     assert r.status_code == 403
-    assert "enrollment" in r.text.lower()
+    # v4: empty-group fails closed; with no authoritative verifier wired the
+    # specific reason is authoritative_payment_verification_unavailable.
+    assert ("enrollment" in r.text.lower()
+            or "unavailable" in r.text.lower())
 
 
 def test_c8_session_without_schedule_accepts_active_student(db, client):
@@ -960,3 +992,339 @@ def test_c9_response_carries_participant(db, client):
     assert p["display_name"] == "Alice"
     assert p["name"] == "Alice"
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FIX 5 (v4) — SESSION-BOUND authoritative empty-group admission
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Empty-group admission requires (a) same-session pool entry + lucky code as
+# supporting records AND (b) an AUTHORITATIVE, session-bound payment verifier
+# (bound to session_id + the SESSION treasury + entry_fee + canonical student).
+# The verified transfer reference becomes the admission's UNIQUE reference, so
+# one authoritative transfer cannot admit into two sessions. When no
+# authoritative verifier is wired, admission fails closed
+# (authoritative_payment_verification_unavailable) unless an explicit, audited
+# human override is supplied.
+
+_TREASURY = "stu092"
+
+
+def _make_authoritative_verifier(ledger):
+    """A fake AUTHORITATIVE, session-bound verifier. `ledger` is a list of
+    dicts: {sender, recipient(treasury), amount, ref, session_window=True}."""
+    async def _verify(*, canonical_student_id, session_id, entry_fee,
+                      session_treasury_id=""):
+        sender = _norm_student_id(canonical_student_id)
+        treasury = _norm_student_id(session_treasury_id or _TREASURY)
+        if not sender or not treasury or sender == treasury:
+            return None
+        for r in ledger:
+            if _norm_student_id(r.get("recipient") or "") != treasury:
+                continue
+            if _norm_student_id(r.get("sender") or "") != sender:
+                continue
+            if int(r.get("amount") or 0) < int(entry_fee or 0):
+                continue
+            ref = (r.get("ref") or "").strip()
+            if not ref:
+                continue
+            return {"verified_transfer_reference": ref,
+                    "verified_amount": int(r.get("amount") or 0),
+                    "verified_sender_id": sender,
+                    "verified_recipient_id": treasury}
+        return None
+    return _verify
+
+
+def _seed_lucky_code(db, *, session_id="sl_test_1", student_id="stu100",
+                     code="WORD-9999", fee=10):
+    _run(db["speaking_lab_lucky_codes"].insert_one({
+        "session_id": session_id, "student_id": student_id,
+        "display_name": "Alice", "code": code, "entry_fee": fee}))
+
+
+def _seed_entry(db, *, session_id="sl_test_1", student_id="stu100"):
+    _run(db["speaking_lab_entries"].insert_one({
+        "session_id": session_id, "student_id": student_id,
+        "display_name": "Alice", "display_name_key": "alice"}))
+
+
+def _seed_support(db, *, session_id="sl_test_1", student_id="stu100", fee=10):
+    _seed_lucky_code(db, session_id=session_id, student_id=student_id, fee=fee)
+    _seed_entry(db, session_id=session_id, student_id=student_id)
+
+
+def _app_auth(db, ledger):
+    return TestClient(_make_app(
+        db, verify_pool_payment=_make_authoritative_verifier(ledger)))
+
+
+def test_fix5_valid_authoritative_admission_succeeds(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-REF-1"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_test_1"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 200, r.text
+    audit = _run(db["speaking_lab_teacher_admissions"].find_one(
+        {"student_id": "stu100"}))
+    assert audit["enrollment_override_basis"] == \
+        "authoritative_session_bound_verification"
+    # FIX 5: verified reference is the unique admission reference.
+    assert audit["normalized_transfer_reference"] == \
+        ta.normalize_reference("GAS-REF-1")
+    assert audit["verified_transfer_reference"] == "GAS-REF-1"
+
+
+def test_fix5_one_transfer_cannot_admit_two_sessions(db):
+    # Two different sessions, same authoritative transfer reference.
+    _seed_session_sync(db, sid="sl_A", schedule="A", fee=10)
+    _seed_session_sync(db, sid="sl_B", schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db, session_id="sl_A")
+    _seed_support(db, session_id="sl_B")
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-REF-DUP"}]
+    client = _app_auth(db, ledger)
+    r1 = client.post(URL.format(sid="sl_A"), json=_body(student_id="stu100"))
+    assert r1.status_code == 200, r1.text
+    r2 = client.post(URL.format(sid="sl_B"), json=_body(student_id="stu100"))
+    # Second session reuses the same verified reference → rejected (409/422/403).
+    assert r2.status_code in (403, 409, 422), r2.text
+
+
+def test_fix5_verifier_uses_session_treasury(db):
+    # Session treasury differs; ledger only credits the SESSION treasury.
+    _run(db["speaking_lab_sessions"].insert_one({
+        "session_id": "sl_T", "schedule": "A", "entry_fee": 10,
+        "status": "waiting", "treasury_id": "stuTREAS"}))
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db, session_id="sl_T")
+    # Credit to the SESSION treasury → succeeds.
+    ledger_ok = [{"sender": "stu100", "recipient": "stuTREAS", "amount": 10,
+                  "ref": "GAS-T1"}]
+    r = _app_auth(db, ledger_ok).post(URL.format(sid="sl_T"),
+                                      json=_body(student_id="stu100"))
+    assert r.status_code == 200, r.text
+
+
+def test_fix5_wrong_treasury_fails(db):
+    _run(db["speaking_lab_sessions"].insert_one({
+        "session_id": "sl_T", "schedule": "A", "entry_fee": 10,
+        "status": "waiting", "treasury_id": "stuTREAS"}))
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db, session_id="sl_T")
+    # Credit to the GLOBAL/default treasury, NOT the session treasury → fail.
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-WT"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_T"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_wrong_student_fails(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    ledger = [{"sender": "someoneelse", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-X"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_test_1"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_underpayment_fails(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 5,
+               "ref": "GAS-LOW"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_test_1"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_missing_ledger_fails_closed(db):
+    # Verifier wired but no matching authoritative payment.
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    r = _app_auth(db, []).post(URL.format(sid="sl_test_1"),
+                               json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_no_verifier_unavailable_fails_closed(db):
+    # No authoritative verifier wired at all → unavailable, fail closed.
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    client = TestClient(_make_app(db))  # verify_pool_payment=None
+    r = client.post(URL.format(sid="sl_test_1"), json=_body(student_id="stu100"))
+    assert r.status_code == 403
+    assert "unavailable" in r.text.lower()
+
+
+def test_fix5_same_session_entry_only_fails(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_entry(db)  # entry but no lucky code, no authoritative payment
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-E"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_test_1"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_same_session_code_only_fails(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_lucky_code(db)  # code but no entry, no authoritative payment
+    r = _app_auth(db, []).post(URL.format(sid="sl_test_1"),
+                               json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_populated_mismatched_group_still_fails(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="B")  # populated mismatch
+    _seed_support(db)
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-M"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_test_1"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+def test_fix5_populated_matching_group_preserved(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="A")
+    r = _app_auth(db, []).post(URL.format(sid="sl_test_1"),
+                               json=_body(student_id="stu100"))
+    assert r.status_code == 200, r.text
+
+
+def test_fix5_human_override_succeeds_with_confirmation(db):
+    # No authoritative verifier, but an explicit audited human override.
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    client = TestClient(_make_app(db))  # no automatic verifier
+    body = _body(student_id="stu100", confirm_external_verification=True,
+                 transfer_reference="HUMAN-REF-1",
+                 teacher_explanation="Checked GAS ledger manually; paid.")
+    r = client.post(URL.format(sid="sl_test_1"), json=body)
+    assert r.status_code == 200, r.text
+    audit = _run(db["speaking_lab_teacher_admissions"].find_one(
+        {"student_id": "stu100"}))
+    assert audit["enrollment_override_basis"] == \
+        "human_authorized_external_verification"
+    assert audit["human_authorized_override"] is True
+    assert audit["normalized_transfer_reference"] == \
+        ta.normalize_reference("HUMAN-REF-1")
+
+
+def test_fix5_inactive_student_still_fails(db):
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="", is_active=False)
+    _seed_support(db)
+    ledger = [{"sender": "stu100", "recipient": _TREASURY, "amount": 10,
+               "ref": "GAS-IA"}]
+    r = _app_auth(db, ledger).post(URL.format(sid="sl_test_1"),
+                                   json=_body(student_id="stu100"))
+    assert r.status_code == 403
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v5.1 FIX 1 — Human admission override must require same-session evidence
+# ═════════════════════════════════════════════════════════════════════════════
+def test_v51_human_override_no_entry_rejected(db):
+    """Empty group + explicit human override + NO same-session entry → 403.
+
+    The human-authorized override is a HUMAN judgement, but the operator
+    cannot demonstrate participation in this session without a same-session
+    pool entry. Refuse 403.
+    """
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    # Same-session lucky code exists, but NO same-session entry.
+    _seed_lucky_code(db)
+    client = TestClient(_make_app(db))  # no automatic verifier
+    body = _body(student_id="stu100", confirm_external_verification=True,
+                 transfer_reference="HUMAN-V51-NOENTRY",
+                 teacher_explanation="Checked GAS ledger manually.")
+    r = client.post(URL.format(sid="sl_test_1"), json=body)
+    assert r.status_code == 403
+    payload = r.json()
+    assert "same-session pool entry" in str(payload).lower() or \
+        "student_enrollment_unverified" in str(payload).lower()
+    # Audit row must NOT exist for a rejected admission.
+    audit = _run(db["speaking_lab_teacher_admissions"].find_one(
+        {"student_id": "stu100"}))
+    assert audit is None
+
+
+def test_v51_human_override_no_lucky_code_rejected(db):
+    """Empty group + explicit human override + NO same-session lucky code
+    → 403."""
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    # Same-session entry exists, but NO same-session lucky code.
+    _seed_entry(db)
+    client = TestClient(_make_app(db))
+    body = _body(student_id="stu100", confirm_external_verification=True,
+                 transfer_reference="HUMAN-V51-NOCODE",
+                 teacher_explanation="Checked GAS ledger manually.")
+    r = client.post(URL.format(sid="sl_test_1"), json=body)
+    assert r.status_code == 403
+    payload = r.json()
+    assert "same-session lucky code" in str(payload).lower() or \
+        "student_enrollment_unverified" in str(payload).lower()
+    audit = _run(db["speaking_lab_teacher_admissions"].find_one(
+        {"student_id": "stu100"}))
+    assert audit is None
+
+
+def test_v51_human_override_with_both_same_session_records_succeeds(db):
+    """Empty group + explicit human override + BOTH same-session records
+    → 200, audited."""
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)  # seeds BOTH entry + lucky code
+    client = TestClient(_make_app(db))
+    body = _body(student_id="stu100", confirm_external_verification=True,
+                 transfer_reference="HUMAN-V51-OK",
+                 teacher_explanation="Checked GAS ledger; transfer confirmed.")
+    r = client.post(URL.format(sid="sl_test_1"), json=body)
+    assert r.status_code == 200, r.text
+    audit = _run(db["speaking_lab_teacher_admissions"].find_one(
+        {"student_id": "stu100"}))
+    assert audit["enrollment_override_basis"] == \
+        "human_authorized_external_verification"
+    assert audit["human_authorized_override"] is True
+    # v5.1: audit must persist the same-session evidence the override relied on.
+    assert audit["same_session_entry_present"] is True
+    assert audit["same_session_lucky_code"] == "WORD-9999"
+
+
+def test_v51_human_override_same_reference_reused_in_other_session_rejected(db):
+    """A transfer reference once used by a human override cannot admit
+    into a second session (unique reference still enforced)."""
+    _seed_session_sync(db, schedule="A", fee=10)
+    _seed_student_sync(db, sid="stu100", group="")
+    _seed_support(db)
+    client = TestClient(_make_app(db))
+    body = _body(student_id="stu100", confirm_external_verification=True,
+                 transfer_reference="HUMAN-V51-UNIQ",
+                 teacher_explanation="Same reference reuse test.")
+    r1 = client.post(URL.format(sid="sl_test_1"), json=body)
+    assert r1.status_code == 200, r1.text
+    # Second session, same student, same transfer reference.
+    _seed_session_sync(db, sid="sl_test_2", schedule="A", fee=10)
+    _seed_lucky_code(db, session_id="sl_test_2")
+    _seed_entry(db, session_id="sl_test_2")
+    r2 = client.post(URL.format(sid="sl_test_2"), json=body)
+    assert r2.status_code == 409

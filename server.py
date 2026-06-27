@@ -28,6 +28,7 @@ from lucky_draw import (
     register_lucky_draw_routes,
     generate_and_publish_lucky_code,
     ensure_lucky_draw_indexes,
+    recover_abandoned_draws,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
@@ -1929,6 +1930,11 @@ GAS_POINTS_LOGIN_URL = os.environ.get(
 # Speaking Lab treasury credentials (env vars set in Render dashboard)
 SL_TREASURY_ID       = os.environ.get("SL_TREASURY_ID", "stu092")
 SL_TREASURY_PASSWORD = os.environ.get("SL_TREASURY_PASSWORD", "")
+
+# v3 (FIX 10): handle to the background browser-abandoned recovery task so it
+# can be cancelled cleanly on shutdown.
+_lucky_draw_recovery_task = None
+_LD_RECOVERY_INTERVAL = 60
 
 
 # Portal GAS backend URL â€” used for server-to-server password sync after reset.
@@ -5417,18 +5423,32 @@ async def sl_pool_reconcile(
 
 
 # ── LUCKY DRAW SURGERY ────────────────────────────────────────────────
-async def _lucky_draw_push_notify(student_id: str, amount: int, code: str) -> None:
-    """Phase 3: send a Web Push to a Lucky Draw winner regardless of how
-    their device originally subscribed (raw id vs clean_id, vs case).
-    Never raises — push is best-effort, the GAS transfer is the truth."""
+async def _lucky_draw_push_notify(student_id: str, amount: int, code: str) -> dict:
+    """v4 (FIX 4): send a Web Push to a Lucky Draw winner and return a TRUTHFUL
+    structured delivery result. Reuses the existing `_fan_out_push` (unchanged)
+    and existing push routes. Does NOT pretend success on failure.
+
+    Returns:
+        {"attempted": bool, "sent": int, "failed": int,
+         "no_subscribers": bool, "error": str}
+    """
     norm = _norm_student_id(student_id)
     candidates: list[str] = []
     for c in (student_id, norm, norm.upper()):
         if c and c not in candidates:
             candidates.append(c)
+    query = {"studentId": {"$in": candidates}}
+    # Distinguish "zero active subscribers" from "delivery failure".
     try:
-        await _fan_out_push(
-            {"studentId": {"$in": candidates}},
+        sub_count = await push_subscriptions.count_documents(query)
+    except Exception:  # noqa: BLE001
+        sub_count = None
+    if sub_count == 0:
+        return {"attempted": False, "sent": 0, "failed": 0,
+                "no_subscribers": True, "error": ""}
+    try:
+        sent, failed = await _fan_out_push(
+            query,
             title=f"🎰 +{amount} Lucky Draw Winner!",
             body=(
                 f"អ្នកឈ្នះ +{amount} ពិន្ទុពី Speaking Lab Lucky Draw! ✨\n"
@@ -5438,6 +5458,12 @@ async def _lucky_draw_push_notify(student_id: str, amount: int, code: str) -> No
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("lucky_draw push notify error: %s", str(exc)[:200])
+        return {"attempted": True, "sent": 0, "failed": 0,
+                "no_subscribers": False, "error": str(exc)[:200]}
+    sent = int(sent or 0)
+    failed = int(failed or 0)
+    return {"attempted": True, "sent": sent, "failed": failed,
+            "no_subscribers": (sent == 0 and failed == 0), "error": ""}
 
 
 register_lucky_draw_routes(
@@ -5449,6 +5475,59 @@ register_lucky_draw_routes(
     require_admin=require_admin,
     push_notify=_lucky_draw_push_notify,
 )
+
+
+# ── FIX 5 (v4): SESSION-BOUND authoritative pool-payment verification ─────────
+# v3 used `push_credit_log` as the evidence source. That log is created from a
+# CLIENT-submitted notification (the client supplies recipientStudentId/amount/
+# transferId) and is therefore NOT authoritative treasury-payment proof. v4
+# requires an AUTHORITATIVE provider/ledger verifier, bound to THIS session's
+# treasury, entry fee and id. No such authoritative GAS-ledger verifier is wired
+# in this build, so this verifier reports `unavailable` and admission FAILS
+# CLOSED (the teacher must use the explicit, audited external-verification
+# override). It NEVER silently falls back to push_credit_log.
+#
+# `_AUTHORITATIVE_LEDGER_VERIFY` is the integration seam: wire a coroutine here
+# (e.g. a server-trusted GAS getRecentTransfers query for the session treasury)
+# to enable automatic empty-group recovery. See DEPLOY.md.
+_AUTHORITATIVE_LEDGER_VERIFY = None  # type: ignore
+
+
+async def _verify_pool_payment_evidence(
+    *,
+    canonical_student_id: str,
+    session_id: str,
+    entry_fee: int,
+    session_treasury_id: str = "",
+) -> dict | None:
+    """Session-bound authoritative payment verification.
+
+    Returns one of:
+      • evidence dict  → authoritative, session-bound proof found
+      • {"unavailable": True} → authoritative verification could not be performed
+      • None           → verification ran but found no matching payment
+
+    The verifier MUST use session_id + the SESSION treasury + entry_fee + the
+    canonical student id. The verified transfer reference becomes the unique
+    admission reference (enforced by the unique normalized_transfer_reference
+    index), so one authoritative transfer cannot admit into two sessions.
+    """
+    treasury = _norm_student_id(session_treasury_id or SL_TREASURY_ID)
+    sender = _norm_student_id(canonical_student_id)
+    if not sender or not treasury or sender == treasury:
+        return None
+    if _AUTHORITATIVE_LEDGER_VERIFY is None:
+        # No authoritative ledger verifier configured → fail closed.
+        return {"unavailable": True}
+    try:
+        return await _AUTHORITATIVE_LEDGER_VERIFY(
+            sender=sender, treasury=treasury, session_id=session_id,
+            entry_fee=int(entry_fee or 0))
+    except Exception as exc:  # noqa: BLE001 — never raise into admission flow
+        log.warning("teacher_admit: authoritative verify error: %s",
+                    str(exc)[:200])
+        return {"unavailable": True}
+
 
 # ?? Speaking Lab Emergency Teacher Admit (v1.1.2) ?????????????????????????????
 # Additive, narrowly scoped recovery route. Does not modify student balances
@@ -5463,6 +5542,7 @@ register_teacher_admission_routes(
     _norm_student_id,
     generate_and_publish_lucky_code,
     log=log,
+    verify_pool_payment=_verify_pool_payment_evidence,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -5641,6 +5721,38 @@ async def startup():
     except Exception as _rec_start_err:  # noqa: BLE001
         log.warning("camrapidpay: reconcile sweep not started: %s", _rec_start_err)
 
+    # ── FIX 10: browser-abandoned Lucky Draw recovery (non-blocking) ───────
+    # A draw prepared but never finalized (teacher's browser closed before
+    # the cinematic completed) is recovered by this background loop. It runs
+    # ~every 60s, only finalizes draws older than the 3-minute grace window
+    # and younger than 24h, skips entirely when payout config is invalid, and
+    # is safe across multiple Render instances (per-winner atomic claims). It
+    # NEVER blocks the startup critical path.
+    global _lucky_draw_recovery_task
+
+    async def _lucky_draw_recovery_loop():
+        while True:
+            try:
+                await asyncio.sleep(_LD_RECOVERY_INTERVAL)
+                await recover_abandoned_draws(
+                    db, _sl_publish, GAS_POINTS_LOGIN_URL, SL_TREASURY_ID,
+                    SL_TREASURY_PASSWORD,
+                    os.environ.get("LUCKY_DRAW_MOCK_GAS", "").lower()
+                    in ("1", "true", "yes"),
+                    log, push_notify=_lucky_draw_push_notify,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as _ld_rec_err:  # noqa: BLE001
+                log.warning("lucky_draw recovery loop error: %s",
+                            str(_ld_rec_err)[:200])
+    try:
+        _lucky_draw_recovery_task = asyncio.create_task(
+            _lucky_draw_recovery_loop())
+        log.info("lucky_draw: browser-abandoned recovery sweep scheduled (60s)")
+    except Exception as _ld_start_err:  # noqa: BLE001
+        log.warning("lucky_draw: recovery sweep not started: %s", _ld_start_err)
+
 
 
     # ─────────────────────────────────────────────────────────
@@ -5660,6 +5772,15 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    # v3 (FIX 10): cancel and await the browser-abandoned recovery task.
+    global _lucky_draw_recovery_task
+    if _lucky_draw_recovery_task is not None:
+        _lucky_draw_recovery_task.cancel()
+        try:
+            await _lucky_draw_recovery_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        _lucky_draw_recovery_task = None
     client.close()
 
 
