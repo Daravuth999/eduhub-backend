@@ -6554,6 +6554,18 @@ except Exception as _pm_load_err:
 # Must run BEFORE app.include_router(api) below.
 register_premium_ai_routes(api, db, require_admin, require_student)
 
+# ── Artwork Campaigns (additive, isolated module — Author Studio v1.0) ─────
+# Self-contained promotional-artwork CRUD + public active-campaigns read.
+# Touches no EduTalk/audio/reader/wallet/payment/auth code. Dedicated
+# `artwork_campaigns` collection. Link-based (no server-side image work).
+try:
+    from artwork_campaign_tools import register_artwork_campaign_routes
+    register_artwork_campaign_routes(api, db, require_admin)
+except Exception as _artwork_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "artwork_campaign_tools: disabled (%s)", _artwork_load_err
+    )
+
 # ── Login Reward Campaigns (additive, isolated module) ────────────────────
 # Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
 # require_admin, require_student, _norm_student_id, GAS treasury constants,
