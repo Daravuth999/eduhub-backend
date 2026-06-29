@@ -1454,6 +1454,11 @@ def _build_target_query(target: str, studentIds: list[str], group: str | None) -
         }
     if target == "group":
         return {"group": group or ""}
+    # Attendance-module logical targets — route to the provided student-ID list
+    # exactly like "students" so closing-soon / at-risk pushes reach only the
+    # intended recipients and do not broadcast to all subscribers.
+    if target in ("session_pending_checkin", "at_risk_score"):
+        return _build_target_query("students", studentIds, group)
     return {}
 
 
