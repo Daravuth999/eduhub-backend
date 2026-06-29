@@ -7058,4 +7058,45 @@ if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
         )
 
 
+# ── Smart Attendance (Constellation Check-In) — additive, non-fatal ──────────
+# Failure is non-fatal: if the module fails to load, only attendance is
+# disabled; every existing route keeps working unchanged.
+try:
+    from attendance_tools import (
+        register_attendance_routes as _register_attendance_routes,
+        ensure_attendance_indexes as _ensure_attendance_indexes,
+    )
+    _attendance_wallet = None
+    if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
+        try:
+            _attendance_wallet = wallet_service.WalletService(db)
+        except Exception as _att_wallet_err:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "attendance: WalletService init failed (rewards disabled): %s",
+                _att_wallet_err,
+            )
+    _register_attendance_routes(
+        api, db, require_admin, require_student,
+        current_student=current_student,
+        fan_out_push=_fan_out_push,
+        build_target_query=_build_target_query,
+        norm_student_id=_norm_student_id,
+        wallet=_attendance_wallet,
+    )
+
+    @app.on_event("startup")
+    async def _attendance_startup_indexes() -> None:
+        try:
+            await _ensure_attendance_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "attendance: index ensure failed at startup (non-fatal): %s", exc,
+            )
+except Exception as _attendance_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "attendance_tools route registration failed (feature disabled): %s",
+        _attendance_err,
+    )
+
+
 app.include_router(api)
