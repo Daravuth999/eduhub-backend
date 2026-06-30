@@ -360,3 +360,82 @@ def test_miss_reason_stored_and_suppresses_next_nudge():
     st = next(d for d in db[att.COLL_STREAKS].docs.values()
               if d.get("student_id") == "stu_alice")
     assert st["last_absence_reason_at"]
+
+
+def test_checkin_returns_tracked_false_when_window_closed():
+    """Session with closes_at in the past → is_open=False → tracked=False, meet_url still returned."""
+    from datetime import datetime, timedelta, timezone
+    db, router, _ = _build()
+    _seed_class(db)
+    now = datetime.now(timezone.utc)
+    db[att.COLL_SESSIONS].docs["ses_stale"] = {
+        "_id": "ses_stale", "session_id": "ses_stale", "class_id": "cls_x",
+        "join_slug": "stale-slug", "meet_url": "https://meet.google.com/stale",
+        "status": att.SESS_OPEN,
+        "opens_at": (now - timedelta(hours=2)).isoformat(),
+        "closes_at": (now - timedelta(hours=1)).isoformat(),   # window already expired
+        "grace_minutes": 10, "mid_session_enabled": True,
+        "date": now.date().isoformat(),
+    }
+    res = _call(router, "POST", "/attendance/checkin",
+                payload=att.CheckInIn(slug="stale-slug"), student=_Student("stu_alice"))
+    assert res["tracked"] is False
+    assert res["is_open"] is False
+    assert res["meet_url"] == "https://meet.google.com/stale"   # still reaches class
+
+
+def test_open_session_resets_expired_window():
+    """admin_open_session refreshes opens_at/closes_at when the window has already expired."""
+    from datetime import datetime, timedelta, timezone
+    db, router, _ = _build()
+    _seed_class(db)
+    now = datetime.now(timezone.utc)
+    # Session created 2 h ago — default window already closed.
+    stale_opens = now - timedelta(hours=2)
+    stale_closes = now - timedelta(hours=1)
+    db[att.COLL_SESSIONS].docs["ses_2"] = {
+        "_id": "ses_2", "session_id": "ses_2", "class_id": "cls_x",
+        "join_slug": "xyz789", "meet_url": "https://meet.google.com/abc",
+        "status": att.SESS_SCHEDULED,
+        "opens_at": stale_opens.isoformat(),
+        "closes_at": stale_closes.isoformat(),
+        "grace_minutes": 10, "mid_session_enabled": True,
+        "date": now.date().isoformat(),
+    }
+    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/open",
+                session_id="ses_2", admin=_Admin())
+    assert res["ok"] is True
+    # Session window must now be in the future so students can check in.
+    updated = db[att.COLL_SESSIONS].docs["ses_2"]
+    assert updated["status"] == att.SESS_OPEN
+    new_closes = att._parse_iso(updated.get("closes_at"))
+    assert new_closes is not None and new_closes > now, "closes_at must be in the future after open"
+    # Verify check-in now succeeds (is_open=True, tracked=True).
+    res2 = _call(router, "POST", "/attendance/checkin",
+                 payload=att.CheckInIn(slug="xyz789"), student=_Student("stu_alice"))
+    assert res2["tracked"] is True
+    assert res2["is_open"] is True
+
+
+def test_open_session_preserves_future_window():
+    """admin_open_session does NOT change closes_at when it is already in the future."""
+    from datetime import datetime, timedelta, timezone
+    db, router, _ = _build()
+    _seed_class(db)
+    now = datetime.now(timezone.utc)
+    future_closes = now + timedelta(hours=2)
+    db[att.COLL_SESSIONS].docs["ses_3"] = {
+        "_id": "ses_3", "session_id": "ses_3", "class_id": "cls_x",
+        "join_slug": "future-slug", "meet_url": "https://meet.google.com/future",
+        "status": att.SESS_SCHEDULED,
+        "opens_at": now.isoformat(),
+        "closes_at": future_closes.isoformat(),
+        "grace_minutes": 10, "mid_session_enabled": True,
+        "date": now.date().isoformat(),
+    }
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/open",
+          session_id="ses_3", admin=_Admin())
+    updated = db[att.COLL_SESSIONS].docs["ses_3"]
+    preserved = att._parse_iso(updated.get("closes_at"))
+    # closes_at must still equal the original future time (not reset to now+90min).
+    assert abs((preserved - future_closes).total_seconds()) < 2

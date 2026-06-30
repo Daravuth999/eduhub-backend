@@ -667,6 +667,13 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             except Exception as exc:  # noqa: BLE001 — tracking must never block class
                 log.warning("attendance: checkin write failed (degrading): %s", exc)
                 record = None
+        else:
+            log.info(
+                "attendance: checkin outside open window — session=%s sid=%s "
+                "status=%s opens=%s closes=%s now=%s",
+                session.get("session_id"), target_sid, session.get("status"),
+                session.get("opens_at"), session.get("closes_at"), _iso(now),
+            )
 
         # Always surface the Meet URL so the student reaches class even if the
         # write failed (client retries, then "Join anyway").
@@ -898,9 +905,23 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
         if not session:
             raise HTTPException(status_code=404, detail="session_not_found")
+        now = _utcnow()
+        settings = await _load_settings()
+        win = int(settings.get("checkin_window_minutes", 90))
+        open_update: dict = {"status": SESS_OPEN, "opened_at": _iso(now)}
+        # If the check-in window has already expired (closes_at in the past or unset),
+        # reset it from the actual open time. This handles the common case where a
+        # session was created hours before class (defaulting opens_at/closes_at to
+        # creation time) and the teacher opens it when class actually starts.
+        closes_at = _parse_iso(session.get("closes_at"))
+        if closes_at is None or closes_at <= now:
+            open_update["opens_at"] = _iso(now)
+            open_update["closes_at"] = _iso(now + timedelta(minutes=win))
+            log.info("attendance: open %s — window reset to now+%dmin (was expires=%s)",
+                     session_id, win, _iso(closes_at))
         await db[COLL_SESSIONS].update_one(
             {"session_id": session_id},
-            {"$set": {"status": SESS_OPEN, "opened_at": _utcnow_iso()}},
+            {"$set": open_update},
         )
         settings = await _load_settings()
         sent = 0
