@@ -86,6 +86,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_LIVE_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview"
 )
+# Voice used for Gemini Live audio output. Without an explicit voice the
+# model silently falls back to text; this env var makes it overridable.
+# Valid names: Puck, Charon, Kore, Fenrir, Aoede (see Gemini Live API docs).
+GEMINI_LIVE_VOICE = os.environ.get("GEMINI_LIVE_VOICE", "Puck")
 # Text model used ONLY for generating the post-session speaking report.
 GEMINI_REPORT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -3092,7 +3096,16 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
     setup_msg = {
         "setup": {
             "model": f"models/{GEMINI_LIVE_MODEL}",
-            "generationConfig": {"responseModalities": ["AUDIO"]},
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": GEMINI_LIVE_VOICE,
+                        }
+                    }
+                },
+            },
             "systemInstruction": {
                 "parts": [{"text": session.get("system_instruction", "")}]
             },
