@@ -732,14 +732,38 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     async def attendance_me(student=Depends(require_student)):
         sid = _sid(student)
         streak = await db[COLL_STREAKS].find_one({"student_id": sid}, {"_id": 0}) or {}
+        # Include present check-ins (in-progress or closed) AND finalized absences.
         cur = db[COLL_RECORDS].find(
-            {"student_id": sid, "checked_in_at": {"$ne": None}}, {"_id": 0},
-        ).sort("checked_in_at", -1).limit(60)
-        history = [
-            {"session_id": r.get("session_id"), "class_id": r.get("class_id"),
-             "status": r.get("status"), "checked_in_at": r.get("checked_in_at")}
-            async for r in cur
-        ]
+            {"student_id": sid,
+             "$or": [{"checked_in_at": {"$ne": None}}, {"finalized": True}]},
+            {"_id": 0},
+        ).sort("updated_at", -1).limit(90)
+        records = [r async for r in cur]
+        # Enrich with session date so absent stamps have a display date too.
+        session_ids = list({r["session_id"] for r in records if r.get("session_id")})
+        sessions_map: dict[str, dict] = {}
+        if session_ids:
+            scur = db[COLL_SESSIONS].find(
+                {"session_id": {"$in": session_ids}},
+                {"_id": 0, "session_id": 1, "date": 1, "opens_at": 1, "class_id": 1},
+            )
+            async for s in scur:
+                sessions_map[s["session_id"]] = s
+        history = []
+        for r in records:
+            s = sessions_map.get(r.get("session_id") or "")
+            session_date = (
+                (s or {}).get("date")
+                or (s or {}).get("opens_at")
+                or r.get("updated_at")
+            )
+            history.append({
+                "session_id": r.get("session_id"),
+                "class_id": r.get("class_id"),
+                "status": r.get("status"),
+                "checked_in_at": r.get("checked_in_at"),
+                "session_date": session_date,
+            })
         return {
             "student_id": sid,
             "current_streak": int(streak.get("current_streak") or 0),
