@@ -7080,7 +7080,7 @@ try:
                 "attendance: WalletService init failed (rewards disabled): %s",
                 _att_wallet_err,
             )
-    _register_attendance_routes(
+    _start_attendance_heartbeat = _register_attendance_routes(
         api, db, require_admin, require_student,
         current_student=current_student,
         fan_out_push=_fan_out_push,
@@ -7097,6 +7097,13 @@ try:
             logging.getLogger("eduhub").warning(
                 "attendance: index ensure failed at startup (non-fatal): %s", exc,
             )
+        if callable(_start_attendance_heartbeat):
+            try:
+                _start_attendance_heartbeat()
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger("eduhub").warning(
+                    "attendance: heartbeat start failed (non-fatal): %s", exc,
+                )
 except Exception as _attendance_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "attendance_tools route registration failed (feature disabled): %s",

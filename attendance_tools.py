@@ -27,6 +27,7 @@ testable without a database (see tests/test_attendance_*.py).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -333,6 +334,7 @@ def default_settings() -> dict:
         "shared_device_prompt_enabled": True,
         "miss_threshold": 3,
         "escalation_threshold": 70,
+        "consecutive_absence_threshold": 2,
         # reward economy — base points credited per present session, scaled by
         # the student's reliability-tier multiplier.
         "base_attendance_points": 5,
@@ -348,6 +350,8 @@ def default_settings() -> dict:
             "closing_soon_offset_minutes": 15,
             "predictive_at_risk_enabled": True,
             "mid_session_push_enabled": True,
+            "auto_open_enabled": True,
+            "auto_close_enabled": True,
         },
         # bilingual nudge copy (EN + KH draft). KH = AI-drafted, pending review.
         "copy": {
@@ -380,6 +384,12 @@ def default_settings() -> dict:
                 "title_kh": "ការរំលឹកដ៏ស្និទ្ធស្នាល",
                 "body_en": "Your next class is coming up. We'd love to see you there.",
                 "body_kh": "ថ្នាក់បន្ទាប់របស់អ្នកជិតមកដល់ហើយ។ យើងរីករាយដែលបានឃើញអ្នកនៅទីនោះ។",
+            },
+            "miss_escalation": {
+                "title_en": "We miss you in class",
+                "title_kh": "យើងនឹករលឹកអ្នកនៅក្នុងថ្នាក់",
+                "body_en": "You've missed several classes in a row. Tap to check your record and let your teacher know.",
+                "body_kh": "អ្នកបានខកខានថ្នាក់ជាច្រើនជាប់គ្នា។ ចុចដើម្បីពិនិត្យការចូលរៀនរបស់អ្នក។",
             },
         },
         "updated_at": _utcnow_iso(),
@@ -900,19 +910,11 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             log.warning("attendance: push fan-out failed: %s", exc)
             return 0, 0
 
-    @api.post("/admin/attendance/sessions/{session_id}/open")
-    async def admin_open_session(session_id: str, admin=Depends(require_admin)):
-        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
-        if not session:
-            raise HTTPException(status_code=404, detail="session_not_found")
-        now = _utcnow()
-        settings = await _load_settings()
+    async def _do_open(session: dict, now: datetime, settings: dict) -> int:
+        """Open one session and fire live-now push. Returns push sent count."""
+        session_id = session["session_id"]
         win = int(settings.get("checkin_window_minutes", 90))
         open_update: dict = {"status": SESS_OPEN, "opened_at": _iso(now)}
-        # If the check-in window has already expired (closes_at in the past or unset),
-        # reset it from the actual open time. This handles the common case where a
-        # session was created hours before class (defaulting opens_at/closes_at to
-        # creation time) and the teacher opens it when class actually starts.
         closes_at = _parse_iso(session.get("closes_at"))
         if closes_at is None or closes_at <= now:
             open_update["opens_at"] = _iso(now)
@@ -920,16 +922,24 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             log.info("attendance: open %s — window reset to now+%dmin (was expires=%s)",
                      session_id, win, _iso(closes_at))
         await db[COLL_SESSIONS].update_one(
-            {"session_id": session_id},
-            {"$set": open_update},
+            {"session_id": session_id}, {"$set": open_update},
         )
-        settings = await _load_settings()
         sent = 0
         if (settings.get("notifications") or {}).get("live_now_enabled"):
             cls = await db[COLL_CLASSES].find_one({"class_id": session.get("class_id")}, {"_id": 0})
             ids = [r["student_id"] for r in await _class_roster(cls or {})]
             title, body = await _bilingual((settings.get("copy") or {}).get("live_now", {}))
-            sent, _ = await _push("students", ids, title, body, f"/attendance/j/{session.get('join_slug')}")
+            sent, _ = await _push("students", ids, title, body,
+                                  f"/attendance/j/{session.get('join_slug')}")
+        return sent
+
+    @api.post("/admin/attendance/sessions/{session_id}/open")
+    async def admin_open_session(session_id: str, admin=Depends(require_admin)):
+        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
+        if not session:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        settings = await _load_settings()
+        sent = await _do_open(session, _utcnow(), settings)
         return {"ok": True, "live_now_push_sent": sent}
 
     @api.post("/admin/attendance/sessions/{session_id}/closing-soon-nudge")
@@ -1009,12 +1019,9 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         )
         return upd
 
-    @api.post("/admin/attendance/sessions/{session_id}/close")
-    async def admin_close_session(session_id: str, admin=Depends(require_admin)):
-        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
-        if not session:
-            raise HTTPException(status_code=404, detail="session_not_found")
-        settings = await _load_settings()
+    async def _do_close(session: dict, settings: dict) -> dict:
+        """Core close logic — shared by HTTP route and heartbeat."""
+        session_id = session["session_id"]
         mid_required = bool(session.get("mid_session_enabled", True)) and \
             bool((settings.get("notifications") or {}).get("mid_session_push_enabled", True))
         cls = await db[COLL_CLASSES].find_one({"class_id": session.get("class_id")}, {"_id": 0})
@@ -1099,13 +1106,74 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             title, body = await _bilingual((settings.get("copy") or {}).get("miss_followup", {}))
             miss_sent, _ = await _push("students", absentees, title, body, "/attendance/me")
 
+        # 5) consecutive absence escalation — fire for students who have hit
+        #    N absences in a row (default 2). Separate from at-risk nudge.
+        esc_threshold = int(settings.get("consecutive_absence_threshold") or 2)
+        escalation_targets: list[str] = []
+        for sid in absentees:
+            n_sid = _norm(sid)
+            recent = [r async for r in db[COLL_RECORDS].find(
+                {"student_id": n_sid, "finalized": True},
+                {"_id": 0, "status": 1},
+            ).sort("updated_at", -1).limit(esc_threshold)]
+            if len(recent) >= esc_threshold and all(
+                r.get("status") == ST_ABSENT for r in recent
+            ):
+                escalation_targets.append(sid)
+        esc_sent = 0
+        if escalation_targets:
+            title, body = await _bilingual(
+                (settings.get("copy") or {}).get("miss_escalation", {}))
+            esc_sent, _ = await _push(
+                "students", escalation_targets, title, body, "/attendance/me")
+            log.info("attendance: escalation push → %d students (session=%s)",
+                     esc_sent, session_id)
+
+        # 6) auto at-risk nudge — fires automatically on close for students
+        #    whose risk score just crossed the threshold (7-day guardrail applies).
+        atrisk_sent = 0
+        if (settings.get("notifications") or {}).get("predictive_at_risk_enabled"):
+            threshold = int(settings.get("escalation_threshold") or 70)
+            now = _utcnow()
+            today = now.date().isoformat()
+            for r in roster:
+                sid = _norm(r["student_id"])
+                st = await db[COLL_STREAKS].find_one({"student_id": sid}, {"_id": 0}) or {}
+                if (st.get("risk_score") or 0) >= threshold:
+                    allowed = nudge_guardrail_allows(
+                        now,
+                        _parse_iso(st.get("last_at_risk_nudge_at")),
+                        (st.get("closing_soon_last_date") == today),
+                        _parse_iso(st.get("last_absence_reason_at")),
+                    )
+                    if allowed:
+                        title, body = await _bilingual(
+                            (settings.get("copy") or {}).get("at_risk", {}))
+                        sent, _ = await _push(
+                            "at_risk_score", [r["student_id"]], title, body, "/attendance/me")
+                        atrisk_sent += sent
+                        await db[COLL_STREAKS].update_one(
+                            {"student_id": sid},
+                            {"$set": {"last_at_risk_nudge_at": _utcnow_iso()}},
+                        )
+
         return {
             "ok": True,
             "present_count": len(present_students),
             "absent_count": len(absentees),
             "rewards_credited": credited,
             "miss_followup_sent": miss_sent,
+            "escalation_sent": esc_sent,
+            "at_risk_auto_sent": atrisk_sent,
         }
+
+    @api.post("/admin/attendance/sessions/{session_id}/close")
+    async def admin_close_session(session_id: str, admin=Depends(require_admin)):
+        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
+        if not session:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        settings = await _load_settings()
+        return await _do_close(session, settings)
 
     @api.post("/admin/attendance/at-risk-nudge")
     async def admin_at_risk_nudge(admin=Depends(require_admin)):
@@ -1223,4 +1291,59 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "by_date": sorted(by_date.values(), key=lambda x: x["date"]),
         }
 
+    # ── Heartbeat — auto open/close sessions so teacher can focus on teaching ──
+
+    async def _heartbeat_tick() -> None:
+        now = _utcnow()
+        settings = await _load_settings()
+        notif = settings.get("notifications") or {}
+
+        # Auto-open: scheduled sessions whose window has started.
+        if notif.get("auto_open_enabled", True):
+            to_open = [s async for s in db[COLL_SESSIONS].find(
+                {"status": SESS_SCHEDULED,
+                 "opens_at": {"$lte": _iso(now)},
+                 "closes_at": {"$gt": _iso(now)}},
+                {"_id": 0},
+            )]
+            for session in to_open:
+                try:
+                    await _do_open(session, now, settings)
+                    log.info("attendance: auto-opened session %s", session["session_id"])
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("attendance: auto-open %s failed: %s",
+                                session.get("session_id"), exc)
+
+        # Auto-close: open sessions whose window has expired.
+        if notif.get("auto_close_enabled", True):
+            to_close = [s async for s in db[COLL_SESSIONS].find(
+                {"status": SESS_OPEN,
+                 "closes_at": {"$lte": _iso(now)}},
+                {"_id": 0},
+            )]
+            for session in to_close:
+                try:
+                    result = await _do_close(session, settings)
+                    log.info("attendance: auto-closed session %s — %s",
+                             session["session_id"], result)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("attendance: auto-close %s failed: %s",
+                                session.get("session_id"), exc)
+
+    async def _run_heartbeat() -> None:
+        interval = 120  # seconds — checks every 2 min, well within the 1-min session granularity
+        log.info("attendance: heartbeat started (interval=%ds)", interval)
+        while True:
+            try:
+                await _heartbeat_tick()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("attendance: heartbeat tick error: %s", exc)
+            await asyncio.sleep(interval)
+
+    def start_heartbeat() -> None:
+        """Schedule the auto open/close heartbeat as an asyncio background task."""
+        asyncio.create_task(_run_heartbeat(), name="attendance_heartbeat")
+        log.info("attendance: heartbeat task scheduled")
+
     log.info("attendance: routes registered (Constellation Check-In).")
+    return start_heartbeat
