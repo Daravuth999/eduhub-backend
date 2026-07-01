@@ -43,6 +43,7 @@ COLL_SESSIONS = "attendance_sessions"
 COLL_RECORDS = "attendance_records"
 COLL_STREAKS = "attendance_streaks"
 COLL_SETTINGS = "attendance_settings"
+COLL_CLAIMS = "attendance_reward_claims"
 SETTINGS_ID = "attendance_settings"
 
 # ── attendance statuses ──────────────────────────────────────────────────────
@@ -353,7 +354,16 @@ def default_settings() -> dict:
             "auto_open_enabled": True,
             "auto_close_enabled": True,
         },
-        # bilingual nudge copy (EN + KH draft). KH = AI-drafted, pending review.
+        # Claim-mode reward settings. Defaults to False — existing auto-credit
+        # behaviour is UNCHANGED until a teacher explicitly enables claim mode
+        # and sets claim_mode_activation_at. Only sessions closed AFTER that
+        # timestamp produce pending claims; older credits remain as-is.
+        "claim_rewards_enabled": False,
+        "claim_mode_activation_at": None,    # ISO timestamp or None
+        "claim_minimum_points": 0,           # 0 = no minimum threshold
+        "reward_ready_push_enabled": True,
+        "reward_claimed_push_enabled": True,
+        # bilingual nudge copy. KH reviewed and corrected below.
         "copy": {
             "live_now": {
                 "title_en": "Class is live now",
@@ -373,11 +383,12 @@ def default_settings() -> dict:
                 "body_en": "Tap once to confirm you're still in class.",
                 "body_kh": "ចុចម្តងដើម្បីបញ្ជាក់ថាអ្នកនៅតែរៀន។",
             },
+            # Corrected Khmer absence copy (replaces previous machine-translated draft).
             "miss_followup": {
-                "title_en": "We missed you today",
-                "title_kh": "យើងបាននឹករអ្នកនៅថ្ងៃនេះ",
-                "body_en": "No worries — let your teacher know what happened.",
-                "body_kh": "កុំបារម្ភ — ប្រាប់គ្រូរបស់អ្នកថាមានរឿងអ្វីកើតឡើង។",
+                "title_en": "Absent today",
+                "title_kh": "អវត្តមានថ្ងៃនេះ",
+                "body_en": "You did not attend today's class. If there was a reason, please let your teacher know.",
+                "body_kh": "អ្នកមិនបានចូលរៀនសម្រាប់ថ្ងៃនេះទេ។ ប្រសិនបើមានមូលហេតុ សូមជូនដំណឹងដល់គ្រូបង្រៀន។",
             },
             "at_risk": {
                 "title_en": "A gentle reminder",
@@ -390,6 +401,19 @@ def default_settings() -> dict:
                 "title_kh": "យើងនឹករលឹកអ្នកនៅក្នុងថ្នាក់",
                 "body_en": "You've missed several classes in a row. Tap to check your record and let your teacher know.",
                 "body_kh": "អ្នកបានខកខានថ្នាក់ជាច្រើនជាប់គ្នា។ ចុចដើម្បីពិនិត្យការចូលរៀនរបស់អ្នក។",
+            },
+            "reward_ready": {
+                "title_en": "Reward ready to claim",
+                "title_kh": "រង្វាន់រួចរាល់សម្រាប់ទទួល",
+                "body_en": "You have attendance reward points waiting. Tap to claim them now.",
+                "body_kh": "អ្នកមានពិន្ទុរង្វាន់វត្តមានរង់ចាំទទួល។ ចុចដើម្បីទទួលឥឡូវនេះ។",
+            },
+            "reward_claimed": {
+                "title_en": "Attendance reward",
+                "title_kh": "រង្វាន់វត្តមាន",
+                # {points} is substituted at send time.
+                "body_en": "Congratulations! +{points} points have been added to your account.",
+                "body_kh": "សូមអបអរសាទរ! ពិន្ទុ +{points} ត្រូវបានបញ្ចូលទៅគណនីរបស់អ្នកដោយជោគជ័យ។",
             },
         },
         "updated_at": _utcnow_iso(),
@@ -476,6 +500,9 @@ async def ensure_attendance_indexes(db) -> None:
         await db[COLL_RECORDS].create_index("student_id")
         await db[COLL_RECORDS].create_index([("class_id", 1), ("checked_in_at", 1)])
         await db[COLL_STREAKS].create_index("student_id", unique=True, sparse=True)
+        await db[COLL_CLAIMS].create_index([("student_id", 1), ("status", 1)])
+        await db[COLL_CLAIMS].create_index("idempotency_key", unique=True, sparse=True)
+        await db[COLL_CLAIMS].create_index("source_session_id")
         log.info("attendance: indexes ensured")
     except Exception as exc:  # noqa: BLE001
         log.warning("attendance: index ensure failed (non-fatal): %s", exc)
@@ -731,46 +758,88 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     @api.get("/attendance/me")
     async def attendance_me(student=Depends(require_student)):
         sid = _sid(student)
+        settings = await _load_settings()
         streak = await db[COLL_STREAKS].find_one({"student_id": sid}, {"_id": 0}) or {}
-        # Include present check-ins (in-progress or closed) AND finalized absences.
         cur = db[COLL_RECORDS].find(
             {"student_id": sid,
              "$or": [{"checked_in_at": {"$ne": None}}, {"finalized": True}]},
             {"_id": 0},
         ).sort("updated_at", -1).limit(90)
         records = [r async for r in cur]
-        # Enrich with session date so absent stamps have a display date too.
+        # Batch-load sessions and classes for enrichment.
         session_ids = list({r["session_id"] for r in records if r.get("session_id")})
         sessions_map: dict[str, dict] = {}
         if session_ids:
             scur = db[COLL_SESSIONS].find(
                 {"session_id": {"$in": session_ids}},
-                {"_id": 0, "session_id": 1, "date": 1, "opens_at": 1, "class_id": 1},
+                {"_id": 0, "session_id": 1, "date": 1, "opens_at": 1,
+                 "class_id": 1, "grace_minutes": 1},
             )
             async for s in scur:
                 sessions_map[s["session_id"]] = s
+        class_ids = list({s["class_id"] for s in sessions_map.values() if s.get("class_id")})
+        classes_map: dict[str, str] = {}
+        if class_ids:
+            ccur = db[COLL_CLASSES].find(
+                {"class_id": {"$in": class_ids}},
+                {"_id": 0, "class_id": 1, "title_en": 1, "title_kh": 1},
+            )
+            async for c in ccur:
+                classes_map[c["class_id"]] = c
+        grace_default = int(settings.get("late_grace_minutes") or 10)
         history = []
         for r in records:
             s = sessions_map.get(r.get("session_id") or "")
+            cls = classes_map.get((s or {}).get("class_id") or "") or {}
             session_date = (
                 (s or {}).get("date")
                 or (s or {}).get("opens_at")
                 or r.get("updated_at")
             )
+            # Compute minutes_late for late check-ins.
+            minutes_late = None
+            if r.get("status") == ST_LATE and r.get("checked_in_at") and (s or {}).get("opens_at"):
+                try:
+                    opens = _parse_iso(s["opens_at"])
+                    checkin = _parse_iso(r["checked_in_at"])
+                    grace = int((s or {}).get("grace_minutes") or grace_default)
+                    if opens and checkin:
+                        diff = int((checkin - opens).total_seconds() / 60) - grace
+                        if diff > 0:
+                            minutes_late = diff
+                except Exception:
+                    pass
             history.append({
                 "session_id": r.get("session_id"),
                 "class_id": r.get("class_id"),
+                "title_en": cls.get("title_en"),
+                "title_kh": cls.get("title_kh"),
                 "status": r.get("status"),
                 "checked_in_at": r.get("checked_in_at"),
                 "session_date": session_date,
+                "session_start_at": (s or {}).get("opens_at"),
+                "minutes_late": minutes_late,
+                "mid_session_confirmed": r.get("mid_session_confirmed"),
+                "miss_reason": r.get("miss_reason"),
             })
+        # Compute present/late/absent counts directly from history for the summary.
+        present_count = sum(1 for h in history if h["status"] in (ST_PRESENT_FULL, ST_PRESENT_PARTIAL))
+        late_count = sum(1 for h in history if h["status"] == ST_LATE)
+        absent_count = sum(1 for h in history if h["status"] == ST_ABSENT)
+        total_sessions = len(history)
+        # risk_score is a PRIVATE teacher signal — never returned to the student.
         return {
             "student_id": sid,
+            "display_name": getattr(student, "display_name", None),
             "current_streak": int(streak.get("current_streak") or 0),
             "longest_streak": int(streak.get("longest_streak") or 0),
             "reliability_tier": streak.get("reliability_tier") or TIER_BRONZE,
             "on_time_rate_rolling": streak.get("on_time_rate_rolling"),
-            "risk_score": streak.get("risk_score"),
+            "attendance_rate": streak.get("attendance_rate"),
+            "present_count": present_count,
+            "late_count": late_count,
+            "absent_count": absent_count,
+            "total_sessions": total_sessions,
             "history": history,
         }
 
@@ -796,6 +865,218 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                     "title_kh": (cls or {}).get("title_kh"),
                 }
         return {"live": False}
+
+    # ─────────────────────────────────────────────────────────────────────
+    # STUDENT CLAIM ROUTES
+    # ─────────────────────────────────────────────────────────────────────
+
+    @api.get("/attendance/rewards/summary")
+    async def attendance_rewards_summary(student=Depends(require_student)):
+        """Return claimable reward state for the authenticated student.
+
+        Never exposes risk_score, wallet IDs, or internal ledger references.
+        """
+        sid = _sid(student)
+        settings = await _load_settings()
+        claim_enabled = bool(settings.get("claim_rewards_enabled"))
+
+        # Count pending claims for this student.
+        pending_cursor = db[COLL_CLAIMS].find(
+            {"student_id": sid, "status": "pending"},
+            {"_id": 0, "points": 1, "source_session_id": 1, "created_at": 1},
+        ).sort("created_at", -1)
+        pending = [c async for c in pending_cursor]
+        claimable_points = sum(c.get("points", 0) for c in pending)
+        claimable_count = len(pending)
+
+        # 5 most recent claimed rewards (confirmation history).
+        recent_cursor = db[COLL_CLAIMS].find(
+            {"student_id": sid, "status": "claimed"},
+            {"_id": 0, "points": 1, "claimed_at": 1, "source_session_id": 1},
+        ).sort("claimed_at", -1).limit(5)
+        recent_claims = [c async for c in recent_cursor]
+
+        # Progress toward next reward threshold (if configured).
+        min_pts = int(settings.get("claim_minimum_points") or 0)
+        next_reward_progress = None
+        if min_pts > 0 and claimable_points < min_pts:
+            next_reward_progress = {
+                "current": claimable_points,
+                "target": min_pts,
+                "percent": round(claimable_points / min_pts * 100),
+            }
+
+        return {
+            "claim_enabled": claim_enabled,
+            "claimable_points": claimable_points,
+            "claimable_count": claimable_count,
+            "next_reward_progress": next_reward_progress,
+            "recent_claims": recent_claims,
+        }
+
+    @api.post("/attendance/rewards/claim")
+    async def attendance_rewards_claim(student=Depends(require_student)):
+        """Atomically claim all pending attendance rewards for this student.
+
+        Concurrency safety — reservation ownership token (claim_batch_id):
+          Two simultaneous requests from the same student cannot process each
+          other's records. The protocol is:
+
+            pending
+            → claiming with a unique claim_batch_id stamped by THIS request
+            → fetch ONLY records owned by this request's claim_batch_id
+            → wallet.credit() per claim (original idempotency_key, safe to retry)
+            → claimed
+
+          A second concurrent request's update_many finds nothing with
+          status="pending" (all already "claiming") → modified_count=0 →
+          returns no_pending_claims without touching any record.
+
+          A process interruption mid-flight leaves records in "claiming" with
+          a claim_batch_id. The student can retry: the next request sees
+          modified_count=0 (still claiming), waits for the interrupted batch
+          to be recovered, OR the recovery path explicitly reverts all
+          records belonging to the interrupted batch back to "pending" so
+          the retry can succeed (see error handling below).
+
+        Other guarantees:
+        - Student can only claim their own records (student_id scoped).
+        - wallet.credit() uses the original idempotency_key → safe retry.
+        - Partial failure: failed records revert to "pending", succeeded remain
+          "claimed". No double-credit ever.
+        - Push is sent AFTER wallet credit; push failure never rolls back credit.
+        - risk_score is never included in any response field.
+        """
+        sid = _sid(student)
+        settings = await _load_settings()
+
+        if not settings.get("claim_rewards_enabled"):
+            raise HTTPException(status_code=403, detail="claim_mode_not_enabled")
+
+        min_pts = int(settings.get("claim_minimum_points") or 0)
+
+        # Step 1 — Generate a unique ownership token for THIS request.
+        # Concurrent requests each get a different batch_id; each can only
+        # process the records it owns.
+        claim_batch_id = secrets.token_hex(12)
+        now_claim = _iso(_utcnow())
+
+        # Atomically reserve pending records owned by this request only.
+        # Any concurrent request that runs update_many AFTER this one will see
+        # modified_count=0 (status is already "claiming", not "pending") and
+        # return "no_pending_claims" immediately.
+        reserve_result = await db[COLL_CLAIMS].update_many(
+            {"student_id": sid, "status": "pending"},
+            {"$set": {
+                "status": "claiming",
+                "claim_batch_id": claim_batch_id,
+                "claiming_started_at": now_claim,
+            }},
+        )
+        if reserve_result.modified_count == 0:
+            return {"ok": True, "credited_points": 0, "claims_processed": 0,
+                    "message": "no_pending_claims"}
+
+        # Step 2 — Load ONLY the records this request reserved (own batch_id).
+        # A concurrent request cannot see these records through claim_batch_id
+        # scoping even if its own update_many partially interleaved.
+        claiming_cursor = db[COLL_CLAIMS].find(
+            {"student_id": sid, "status": "claiming", "claim_batch_id": claim_batch_id},
+            {"_id": 0},
+        )
+        claiming = [c async for c in claiming_cursor]
+        total_points = sum(c.get("points", 0) for c in claiming)
+
+        if min_pts > 0 and total_points < min_pts:
+            # Revert only THIS batch back to pending.
+            await db[COLL_CLAIMS].update_many(
+                {"student_id": sid, "status": "claiming",
+                 "claim_batch_id": claim_batch_id},
+                {"$set": {"status": "pending"},
+                 "$unset": {"claim_batch_id": "", "claiming_started_at": ""}},
+            )
+            return {"ok": False, "credited_points": 0, "claims_processed": 0,
+                    "message": "below_minimum", "minimum": min_pts,
+                    "current": total_points}
+
+        # Step 3 — Credit wallet once per claim this request owns.
+        # Each claim carries its original idempotency_key from when it was
+        # created in _do_close() — independent of claim_batch_id — so:
+        #   • a retry after process interruption credits each claim exactly once
+        #   • auto-credited sessions share the same key space and can never
+        #     be re-paid through this path (wallet returns duplicate=True)
+        credited_points = 0
+        failed_idem_keys: list[str] = []
+        if wallet is not None:
+            for claim in claiming:
+                idem_key = claim.get("idempotency_key") or (
+                    f"attendance:{claim.get('source_session_id')}:{sid}")
+                try:
+                    result = await wallet.credit(
+                        claim.get("wallet_student_id") or sid,
+                        claim["points"],
+                        source="attendance",
+                        source_ref=claim.get("source_session_id"),
+                        idempotency_key=idem_key,
+                        clean_id=claim.get("clean_id"),
+                    )
+                    # Fresh credit OR idempotent duplicate both count as success.
+                    if result.get("ok") or result.get("duplicate"):
+                        credited_points += claim["points"]
+                        now_str = _iso(_utcnow())
+                        await db[COLL_CLAIMS].update_one(
+                            {"idempotency_key": idem_key},
+                            {"$set": {
+                                "status": "claimed",
+                                "claimed_at": now_str,
+                                "wallet_transaction_id": result.get("transaction_id"),
+                            },
+                             "$unset": {"claim_batch_id": "",
+                                        "claiming_started_at": ""}},
+                        )
+                    else:
+                        failed_idem_keys.append(idem_key)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("attendance: claim wallet credit failed key=%s: %s",
+                                idem_key, exc)
+                    failed_idem_keys.append(idem_key)
+
+        # Revert only THIS batch's failed records to pending.
+        # Records from other batches (e.g. a concurrent request that partially
+        # interleaved) are never touched.
+        if failed_idem_keys:
+            await db[COLL_CLAIMS].update_many(
+                {"idempotency_key": {"$in": failed_idem_keys},
+                 "claim_batch_id": claim_batch_id},
+                {"$set": {"status": "pending"},
+                 "$unset": {"claim_batch_id": "", "claiming_started_at": ""}},
+            )
+
+        # Step 4 — Push notification AFTER credit (failure here never rolls back).
+        if credited_points > 0 and settings.get("reward_claimed_push_enabled", True):
+            copy_block = (settings.get("copy") or {}).get("reward_claimed", {})
+            raw_title = copy_block.get("title_en") or "Attendance reward"
+            raw_title_kh = copy_block.get("title_kh") or "រង្វាន់វត្តមាន"
+            raw_body = copy_block.get("body_en") or "+{points} points added to your account."
+            raw_body_kh = copy_block.get("body_kh") or "ពិន្ទុ +{points} ត្រូវបានបញ្ចូលទៅគណនីរបស់អ្នក។"
+            title = f"{raw_title} / {raw_title_kh}"
+            body_en = raw_body.replace("{points}", str(credited_points))
+            body_kh = raw_body_kh.replace("{points}", str(credited_points))
+            body = f"{body_en} {body_kh}"
+            try:
+                if callable(fan_out_push) and callable(build_target_query):
+                    query = build_target_query("students", [claim.get("clean_id") or sid
+                                                            for claim in claiming], None)
+                    await fan_out_push(query, title, body, "/attendance/me")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("attendance: reward_claimed push failed: %s", exc)
+
+        return {
+            "ok": True,
+            "credited_points": credited_points,
+            "claims_processed": len(claiming) - len(failed_idem_keys),
+            "failed_count": len(failed_idem_keys),
+        }
 
     # ─────────────────────────────────────────────────────────────────────
     # ADMIN ROUTES
@@ -1090,20 +1371,57 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         for r in roster:
             await _recompute_student(r["student_id"], settings)
 
-        # 3) idempotent reward credit for present students (tier multiplier).
+        # 3) Reward processing for present students (tier multiplier).
+        #
+        # TWO modes controlled by settings["claim_rewards_enabled"]:
+        #
+        # AUTO mode (claim_rewards_enabled=False, the DEFAULT):
+        #   Existing behaviour unchanged — wallet.credit() fires immediately on
+        #   session close. Safe for all sessions credited before claim mode was
+        #   ever activated.
+        #
+        # CLAIM mode (claim_rewards_enabled=True):
+        #   Eligibility is calculated and stored as a PENDING claim in
+        #   attendance_reward_claims. NO wallet credit happens yet. The student
+        #   sees the pending balance and taps "Claim" when ready. Duplicate
+        #   protection: each (session_id, student_id) pair has a unique
+        #   idempotency_key; the claim record is created with $setOnInsert so
+        #   re-running _do_close can never create two pending claims for the
+        #   same session+student.
+        #
+        # Historical safety: sessions closed BEFORE claim_mode_activation_at
+        # still use AUTO mode even when claim mode is now enabled, so previously
+        # credited rewards can never be re-claimed.
         credited = 0
+        pending_claims = 0
         base = int(settings.get("base_attendance_points") or 0)
-        if wallet is not None and base > 0:
+        claim_mode = bool(settings.get("claim_rewards_enabled")) and base > 0
+        activation_iso = settings.get("claim_mode_activation_at")
+        now_close = _utcnow()
+        # Determine whether claim mode applies to THIS session close.
+        # Safe parsing rules:
+        #   • activation_at absent/None → no restriction, claim mode applies.
+        #   • activation_at valid ISO → claim mode only if now >= activation_at.
+        #   • activation_at present but unparseable → block claim mode to
+        #     prevent retroactive reward creation (safe fallback).
+        if not activation_iso:
+            # No activation restriction configured.
+            use_claim_mode = claim_mode
+        else:
+            activation_dt = _parse_iso(activation_iso)
+            if activation_dt is None:
+                # Unparseable timestamp → refuse to activate (prevents retroactive
+                # reward creation if someone sets a malformed value).
+                use_claim_mode = False
+                log.warning("attendance: claim_mode_activation_at is set but unparseable "
+                            "(%r) — defaulting to auto-credit for session %s",
+                            activation_iso, session_id)
+            else:
+                use_claim_mode = claim_mode and now_close >= activation_dt
+
+        if base > 0:
             for roster_row, _final in present_students:
-                clean_sid = roster_row["student_id"]   # clean_id — bookkeeping key (unchanged)
-                # §1 FIX: the points wallet/ledger keys on the internal
-                # UUID-style student_id (assigned at signup, distinct from the
-                # human-facing clean_id). Every other reward feature AND
-                # GET /student/points/history look transactions up by that
-                # student_id — a credit filed under clean_id would never surface
-                # in the student's balance or history. So we pass the real
-                # student_id as the primary wallet identity and keep clean_id
-                # only as metadata, mirroring ai_assistant_voice_tools.py.
+                clean_sid = roster_row["student_id"]
                 wallet_sid = roster_row.get("wallet_student_id") or clean_sid
                 streak = await db[COLL_STREAKS].find_one(
                     {"student_id": _norm(clean_sid)}, {"_id": 0}) or {}
@@ -1112,17 +1430,57 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 amount = int(round(base * mult))
                 if amount <= 0:
                     continue
-                try:
-                    await wallet.credit(
-                        wallet_sid, amount,
-                        source="attendance",
-                        source_ref=session_id,
-                        idempotency_key=f"attendance:{session_id}:{_norm(wallet_sid)}",
-                        clean_id=clean_sid,
-                    )
-                    credited += 1
-                except Exception as exc:  # noqa: BLE001 — reward never blocks close
-                    log.warning("attendance: reward credit failed sid=%s: %s", wallet_sid, exc)
+                idem_key = f"attendance:{session_id}:{_norm(wallet_sid)}"
+                if use_claim_mode:
+                    # Store pending claim — no wallet credit yet.
+                    try:
+                        await db[COLL_CLAIMS].update_one(
+                            {"idempotency_key": idem_key},
+                            {"$setOnInsert": {
+                                "idempotency_key": idem_key,
+                                "student_id": _norm(clean_sid),
+                                "wallet_student_id": wallet_sid,
+                                "clean_id": clean_sid,
+                                "source_session_id": session_id,
+                                "points": amount,
+                                "status": "pending",
+                                "created_at": _iso(now_close),
+                                "eligible_at": _iso(now_close),
+                                "claimed_at": None,
+                                "wallet_transaction_id": None,
+                                "notification_sent": False,
+                                "schema_version": 1,
+                            }},
+                            upsert=True,
+                        )
+                        pending_claims += 1
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("attendance: pending claim create failed sid=%s: %s",
+                                    clean_sid, exc)
+                else:
+                    # AUTO mode: credit wallet immediately (existing behaviour).
+                    if wallet is None:
+                        continue
+                    try:
+                        await wallet.credit(
+                            wallet_sid, amount,
+                            source="attendance",
+                            source_ref=session_id,
+                            idempotency_key=idem_key,
+                            clean_id=clean_sid,
+                        )
+                        credited += 1
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("attendance: reward credit failed sid=%s: %s", wallet_sid, exc)
+
+        # Send reward-ready push when new pending claims were created.
+        reward_ready_sent = 0
+        if pending_claims > 0 and (settings.get("reward_ready_push_enabled", True)):
+            ready_ids = [r["student_id"] for r, _ in present_students]
+            title, body = await _bilingual(
+                (settings.get("copy") or {}).get("reward_ready", {}))
+            reward_ready_sent, _ = await _push(
+                "students", ready_ids, title, body, "/attendance")
 
         # 4) miss follow-up push to absentees (non-punitive, with reason picker).
         miss_sent = 0
