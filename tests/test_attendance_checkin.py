@@ -94,10 +94,21 @@ class _Coll:
                 doc.setdefault(k, v)
         if "$set" in up:
             doc.update(up["$set"])
+        if "$unset" in up:
+            for k in up["$unset"]:
+                doc.pop(k, None)
         if "$inc" in up:
             for k, v in up["$inc"].items():
                 doc[k] = (doc.get(k) or 0) + v
         return doc
+
+    async def update_many(s, q, up):
+        count = 0
+        for d in s.docs.values():
+            if _match(d, q):
+                s._apply(d, up)
+                count += 1
+        return type("R", (), {"matched_count": count, "modified_count": count})()
 
     async def update_one(s, q, up, upsert=False):
         for d in s.docs.values():
