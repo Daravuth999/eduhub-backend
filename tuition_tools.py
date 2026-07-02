@@ -426,11 +426,13 @@ async def student_tuition_record(student=Depends(require_student)):  # noqa: F82
         {"student_id": student.student_id},
         {"_id": 0},
     )
-    if not rec:
-        raise HTTPException(  # noqa: F821
-            status_code=404,
-            detail={"code": "TUITION_RECORD_NOT_FOUND", "mode": "gas"},
-        )
+    gas_only = not bool(rec)
+    if gas_only:
+        # No MongoDB shadow record yet — student is GAS-only.
+        # Compute payment_action from global config + active intent only.
+        # Billing fields are absent; the frontend falls back to GAS student prop.
+        # Shadow records are created when a teacher runs tuition_shadow_write().
+        rec = {}
 
     today = _ttn_today_kh()
     global_config = await _ttn_get_global_config()
@@ -487,6 +489,7 @@ async def student_tuition_record(student=Depends(require_student)):  # noqa: F82
     return {
         **rec,
         "ok": True,
+        "gas_only":                   gas_only,
         "feature_enabled":            global_config.get("enabled", True),
         "payment_action":             payment_action,
         "payment_block_reason":       block_reason,

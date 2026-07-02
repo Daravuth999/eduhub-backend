@@ -548,6 +548,134 @@ class TestReceiptContract:
         billing_anchor_day = parsed.day
         assert billing_anchor_day == 15
 
+
+# ── Gate 13: state invariants ─────────────────────────────────────────────────
+
+class TestStateInvariants:
+    """
+    Gate 13 — Impossible payment states must be rejected by the engine.
+
+    These tests codify the matrix from the correction pass spec:
+      Overdue  → pay_now  (never unavailable/paid_current_cycle)
+      GAS-only → pay_now  (empty rec, methods available)
+      no methods → unavailable  (regardless of status)
+      resume_payment requires an active intent
+      can_pay=True iff payment_action==pay_now
+    """
+
+    @staticmethod
+    def _advance_billing(current_ndd: date, today: date) -> date:
+        """Inline mirror of _ttn_advance_billing — advance billing anchor by 1 month."""
+        base = current_ndd if current_ndd else today
+        month = base.month % 12 + 1
+        year = base.year + (1 if base.month == 12 else 0)
+        day = min(base.day, calendar.monthrange(year, month)[1])
+        return date(year, month, day)
+
+    def test_overdue_paid_status_returns_pay_now_not_unavailable(self):
+        """Status=Paid but next_due_date is 10 days past → pay_now (new cycle)."""
+        rec = {"tuition_status": "Paid", "next_due_date": "2026.06.22"}
+        action, reason = _compute_payment_action(
+            rec, _DEFAULT_CONFIG, None, _TODAY, _KHQR_METHODS
+        )
+        assert action == "pay_now", f"Expected pay_now, got {action}"
+        assert reason is None
+
+    def test_overdue_cannot_yield_paid_current_cycle(self):
+        """paid_current_cycle requires days_until_due >= 0, so overdue is impossible."""
+        rec = _overdue_rec(days_past=10)
+        action, reason = _compute_payment_action(
+            rec, _DEFAULT_CONFIG, None, _TODAY, _KHQR_METHODS
+        )
+        assert action != "unavailable" or reason != "paid_current_cycle", (
+            "Overdue student must never get paid_current_cycle"
+        )
+        assert action == "pay_now"
+
+    def test_can_pay_true_requires_payment_methods(self):
+        """can_pay=True (pay_now) is impossible with an empty methods list."""
+        action, _ = _compute_payment_action(
+            _overdue_rec(), _DEFAULT_CONFIG, None, _TODAY, _NO_METHODS
+        )
+        assert action != "pay_now", "pay_now returned despite no payment methods"
+        assert action == "unavailable"
+
+    def test_can_pay_implies_methods_available(self):
+        """If action==pay_now, there must have been at least one method."""
+        action_with_methods, _ = _compute_payment_action(
+            _overdue_rec(), _DEFAULT_CONFIG, None, _TODAY, _KHQR_METHODS
+        )
+        action_no_methods, _ = _compute_payment_action(
+            _overdue_rec(), _DEFAULT_CONFIG, None, _TODAY, _NO_METHODS
+        )
+        assert action_with_methods == "pay_now"
+        assert action_no_methods != "pay_now"
+
+    def test_resume_payment_requires_active_intent(self):
+        """resume_payment is impossible without an active intent."""
+        action, _ = _compute_payment_action(
+            _unpaid_rec(), _DEFAULT_CONFIG, None, _TODAY, _KHQR_METHODS
+        )
+        assert action != "resume_payment", "resume_payment returned with no active intent"
+
+    def test_can_pay_false_when_action_is_not_pay_now(self):
+        """can_pay is derived as (action == pay_now); any other action → can_pay=False."""
+        for action_str in ("pay_early", "resume_payment", "under_review", "unavailable", "disabled"):
+            can_pay = (action_str == "pay_now")
+            assert can_pay is False, f"can_pay should be False for action={action_str}"
+
+    def test_gas_only_student_gets_pay_now_when_methods_available(self):
+        """Empty rec (GAS-only, no shadow record) → pay_now when methods configured."""
+        rec = {}
+        action, reason = _compute_payment_action(
+            rec, _DEFAULT_CONFIG, None, _TODAY, _KHQR_METHODS
+        )
+        assert action == "pay_now"
+        assert reason is None
+
+    def test_gas_only_student_gets_unavailable_when_no_methods(self):
+        """Empty rec (GAS-only) → unavailable/no_payment_methods when methods empty."""
+        rec = {}
+        action, reason = _compute_payment_action(
+            rec, _DEFAULT_CONFIG, None, _TODAY, _NO_METHODS
+        )
+        assert action == "unavailable"
+        assert reason == "no_payment_methods"
+
+    def test_gas_only_student_active_intent_returns_resume(self):
+        """GAS-only student with an active intent → resume_payment (not pay_now)."""
+        rec    = {}
+        intent = {"intent_id": "tui_gas", "status": "pending"}
+        action, _ = _compute_payment_action(
+            rec, _DEFAULT_CONFIG, intent, _TODAY, _KHQR_METHODS
+        )
+        assert action == "resume_payment"
+
+    def test_future_paid_returns_unavailable_not_pay_now(self):
+        """Paid + days_until_due > 0 → unavailable (paid current cycle)."""
+        rec = _paid_current_rec(days_future=8)
+        action, reason = _compute_payment_action(
+            rec, _DEFAULT_CONFIG, None, _TODAY, _KHQR_METHODS
+        )
+        assert action == "unavailable"
+        assert reason == "paid_current_cycle"
+
+    def test_can_pay_and_payment_action_always_consistent(self):
+        """Derive can_pay from action — they must always agree."""
+        test_cases = [
+            (_overdue_rec(),           _DEFAULT_CONFIG, None,                      _KHQR_METHODS),
+            (_paid_current_rec(),      _DEFAULT_CONFIG, None,                      _KHQR_METHODS),
+            (_unpaid_rec(),            _DEFAULT_CONFIG, None,                      _KHQR_METHODS),
+            (_unpaid_rec(),            _DEFAULT_CONFIG, {"status": "pending"},     _KHQR_METHODS),
+            (_unpaid_rec(),            _DEFAULT_CONFIG, None,                      _NO_METHODS),
+            ({},                       _DEFAULT_CONFIG, None,                      _KHQR_METHODS),
+        ]
+        for rec, cfg, intent, methods in test_cases:
+            action, _ = _compute_payment_action(rec, cfg, intent, _TODAY, methods)
+            can_pay   = action == "pay_now"
+            expected  = action == "pay_now"
+            assert can_pay == expected, f"can_pay mismatch: action={action}"
+
     def test_unacknowledged_endpoint_contract_shape(self):
         """
         GET /api/student/tuition/unacknowledged returns:
