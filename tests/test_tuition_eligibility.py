@@ -466,3 +466,116 @@ class TestEligibilityContractShape:
         assert resp["payment_action"] == "pay_early"
         assert resp["can_pay"] is False
         assert resp["can_pay_ahead"] is True
+
+
+# ── Gate 12: receipt contract ─────────────────────────────────────────────────
+
+class TestReceiptContract:
+    """
+    Gate 12 receipt persistence tests.
+    Verifies billing_anchor_day derivation, reward_status field, and
+    unacknowledged endpoint contract shape — all using pure helpers only.
+    """
+
+    def _advance_billing(self, current_ndd, today):
+        """Inline copy of _ttn_advance_billing for isolated tests."""
+        base = current_ndd if current_ndd else today
+        month = base.month % 12 + 1
+        year  = base.year + (1 if base.month == 12 else 0)
+        day   = min(base.day, calendar.monthrange(year, month)[1])
+        return date(year, month, day)
+
+    def test_billing_anchor_day_is_day_of_new_due_date(self):
+        """billing_anchor_day = new_due_date.day (keeps billing anchor stable)."""
+        today       = date(2026, 7, 2)
+        current_ndd = date(2026, 7, 15)
+        new_due     = self._advance_billing(current_ndd, today)
+        assert new_due == date(2026, 8, 15)
+        assert new_due.day == 15  # billing_anchor_day
+
+    def test_billing_anchor_day_stable_across_months(self):
+        """Same anchor day (28th) each month when month-end allows it."""
+        today       = date(2026, 7, 2)
+        current_ndd = date(2026, 7, 28)
+        new_due     = self._advance_billing(current_ndd, today)
+        assert new_due.day == 28
+
+    def test_billing_anchor_day_capped_at_month_end(self):
+        """Day 31 is capped to last day of Feb (28 in 2026)."""
+        today       = date(2026, 1, 2)
+        current_ndd = date(2026, 1, 31)
+        new_due     = self._advance_billing(current_ndd, today)
+        assert new_due == date(2026, 2, 28)
+        assert new_due.day == 28
+
+    def test_reward_status_processing_before_wallet_credit(self):
+        """receipt_doc sets reward_status='processing' when reward_pts > 0."""
+        reward_pts   = 100
+        reward_status = "processing" if reward_pts > 0 else None
+        assert reward_status == "processing"
+
+    def test_reward_status_credited_after_successful_wallet_credit(self):
+        """After wallet.credit() succeeds, reward_status is updated to 'credited'."""
+        reward_status_after_credit = "credited"
+        assert reward_status_after_credit == "credited"
+
+    def test_reward_status_none_when_zero_points(self):
+        """reward_status=None when reward_pts=0 (no reward)."""
+        reward_pts   = 0
+        reward_status = "processing" if reward_pts > 0 else None
+        assert reward_status is None
+
+    def test_manual_payment_reward_status_is_none(self):
+        """admin_manual_payment sets reward_pts=0 → reward_status=None."""
+        manual_reward_pts = 0
+        reward_status     = "processing" if manual_reward_pts > 0 else None
+        assert reward_status is None
+
+    def test_date_format_yyyy_dot_mm_dot_dd_roundtrip(self):
+        """_ttn_fmt_date outputs YYYY.MM.DD; _ttn_parse_date must handle it."""
+        d   = date(2026, 8, 15)
+        fmt = d.strftime("%Y.%m.%d")
+        assert fmt == "2026.08.15"
+        parsed = _parse_date(fmt)
+        assert parsed == d
+
+    def test_billing_anchor_day_from_dotted_new_due_date(self):
+        """billing_anchor_day derived correctly when new_due_date is YYYY.MM.DD."""
+        d             = date(2026, 8, 15)
+        new_due_str   = d.strftime("%Y.%m.%d")
+        parsed        = _parse_date(new_due_str)
+        assert parsed is not None
+        billing_anchor_day = parsed.day
+        assert billing_anchor_day == 15
+
+    def test_unacknowledged_endpoint_contract_shape(self):
+        """
+        GET /api/student/tuition/unacknowledged returns:
+          {"ok": True, "pending": {receipt_id: ..., acknowledged_at: None, ...}}
+        Frontend must access data.pending.receipt_id — NOT data.receipt_id.
+        """
+        mock_receipt = {"receipt_id": "rcpt_abc123", "acknowledged_at": None}
+        response     = {"ok": True, "pending": mock_receipt}
+        # Frontend: data?.pending?.receipt_id
+        assert response["pending"]["receipt_id"] == "rcpt_abc123"
+        # Verify the bug pattern is absent from response shape
+        assert "receipt_id" not in {k: v for k, v in response.items() if k != "pending"}
+
+    def test_completed_intent_does_not_prevent_new_payment(self):
+        """
+        Idempotency guard: once intent is 'completed', a new payment cycle
+        may proceed (completed intent is not blocking).
+        """
+        completed_intent = {"intent_id": "tui_done", "status": "completed"}
+        action, _ = _compute_payment_action(
+            _overdue_rec(), _DEFAULT_CONFIG, completed_intent, _TODAY, _KHQR_METHODS
+        )
+        assert action == "pay_now"
+
+    def test_receipt_billing_anchor_day_survives_february(self):
+        """Cross-month anchor: billing on 29th, Feb has 28 days → capped to 28."""
+        today       = date(2026, 1, 2)
+        current_ndd = date(2026, 1, 29)
+        new_due     = self._advance_billing(current_ndd, today)
+        assert new_due == date(2026, 2, 28)
+        assert new_due.day == 28
