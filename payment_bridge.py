@@ -366,59 +366,97 @@ def _v4_normalize_pkg_amounts(d: dict) -> dict:
 # ------ Internal helpers ------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 async def _complete_tuition_payment(db, student_id: str, txn: dict) -> dict:
-    """Auto-complete a tuition payment --- reuses the same GAS call as teacher_update_tuition."""
-    import calendar as _cal
-    from datetime import date as _date
+    """Auto-complete a tuition payment — delegates to tuition_tools.tuition_finalize_payment.
 
-    def _fmt(d):
-        return d.strftime("%Y.%m.%d")
-
-    def _add_one_month(d):
-        month = d.month % 12 + 1
-        year  = d.year + (1 if d.month == 12 else 0)
-        day   = min(d.day, _cal.monthrange(year, month)[1])
-        return _date(year, month, day)
-
+    tuition_tools.py is loaded via exec() AFTER payment_bridge.py at server startup,
+    so tuition_finalize_payment is in the global namespace by the time any request
+    reaches this function.  Falls back to the legacy GAS-only path when the new
+    module is not yet loaded (safe degradation during cold-start or deploy window).
+    """
+    # Look up student for clean_id (needed by both paths)
     doc = await db.students.find_one(
         {"$or": [{"student_id": student_id}, {"clean_id": student_id}]},
-        {"_id": 0, "clean_id": 1, "display_name": 1},
+        {"_id": 0, "student_id": 1, "clean_id": 1, "display_name": 1},
     )
     if not doc:
-        return {"ok": False, "error": f"Student {student_id} not found in MongoDB"}
+        return {"ok": False, "error": f"Student {student_id!r} not found in MongoDB"}
 
-    clean_id = doc["clean_id"]
-    today    = _date.today()
+    _student_id = doc["student_id"]
+    clean_id    = doc["clean_id"]
+    amount_usd  = round(float(txn.get("amount", 0)), 2)
+    amount_khr  = int(txn.get("amount_khr") or txn.get("khr_amount") or 0)
+    method      = str(txn.get("provider") or txn.get("payment_method") or "aba")
+    reference   = str(txn.get("transaction_id") or txn.get("reference") or "")
 
+    # Delegate to tuition_tools finalizer (available after its exec() load)
+    _finalizer = globals().get("tuition_finalize_payment")
+    if _finalizer is not None:
+        result = await _finalizer(
+            student_id=_student_id,
+            clean_id=clean_id,
+            amount_usd=amount_usd,
+            amount_khr=amount_khr,
+            method=method,
+            reference=reference,
+            intent_id=txn.get("intent_id"),
+        )
+        if result.get("ok"):
+            log.info(
+                "payment_bridge: tuition delegated to tuition_tools for %s (trx=%s receipt=%s)",
+                clean_id, reference, result.get("receipt_id"),
+            )
+        else:
+            log.warning(
+                "payment_bridge: tuition_finalize_payment failed for %s: %s",
+                clean_id, result.get("error"),
+            )
+        return result
+
+    # ── Legacy fallback: direct GAS write (tuition_tools not yet loaded) ──
+    log.warning(
+        "payment_bridge: tuition_finalize_payment not found — using legacy GAS path for %s",
+        clean_id,
+    )
+    import calendar as _cal_fb
+    from datetime import date as _date_fb
+
+    def _fmt_fb(d):
+        return d.strftime("%Y.%m.%d")
+
+    def _add_one_month_fb(d):
+        month = d.month % 12 + 1
+        year  = d.year + (1 if d.month == 12 else 0)
+        day   = min(d.day, _cal_fb.monthrange(year, month)[1])
+        return _date_fb(year, month, day)
+
+    today = _date_fb.today()
     gas_ok = False
     gas_error = "unknown"
     try:
         result = await _update_tuition_in_gas(
             clean_id=clean_id,
             tuition_status="Paid",
-            last_payment_date=_fmt(today),
-            next_due_date=_fmt(_add_one_month(today)),
-            payment_amount=str(round(txn.get("amount", 0), 2)),
+            last_payment_date=_fmt_fb(today),
+            next_due_date=_fmt_fb(_add_one_month_fb(today)),
+            payment_amount=str(amount_usd),
         )
         gas_ok = result.get("ok") is True
     except RuntimeError as exc:
         gas_error = str(exc)
 
     if gas_ok:
-        # Fire push notification (fire-and-forget)
         asyncio.create_task(
             _fan_out_push(
                 {"studentId": clean_id},
                 title="Tuition Payment Confirmed",
-                body=f"Payment of {int(txn.get('amount', 0)):,} KHR received. Tuition status updated to Paid.",
+                body=f"Payment of {amount_khr:,} KHR received. Tuition status updated to Paid.",
                 url="/portal/me",
             )
         )
-        log.info("payment_bridge: tuition auto-completed for %s (trx=%s)",
-                 clean_id, txn.get("transaction_id"))
+        log.info("payment_bridge: tuition legacy GAS completed for %s (trx=%s)", clean_id, reference)
         return {"ok": True, "clean_id": clean_id}
     else:
-        log.warning("payment_bridge: GAS tuition update failed for %s: %s",
-                    clean_id, gas_error)
+        log.warning("payment_bridge: tuition legacy GAS failed for %s: %s", clean_id, gas_error)
         return {"ok": False, "error": gas_error}
 
 
