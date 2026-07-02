@@ -104,6 +104,68 @@ def _ttn_reward_points(amount_usd: float) -> int:
     return max(0, round(amount_usd * _TTN_POINTS_PER_USD))
 
 
+def _ttn_compute_payment_action(
+    rec: dict,
+    global_config: dict,
+    active_intent: "dict | None",
+    today: "date",
+    available_methods: "list[str]",
+) -> "tuple[str, str | None]":
+    """
+    Backend-authoritative payment eligibility decision.
+
+    Returns (payment_action, block_reason).
+    payment_action is one of:
+      pay_now        — overdue, unpaid, or paid+cycle-expired (new cycle)
+      pay_early      — paid current cycle, advance-payment enabled globally
+      resume_payment — active pending/verifying/finalizing intent
+      under_review   — active manual_review intent
+      unavailable    — paid current cycle with no advance; or no payment methods
+      disabled       — feature or account-level disable
+
+    Priority order: feature gate → account gate → active intent → methods → billing.
+    """
+    # 1. Global feature disabled
+    if not global_config.get("enabled", True):
+        return ("disabled", "feature_disabled")
+
+    # 2. Per-student payment disabled
+    if rec.get("payment_enabled") is False:
+        return ("disabled", "account_disabled")
+
+    # 3. Active intent state blocks or redirects
+    if active_intent:
+        intent_status = active_intent.get("status", "")
+        if intent_status in ("pending", "verifying", "finalizing"):
+            return ("resume_payment", None)
+        if intent_status == "manual_review":
+            return ("under_review", "manual_review")
+        # completed or expired → fall through (no longer blocking)
+
+    # 4. No payment methods configured/enabled
+    if not available_methods:
+        return ("unavailable", "no_payment_methods")
+
+    # 5. Billing cycle check
+    status = (rec.get("tuition_status") or "").strip().lower()
+    ndd = _ttn_parse_date(rec.get("next_due_date"))
+    days_until_due = (ndd - today).days if ndd is not None else None
+
+    # Paid AND current cycle not yet expired
+    paid_current_cycle = (
+        status == "paid"
+        and days_until_due is not None
+        and days_until_due >= 0
+    )
+    if paid_current_cycle:
+        if global_config.get("allow_advance_payment", False):
+            return ("pay_early", None)
+        return ("unavailable", "paid_current_cycle")
+
+    # Overdue, unpaid, or paid+cycle-expired (new cycle open) → student may pay
+    return ("pay_now", None)
+
+
 def _ttn_make_reference() -> str:
     """Generate a CamRapidPay-safe reference string: TUITION-{ts}-{rand}."""
     short_ts = datetime.now(_TTN_KH_TZ).strftime("%m%d%H%M%S")
@@ -340,7 +402,20 @@ async def tuition_shadow_write(
 
 @api.get("/student/tuition")  # noqa: F821
 async def student_tuition_record(student=Depends(require_student)):  # noqa: F821
-    """Return this student's Mongo tuition record, or 404 if not yet shadowed."""
+    """
+    Return this student's tuition record with backend-authoritative eligibility contract.
+
+    Response always includes:
+      payment_action       — pay_now | pay_early | resume_payment | under_review |
+                             unavailable | disabled
+      payment_block_reason — null or a machine-readable reason string
+      can_pay              — True when payment_action is pay_now
+      can_pay_ahead        — True when payment_action is pay_early
+      active_intent        — safe summary of any blocking intent, or null
+      available_payment_methods — list of enabled methods (e.g. ["khqr"])
+      feature_enabled      — global tuition feature flag
+      reward_points        — reward preview for this student's payment amount
+    """
     rec = await db[_TTN_COLL_RECORDS].find_one(  # noqa: F821
         {"student_id": student.student_id},
         {"_id": 0},
@@ -350,9 +425,74 @@ async def student_tuition_record(student=Depends(require_student)):  # noqa: F82
             status_code=404,
             detail={"code": "TUITION_RECORD_NOT_FOUND", "mode": "gas"},
         )
+
+    today = _ttn_today_kh()
+    global_config = await _ttn_get_global_config()
+
+    # Fetch any active (blocking) intent — completed/expired do not block
+    active_intent_doc = await db[_TTN_COLL_INTENTS].find_one(  # noqa: F821
+        {
+            "student_id": student.student_id,
+            "status": {"$in": ["pending", "verifying", "finalizing", "manual_review"]},
+        },
+        {"_id": 0, "qr_payload": 0},
+        sort=[("created_at", -1)],
+    )
+
+    # Available payment methods
+    available_methods: list = []
+    try:
+        from payment_providers import camrapidpay_provider as _crp
+        if _crp.is_enabled():
+            available_methods = ["khqr"]
+    except Exception:
+        pass
+
+    payment_action, block_reason = _ttn_compute_payment_action(
+        rec, global_config, active_intent_doc, today, available_methods
+    )
+
+    # Safe active-intent summary (no QR data, no internal provider state)
+    active_intent_safe = None
+    if active_intent_doc and active_intent_doc.get("status") in (
+        "pending", "verifying", "finalizing", "manual_review"
+    ):
+        exp = active_intent_doc.get("expires_at")
+        active_intent_safe = {
+            "intent_id":  active_intent_doc.get("intent_id"),
+            "status":     active_intent_doc.get("status"),
+            "amount_usd": active_intent_doc.get("amount_usd"),
+            "amount_khr": active_intent_doc.get("amount_khr"),
+            "expires_at": exp.isoformat() if isinstance(exp, datetime) else exp,
+        }
+
+    # Reward preview
+    payment_amount = float(rec.get("payment_amount") or 0)
+    per_usd = float(
+        rec.get("per_student_points_per_usd")
+        or global_config.get("default_points_per_usd")
+        or _TTN_POINTS_PER_USD
+    )
+    reward_preview = max(0, round(payment_amount * per_usd)) if payment_amount > 0 else 0
+
     if isinstance(rec.get("updated_at"), datetime):
         rec["updated_at"] = rec["updated_at"].isoformat()
-    return rec
+
+    return {
+        **rec,
+        "ok": True,
+        "feature_enabled":            global_config.get("enabled", True),
+        "payment_action":             payment_action,
+        "payment_block_reason":       block_reason,
+        "can_pay":                    payment_action == "pay_now",
+        "can_pay_ahead":              payment_action == "pay_early",
+        "active_intent":              active_intent_safe,
+        "available_payment_methods":  available_methods,
+        "reward_points":              reward_preview,
+        # Backward-compat shims — frontend migrating away from these:
+        "pending_intent_id":          (active_intent_safe or {}).get("intent_id"),
+        "intent_status":              (active_intent_safe or {}).get("status"),
+    }
 
 
 @api.get("/student/tuition/receipt/{receipt_id}")
@@ -418,6 +558,65 @@ async def create_tuition_intent(
         raise HTTPException(status_code=400, detail="Amount must be positive")  # noqa: F821
 
     current_ndd: str | None = (payload.get("current_ndd") or "").strip() or None
+
+    # ── Server-side eligibility revalidation (forged frontend state is rejected) ──
+    global_config = await _ttn_get_global_config()
+    if not global_config.get("enabled", True):
+        raise HTTPException(  # noqa: F821
+            status_code=403,
+            detail={"code": "TUITION_DISABLED", "message": "Tuition payment is currently disabled."},
+        )
+
+    ttn_rec = await db[_TTN_COLL_RECORDS].find_one({"student_id": student.student_id})  # noqa: F821
+    if not ttn_rec:
+        raise HTTPException(  # noqa: F821
+            status_code=403,
+            detail={"code": "TUITION_NO_RECORD", "message": "No tuition record found for this account."},
+        )
+    if ttn_rec.get("payment_enabled") is False:
+        raise HTTPException(  # noqa: F821
+            status_code=403,
+            detail={"code": "TUITION_ACCOUNT_DISABLED", "message": "Tuition payment is disabled for this account."},
+        )
+
+    # Block duplicate intent creation
+    blocking_intent = await db[_TTN_COLL_INTENTS].find_one(  # noqa: F821
+        {
+            "student_id": student.student_id,
+            "status": {"$in": ["pending", "verifying", "finalizing", "manual_review"]},
+        },
+    )
+    if blocking_intent:
+        bi_status = blocking_intent.get("status")
+        if bi_status == "manual_review":
+            raise HTTPException(  # noqa: F821
+                status_code=409,
+                detail={"code": "TUITION_MANUAL_REVIEW", "message": "Payment is under manual review."},
+            )
+        raise HTTPException(  # noqa: F821
+            status_code=409,
+            detail={
+                "code": "INTENT_ACTIVE",
+                "intent_id": blocking_intent["intent_id"],
+                "status": bi_status,
+                "message": "An active payment intent already exists. Resume it instead.",
+            },
+        )
+
+    # Billing eligibility: reject if paid for the current cycle and advance is not enabled
+    today_check = _ttn_today_kh()
+    ttn_ndd = _ttn_parse_date(ttn_rec.get("next_due_date"))
+    days_check = (ttn_ndd - today_check).days if ttn_ndd is not None else None
+    ttn_status = (ttn_rec.get("tuition_status") or "").strip().lower()
+    if ttn_status == "paid" and days_check is not None and days_check >= 0:
+        if not global_config.get("allow_advance_payment", False):
+            raise HTTPException(  # noqa: F821
+                status_code=403,
+                detail={
+                    "code": "TUITION_PAID_CURRENT_CYCLE",
+                    "message": "Tuition is already paid for the current billing cycle.",
+                },
+            )
 
     # ── CamRapidPay KHQR invoice creation ─────────────────────────────────
     try:
@@ -776,6 +975,7 @@ async def _ttn_get_global_config() -> dict:
         "payment_confirmed_push": True,
         "reward_push": True,
         "late_cutoff_days": 0,
+        "allow_advance_payment": False,
     }
 
 
@@ -942,6 +1142,7 @@ async def admin_tuition_set_config(payload: dict, admin=Depends(require_admin)):
     allowed = {
         "enabled", "default_points_per_usd",
         "payment_confirmed_push", "reward_push", "late_cutoff_days",
+        "allow_advance_payment",
     }
     updates = {k: v for k, v in payload.items() if k in allowed}
     if not updates:
