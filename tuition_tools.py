@@ -231,20 +231,22 @@ async def tuition_finalize_payment(
         receipt_id = "rcpt_" + _ttn_secrets.token_hex(12)
         now = _ttn_utcnow()
         receipt_doc = {
-            "receipt_id":     receipt_id,
-            "student_id":     student_id,
-            "clean_id":       clean_id,
-            "amount_usd":     round(float(amount_usd), 2),
-            "amount_khr":     int(amount_khr),
-            "method":         method,
-            "reference":      reference,
-            "tuition_status": "Paid",
-            "prev_due_date":  current_ndd_str,
-            "new_due_date":   new_due_str,
-            "reward_points":  reward_pts,
-            "confirmed_at":   now,
-            "acknowledged_at": None,
-            "intent_id":      intent_id,
+            "receipt_id":       receipt_id,
+            "student_id":       student_id,
+            "clean_id":         clean_id,
+            "amount_usd":       round(float(amount_usd), 2),
+            "amount_khr":       int(amount_khr),
+            "method":           method,
+            "reference":        reference,
+            "tuition_status":   "Paid",
+            "prev_due_date":    current_ndd_str,
+            "new_due_date":     new_due_str,
+            "billing_anchor_day": new_due_date.day,
+            "reward_points":    reward_pts,
+            "reward_status":    "processing" if reward_pts > 0 else None,
+            "confirmed_at":     now,
+            "acknowledged_at":  None,
+            "intent_id":        intent_id,
         }
         await db[_TTN_COLL_RECEIPTS].insert_one(receipt_doc)
 
@@ -307,6 +309,10 @@ async def tuition_finalize_payment(
                     idempotency_key=f"tuition:{student_id}:{receipt_id}",
                     payload={"amount_usd": amount_usd, "method": method, "receipt_id": receipt_id},
                     clean_id=clean_id,
+                )
+                await db[_TTN_COLL_RECEIPTS].update_one(  # noqa: F821
+                    {"receipt_id": receipt_id},
+                    {"$set": {"reward_status": "credited"}},
                 )
             except Exception as _wal_exc:
                 _TTN_LOG.warning(
@@ -1309,23 +1315,25 @@ async def admin_manual_payment(
     receipt_id = "rcpt_" + _ttn_secrets.token_hex(12)
     now = _ttn_utcnow()
     receipt_doc = {
-        "receipt_id":     receipt_id,
-        "student_id":     student_id,
-        "clean_id":       clean_id,
-        "amount_usd":     round(amount_usd, 2),
-        "amount_khr":     amount_khr,
-        "method":         method,
-        "reference":      reference or f"MANUAL-{receipt_id}",
-        "tuition_status": "Paid",
-        "prev_due_date":  _ttn_fmt_date(current_ndd) if current_ndd else None,
-        "new_due_date":   new_due_str,
-        "reward_points":  reward_pts,
-        "months_covered": months,
-        "note":           note,
-        "confirmed_at":   now,
-        "acknowledged_at": None,
-        "recorded_by":    "admin",
-        "intent_id":      None,
+        "receipt_id":       receipt_id,
+        "student_id":       student_id,
+        "clean_id":         clean_id,
+        "amount_usd":       round(amount_usd, 2),
+        "amount_khr":       amount_khr,
+        "method":           method,
+        "reference":        reference or f"MANUAL-{receipt_id}",
+        "tuition_status":   "Paid",
+        "prev_due_date":    _ttn_fmt_date(current_ndd) if current_ndd else None,
+        "new_due_date":     new_due_str,
+        "billing_anchor_day": new_due_date.day,
+        "reward_points":    reward_pts,
+        "reward_status":    None,
+        "months_covered":   months,
+        "note":             note,
+        "confirmed_at":     now,
+        "acknowledged_at":  None,
+        "recorded_by":      "admin",
+        "intent_id":        None,
     }
     await db[_TTN_COLL_RECEIPTS].insert_one(receipt_doc)  # noqa: F821
 
