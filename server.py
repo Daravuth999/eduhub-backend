@@ -4026,6 +4026,24 @@ async def teacher_update_tuition(
         "teacher_update_tuition: %s action=%s clean_id=%s by %s",
         student_id, action, clean_id, admin.email,
     )
+
+    # Shadow write to MongoDB (fire-and-forget; never blocks response).
+    # tuition_shadow_write is defined in tuition_tools.py (loaded after this
+    # function is defined, but before any request reaches this endpoint).
+    _ttn_sw = globals().get("tuition_shadow_write")
+    if _ttn_sw is not None:
+        import asyncio as _asyncio_ttn_sw
+        _asyncio_ttn_sw.create_task(
+            _ttn_sw(
+                student_id=student_id,
+                clean_id=clean_id,
+                tuition_status=tuition_status,
+                last_payment_date=last_payment_date,
+                next_due_date=next_due_date,
+                payment_amount=payment_amount,
+            )
+        )
+
     return {
         "ok": True,
         "action": action,
@@ -6550,6 +6568,29 @@ except Exception as _pm_load_err:
     logging.getLogger("eduhub").warning(
         "payment_methods_config_tools.py failed to load (display gate disabled): %s",
         _pm_load_err,
+    )
+
+# ── Tuition Pay (MongoDB billing, KHQR, rewards, receipts) ───────────────
+# Loaded AFTER payment_bridge and camrapidpay_payment_tools so it can reuse
+# _update_tuition_in_gas, _fan_out_push, and all shared globals. Adds:
+#   GET  /api/student/tuition
+#   GET  /api/student/tuition/receipt/{receipt_id}
+#   POST /api/student/tuition/receipt/{receipt_id}/acknowledge
+#   POST /api/student/tuition/intent
+#   GET  /api/student/tuition/intent/{intent_id}
+#   POST /api/payments/tuition/khqr/webhook
+#   GET  /api/admin/tuition/dashboard
+#   GET  /api/admin/tuition/receipts
+#   GET  /api/admin/tuition/migration-status
+#   POST /api/admin/tuition/setup-indexes
+# Also exports: tuition_finalize_payment (called by payment_bridge),
+#               tuition_shadow_write     (called by teacher_update_tuition).
+try:
+    exec(open(__import__("pathlib").Path(__file__).parent / "tuition_tools.py").read())
+except Exception as _ttn_load_err:
+    logging.getLogger("eduhub").warning(
+        "tuition_tools.py failed to load (tuition pay disabled): %s",
+        _ttn_load_err,
     )
 
 # ── Premium AI Tools (Phase 1) — register isolated routes onto /api ──────
