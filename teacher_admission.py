@@ -151,6 +151,31 @@ def utcnow() -> datetime:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Schedule normalisation — single source of truth is students.group.
+# ALLOWED values are "A" / "B"; anything blank/None means "Unassigned".
+# ──────────────────────────────────────────────────────────────────────────────
+ALLOWED_SCHEDULE_VALUES = {"A", "B"}
+
+
+def _normalize_schedule(raw: Optional[str]) -> str:
+    """Uppercase/trim a schedule value. Returns "" for unassigned/blank.
+
+    Does NOT validate against ALLOWED_SCHEDULE_VALUES — callers that need
+    to reject invalid input (anything other than "A"/"B"/blank) must check
+    that separately, since some callers (candidate classification) must
+    tolerate legacy/free-form group values without raising.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip().upper()
+    # Legacy students.group sometimes carries "A:Beginner" style values —
+    # only the part before ":" is the schedule.
+    if ":" in s:
+        s = s.split(":", 1)[0].strip()
+    return s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Request / response models
 # ──────────────────────────────────────────────────────────────────────────────
 class TeacherAdmitRequest(BaseModel):
@@ -403,11 +428,13 @@ class MissingCodeCandidate(BaseModel):
     status: str
     restorable: bool
     reason: str = ""
+    student_schedule: str = ""
 
 
 class MissingCodeCandidatesResponse(BaseModel):
     ok: bool = True
     session_id: str
+    session_schedule: str = ""
     entry_fee: int
     candidates: list[MissingCodeCandidate] = Field(default_factory=list)
     restorable_count: int = 0
@@ -447,30 +474,30 @@ class RecoverMissingCodesBulkResponse(BaseModel):
     results: list[RecoverMissingCodeResult] = Field(default_factory=list)
 
 
-async def _lookup_student_display(db, norm_id: str) -> str:
+async def _lookup_student_record(db, norm_id: str) -> dict:
     student_doc = await db.students.find_one(
         {"$or": [{"clean_id": norm_id}, {"student_id": norm_id}]},
-        {"_id": 0, "display_name": 1, "name": 1},
+        {"_id": 0, "display_name": 1, "name": 1, "group": 1, "schedule": 1},
     )
-    if student_doc:
-        return (
-            student_doc.get("display_name")
-            or student_doc.get("name")
-            or norm_id
-        )
-    return norm_id
+    return student_doc or {}
 
 
 async def _gather_candidate(
     db, SL_ENTRIES, session_id: str, entry_fee: int, norm_id: str,
-    row: Optional[dict],
+    row: Optional[dict], session_schedule: str = "",
 ) -> dict:
     """Classify one push_credit_log row into a reviewable candidate.
 
     NEVER treats the row as proof of payment — only as a reviewable
     signal a human teacher must confirm before anything is created.
     """
-    display_name = await _lookup_student_display(db, norm_id)
+    student_doc = await _lookup_student_record(db, norm_id)
+    display_name = (
+        student_doc.get("display_name") or student_doc.get("name") or norm_id
+    )
+    student_schedule = _normalize_schedule(
+        student_doc.get("group") or student_doc.get("schedule") or "",
+    )
     claimed_amount = int((row or {}).get("amount") or 0)
     raw_ref = str((row or {}).get("transferId") or "").strip()
     normalized_ref = normalize_reference(raw_ref)
@@ -498,11 +525,26 @@ async def _gather_candidate(
         "normalized_reference": normalized_ref,
         "current_status": current_status,
         "entry_doc": entry_doc, "code_doc": code_doc,
+        "student_schedule": student_schedule,
     }
 
     if has_entry and has_code:
         return {**base, "status": "already_has_code", "restorable": False,
                 "reason": ""}
+
+    # Persistent schedule assignment gate — a student must be assigned to
+    # THIS session's schedule before Missing Code Rescue may restore them.
+    # Never inferred/auto-assigned here; see the schedule-assignment routes.
+    session_schedule_norm = _normalize_schedule(session_schedule)
+    if session_schedule_norm:
+        if not student_schedule:
+            return {**base, "status": "manual_review_required",
+                    "restorable": False,
+                    "reason": "schedule_assignment_required"}
+        if student_schedule != session_schedule_norm:
+            return {**base, "status": "manual_review_required",
+                    "restorable": False, "reason": "wrong_schedule"}
+
     if not raw_ref:
         return {**base, "status": "manual_review_required",
                 "restorable": False, "reason": "missing_transfer_reference"}
@@ -532,6 +574,193 @@ async def _gather_candidate(
 
     return {**base, "status": "review_required", "restorable": True,
             "reason": ""}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Schedule Assignment — persistent A/B roster split (v1.0)
+# ──────────────────────────────────────────────────────────────────────────────
+# The existing generic `PATCH /teacher/students/{id}` (server.py) is shared
+# with Author Studio / the original PWA and is intentionally left untouched
+# here. These routes are Speaking-Lab-scoped but write the SAME
+# ``students.group`` field — there is no second source of truth.
+COLLECTION_SCHEDULE_AUDIT = "speaking_lab_schedule_assignments"
+
+
+async def ensure_schedule_assignment_indexes(db) -> bool:
+    """Best-effort index creation for the append-only assignment audit
+    log. Non-fatal — this is a low-stakes audit trail, not a durable
+    uniqueness contract, so no fail-closed health gate is needed."""
+    try:
+        audit = db[COLLECTION_SCHEDULE_AUDIT]
+        await audit.create_index([("assignment_id", 1)], unique=True,
+                                  name="uq_schedule_assignment_id")
+        await audit.create_index([("student_id", 1), ("changed_at", -1)],
+                                  name="idx_schedule_assignment_student")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("schedule_assignment: index ensure failed: %s", exc)
+        return False
+
+
+class UpdateStudentScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    schedule: Optional[str] = None
+    confirm: bool = False
+    session_context_id: Optional[str] = None
+
+
+class UpdateStudentScheduleResult(BaseModel):
+    ok: bool = True
+    student_id: str
+    student_name: str = ""
+    previous_schedule: str = ""
+    new_schedule: str = ""
+    outcome: str
+    reason: str = ""
+
+
+class BulkUpdateScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    student_ids: list[str] = Field(..., min_length=1, max_length=500)
+    schedule: Optional[str] = None
+    confirm: bool = False
+    session_context_id: Optional[str] = None
+
+
+class BulkUpdateScheduleResponse(BaseModel):
+    ok: bool = True
+    updated_count: int = 0
+    skipped_count: int = 0
+    results: list[UpdateStudentScheduleResult] = Field(default_factory=list)
+
+
+def _validate_schedule_target(raw: Optional[str]) -> str:
+    """Normalise + validate a requested schedule value. Raises 422 for
+    anything other than "A", "B", or blank/None (unassign)."""
+    target = _normalize_schedule(raw)
+    if raw not in (None, "") and target not in ALLOWED_SCHEDULE_VALUES:
+        raise HTTPException(
+            422, "schedule must be 'A', 'B', or empty/null (unassigned).",
+        )
+    return target
+
+
+async def _has_active_entry_in_other_schedule(
+    db, SL_SESSIONS, SL_ENTRIES, norm_id: str, target_schedule: str,
+) -> Optional[str]:
+    """Return the conflicting session_id if the student already has a pool
+    entry or lucky code in an OPEN session whose schedule differs from
+    ``target_schedule``; None if there is no conflict."""
+    cur = SL_SESSIONS.find(
+        {}, {"_id": 0, "session_id": 1, "schedule": 1, "status": 1,
+             "lucky_draw_done": 1, "lucky_draw_prepared_draw_id": 1},
+    )
+    async for sess in cur:
+        sess_schedule = _normalize_schedule(sess.get("schedule") or "")
+        if not sess_schedule or sess_schedule == target_schedule:
+            continue
+        if _draw_locked(sess):
+            continue
+        status = (sess.get("status") or "").strip().lower()
+        if status not in ALLOWED_SESSION_STATES:
+            continue
+        sid = sess.get("session_id")
+        if not sid:
+            continue
+        has_entry = await SL_ENTRIES.find_one(
+            {"session_id": sid, "student_id": norm_id},
+            {"_id": 0, "student_id": 1},
+        )
+        has_code = await db[COLLECTION_CODES].find_one(
+            {"session_id": sid, "student_id": norm_id},
+            {"_id": 0, "student_id": 1},
+        )
+        if has_entry or has_code:
+            return sid
+    return None
+
+
+async def _assign_schedule_one(
+    db, SL_SESSIONS, SL_ENTRIES, norm_student_id, student_id_raw: str,
+    target_schedule: str, confirm: bool, session_context_id: Optional[str],
+    teacher_identity: str,
+) -> UpdateStudentScheduleResult:
+    norm_id = norm_student_id(student_id_raw)
+    if not norm_id:
+        return UpdateStudentScheduleResult(
+            ok=False, student_id=str(student_id_raw or ""),
+            outcome="not_found", reason="invalid_student_id",
+        )
+    student_doc = await db.students.find_one(
+        {"$or": [{"clean_id": norm_id}, {"student_id": norm_id}]},
+        {"_id": 0, "display_name": 1, "name": 1, "group": 1,
+         "student_id": 1, "clean_id": 1},
+    )
+    if not student_doc:
+        return UpdateStudentScheduleResult(
+            student_id=norm_id, outcome="not_found",
+            reason="student_not_found",
+        )
+    display_name = (
+        student_doc.get("display_name") or student_doc.get("name") or norm_id
+    )
+    previous = _normalize_schedule(student_doc.get("group") or "")
+
+    if previous == target_schedule:
+        return UpdateStudentScheduleResult(
+            student_id=norm_id, student_name=display_name,
+            previous_schedule=previous, new_schedule=target_schedule,
+            outcome="unchanged",
+        )
+
+    # Hard safety block — never silently move a student who already has an
+    # active pool entry / lucky code under a DIFFERENT schedule's open
+    # session. `confirm` cannot override this; it must be resolved manually.
+    conflict_session = await _has_active_entry_in_other_schedule(
+        db, SL_SESSIONS, SL_ENTRIES, norm_id, target_schedule,
+    )
+    if conflict_session:
+        return UpdateStudentScheduleResult(
+            student_id=norm_id, student_name=display_name,
+            previous_schedule=previous, new_schedule=target_schedule,
+            outcome="blocked_active_elsewhere",
+            reason=f"active_entry_in_session:{conflict_session}",
+        )
+
+    # Reassigning an ALREADY-assigned student (A<->B, or A/B->unassigned)
+    # requires an explicit confirmation. Assigning a previously-unassigned
+    # student never requires it.
+    if previous and not confirm:
+        return UpdateStudentScheduleResult(
+            student_id=norm_id, student_name=display_name,
+            previous_schedule=previous, new_schedule=target_schedule,
+            outcome="confirmation_required",
+            reason="reassigning an already-assigned student requires "
+                   "explicit confirmation",
+        )
+
+    canonical_student_id = (
+        student_doc.get("student_id") or student_doc.get("clean_id") or norm_id
+    )
+    await db.students.update_one(
+        {"student_id": canonical_student_id},
+        {"$set": {"group": target_schedule}},
+    )
+    audit_doc = {
+        "assignment_id":         str(uuid.uuid4()),
+        "student_id":            canonical_student_id,
+        "previous_schedule":     previous,
+        "new_schedule":          target_schedule,
+        "authenticated_teacher": teacher_identity,
+        "session_context_id":    session_context_id or "",
+        "changed_at":            utcnow().isoformat(),
+    }
+    await db[COLLECTION_SCHEDULE_AUDIT].insert_one(audit_doc)
+    return UpdateStudentScheduleResult(
+        student_id=norm_id, student_name=display_name,
+        previous_schedule=previous, new_schedule=target_schedule,
+        outcome="updated",
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -873,12 +1102,14 @@ def register_teacher_admission_routes(
             raise HTTPException(404, "Session not found.")
         entry_fee = int(sess.get("entry_fee") or 0)
         treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        session_schedule = _normalize_schedule(sess.get("schedule") or "")
         by_sender = await _latest_rows_by_sender(treasury_id, look_back_minutes)
 
         candidates: list[MissingCodeCandidate] = []
         for sender_norm, row in by_sender.items():
             info = await _gather_candidate(
                 db, SL_ENTRIES, session_id, entry_fee, sender_norm, row,
+                session_schedule,
             )
             candidates.append(MissingCodeCandidate(
                 student_id=sender_norm,
@@ -891,9 +1122,11 @@ def register_teacher_admission_routes(
                 status=info["status"],
                 restorable=info["restorable"],
                 reason=info["reason"],
+                student_schedule=info["student_schedule"],
             ))
         return MissingCodeCandidatesResponse(
             session_id=session_id,
+            session_schedule=session_schedule,
             entry_fee=entry_fee,
             candidates=candidates,
             restorable_count=sum(1 for c in candidates if c.restorable),
@@ -901,7 +1134,7 @@ def register_teacher_admission_routes(
 
     async def _recover_one(
         session_id: str, entry_fee: int, treasury_id: str,
-        student_id_raw: str, teacher_identity: str,
+        session_schedule: str, student_id_raw: str, teacher_identity: str,
     ) -> RecoverMissingCodeResult:
         norm_id = norm_student_id(student_id_raw)
         if not norm_id:
@@ -914,6 +1147,7 @@ def register_teacher_admission_routes(
             row = by_sender.get(norm_id)
             info = await _gather_candidate(
                 db, SL_ENTRIES, session_id, entry_fee, norm_id, row,
+                session_schedule,
             )
             display_name = info["display_name"]
 
@@ -1156,13 +1390,14 @@ def register_teacher_admission_routes(
         _require_session_open(sess)
         entry_fee = int(sess.get("entry_fee") or 0)
         treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        session_schedule = _normalize_schedule(sess.get("schedule") or "")
         teacher_identity = (
             getattr(admin, "email", None) or getattr(admin, "user_id", None)
             or "unknown_admin"
         )
         return await _recover_one(
-            session_id, entry_fee, treasury_id, body.student_id,
-            teacher_identity,
+            session_id, entry_fee, treasury_id, session_schedule,
+            body.student_id, teacher_identity,
         )
 
     @api.post(
@@ -1195,6 +1430,7 @@ def register_teacher_admission_routes(
         _require_session_open(sess)
         entry_fee = int(sess.get("entry_fee") or 0)
         treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        session_schedule = _normalize_schedule(sess.get("schedule") or "")
         teacher_identity = (
             getattr(admin, "email", None) or getattr(admin, "user_id", None)
             or "unknown_admin"
@@ -1203,7 +1439,8 @@ def register_teacher_admission_routes(
         for sid in body.student_ids:
             try:
                 res = await _recover_one(
-                    session_id, entry_fee, treasury_id, sid, teacher_identity,
+                    session_id, entry_fee, treasury_id, session_schedule,
+                    sid, teacher_identity,
                 )
             except Exception as exc:  # noqa: BLE001
                 L.error("missing_code_recovery bulk item failed sid=%s: %s",
@@ -1218,6 +1455,63 @@ def register_teacher_admission_routes(
         return RecoverMissingCodesBulkResponse(
             session_id=session_id, restored_count=restored_count,
             skipped_count=skipped_count, results=results,
+        )
+
+    @api.post(
+        "/speaking-lab/students/{student_id}/schedule-assignment",
+        response_model=UpdateStudentScheduleResult,
+        summary="Assign a student's persistent Schedule A/B (or unassign)",
+    )
+    async def assign_student_schedule(
+        student_id: str,
+        body: UpdateStudentScheduleRequest,
+        admin=Depends(require_admin_dep),
+    ) -> UpdateStudentScheduleResult:
+        target = _validate_schedule_target(body.schedule)
+        teacher_identity = (
+            getattr(admin, "email", None) or getattr(admin, "user_id", None)
+            or "unknown_admin"
+        )
+        return await _assign_schedule_one(
+            db, SL_SESSIONS, SL_ENTRIES, norm_student_id, student_id,
+            target, body.confirm, body.session_context_id, teacher_identity,
+        )
+
+    @api.post(
+        "/speaking-lab/students/schedule-assignment/bulk",
+        response_model=BulkUpdateScheduleResponse,
+        summary="Bulk-assign students' persistent Schedule A/B",
+    )
+    async def assign_student_schedules_bulk(
+        body: BulkUpdateScheduleRequest,
+        admin=Depends(require_admin_dep),
+    ) -> BulkUpdateScheduleResponse:
+        target = _validate_schedule_target(body.schedule)
+        teacher_identity = (
+            getattr(admin, "email", None) or getattr(admin, "user_id", None)
+            or "unknown_admin"
+        )
+        results: list[UpdateStudentScheduleResult] = []
+        for sid in body.student_ids:
+            try:
+                res = await _assign_schedule_one(
+                    db, SL_SESSIONS, SL_ENTRIES, norm_student_id, sid,
+                    target, body.confirm, body.session_context_id,
+                    teacher_identity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                L.error("schedule_assignment bulk item failed sid=%s: %s",
+                        sid, exc)
+                res = UpdateStudentScheduleResult(
+                    ok=False, student_id=str(sid), outcome="error",
+                    reason="assignment_failed",
+                )
+            results.append(res)
+        updated_count = sum(1 for r in results if r.outcome == "updated")
+        return BulkUpdateScheduleResponse(
+            updated_count=updated_count,
+            skipped_count=len(results) - updated_count,
+            results=results,
         )
 
 

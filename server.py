@@ -24,6 +24,7 @@ from teacher_admission import (
     register_teacher_admission_routes,
     ensure_teacher_admission_indexes,
     ensure_missing_code_recovery_indexes,
+    ensure_schedule_assignment_indexes,
 )
 from lucky_draw import (
     register_lucky_draw_routes,
@@ -5659,6 +5660,7 @@ async def startup():
     # ?? Speaking Lab Emergency Teacher Admit indexes ??
     await ensure_teacher_admission_indexes(db)
     await ensure_missing_code_recovery_indexes(db)
+    await ensure_schedule_assignment_indexes(db)
     # ── Voice Treasure (Phase 2) — seed default config doc if absent ──
     try:
         from voice_treasure_config_tools import ensure_voice_treasure_indexes
