@@ -5474,10 +5474,10 @@ async def _lucky_draw_push_notify(student_id: str, amount: int, code: str) -> di
     try:
         sent, failed = await _fan_out_push(
             query,
-            title=f"🎰 +{amount} Lucky Draw Winner!",
+            title="🎉 Speaking Lab Prize Won!",
             body=(
-                f"អ្នកឈ្នះ +{amount} ពិន្ទុពី Speaking Lab Lucky Draw! ✨\n"
-                f"You won +{amount} pts from the Speaking Lab pool · ticket {code}"
+                f"You won {amount} points in the Speaking Lab Prize Pool. "
+                f"Your reward has been added successfully."
             ),
             url="/portal",
         )
