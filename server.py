@@ -23,6 +23,7 @@ import httpx
 from teacher_admission import (
     register_teacher_admission_routes,
     ensure_teacher_admission_indexes,
+    ensure_missing_code_recovery_indexes,
 )
 from lucky_draw import (
     register_lucky_draw_routes,
@@ -5552,6 +5553,31 @@ async def _verify_pool_payment_evidence(
         return {"unavailable": True}
 
 
+# ── Missing Code Rescue: read-only push_credit_log signal source ──────────────
+# NOT an authoritative ledger read — `push_credit_log` is client-submitted
+# (see `_verify_pool_payment_evidence` above). This only surfaces candidate
+# rows for teacher_admission.py's human-reviewed Missing Code Rescue; the
+# teacher must still explicitly confirm each restore.
+async def _find_recent_treasury_credits(
+    *, treasury_id: str, since,
+) -> list[dict]:
+    treasury_norm = _norm_student_id(treasury_id or SL_TREASURY_ID)
+    rows: list[dict] = []
+    try:
+        cur = push_credit_log.find(
+            {"createdAt": {"$gte": since}},
+            {"_id": 0, "senderStudentId": 1, "recipientStudentId": 1,
+             "amount": 1, "createdAt": 1, "transferId": 1},
+        ).sort("createdAt", -1).limit(500)
+        async for r in cur:
+            if _norm_student_id(r.get("recipientStudentId") or "") == treasury_norm:
+                rows.append(r)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("missing_code_rescue: push_credit_log read failed: %s",
+                    str(exc)[:200])
+    return rows
+
+
 # ?? Speaking Lab Emergency Teacher Admit (v1.1.2) ?????????????????????????????
 # Additive, narrowly scoped recovery route. Does not modify student balances
 # or protected lucky-draw winner, finalize, claim, or payout behavior.
@@ -5566,6 +5592,7 @@ register_teacher_admission_routes(
     generate_and_publish_lucky_code,
     log=log,
     verify_pool_payment=_verify_pool_payment_evidence,
+    find_recent_treasury_credits=_find_recent_treasury_credits,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -5631,6 +5658,7 @@ async def startup():
     await ensure_lucky_draw_indexes(db)
     # ?? Speaking Lab Emergency Teacher Admit indexes ??
     await ensure_teacher_admission_indexes(db)
+    await ensure_missing_code_recovery_indexes(db)
     # ── Voice Treasure (Phase 2) — seed default config doc if absent ──
     try:
         from voice_treasure_config_tools import ensure_voice_treasure_indexes

@@ -85,7 +85,7 @@ import asyncio
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Awaitable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -335,6 +335,206 @@ async def _restore_entry(SL_ENTRIES, session_id: str, snapshot: dict,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Missing Code Rescue — human-reviewed recovery for "paid but no code" (v1.0)
+# ──────────────────────────────────────────────────────────────────────────────
+# IMPORTANT: `push_credit_log` (surfaced here via the injected
+# ``find_recent_treasury_credits`` callable) is a CLIENT-SUBMITTED
+# notification, NOT an authoritative treasury ledger — see
+# server.py's ``_verify_pool_payment_evidence`` for the same caveat. This
+# feature never claims automatic payment verification. It only turns a raw
+# push_credit_log row into a *reviewable candidate*; the teacher must
+# explicitly confirm (tap Restore) each one before any pool entry / lucky
+# code is created. No wallet balance is ever touched and no GAS/provider
+# call is made — recovery only repairs the pool-entry surface, exactly like
+# the existing ``/pool/reconcile`` endpoint.
+COLLECTION_RECOVERIES = "speaking_lab_missing_code_recoveries"
+
+
+class _RecoveryIndexHealth:
+    unique_ref_ok: bool = False
+    last_error: str = ""
+
+
+async def ensure_missing_code_recovery_indexes(db) -> bool:
+    """Create indexes required by Missing Code Rescue. Non-fatal at
+    startup; the routes fail closed if the unique indexes are unhealthy."""
+    _RecoveryIndexHealth.unique_ref_ok = False
+    _RecoveryIndexHealth.last_error = ""
+    try:
+        recoveries = db[COLLECTION_RECOVERIES]
+        await recoveries.create_index(
+            [("normalized_source_reference", 1)],
+            unique=True,
+            name="uq_missing_code_recovery_reference",
+        )
+        await recoveries.create_index(
+            [("session_id", 1), ("student_id", 1)],
+            unique=True,
+            name="uq_missing_code_recovery_session_student",
+        )
+        await recoveries.create_index(
+            [("recovery_id", 1)],
+            unique=True,
+            name="uq_missing_code_recovery_id",
+        )
+        _RecoveryIndexHealth.unique_ref_ok = True
+        logger.info("missing_code_recovery: indexes ensured (unique_ref_ok=True).")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _RecoveryIndexHealth.last_error = str(exc)[:240]
+        logger.warning("missing_code_recovery: index ensure failed: %s", exc)
+        return False
+
+
+def _force_recovery_index_health(ok: bool, last_error: str = "") -> None:
+    """Test-only helper to drive the health gate without touching Mongo."""
+    _RecoveryIndexHealth.unique_ref_ok = ok
+    _RecoveryIndexHealth.last_error = last_error
+
+
+class MissingCodeCandidate(BaseModel):
+    student_id: str
+    student_name: str
+    claimed_amount: int
+    transfer_time: str
+    transfer_reference: str
+    entry_fee: int
+    current_status: str
+    status: str
+    restorable: bool
+    reason: str = ""
+
+
+class MissingCodeCandidatesResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    entry_fee: int
+    candidates: list[MissingCodeCandidate] = Field(default_factory=list)
+    restorable_count: int = 0
+
+
+class RecoverMissingCodeRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    student_id: str = Field(..., min_length=1, max_length=64)
+    teacher_confirmed: bool
+
+
+class RecoverMissingCodeResult(BaseModel):
+    ok: bool = True
+    student_id: str
+    display_name: str = ""
+    outcome: str
+    reason: str = ""
+    lucky_code: str = ""
+    entry_fee: int = 0
+    pool_total: int = 0
+    player_count: int = 0
+    recovery_id: str = ""
+    idempotent_replay: bool = False
+
+
+class RecoverMissingCodesBulkRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    student_ids: list[str] = Field(..., min_length=1, max_length=200)
+    teacher_confirmed: bool
+
+
+class RecoverMissingCodesBulkResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    restored_count: int = 0
+    skipped_count: int = 0
+    results: list[RecoverMissingCodeResult] = Field(default_factory=list)
+
+
+async def _lookup_student_display(db, norm_id: str) -> str:
+    student_doc = await db.students.find_one(
+        {"$or": [{"clean_id": norm_id}, {"student_id": norm_id}]},
+        {"_id": 0, "display_name": 1, "name": 1},
+    )
+    if student_doc:
+        return (
+            student_doc.get("display_name")
+            or student_doc.get("name")
+            or norm_id
+        )
+    return norm_id
+
+
+async def _gather_candidate(
+    db, SL_ENTRIES, session_id: str, entry_fee: int, norm_id: str,
+    row: Optional[dict],
+) -> dict:
+    """Classify one push_credit_log row into a reviewable candidate.
+
+    NEVER treats the row as proof of payment — only as a reviewable
+    signal a human teacher must confirm before anything is created.
+    """
+    display_name = await _lookup_student_display(db, norm_id)
+    claimed_amount = int((row or {}).get("amount") or 0)
+    raw_ref = str((row or {}).get("transferId") or "").strip()
+    normalized_ref = normalize_reference(raw_ref)
+    created_at = (row or {}).get("createdAt")
+    transfer_time = (
+        created_at.isoformat() if hasattr(created_at, "isoformat")
+        else str(created_at or "")
+    )
+
+    entry_doc = await SL_ENTRIES.find_one(
+        {"session_id": session_id, "student_id": norm_id}, {"_id": 0},
+    )
+    code_doc = await db[COLLECTION_CODES].find_one(
+        {"session_id": session_id, "student_id": norm_id}, {"_id": 0},
+    )
+    has_entry, has_code = bool(entry_doc), bool(code_doc)
+    current_status = (
+        "has_entry_and_code" if (has_entry and has_code)
+        else "has_entry_no_code" if has_entry
+        else "no_entry_no_code"
+    )
+    base = {
+        "display_name": display_name, "claimed_amount": claimed_amount,
+        "transfer_time": transfer_time, "transfer_reference": raw_ref,
+        "normalized_reference": normalized_ref,
+        "current_status": current_status,
+        "entry_doc": entry_doc, "code_doc": code_doc,
+    }
+
+    if has_entry and has_code:
+        return {**base, "status": "already_has_code", "restorable": False,
+                "reason": ""}
+    if not raw_ref:
+        return {**base, "status": "manual_review_required",
+                "restorable": False, "reason": "missing_transfer_reference"}
+    if claimed_amount != int(entry_fee or 0):
+        return {**base, "status": "manual_review_required",
+                "restorable": False, "reason": "amount_mismatch"}
+
+    existing_recovery = await db[COLLECTION_RECOVERIES].find_one(
+        {"normalized_source_reference": normalized_ref}, {"_id": 0},
+    )
+    if existing_recovery:
+        if existing_recovery.get("session_id") == session_id \
+                and existing_recovery.get("student_id") == norm_id \
+                and existing_recovery.get("status") == "restored":
+            return {**base, "status": "already_restored", "restorable": False,
+                    "reason": "", "existing_recovery": existing_recovery}
+        return {**base, "status": "manual_review_required",
+                "restorable": False, "reason": "reference_already_consumed"}
+
+    existing_admission = await db[COLLECTION_ADMISSIONS].find_one(
+        {"normalized_transfer_reference": normalized_ref,
+         "status_after": "admitted"}, {"_id": 0},
+    )
+    if existing_admission:
+        return {**base, "status": "manual_review_required",
+                "restorable": False, "reason": "reference_already_consumed"}
+
+    return {**base, "status": "review_required", "restorable": True,
+            "reason": ""}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Route factory
 # ──────────────────────────────────────────────────────────────────────────────
 def register_teacher_admission_routes(
@@ -348,6 +548,9 @@ def register_teacher_admission_routes(
     generate_and_publish_lucky_code: Callable[..., Awaitable[Optional[dict]]],
     log: Optional[logging.Logger] = None,
     verify_pool_payment: Optional[Callable[..., Awaitable[Optional[dict]]]] = None,
+    find_recent_treasury_credits: Optional[
+        Callable[..., Awaitable[list[dict]]]
+    ] = None,
 ) -> None:
     L = log or logger
 
@@ -356,6 +559,10 @@ def register_teacher_admission_routes(
     # only short-circuits the duplicate work locally so test
     # `asyncio.gather` does not double-write before the reservation lands.
     _serialize_lock = asyncio.Lock()
+
+    # Separate lock for Missing Code Rescue so it never contends with the
+    # unrelated teacher-admit path above.
+    _recovery_lock = asyncio.Lock()
 
     @api.post(
         "/speaking-lab/sessions/{session_id}/teacher-admit",
@@ -614,6 +821,404 @@ def register_teacher_admission_routes(
                 canonical_student_id, display_name, display_name_key,
                 admin, enrollment_override,
             )
+
+    # ── Missing Code Rescue: shared session gate ────────────────────────────
+    def _require_session_open(sess: dict) -> None:
+        locked = _draw_locked(sess)
+        if locked:
+            raise HTTPException(
+                409, f"Session is locked for admission ({locked}).",
+            )
+        sess_status = (sess.get("status") or "").strip().lower()
+        if sess_status not in ALLOWED_SESSION_STATES:
+            raise HTTPException(
+                409, f"Session state '{sess_status}' does not accept entries.",
+            )
+
+    async def _latest_rows_by_sender(
+        session_treasury_id: str, look_back_minutes: int,
+    ) -> dict:
+        window = max(1, min(int(look_back_minutes or 1440), 24 * 60))
+        since = utcnow() - timedelta(minutes=window)
+        rows = await find_recent_treasury_credits(
+            treasury_id=session_treasury_id, since=since,
+        )
+        by_sender: dict[str, dict] = {}
+        for row in (rows or []):
+            sender_norm = norm_student_id(row.get("senderStudentId") or "")
+            if not sender_norm or sender_norm in by_sender:
+                continue  # rows arrive most-recent-first; keep first seen
+            by_sender[sender_norm] = row
+        return by_sender
+
+    @api.get(
+        "/speaking-lab/sessions/{session_id}/missing-code-candidates",
+        response_model=MissingCodeCandidatesResponse,
+        summary="Missing Code Rescue — list reviewable candidates "
+                "(NOT verified payment proof)",
+    )
+    async def missing_code_candidates(
+        session_id: str,
+        look_back_minutes: int = 1440,
+        admin=Depends(require_admin_dep),
+    ) -> MissingCodeCandidatesResponse:
+        if find_recent_treasury_credits is None:
+            raise HTTPException(
+                503,
+                {"detail": "missing_code_review_unavailable",
+                 "reason": "no candidate signal source is configured."},
+            )
+        sess = await SL_SESSIONS.find_one({"session_id": session_id})
+        if not sess:
+            raise HTTPException(404, "Session not found.")
+        entry_fee = int(sess.get("entry_fee") or 0)
+        treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        by_sender = await _latest_rows_by_sender(treasury_id, look_back_minutes)
+
+        candidates: list[MissingCodeCandidate] = []
+        for sender_norm, row in by_sender.items():
+            info = await _gather_candidate(
+                db, SL_ENTRIES, session_id, entry_fee, sender_norm, row,
+            )
+            candidates.append(MissingCodeCandidate(
+                student_id=sender_norm,
+                student_name=info["display_name"],
+                claimed_amount=info["claimed_amount"],
+                transfer_time=info["transfer_time"],
+                transfer_reference=info["transfer_reference"],
+                entry_fee=entry_fee,
+                current_status=info["current_status"],
+                status=info["status"],
+                restorable=info["restorable"],
+                reason=info["reason"],
+            ))
+        return MissingCodeCandidatesResponse(
+            session_id=session_id,
+            entry_fee=entry_fee,
+            candidates=candidates,
+            restorable_count=sum(1 for c in candidates if c.restorable),
+        )
+
+    async def _recover_one(
+        session_id: str, entry_fee: int, treasury_id: str,
+        student_id_raw: str, teacher_identity: str,
+    ) -> RecoverMissingCodeResult:
+        norm_id = norm_student_id(student_id_raw)
+        if not norm_id:
+            return RecoverMissingCodeResult(
+                ok=False, student_id=str(student_id_raw or ""),
+                outcome="manual_review_required", reason="invalid_student_id",
+            )
+        async with _recovery_lock:
+            by_sender = await _latest_rows_by_sender(treasury_id, 1440)
+            row = by_sender.get(norm_id)
+            info = await _gather_candidate(
+                db, SL_ENTRIES, session_id, entry_fee, norm_id, row,
+            )
+            display_name = info["display_name"]
+
+            if info["status"] == "already_has_code":
+                snap = await _pool_snapshot(db, session_id)
+                return RecoverMissingCodeResult(
+                    student_id=norm_id, display_name=display_name,
+                    outcome="skipped", reason="already_has_code",
+                    lucky_code=(info.get("code_doc") or {}).get("code", ""),
+                    entry_fee=entry_fee, pool_total=snap["pool_total"],
+                    player_count=snap["player_count"],
+                )
+            if info["status"] == "already_restored":
+                existing_recovery = info.get("existing_recovery") or {}
+                snap = await _pool_snapshot(db, session_id)
+                return RecoverMissingCodeResult(
+                    student_id=norm_id, display_name=display_name,
+                    outcome="already_restored",
+                    lucky_code=(info.get("code_doc") or {}).get("code", "")
+                        or existing_recovery.get("generated_code", ""),
+                    entry_fee=entry_fee, pool_total=snap["pool_total"],
+                    player_count=snap["player_count"],
+                    recovery_id=existing_recovery.get("recovery_id", ""),
+                    idempotent_replay=True,
+                )
+            if info["status"] == "manual_review_required":
+                return RecoverMissingCodeResult(
+                    student_id=norm_id, display_name=display_name,
+                    outcome="manual_review_required", reason=info["reason"],
+                    entry_fee=entry_fee,
+                )
+
+            # status == "review_required" → proceed with the human-confirmed
+            # restore. Reserve the recovery row FIRST (durable dedup via the
+            # unique indexes) before creating any pool state.
+            recovery_id = str(uuid.uuid4())
+            now = utcnow()
+            audit_doc = {
+                "recovery_id":                 recovery_id,
+                "session_id":                  session_id,
+                "student_id":                  norm_id,
+                "display_name":                display_name,
+                "entry_fee":                   entry_fee,
+                "claimed_amount":               info["claimed_amount"],
+                "source_reference_raw":        info["transfer_reference"],
+                "normalized_source_reference": info["normalized_reference"],
+                "source_transfer_time":        info["transfer_time"],
+                "source_record":               "push_credit_log",
+                "authenticated_teacher":       teacher_identity,
+                "teacher_confirmed":           True,
+                "confirmed_at":                now.isoformat(),
+                "status":                      "processing",
+                "generated_code":              None,
+                "created_at":                  now.isoformat(),
+                "updated_at":                  now.isoformat(),
+                "completed_at":                None,
+                "last_error":                  None,
+            }
+            try:
+                await db[COLLECTION_RECOVERIES].insert_one(audit_doc)
+            except Exception:  # noqa: BLE001 — race on either unique index
+                re_read = await db[COLLECTION_RECOVERIES].find_one(
+                    {"$or": [
+                        {"normalized_source_reference": info["normalized_reference"]},
+                        {"session_id": session_id, "student_id": norm_id},
+                    ]},
+                    {"_id": 0},
+                )
+                if re_read and re_read.get("status") == "restored":
+                    snap = await _pool_snapshot(db, session_id)
+                    return RecoverMissingCodeResult(
+                        student_id=norm_id, display_name=display_name,
+                        outcome="already_restored",
+                        lucky_code=re_read.get("generated_code", ""),
+                        entry_fee=entry_fee, pool_total=snap["pool_total"],
+                        player_count=snap["player_count"],
+                        recovery_id=re_read.get("recovery_id", ""),
+                        idempotent_replay=True,
+                    )
+                return RecoverMissingCodeResult(
+                    student_id=norm_id, display_name=display_name,
+                    outcome="manual_review_required",
+                    reason="concurrent_recovery_in_progress",
+                    entry_fee=entry_fee,
+                )
+
+            entry_created = False
+            code_owned_by_us = False
+            try:
+                if not info["entry_doc"]:
+                    position = (
+                        await SL_ENTRIES.count_documents(
+                            {"session_id": session_id},
+                        )
+                    ) + 1
+                    entry_doc = {
+                        "session_id":         session_id,
+                        "student_id":         norm_id,
+                        "display_name":       display_name,
+                        "display_name_key":   display_name.lower(),
+                        "position":           position,
+                        "entered_at":         utcnow().isoformat(),
+                        "source":             "missing_code_recovery",
+                        "recovery_id":        recovery_id,
+                        "recovery_reference": info["normalized_reference"],
+                        "recovery_by":        teacher_identity,
+                        "recovery_at":        utcnow().isoformat(),
+                        "eligible":           True,
+                        "paid_entry":         True,
+                    }
+                    await SL_ENTRIES.insert_one(entry_doc)
+                    entry_created = True
+                    await sl_publish(session_id, {
+                        "type":         "entry",
+                        "student_id":   norm_id,
+                        "display_name": display_name,
+                        "position":     position,
+                        "entered_at":   entry_doc["entered_at"],
+                    })
+
+                pre_existing_code = await db[COLLECTION_CODES].find_one(
+                    {"session_id": session_id, "student_id": norm_id},
+                    {"_id": 0, "code": 1},
+                )
+                code_owned_by_us = not bool(pre_existing_code)
+                await generate_and_publish_lucky_code(
+                    db, sl_publish, session_id, norm_id, display_name,
+                    amount=entry_fee, log=L,
+                )
+                if code_owned_by_us:
+                    await db[COLLECTION_CODES].update_one(
+                        {"session_id": session_id, "student_id": norm_id,
+                         "$or": [{"recovery_id": {"$exists": False}},
+                                 {"recovery_id": recovery_id}]},
+                        {"$set": {
+                            "recovery_id":        recovery_id,
+                            "recovery_reference": info["normalized_reference"],
+                            "recovery_by":        teacher_identity,
+                            "recovered_at":       utcnow().isoformat(),
+                            "source":             "missing_code_recovery",
+                        }},
+                    )
+                verify_code = await db[COLLECTION_CODES].find_one(
+                    {"session_id": session_id, "student_id": norm_id},
+                    {"_id": 0},
+                )
+                if not verify_code or not verify_code.get("code"):
+                    raise RuntimeError("lucky code missing after write")
+            except Exception as exc:  # noqa: BLE001
+                if entry_created:
+                    try:
+                        await SL_ENTRIES.delete_one({
+                            "session_id": session_id, "student_id": norm_id,
+                            "recovery_id": recovery_id,
+                            "source": "missing_code_recovery",
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                if code_owned_by_us:
+                    try:
+                        await db[COLLECTION_CODES].delete_one({
+                            "session_id": session_id, "student_id": norm_id,
+                            "recovery_id": recovery_id,
+                            "source": "missing_code_recovery",
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                await db[COLLECTION_RECOVERIES].update_one(
+                    {"recovery_id": recovery_id},
+                    {"$set": {"status": "rolled_back",
+                              "last_error": str(exc)[:240],
+                              "updated_at": utcnow().isoformat()}},
+                )
+                L.error("missing_code_recovery FAILED recovery_id=%s: %s",
+                        recovery_id, exc)
+                return RecoverMissingCodeResult(
+                    ok=False, student_id=norm_id, display_name=display_name,
+                    outcome="error", reason="recovery_failed",
+                    entry_fee=entry_fee,
+                )
+
+            await db[COLLECTION_RECOVERIES].update_one(
+                {"recovery_id": recovery_id},
+                {"$set": {
+                    "status":         "restored",
+                    "generated_code": verify_code["code"],
+                    "completed_at":   utcnow().isoformat(),
+                    "updated_at":     utcnow().isoformat(),
+                }},
+            )
+            snap = await _pool_snapshot(db, session_id)
+            try:
+                await sl_publish(session_id, {
+                    "type":         "pool_update",
+                    "pool_total":   snap["pool_total"],
+                    "player_count": snap["player_count"],
+                })
+            except Exception as pub_exc:  # noqa: BLE001
+                L.warning("missing_code_recovery pool_update SSE failed: %s",
+                          str(pub_exc)[:200])
+            L.info(
+                "missing_code_recovery OK: session=%s student=%s code=%s "
+                "teacher=%s", session_id, norm_id, verify_code["code"],
+                teacher_identity,
+            )
+            return RecoverMissingCodeResult(
+                student_id=norm_id, display_name=display_name,
+                outcome="restored", lucky_code=verify_code["code"],
+                entry_fee=int(verify_code.get("entry_fee") or entry_fee),
+                pool_total=snap["pool_total"], player_count=snap["player_count"],
+                recovery_id=recovery_id,
+            )
+
+    @api.post(
+        "/speaking-lab/sessions/{session_id}/recover-missing-code",
+        response_model=RecoverMissingCodeResult,
+        summary="Missing Code Rescue — restore one teacher-reviewed student",
+    )
+    async def recover_missing_code(
+        session_id: str,
+        body: RecoverMissingCodeRequest,
+        admin=Depends(require_admin_dep),
+    ) -> RecoverMissingCodeResult:
+        if find_recent_treasury_credits is None:
+            raise HTTPException(
+                503, {"detail": "missing_code_review_unavailable"},
+            )
+        if not _RecoveryIndexHealth.unique_ref_ok:
+            raise HTTPException(
+                503,
+                {"detail": "missing_code_recovery_unavailable",
+                 "index_health_error": _RecoveryIndexHealth.last_error
+                                        or "unknown"},
+            )
+        if not body.teacher_confirmed:
+            raise HTTPException(422, "Teacher confirmation is required.")
+        sess = await SL_SESSIONS.find_one({"session_id": session_id})
+        if not sess:
+            raise HTTPException(404, "Session not found.")
+        _require_session_open(sess)
+        entry_fee = int(sess.get("entry_fee") or 0)
+        treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        teacher_identity = (
+            getattr(admin, "email", None) or getattr(admin, "user_id", None)
+            or "unknown_admin"
+        )
+        return await _recover_one(
+            session_id, entry_fee, treasury_id, body.student_id,
+            teacher_identity,
+        )
+
+    @api.post(
+        "/speaking-lab/sessions/{session_id}/recover-missing-codes/bulk",
+        response_model=RecoverMissingCodesBulkResponse,
+        summary="Missing Code Rescue — restore multiple teacher-reviewed "
+                "students",
+    )
+    async def recover_missing_codes_bulk(
+        session_id: str,
+        body: RecoverMissingCodesBulkRequest,
+        admin=Depends(require_admin_dep),
+    ) -> RecoverMissingCodesBulkResponse:
+        if find_recent_treasury_credits is None:
+            raise HTTPException(
+                503, {"detail": "missing_code_review_unavailable"},
+            )
+        if not _RecoveryIndexHealth.unique_ref_ok:
+            raise HTTPException(
+                503,
+                {"detail": "missing_code_recovery_unavailable",
+                 "index_health_error": _RecoveryIndexHealth.last_error
+                                        or "unknown"},
+            )
+        if not body.teacher_confirmed:
+            raise HTTPException(422, "Teacher confirmation is required.")
+        sess = await SL_SESSIONS.find_one({"session_id": session_id})
+        if not sess:
+            raise HTTPException(404, "Session not found.")
+        _require_session_open(sess)
+        entry_fee = int(sess.get("entry_fee") or 0)
+        treasury_id = norm_student_id(sess.get("treasury_id") or "")
+        teacher_identity = (
+            getattr(admin, "email", None) or getattr(admin, "user_id", None)
+            or "unknown_admin"
+        )
+        results: list[RecoverMissingCodeResult] = []
+        for sid in body.student_ids:
+            try:
+                res = await _recover_one(
+                    session_id, entry_fee, treasury_id, sid, teacher_identity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                L.error("missing_code_recovery bulk item failed sid=%s: %s",
+                        sid, exc)
+                res = RecoverMissingCodeResult(
+                    ok=False, student_id=str(sid), outcome="error",
+                    reason="recovery_failed",
+                )
+            results.append(res)
+        restored_count = sum(1 for r in results if r.outcome == "restored")
+        skipped_count = len(results) - restored_count
+        return RecoverMissingCodesBulkResponse(
+            session_id=session_id, restored_count=restored_count,
+            skipped_count=skipped_count, results=results,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
