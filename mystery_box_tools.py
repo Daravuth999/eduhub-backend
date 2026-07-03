@@ -30,6 +30,7 @@
 # v1.0 — initial release
 # ============================================================================
 
+import asyncio as _mbt_asyncio
 import logging as _mbt_logging
 import secrets as _mbt_secrets
 import uuid as _mbt_uuid
@@ -632,6 +633,199 @@ except Exception as _et_hook_err:
         "consumed inside EduTalk yet): %s",
         _et_hook_err,
     )
+
+
+# ── reward-success push notifications (additive, v1.0) ──────────────────────
+#
+# Exactly-once push for a DURABLY GRANTED Mystery Box prize. Mirrors the
+# pattern already proven for Speaking Lab Lucky Draw
+# (`_send_winner_push_idempotent` in lucky_draw.py): claim the notification
+# slot atomically on the EXISTING grant record, call the REAL push helper,
+# and only ever mark `sent` on a truthful delivery result. This module
+# NEVER grants anything — see `notify_mystery_box_prize` docstring.
+#
+# Durable grant identity: `speaking_lab_mystery_claims.id` (the claim row
+# already created by `mbt_reveal_round`, unique per (round_id,
+# student_id_norm) via the existing `round_student_unique` index). That id
+# is the notification idempotency key (`mystery_box_grant_id`) — stable
+# across retries because a failed-grant retry reuses the SAME claim id.
+#
+# Notifiable prize types are exactly the ones with a PROVEN durable success
+# signal today:
+#   * points          → `_lrc_credit_via_treasury` result is checked by
+#                        `_mbt_grant_prize` itself (ok=False on failure).
+#   * book_voucher     → `_lrc_issue_voucher_for_claim` result is checked
+#                        (ok=False on failure / falsy payload).
+#   * edutalk_session / edutalk_voice → `_mbt_grant_edutalk_pass` inserts
+#                        an entitlement row or raises; a claim can only
+#                        reach `granted_status="granted"` if it returned.
+#
+# "consolation" is intentionally EXCLUDED: its existing grant path calls
+# the same treasury credit but swallows the result (`except Exception:
+# pass`) and unconditionally returns `ok=True` regardless of whether the
+# credit actually succeeded. There is no way to add a truthful success
+# signal for it without changing that existing return contract, which is
+# out of scope for a notification-only change — sending a push there
+# would mean faking exactly-once behavior on an unproven grant. This is
+# the one reported blocker from the inventory pass.
+#
+# "lucky_draw_entry" / "recognition" are excluded because they are
+# visual/record-only per the code's own docstring — no points, voucher,
+# or entitlement is ever durably granted for them.
+_MBT_PUSH_STALE_SECONDS = 120
+_MBT_NOTIFIABLE_PRIZE_TYPES = {"points", "book_voucher", "edutalk_session", "edutalk_voice"}
+
+
+def _mbt_prize_notification_content(prize_type: str, prize_title: str,
+                                    safe_display: dict) -> tuple[str, str]:
+    """Truthful, prize-specific title/body built ONLY from fields already
+    present in the existing `safe_display` payload shown to Speaking Lab
+    (never a raw db id, provider error, or un-exposed entitlement code)."""
+    safe_display = safe_display or {}
+    if prize_type == "points":
+        amount = int(safe_display.get("points") or 0)
+        return ("🎁 Mystery Box Reward!",
+                f"You received {amount} points from your Mystery Box. "
+                f"Your reward was added successfully.")
+    if prize_type == "book_voucher":
+        name = prize_title or safe_display.get("title") or "a voucher"
+        return ("📚 Mystery Box Reward!",
+                f"You unlocked {name} from your Mystery Box.")
+    if prize_type in ("edutalk_session", "edutalk_voice"):
+        qty = int(safe_display.get("quantity") or 1)
+        label = safe_display.get("pass_label") or "an EduTalk pass"
+        pass_description = f"{qty} {label}" if qty > 1 else label
+        return ("🎙️ Mystery Box Reward!",
+                f"You received {pass_description} for EduTalk.")
+    return ("🎁 Mystery Box Reward!",
+            "Your Mystery Box reward was granted successfully.")
+
+
+async def _mbt_push_notify_prize(student_clean_id: str, title: str, body: str) -> dict:
+    """Reuse the EXISTING subscription normalization + `_fan_out_push`
+    (both unchanged, shared with Lucky Draw) — never a second push
+    delivery system. Returns a TRUTHFUL structured result; never pretends
+    success on failure."""
+    norm = _mbt_norm_id(student_clean_id)
+    candidates: list[str] = []
+    for c in (student_clean_id, norm, norm.upper()):
+        if c and c not in candidates:
+            candidates.append(c)
+    query = {"studentId": {"$in": candidates}}
+    try:
+        sub_count = await push_subscriptions.count_documents(query)  # noqa: F821
+    except Exception:  # noqa: BLE001
+        sub_count = None
+    if sub_count == 0:
+        return {"attempted": False, "sent": 0, "failed": 0,
+                "no_subscribers": True, "error": ""}
+    try:
+        sent, failed = await _fan_out_push(  # noqa: F821
+            query, title=title, body=body, url="/portal",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"attempted": True, "sent": 0, "failed": 0,
+                "no_subscribers": False, "error": str(exc)[:200]}
+    sent = int(sent or 0)
+    failed = int(failed or 0)
+    return {"attempted": True, "sent": sent, "failed": failed,
+            "no_subscribers": (sent == 0 and failed == 0), "error": ""}
+
+
+async def notify_mystery_box_prize(
+    *,
+    student_id: str,
+    grant_id: str,
+    prize_type: str,
+    prize_payload: dict,
+    source: str = "speaking_lab_mystery_box",
+) -> dict:
+    """Send the Mystery Box reward-success push truthfully and EXACTLY
+    ONCE, for a prize that is ALREADY durably granted.
+
+    This function NEVER grants the prize — the caller MUST have already
+    persisted `speaking_lab_mystery_claims.{grant_id}.granted_status ==
+    "granted"` before calling this. It only atomically claims the
+    notification slot on that existing row, calls the real push helper,
+    and records a truthful outcome. Safe to call repeatedly (idempotent)
+    and safe under concurrency (exactly one caller wins the atomic claim).
+    """
+    if prize_type not in _MBT_NOTIFIABLE_PRIZE_TYPES:
+        return {"ok": True, "skipped": True, "reason": "not_notifiable_prize_type"}
+
+    now = _mbt_now()
+    now_iso = _mbt_iso(now)
+    attempt_id = _mbt_uuid.uuid4().hex
+    stale_cut = _mbt_iso(now - timedelta(seconds=_MBT_PUSH_STALE_SECONDS))
+
+    # Atomic claim: only a granted row, not already sent, and the slot is
+    # claimable (missing / pending / failed). Concurrent callers converge
+    # on exactly one winner via this conditional update.
+    claim_res = await _mbt_claims.update_one(
+        {"id": grant_id, "granted_status": "granted",
+         "notification_status": {"$in": [None, "pending", "failed"]}},
+        {"$set": {"notification_status": "sending",
+                  "notification_attempt_id": attempt_id,
+                  "notification_attempted_at": now_iso,
+                  "notification_key": grant_id,
+                  "notification_payload_version": 1}},
+    )
+    if getattr(claim_res, "modified_count", 0) != 1:
+        # Not grantable / already sent / claimed elsewhere — try the
+        # bounded stale-`sending` recovery path (mirrors Lucky Draw).
+        reclaim_res = await _mbt_claims.update_one(
+            {"id": grant_id, "granted_status": "granted",
+             "notification_status": "sending",
+             "notification_attempted_at": {"$lt": stale_cut}},
+            {"$set": {"notification_status": "sending",
+                      "notification_attempt_id": attempt_id,
+                      "notification_attempted_at": now_iso}},
+        )
+        if getattr(reclaim_res, "modified_count", 0) != 1:
+            return {"ok": True, "skipped": True, "reason": "not_claimable"}
+
+    prize_payload = prize_payload or {}
+    title, body = _mbt_prize_notification_content(
+        prize_type, prize_payload.get("title"), prize_payload,
+    )
+
+    try:
+        result = await _mbt_push_notify_prize(student_id, title, body)
+    except _mbt_asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — helper should not raise, but be safe
+        # Guard the terminal write on OUR attempt id so a delayed older
+        # worker can never overwrite a newer attempt's outcome.
+        await _mbt_claims.update_one(
+            {"id": grant_id, "notification_attempt_id": attempt_id},
+            {"$set": {"notification_status": "failed",
+                      "notification_error": str(exc)[:200]}},
+        )
+        _MBT_LOG.warning(
+            "mystery_box: reward push raised (grant stays successful) "
+            "grant_id=%s err=%s", grant_id, str(exc)[:200],
+        )
+        return {"ok": False, "sent": False, "error": str(exc)[:200]}
+
+    sent = int(result.get("sent") or 0)
+    if sent >= 1:
+        await _mbt_claims.update_one(
+            {"id": grant_id, "notification_attempt_id": attempt_id},
+            {"$set": {"notification_status": "sent",
+                      "notification_sent_at": _mbt_iso(_mbt_now()),
+                      "notification_error": ""}},
+        )
+        return {"ok": True, "sent": True}
+
+    no_subs = bool(result.get("no_subscribers"))
+    err = str(result.get("error") or "")
+    await _mbt_claims.update_one(
+        {"id": grant_id, "notification_attempt_id": attempt_id},
+        {"$set": {"notification_status": "failed",
+                  "notification_error": err or ("no_subscribers" if no_subs else "delivery_failed")}},
+    )
+    return {"ok": True, "sent": False,
+            "reason": "no_subscribers" if no_subs else "delivery_failed"}
 
 
 # ── prize granting (server is single source of truth) ───────────────────────
@@ -1413,6 +1607,25 @@ async def mbt_reveal_round(rid: str, payload: _RevealIn, admin=Depends(require_a
         }},
     )
 
+    # Reward-success push — ONLY now that the grant is durably persisted
+    # as "granted" above. Best-effort: a push failure/exception must never
+    # affect the reveal response below (the prize is already granted
+    # regardless of notification outcome). Never re-grants anything —
+    # see `notify_mystery_box_prize` docstring.
+    try:
+        await notify_mystery_box_prize(
+            student_id=sid_clean,
+            grant_id=pending_id,
+            prize_type=(prize.get("type") or "").strip().lower(),
+            prize_payload=safe_display,
+            source="speaking_lab_mystery_box",
+        )
+    except Exception as _notify_exc:  # noqa: BLE001
+        _MBT_LOG.warning(
+            "mystery_box: notify_mystery_box_prize raised (grant stays "
+            "successful) claim=%s err=%s", pending_id, str(_notify_exc)[:200],
+        )
+
     # v1.7 EMERGENCY FIX: mirror a successful POINTS grant into the Mongo
     # points ledger + wallet so it becomes visible in My Portal via the
     # existing /api/student/points/latest and /transactions endpoints.
@@ -1788,6 +2001,39 @@ async def mbt_admin_reconcile_points(
         }},
     )
     return {"ok": True, "mirror": mirror}
+
+
+class _MBTRetryPushIn(BaseModel):  # type: ignore[name-defined]
+    model_config = ConfigDict(extra="ignore")  # type: ignore[name-defined]
+    claim_id: str = Field(..., min_length=1)  # type: ignore[name-defined]
+
+
+@api.post("/admin/mystery-box/claims/retry-push")  # noqa: F821
+async def mbt_admin_retry_push(
+    payload: _MBTRetryPushIn,
+    admin=Depends(require_admin),  # type: ignore[name-defined]
+):
+    """Notification-only retry (admin-only). Re-sends the reward-success
+    push for an already-granted claim whose notification previously
+    failed / has no active subscribers. NEVER re-grants points, a
+    voucher, or an EduTalk pass, and never calls the prize provider —
+    it only re-attempts delivery via `notify_mystery_box_prize`, which is
+    idempotent and safe to call any number of times."""
+    claim = await _mbt_claims.find_one({"id": payload.claim_id}, {"_id": 0})
+    if not claim:
+        raise HTTPException(status_code=404, detail="claim not found")  # type: ignore[name-defined]
+    if (claim.get("granted_status") or "").lower() != "granted":
+        raise HTTPException(  # type: ignore[name-defined]
+            status_code=400, detail="claim is not in granted status")
+    resolved = await _mbt_resolve_student(claim.get("student_id") or "")
+    result = await notify_mystery_box_prize(
+        student_id=resolved["clean_id"] or claim.get("student_id"),
+        grant_id=claim.get("id"),
+        prize_type=(claim.get("prize_type") or "").strip().lower(),
+        prize_payload=claim.get("safe_display_payload") or {},
+        source="speaking_lab_mystery_box_retry",
+    )
+    return {"ok": True, "result": result}
 
 
 # ── Player join the round (Speaking Lab passes the picked student) ──────────
