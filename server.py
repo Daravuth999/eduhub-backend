@@ -836,9 +836,14 @@ async def studio_get_book(slug: str, admin: User = Depends(require_admin)):
     return {"success": True, "book": _clean_book(doc)}
 
 
-@api.post("/studio/books")
-async def studio_save_book(payload: BookPayload, admin: User = Depends(require_admin)):
-    """Append-only save   writes a new revision document."""
+async def _save_book_revision(payload: BookPayload, admin_email: str) -> dict:
+    """Append-only save — writes a new revision document.
+
+    Extracted core (Book Factory §AMENDMENT 10): reused by the manual Studio
+    save route AND by the Book Factory save-draft route so there is exactly
+    ONE book-persistence code path. No logic changed from the original route
+    body — this is a pure extraction.
+    """
     slug = slugify(payload.slug or payload.title)
     # compute next revision
     latest = await db.books.find_one({"slug": slug}, {"_id": 0, "revision": 1},
@@ -855,15 +860,22 @@ async def studio_save_book(payload: BookPayload, admin: User = Depends(require_a
         "slug": slug,
         "revision": next_rev,
         "_authoredAt": now,
-        "_authoredBy": admin.email,
+        "_authoredBy": admin_email,
     })
     await db.books.insert_one(doc)
-    log.info("studio: saved slug=%s rev=%s by=%s", slug, next_rev, admin.email)
+    log.info("studio: saved slug=%s rev=%s by=%s", slug, next_rev, admin_email)
     return {"success": True, "slug": slug, "revision": next_rev, "book": _clean_book(doc)}
 
 
-@api.post("/studio/books/{slug}/publish")
-async def studio_publish(slug: str, admin: User = Depends(require_admin)):
+@api.post("/studio/books")
+async def studio_save_book(payload: BookPayload, admin: User = Depends(require_admin)):
+    return await _save_book_revision(payload, admin.email)
+
+
+async def _publish_book(slug: str) -> dict:
+    """Extracted core (Book Factory §AMENDMENT 10): reused by the manual
+    Studio publish route AND the Book Factory publish route. Pure extraction,
+    no logic changed."""
     res = await db.books.update_many({"slug": slug}, {"$set": {"published": True}})
 
     # ---- Feature 4: notify all subscribers when a new book is published ----
@@ -881,6 +893,11 @@ async def studio_publish(slug: str, admin: User = Depends(require_admin)):
         pass  # push failure never blocks publish
 
     return {"success": True, "matched": res.matched_count, "modified": res.modified_count}
+
+
+@api.post("/studio/books/{slug}/publish")
+async def studio_publish(slug: str, admin: User = Depends(require_admin)):
+    return await _publish_book(slug)
 
 
 @api.post("/studio/books/{slug}/unpublish")
@@ -1055,34 +1072,33 @@ async def studio_audio_stream(audio_filename: str, request: Request):
     )
 
 
-@api.post("/studio/books/{slug}/elevenlabs")
-async def studio_elevenlabs_generate(
-    slug: str,
-    payload: dict,
-    admin: User = Depends(require_admin),
-):
+async def run_elevenlabs_for_chapter(
+    *, slug: str, chapter_index: int, raw_voice: str,
+    book_in: dict | None, admin_email: str,
+) -> dict:
     """Generate AI voice for one chapter using ElevenLabs.
-    Teacher-side only. Never called by students.
-    Injects audio_url + wordTimestamps into chapter blocks.
-    Saves a new book revision to MongoDB.
+
+    Extracted core of the /elevenlabs route (pure extraction, zero logic
+    change) so Book Factory's job-fenced narration route
+    (book_factory_jobs.py) can call the EXACT same code path as the manual
+    Studio "Generate AI Voice" button — one implementation, two callers.
     """
-    chapter_index = int(payload.get("chapterIndex", 0))
-    # Defensive: reject human-readable names like "Rachel" â€” ElevenLabs
+    # Defensive: reject human-readable names like "Rachel" — ElevenLabs
     # requires a 20-char alphanumeric voice_id. If the client somehow sends
     # anything else (stale cached frontend, manual API caller, etc.), fall
     # back to the configured default instead of 404-ing.
-    raw_voice = str(payload.get("voice") or "").strip()
+    raw_voice = str(raw_voice or "").strip()
     if _VOICE_ID_RE.match(raw_voice):
         voice_id = raw_voice
     else:
         if raw_voice:
             log.warning(
-                "elevenlabs: rejected invalid voice value %r â€” using default %s",
+                "elevenlabs: rejected invalid voice value %r — using default %s",
                 raw_voice, ELEVENLABS_DEFAULT_VOICE,
             )
         voice_id = ELEVENLABS_DEFAULT_VOICE
 
-    # Define now early â€” used in GridFS metadata and ai_voice meta below
+    # Define now early — used in GridFS metadata and ai_voice meta below
     now = datetime.now(timezone.utc).isoformat()
 
     # Load current book (latest revision).
@@ -1090,7 +1106,7 @@ async def studio_elevenlabs_generate(
     # auto-saving, which avoids any MongoDB replication race condition.
     # Fall back to find_one for backward compatibility.
     import asyncio
-    book = payload.get("book") or None
+    book = book_in or None
     if not book:
         book = await db.books.find_one(
             {"slug": slug},
@@ -1161,7 +1177,7 @@ async def studio_elevenlabs_generate(
             "chapter_index": str(chapter_index),
             "voice":         voice_id,
             "created_at":    now,
-            "created_by":    admin.email,
+            "created_by":    admin_email,
         },
     )
 
@@ -1184,7 +1200,7 @@ async def studio_elevenlabs_generate(
                     "chapter_index": chapter_index,
                     "voice":         voice_id,
                     "created_at":    now,
-                    "created_by":    admin.email,
+                    "created_by":    admin_email,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -1207,7 +1223,7 @@ async def studio_elevenlabs_generate(
     blocks.append({
         "type": "audio",
         "text": audio_url,
-        "heading": f"AI Voice â€” {chapter.get('title', 'Chapter')}",
+        "heading": f"AI Voice — {chapter.get('title', 'Chapter')}",
         "_elevenlabs_audio": True,
         "_audio_id": audio_id,
     })
@@ -1248,7 +1264,7 @@ async def studio_elevenlabs_generate(
         "word_count": len(word_timestamps),
     }
 
-    # Save new revision (append-only â€” same as studio_save_book)
+    # Save new revision (append-only — same as studio_save_book)
     latest = await db.books.find_one(
         {"slug": slug}, {"_id": 0, "revision": 1},
         sort=[("revision", -1)]
@@ -1261,7 +1277,7 @@ async def studio_elevenlabs_generate(
         "ai_voice": ai_voice_meta,
         "revision": next_rev,
         "_authoredAt": now,
-        "_authoredBy": admin.email,
+        "_authoredBy": admin_email,
     }
     updated_doc.pop("_id", None)
 
@@ -1279,6 +1295,26 @@ async def studio_elevenlabs_generate(
         "revision": next_rev,
         "voice": voice_id,
     }
+
+
+@api.post("/studio/books/{slug}/elevenlabs")
+async def studio_elevenlabs_generate(
+    slug: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Generate AI voice for one chapter using ElevenLabs.
+    Teacher-side only. Never called by students.
+    Injects audio_url + wordTimestamps into chapter blocks.
+    Saves a new book revision to MongoDB.
+    """
+    return await run_elevenlabs_for_chapter(
+        slug=slug,
+        chapter_index=int(payload.get("chapterIndex", 0)),
+        raw_voice=str(payload.get("voice") or ""),
+        book_in=payload.get("book") or None,
+        admin_email=admin.email,
+    )
 
 
 @api.delete("/studio/books/{slug}")
@@ -6323,44 +6359,34 @@ async def _elevenlabs_generate_line(text, voice_id, voice_settings=None, acting_
 
 # â”€â”€â”€ PASTE NEW ROUTE alongside the existing /elevenlabs route â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
 
-@api.post("/studio/books/{slug}/conversation")
-async def studio_conversation_generate(
-    slug: str,
-    payload: dict,
-    admin: User = Depends(require_admin),
-):
+async def run_conversation_for_chapter(
+    *, slug: str, chapter_index: int, lines: list,
+    book_in: dict | None, admin_email: str,
+) -> dict:
     """Generate multi-character emotional dialogue audio for a chapter.
-    Teacher-side only. Never called by students.
+
+    Extracted core of the /conversation route (pure extraction, zero logic
+    change). NOTE (§AMENDMENT 5): this function still performs one ElevenLabs
+    call PER LINE internally with no persisted line-level checkpointing — a
+    call into this function is an all-or-nothing unit of work from the
+    caller's point of view. Book Factory does NOT wrap this in a per-chapter
+    claim/fence stage in this build (that would be a falsely idempotent
+    single stage around a multi-call operation — see book_factory_jobs.py
+    module docstring for the explicit reasoning). This function is reused
+    ONLY by the existing manual Studio Conversation Voice Studio route today;
+    Book Factory automation of conversation audio is intentionally deferred.
 
     Per-line: calls ElevenLabs with per-speaker voice, emotion, acting notes,
     and voice settings. Stitches all segments into one stable MP3. Stores
     in GridFS. Updates dialog blocks with adjusted timestamps.
-
-    Payload:
-        chapterIndex: int
-        book: dict   (pre-saved, same pattern as /elevenlabs)
-        lines: [
-            {
-                lineIndex: int,
-                speaker: str,
-                text: str,
-                voiceId: str,
-                emotion: str,
-                actingNote: str,
-                voiceSettings: { stability, similarity_boost, style },
-                pauseAfter: float,
-            }
-        ]
     """
     import asyncio  # noqa: PLC0415
 
-    chapter_index = int(payload.get("chapterIndex", 0))
-    lines = payload.get("lines") or []
     if not lines:
         raise HTTPException(status_code=400, detail="No lines provided.")
 
     # Load book (same pattern as /elevenlabs)
-    book = payload.get("book") or None
+    book = book_in or None
     if not book:
         book = await db.books.find_one(
             {"slug": slug}, {"_id": 0}, sort=[("revision", -1)]
@@ -6509,7 +6535,7 @@ async def studio_conversation_generate(
                 "speakers": list({lr["speaker"] for lr in line_results}),
                 "line_count": len(lines),
                 "created_at": now,
-                "created_by": admin.email,
+                "created_by": admin_email,
             },
         )
     except Exception as exc:  # noqa: BLE001
@@ -6557,7 +6583,7 @@ async def studio_conversation_generate(
         "chapters": chapters,
         "revision": next_rev,
         "_authoredAt": now,
-        "_authoredBy": admin.email,
+        "_authoredBy": admin_email,
     }
     updated_doc.pop("_id", None)
     await db.books.insert_one(updated_doc)
@@ -6577,7 +6603,33 @@ async def studio_conversation_generate(
     }
 
 
-# â”€â”€ Register all api routes with the app â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@api.post("/studio/books/{slug}/conversation")
+async def studio_conversation_generate(
+    slug: str,
+    payload: dict,
+    admin: User = Depends(require_admin),
+):
+    """Generate multi-character emotional dialogue audio for a chapter.
+    Teacher-side only. Never called by students. Thin wrapper — see
+    run_conversation_for_chapter for the full docstring/behavior.
+
+    Payload:
+        chapterIndex: int
+        book: dict   (pre-saved, same pattern as /elevenlabs)
+        lines: [ { lineIndex, speaker, text, voiceId, emotion, actingNote,
+                   voiceSettings: { stability, similarity_boost, style },
+                   pauseAfter } ]
+    """
+    return await run_conversation_for_chapter(
+        slug=slug,
+        chapter_index=int(payload.get("chapterIndex", 0)),
+        lines=payload.get("lines") or [],
+        book_in=payload.get("book") or None,
+        admin_email=admin.email,
+    )
+
+
+# ── Register all api routes with the app ────────────────────────────────────
 # MUST be the last include_router(api) call — v2 so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
 exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").read())
@@ -6657,7 +6709,26 @@ except Exception as _artwork_load_err:  # noqa: BLE001
 # and never generates media. Dedicated `book_factory_jobs` collection.
 try:
     from book_factory_jobs import register_book_factory_routes
-    register_book_factory_routes(api, db, require_admin)
+
+    async def _bf_save_book_revision(payload_dict: dict, admin_email: str) -> dict:
+        """Adapter: book_factory_jobs.py passes a plain dict (it must not
+        import BookPayload from server.py — that would be a circular import
+        since server.py imports book_factory_jobs, not vice versa)."""
+        return await _save_book_revision(BookPayload(**payload_dict), admin_email)
+
+    async def _bf_get_book_by_slug(slug: str) -> dict | None:
+        """Read-only adapter — lets book_factory_jobs.py inspect the current
+        saved revision (e.g. for the synced-words transform) WITHOUT ever
+        importing or touching db.books directly itself."""
+        return await db.books.find_one({"slug": slug}, {"_id": 0}, sort=[("revision", -1)])
+
+    register_book_factory_routes(
+        api, db, require_admin,
+        save_book_revision=_bf_save_book_revision,
+        publish_book=_publish_book,
+        run_elevenlabs_for_chapter=run_elevenlabs_for_chapter,
+        get_book_by_slug=_bf_get_book_by_slug,
+    )
 except Exception as _book_factory_load_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "book_factory_jobs: disabled (%s)", _book_factory_load_err

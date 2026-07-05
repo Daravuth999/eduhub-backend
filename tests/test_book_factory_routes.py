@@ -56,7 +56,14 @@ def test_status_reports_flags_even_while_disabled(monkeypatch, visible, enabled)
     r = client.get("/api/studio/book-factory/status")
     assert r.status_code == 200
     body = r.json()
-    assert body == {"visible": visible, "enabled": enabled, "geminiEnabled": False}
+    # Phase 2-4 additive flags default false regardless of the core
+    # visible/enabled/geminiEnabled combination under test here.
+    assert body == {
+        "visible": visible, "enabled": enabled, "geminiEnabled": False,
+        "coverEnabled": False, "coverProviderReady": False, "coverStorageReady": False,
+        "narrationEnabled": False, "conversationAudioEnabled": False,
+        "directPublishEnabled": False,
+    }
 
 
 def test_status_gemini_enabled_requires_flag_and_key(monkeypatch):

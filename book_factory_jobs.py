@@ -26,10 +26,13 @@ book_factory_validator.py.  It never writes to db.books.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import logging
 import math
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -46,6 +49,8 @@ from book_factory_gemini import (
 )
 import book_factory_composer as bf_composer
 import book_factory_validator as bf_validator
+import book_factory_image as bf_image
+import book_factory_narration as bf_narration
 
 log = logging.getLogger("eduhub.book_factory")
 
@@ -447,11 +452,38 @@ def generation_permitted() -> bool:
     return factory_enabled() and factory_gemini_enabled()
 
 
+# ── Phase 2-4 optional-automation flags (all default false; independent of
+# each other and of the core BOOK_FACTORY_ENABLED/GEMINI_ENABLED flags) ──────
+def cover_generation_permitted() -> bool:
+    return _flag("BOOK_FACTORY_COVER_ENABLED") and bf_image.is_enabled()
+
+
+def narration_automation_permitted() -> bool:
+    return _flag("BOOK_FACTORY_NARRATION_ENABLED")
+
+
+def conversation_audio_automation_permitted() -> bool:
+    return _flag("BOOK_FACTORY_CONVERSATION_AUDIO_ENABLED")
+
+
+def direct_publish_permitted() -> bool:
+    return _flag("BOOK_FACTORY_DIRECT_PUBLISH_ENABLED")
+
+
 def status_payload() -> dict:
     return {
         "visible": factory_visible(),
         "enabled": factory_enabled(),
         "geminiEnabled": factory_gemini_enabled(),
+        "coverEnabled": cover_generation_permitted(),
+        # §AMENDMENT 3: distinct readiness signals so the UI can explain WHY
+        # cover generation is unavailable (flag off vs. no image key vs. no
+        # R2 storage) instead of one opaque boolean.
+        "coverProviderReady": bf_image.is_enabled(),
+        "coverStorageReady": bf_image.storage_configured(),
+        "narrationEnabled": narration_automation_permitted(),
+        "conversationAudioEnabled": conversation_audio_automation_permitted(),
+        "directPublishEnabled": direct_publish_permitted(),
     }
 
 
@@ -723,6 +755,155 @@ async def _run_blueprint(db, job_id: str, owner: str | None = None) -> dict:
     return {"status": "completed", "stage": "blueprint", "chapterOrder": order}
 
 
+# ── Phase 2: optional AI cover-image stage ──────────────────────────────────
+async def _run_cover(db, job_id: str, owner: str | None = None) -> dict:
+    """Claim → fence → call the isolated image adapter → complete/fail.
+    Uses the SAME generic primitives as _run_blueprint; a cover failure of any
+    kind never touches blueprint/chapters and never blocks export."""
+    path = "cover"
+    claimed, attempt = await _claim_stage(db, job_id, path, owner=owner)
+    if claimed is None:
+        doc = await db[COLL].find_one({"_id": job_id})
+        return {"status": "skipped", "reason": _get_path(doc, path).get("state")}
+    genver = int(_get_path(claimed, path).get("generationVersion") or 0)
+
+    if not await _fence_provider(db, job_id, path, attempt, genver, owner=owner):
+        return {"status": "superseded"}
+
+    config = claimed.get("config") or {}
+    try:
+        result = await bf_image.generate_and_store_cover(
+            job_id=job_id,
+            attempt_id=attempt,
+            title=str(config.get("title") or ""),
+            topic=str(config.get("topic") or ""),
+            section=str(config.get("section") or "story"),
+            level=str(config.get("level") or "A2"),
+            tier=str(config.get("tier") or "free"),
+            accent=str(config.get("accent") or "#D4A843"),
+            admin_email=owner or "",
+        )
+    except BFTerminalError as exc:
+        st = await _fail_terminal(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "failed", "state": st}
+    except BFUnknownOutcomeError as exc:
+        st = await _fail_unknown(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "unknown", "state": st}
+    except BFRetryableError as exc:
+        st = await _fail_stage(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "failed", "state": st}
+    except Exception as exc:  # noqa: BLE001
+        st = await _fail_stage(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "failed", "state": st}
+
+    # The image is already safely stored on R2 at this point. A failure to
+    # persist the completion in Mongo (transient write error, brief network
+    # blip) must NEVER trigger a second paid Gemini call — retry ONLY the DB
+    # write, bounded, reusing the SAME already-generated result.
+    ok = False
+    last_exc: Exception | None = None
+    for db_attempt in range(3):
+        try:
+            ok = await _complete_stage(db, job_id, path, attempt, genver, {
+                "coverImage": result["url"], "mimeType": result["mimeType"],
+            }, owner=owner)
+            break
+        except Exception as exc:  # noqa: BLE001 — transient Mongo error, retry the write only
+            last_exc = exc
+            log.warning("book_factory: cover completion write failed (attempt %d/3): %s",
+                        db_attempt + 1, exc)
+            continue
+    if not ok:
+        if last_exc is not None:
+            # The image IS stored at a deterministic, discoverable key
+            # (book-covers/{job_id}/{attempt}.*); a subsequent manual
+            # "Generate Cover" retry within this SAME unresolved attempt would
+            # find and reuse it rather than paying for a new image. Report a
+            # clear, non-silent failure rather than pretending success.
+            return {"status": "failed", "state": "unknown_outcome",
+                    "reason": f"cover generated and stored but completion write failed: {last_exc}",
+                    "coverImage": result["url"]}
+        return {"status": "superseded"}
+    return {"status": "completed", "stage": "cover", "coverImage": result["url"]}
+
+
+_NARRATION_STAGE_TEMPLATE = {
+    "state": S_PENDING, "attemptId": None, "attemptCount": 0,
+    "generationVersion": 0, "providerCallCount": 0,
+    "voice": "", "revision": None, "wordCount": None,
+}
+
+
+async def _seed_stage_if_absent(db, job_id: str, path: str, template: dict, owner: str | None = None) -> None:
+    """Lazily create a per-chapter stage sub-document the first time it is
+    requested. Idempotent — a no-op if the sub-document already exists."""
+    await db[COLL].update_one(
+        {"_id": job_id, **_owner_clause(owner), f"{path}": {"$exists": False}},
+        {"$set": {path: dict(template)}},
+    )
+
+
+class _NarrationHTTPOutcome:
+    """Classifies an HTTPException raised by the extracted
+    run_elevenlabs_for_chapter into the SAME conservative taxonomy used
+    everywhere else (§AMENDMENT 4): proven-not-sent → retryable; anything
+    ambiguous → unknown_outcome; a structural/config problem → terminal."""
+    TERMINAL_STATUSES = {400, 404}
+    RETRYABLE_STATUSES = {500, 502, 503}
+
+
+async def _run_narration_chapter(
+    db, job_id: str, chapter_id: str, saved_index: int, slug: str,
+    voice_id: str, owner: str, run_elevenlabs_fn,
+) -> dict:
+    """Claim → fence → call the extracted ElevenLabs core function → complete
+    or fail, using the SAME generic primitives as blueprint/chapter/cover
+    stages, keyed by the chapter's STABLE chapterId."""
+    path = f"narration.{chapter_id}"
+    await _seed_stage_if_absent(db, job_id, path, _NARRATION_STAGE_TEMPLATE, owner=owner)
+
+    claimed, attempt = await _claim_stage(db, job_id, path, owner=owner)
+    if claimed is None:
+        doc = await db[COLL].find_one({"_id": job_id})
+        return {"status": "skipped", "reason": _get_path(doc, path).get("state")}
+    genver = int(_get_path(claimed, path).get("generationVersion") or 0)
+
+    if not await _fence_provider(db, job_id, path, attempt, genver, owner=owner):
+        return {"status": "superseded"}
+
+    try:
+        result = await run_elevenlabs_fn(
+            slug=slug, chapter_index=saved_index, raw_voice=voice_id,
+            book_in=None,  # always re-fetch the CURRENT saved revision by slug
+            admin_email=owner,
+        )
+    except HTTPException as exc:
+        status = exc.status_code
+        reason = f"HTTPException {status}: {exc.detail}"
+        if status in _NarrationHTTPOutcome.TERMINAL_STATUSES:
+            st = await _fail_terminal(db, job_id, path, attempt, genver, reason, owner=owner)
+            return {"status": "failed", "state": st}
+        if status in _NarrationHTTPOutcome.RETRYABLE_STATUSES:
+            st = await _fail_stage(db, job_id, path, attempt, genver, reason, owner=owner)
+            return {"status": "failed", "state": st}
+        # Any other status is ambiguous — manual retry only, never silently
+        # re-attempted (§AMENDMENT 4: do not classify everything as retryable).
+        st = await _fail_unknown(db, job_id, path, attempt, genver, reason, owner=owner)
+        return {"status": "unknown", "state": st}
+    except Exception as exc:  # noqa: BLE001 — unclassified failure: safest default is unknown, not retryable
+        st = await _fail_unknown(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "unknown", "state": st}
+
+    ok = await _complete_stage(db, job_id, path, attempt, genver, {
+        "voice": result.get("voice", voice_id),
+        "revision": result.get("revision"),
+        "wordCount": result.get("wordCount"),
+    }, owner=owner)
+    if not ok:
+        return {"status": "superseded"}
+    return {"status": "completed", "chapterId": chapter_id, "revision": result.get("revision")}
+
+
 async def _validate_and_compose(semantic: dict) -> tuple[list[dict], list[dict]]:
     """NO in-stage repair. Validate each MCQ once; on failure drop it and record
     an mcq_dropped warning. Validate fillblanks; on failure drop it and record a
@@ -896,6 +1077,58 @@ def _job_view(doc: dict) -> dict:
     return {k: v for k, v in doc.items() if k != "_id"}
 
 
+def _compute_export(doc: dict) -> dict:
+    """Build the canonical export book + chapterId→saved-index map from a job
+    document. Single source of truth reused by /export AND /save-draft so the
+    two can never drift (§AMENDMENT 2: the saved-index map is exactly the
+    ordering /save-draft persists into db.books)."""
+    order = doc.get("chapterOrder") or []
+    chapters_map = doc.get("chapters") or {}
+    ordered: list[dict] = []
+    chapter_id_to_index: dict[str, int] = {}
+    for cid in order:
+        ch = chapters_map.get(cid)
+        if ch and ch.get("state") == S_COMPLETED:
+            chapter_id_to_index[cid] = len(ordered)
+            ordered.append({"title": ch.get("title"), "blocks": ch.get("blocks") or []})
+    # Phase 2: an AI-generated cover (if the stage completed) overrides the
+    # config default coverImage; a never-run or failed cover stage leaves the
+    # author's manually-configured coverImage untouched (falls back to
+    # StylizedCover in the Reader when both are empty).
+    config = dict(doc.get("config") or {})
+    cover_url = (doc.get("cover") or {}).get("coverImage")
+    if cover_url:
+        config["coverImage"] = cover_url
+    book = bf_composer.export_canonical_book(config, ordered)
+    speakers = bf_composer.extract_speakers(ordered)
+    return {
+        "book": book,
+        "completed": len(ordered),
+        "total": len(order),
+        "speakers": speakers,
+        "chapterIdToSavedIndex": chapter_id_to_index,
+    }
+
+
+def _export_hash(book: dict) -> str:
+    """Deterministic content hash of a canonical export — used to detect a
+    genuinely unchanged resave (§AMENDMENT 2/10: a lost-response retry must
+    recover the existing binding, not mint a duplicate revision)."""
+    return hashlib.sha256(json.dumps(book, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _mint_bf_slug(title: str, job_id: str) -> str:
+    """A deterministic-enough slug seed: title text + a job-id suffix that is
+    NEVER shared by any other job, so a Book-Factory-authored book can never
+    silently become a revision of an unrelated manually-authored book that
+    happens to share a title. The actual character-cleaning (lowercasing,
+    stripping invalid chars) is left to server.py's slugify() — this function
+    only needs to guarantee the uniqueness-bearing suffix survives that pass."""
+    base = (title or "untitled").strip()[:80]
+    suffix = re.sub(r"[^a-zA-Z0-9]", "", job_id or "")[-10:] or uuid.uuid4().hex[:10]
+    return f"{base}-bf-{suffix}"
+
+
 def _job_summary(doc: dict) -> dict:
     """Compact summary for the recent-jobs listing (§HIGH 7)."""
     cfg = doc.get("config") or {}
@@ -911,8 +1144,25 @@ def _job_summary(doc: dict) -> dict:
 
 
 # ── route registration ─────────────────────────────────────────────────────
-def register_book_factory_routes(api, db, require_admin) -> None:
-    """Register Book Factory admin routes onto the shared /api router."""
+def register_book_factory_routes(
+    api, db, require_admin, *,
+    save_book_revision=None, publish_book=None, run_elevenlabs_for_chapter=None,
+    get_book_by_slug=None,
+) -> None:
+    """Register Book Factory admin routes onto the shared /api router.
+
+    `save_book_revision(payload_dict, admin_email) -> {slug, revision, book}`,
+    `publish_book(slug) -> {matched, modified}`,
+    `run_elevenlabs_for_chapter(slug=, chapter_index=, raw_voice=, book_in=,
+    admin_email=) -> {...}`, and `get_book_by_slug(slug) -> dict | None` are
+    the SAME functions/reads the manual Studio Editor routes use (extracted in
+    server.py) — injected here so Book Factory's save-draft/publish/narration
+    automation reuses one implementation instead of a second one, and so this
+    module NEVER touches db.books directly (read or write) — preserving its
+    documented hard guarantee. If a caller omits any of them (e.g. an isolated
+    test harness exercising only blueprint/chapter routes), the corresponding
+    new route 503s instead of raising at import time.
+    """
 
     def _need_generation():
         if not factory_enabled():
@@ -983,6 +1233,46 @@ def register_book_factory_routes(api, db, require_admin) -> None:
             "blueprintApprovedAt": None,
             "chapters": {},
             "chapterOrder": [],
+            # Phase 2: optional AI cover-image stage — same shape as blueprint.
+            # Independent of blueprint/chapters; a failed/skipped cover never
+            # blocks export (export falls back to config.coverImage / "").
+            "cover": {
+                "state": S_PENDING, "attemptId": None,
+                "attemptCount": 0, "generationVersion": 0,
+                "providerCallCount": 0, "coverImage": "", "mimeType": "",
+            },
+            # Phase 3: optional per-chapter narration automation stage map,
+            # keyed by the chapter's STABLE chapterId (never an array index —
+            # see _run_narration_chapter). Lazily populated on first request
+            # for that chapterId.
+            "narration": {},
+            # Phase 4 (reserved, NOT wired to a route this session — see the
+            # module docstring "conversation audio automation" note): a
+            # single chapter-level claim around the existing multi-call-per-
+            # line /conversation route would be falsely idempotent (a crash
+            # mid-chapter would either duplicate paid ElevenLabs calls on
+            # retry or lose progress). Real automation needs persisted
+            # line-level stages (conversationAudio.{chapterId}.lines.{lineId})
+            # plus a separate assembly stage — deferred as its own build.
+            # Zero-copy CVS *seeding* (frontend) does not depend on this.
+            "conversationAudio": {},
+            # §AMENDMENT 2: server-authoritative binding to the saved db.books
+            # document — narration/publish operate on THIS binding, never on
+            # a slug supplied freely by a client request.
+            "savedBookSlug": None,
+            "savedBookRevision": None,
+            "savedBookOwner": None,
+            "savedBookExportHash": None,
+            "savedAt": None,
+            # Maps each completed chapter's stable chapterId to its index in
+            # the LAST SAVED book's `chapters` array (skips any chapter still
+            # incomplete at save time) — rebuilt on every save-draft call.
+            # Narration resolves chapterId → array index through THIS map,
+            # never through the job's own position/order (which counts every
+            # chapter, including ones never exported).
+            "chapterIdToSavedIndex": {},
+            "publishedAt": None,
+            "publishedRevision": None,
             "warnings": [],
             "createdAt": now,
             "updatedAt": now,
@@ -1160,6 +1450,246 @@ def register_book_factory_routes(api, db, require_admin) -> None:
             )
         return {"success": True, "job": _job_view(done)}
 
+    @api.post("/studio/book-factory/jobs/{job_id}/cover/generate")
+    async def book_factory_cover_generate(job_id: str, admin=Depends(require_admin)):
+        # Phase 2: optional AI cover-image stage. Independent flag gate — a
+        # teacher can generate chapters with COVER_ENABLED=false and this
+        # route simply 503s; nothing else about the job is affected.
+        _need_enabled()
+        email = _admin_email(admin)
+        if not cover_generation_permitted():
+            raise HTTPException(status_code=503, detail="Book Factory cover generation is disabled or not configured.")
+        await _owned_or_404(job_id, email)
+        result = await _run_cover(db, job_id, owner=email)
+        latest = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+        return {"success": True, "result": result, "job": _job_view(latest)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/cover/regenerate")
+    async def book_factory_cover_regenerate(job_id: str, admin=Depends(require_admin)):
+        # Reset a completed cover stage back to pending (mirrors chapter
+        # regenerate). Fenced on the CURRENT attemptId + generationVersion so
+        # a stale request can never clobber a newer generation.
+        _need_enabled()
+        email = _admin_email(admin)
+        if not cover_generation_permitted():
+            raise HTTPException(status_code=503, detail="Book Factory cover generation is disabled or not configured.")
+        pre = await _owned_or_404(job_id, email)
+        spec = pre.get("cover") or {}
+        exp_attempt = spec.get("attemptId")
+        exp_genver = spec.get("generationVersion")
+        cur_state = spec.get("state")
+        if cur_state not in (S_COMPLETED, S_FAILED_TERMINAL, S_FAILED_RETRYABLE, S_UNKNOWN):
+            raise HTTPException(status_code=409, detail=f"Cover state '{cur_state}' cannot be regenerated right now.")
+        now = _now_iso()
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        done = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email), "state": {"$ne": _JOB_CANCELLED},
+             "cover.attemptId": exp_attempt, "cover.generationVersion": exp_genver,
+             "cover.state": cur_state},
+            {"$set": {"cover.state": S_PENDING, "cover.attemptId": None,
+                      "cover.attemptCount": 0, "cover.coverImage": "", "cover.mimeType": "",
+                      "updatedAt": now}},
+            **kwargs,
+        )
+        if done is None:
+            raise HTTPException(status_code=409, detail="Cover changed concurrently; regenerate rejected.")
+        return {"success": True, "job": _job_view(done)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/save-draft")
+    async def book_factory_save_draft(job_id: str, admin=Depends(require_admin)):
+        # §AMENDMENT 2 + 10: server-side, owner-bound, recoverable save. The
+        # slug/revision binding lives on the JOB, never supplied by the
+        # client — narration/publish read it from here, not from a request
+        # body. A lost-response retry with unchanged content recovers the
+        # existing binding instead of writing a duplicate revision; changed
+        # content (e.g. a cover finished after the first save) writes a new
+        # revision under the SAME already-bound slug.
+        _need_enabled()
+        if save_book_revision is None:
+            raise HTTPException(status_code=503, detail="Save Draft is not wired on this server.")
+        email = _admin_email(admin)
+        doc = await _owned_or_404(job_id, email)
+        if doc.get("state") == _JOB_CANCELLED:
+            raise HTTPException(status_code=409, detail="Job is cancelled.")
+
+        exp = _compute_export(doc)
+        if exp["completed"] == 0:
+            raise HTTPException(status_code=409, detail="No completed chapters to save yet.")
+        new_hash = _export_hash(exp["book"])
+        now = _now_iso()
+
+        existing_slug = doc.get("savedBookSlug")
+
+        if existing_slug:
+            if doc.get("savedBookExportHash") == new_hash:
+                # Idempotent recovery: identical content already saved under
+                # this binding — do NOT write another revision.
+                return {"success": True, "slug": existing_slug,
+                        "revision": doc.get("savedBookRevision"),
+                        "recovered": True, "job": _job_view(doc)}
+            book_payload = dict(exp["book"])
+            book_payload["slug"] = existing_slug
+            book_payload["published"] = False
+            result = await save_book_revision(book_payload, email)
+            kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+            updated = await db[COLL].find_one_and_update(
+                {"_id": job_id, **_owner_clause(email), "savedBookSlug": existing_slug},
+                {"$set": {
+                    "savedBookRevision": result["revision"],
+                    "savedBookExportHash": new_hash,
+                    "savedAt": now,
+                    "chapterIdToSavedIndex": exp["chapterIdToSavedIndex"],
+                    "updatedAt": now,
+                }},
+                **kwargs,
+            )
+            return {"success": True, "slug": existing_slug, "revision": result["revision"],
+                    "recovered": False, "job": _job_view(updated or doc)}
+
+        # First save for this job: atomically claim the "unbound" slot with a
+        # freshly minted, collision-proof slug BEFORE calling save_book_revision,
+        # so two concurrent save-draft requests can never mint two different
+        # books for the same job.
+        candidate_slug = _mint_bf_slug(exp["book"].get("title") or doc.get("config", {}).get("title"), job_id)
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        claimed_bind = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email), "state": {"$ne": _JOB_CANCELLED},
+             "savedBookSlug": None},
+            {"$set": {"savedBookSlug": candidate_slug, "savedBookOwner": email, "updatedAt": now}},
+            **kwargs,
+        )
+        if claimed_bind is None:
+            # Another concurrent request already bound a slug for this job —
+            # re-read and fall through to the update-in-place path so we never
+            # save the book twice under two different slugs.
+            fresh = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+            won_slug = (fresh or {}).get("savedBookSlug")
+            if not won_slug:
+                raise HTTPException(status_code=409, detail="Save Draft is in progress; try again.")
+            book_payload = dict(exp["book"])
+            book_payload["slug"] = won_slug
+            book_payload["published"] = False
+            result = await save_book_revision(book_payload, email)
+            await db[COLL].update_one(
+                {"_id": job_id, **_owner_clause(email), "savedBookSlug": won_slug},
+                {"$set": {
+                    "savedBookRevision": result["revision"], "savedBookExportHash": new_hash,
+                    "savedAt": now, "chapterIdToSavedIndex": exp["chapterIdToSavedIndex"],
+                    "updatedAt": now,
+                }},
+            )
+            latest = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+            return {"success": True, "slug": won_slug, "revision": result["revision"],
+                    "recovered": False, "job": _job_view(latest)}
+
+        book_payload = dict(exp["book"])
+        book_payload["slug"] = candidate_slug
+        book_payload["published"] = False
+        result = await save_book_revision(book_payload, email)
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        updated = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email), "savedBookSlug": candidate_slug},
+            {"$set": {
+                "savedBookRevision": result["revision"], "savedBookExportHash": new_hash,
+                "savedAt": now, "chapterIdToSavedIndex": exp["chapterIdToSavedIndex"],
+                "updatedAt": now,
+            }},
+            **kwargs,
+        )
+        return {"success": True, "slug": candidate_slug, "revision": result["revision"],
+                "recovered": False, "job": _job_view(updated or claimed_bind)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/publish")
+    async def book_factory_publish(job_id: str, admin=Depends(require_admin)):
+        # §AMENDMENT 10: publish ALWAYS targets the server-bound slug — a
+        # client can never pass an arbitrary slug in. Requires Save Draft to
+        # have run at least once. Optional-stage completeness (cover /
+        # narration) is never checked here — publishing without them is
+        # always allowed (§AMENDMENT 11); the frontend surfaces an explicit
+        # confirmation before calling this route.
+        _need_enabled()
+        if publish_book is None:
+            raise HTTPException(status_code=503, detail="Publish is not wired on this server.")
+        email = _admin_email(admin)
+        doc = await _owned_or_404(job_id, email)
+        slug = doc.get("savedBookSlug")
+        if not slug:
+            raise HTTPException(status_code=409, detail="Save Draft before publishing.")
+        result = await publish_book(slug)
+        now = _now_iso()
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        updated = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email)},
+            {"$set": {"publishedAt": now, "publishedRevision": doc.get("savedBookRevision"),
+                      "updatedAt": now}},
+            **kwargs,
+        )
+        return {"success": True, "slug": slug, "publish": result, "job": _job_view(updated or doc)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/narration/{chapter_id}")
+    async def book_factory_narrate_chapter(
+        job_id: str, chapter_id: str, payload: dict = None, admin=Depends(require_admin),
+    ):
+        # §AMENDMENT 1 + 6: chapterId is the identity, never an array index.
+        # Resolved to the CURRENT saved-book position only immediately before
+        # calling the legacy narration function. Progress is entirely
+        # server-side (job.narration.{chapterId}) — a client refresh simply
+        # re-reads this same job state, never trusts localStorage for "was
+        # this paid call already made".
+        _need_enabled()
+        if not narration_automation_permitted():
+            raise HTTPException(status_code=503, detail="Book Factory narration automation is disabled.")
+        if run_elevenlabs_for_chapter is None:
+            raise HTTPException(status_code=503, detail="Narration is not wired on this server.")
+        email = _admin_email(admin)
+        doc = await _owned_or_404(job_id, email)
+        if doc.get("state") == _JOB_CANCELLED:
+            raise HTTPException(status_code=409, detail="Job is cancelled.")
+        if chapter_id not in (doc.get("chapterOrder") or []):
+            raise HTTPException(status_code=404, detail="Chapter not found in this job's approved outline.")
+        slug = doc.get("savedBookSlug")
+        if not slug:
+            raise HTTPException(status_code=409, detail="Save Draft before narrating.")
+        saved_index = (doc.get("chapterIdToSavedIndex") or {}).get(chapter_id)
+        if saved_index is None:
+            raise HTTPException(
+                status_code=409,
+                detail="This chapter is not present in the last saved draft — Save Draft again first.",
+            )
+
+        voice_id = str((payload or {}).get("voice") or "")
+        synced_words = bool((payload or {}).get("syncedWords"))
+        if synced_words:
+            # §AMENDMENT 7: transform runs on the SAVED revision and produces
+            # its own new authoritative revision BEFORE narration is called —
+            # never an inline flag mutating blocks inside the ElevenLabs call.
+            # Naturally idempotent (see book_factory_narration.py) — a repeat
+            # request with no remaining paragraph blocks is a no-op.
+            if get_book_by_slug is None or save_book_revision is None:
+                raise HTTPException(status_code=503, detail="Synced-words transform is not wired on this server.")
+            book_now = await get_book_by_slug(slug)
+            if book_now:
+                new_chapters, changed = bf_narration.convert_paragraphs_to_transcript(
+                    book_now.get("chapters") or []
+                )
+                if changed:
+                    payload_dict = dict(book_now)
+                    payload_dict["chapters"] = new_chapters
+                    payload_dict["slug"] = slug
+                    resave = await save_book_revision(payload_dict, email)
+                    now2 = _now_iso()
+                    await db[COLL].update_one(
+                        {"_id": job_id, **_owner_clause(email), "savedBookSlug": slug},
+                        {"$set": {"savedBookRevision": resave["revision"], "updatedAt": now2}},
+                    )
+
+        result = await _run_narration_chapter(
+            db, job_id, chapter_id, saved_index, slug, voice_id, email,
+            run_elevenlabs_for_chapter,
+        )
+        latest = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+        return {"success": True, "result": result, "job": _job_view(latest)}
+
     @api.post("/studio/book-factory/jobs/{job_id}/cancel")
     async def book_factory_cancel(job_id: str, admin=Depends(require_admin)):
         # §BLOCKER 2: idempotent, TERMINAL cancellation scoped to the owner. It
@@ -1205,20 +1735,12 @@ def register_book_factory_routes(api, db, require_admin) -> None:
     async def book_factory_export(job_id: str, admin=Depends(require_admin)):
         _need_enabled()
         doc = await _owned_or_404(job_id, _admin_email(admin))
-        order = doc.get("chapterOrder") or []
-        chapters_map = doc.get("chapters") or {}
-        ordered = []
-        for cid in order:
-            ch = chapters_map.get(cid)
-            if ch and ch.get("state") == S_COMPLETED:
-                ordered.append({"title": ch.get("title"), "blocks": ch.get("blocks") or []})
-        book = bf_composer.export_canonical_book(doc.get("config") or {}, ordered)
-        total = len(order)
-        completed = len(ordered)
-        return {"success": True, "book": book,
-                "completedChapters": completed, "totalChapters": total,
-                "incomplete": completed < total,
-                "cancelled": doc.get("state") == _JOB_CANCELLED}
+        exp = _compute_export(doc)
+        return {"success": True, "book": exp["book"],
+                "completedChapters": exp["completed"], "totalChapters": exp["total"],
+                "incomplete": exp["completed"] < exp["total"],
+                "cancelled": doc.get("state") == _JOB_CANCELLED,
+                "speakers": exp["speakers"]}
 
     log.info("book_factory: routes registered")
 

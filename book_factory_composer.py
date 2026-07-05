@@ -255,3 +255,21 @@ def export_canonical_book(config: dict, chapters: list[dict]) -> dict:
         })
     out["chapters"] = export_chapters
     return out
+
+
+# ── Phase 4: speaker extraction for zero-copy conversation automation ──────
+def extract_speakers(chapters: list[dict]) -> list[str]:
+    """Return unique dialog-block speaker names across the given chapters, in
+    first-seen order. `chapters` may be raw {title, blocks} dicts (as passed
+    to export_canonical_book) — never mutates its input."""
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for ch in chapters or []:
+        for b in (ch or {}).get("blocks") or []:
+            if not isinstance(b, dict) or b.get("type") != "dialog":
+                continue
+            speaker = str(b.get("speaker") or "").strip()
+            if speaker and speaker not in seen_set:
+                seen_set.add(speaker)
+                seen.append(speaker)
+    return seen
