@@ -1175,10 +1175,12 @@ async def _run_conversation_assembly(
     return {"status": "completed", "audioUrl": result["audioUrl"], "revision": result.get("revision")}
 
 
-async def _validate_and_compose(semantic: dict) -> tuple[list[dict], list[dict]]:
+async def _validate_and_compose(semantic: dict, level: str = "A2") -> tuple[list[dict], list[dict]]:
     """NO in-stage repair. Validate each MCQ once; on failure drop it and record
     an mcq_dropped warning. Validate fillblanks; on failure drop it and record a
-    fillblank_dropped warning (§MEDIUM 14). Then compose canonical blocks.
+    fillblank_dropped warning (§MEDIUM 14). Validate + CEFR-cap vocabulary
+    (§PART C/D/E: IPA/Khmer validated per item, quantity backend-authoritative
+    regardless of what Gemini returned). Then compose canonical blocks.
     Returns (blocks, warnings)."""
     chapter_text = bf_composer.build_chapter_full_text(semantic)
     warnings: list[dict] = []
@@ -1209,7 +1211,22 @@ async def _validate_and_compose(semantic: dict) -> tuple[list[dict], list[dict]]
             "text": (fb.get("text") if isinstance(fb, dict) else None),
         })
 
-    blocks = bf_composer.compose_chapter_blocks(semantic, validated, fillblanks)
+    # §PART C/D/E: vocabulary — IPA/Khmer validated per item (never fabricated;
+    # a bad IPA or missing Khmer degrades gracefully rather than dropping the
+    # whole word), and CEFR-scaled quantity is a HARD backend-authoritative
+    # cap — Gemini returning more than the level supports never reaches export.
+    _vocab_lo, vocab_hi = bf_validator.vocab_count_range(level)
+    validated_vocab: list[dict] = []
+    for v in semantic.get("vocabulary") or []:
+        if len(validated_vocab) >= vocab_hi:
+            break
+        item, item_warnings = bf_validator.validate_vocab_item(v)
+        for w in item_warnings:
+            warnings.append({"type": "vocab_issue", "reason": w})
+        if item:
+            validated_vocab.append(item)
+
+    blocks = bf_composer.compose_chapter_blocks(semantic, validated, fillblanks, validated_vocab)
     return blocks, warnings
 
 
@@ -1251,7 +1268,7 @@ async def _run_chapter(db, job_id: str, chapter_id: str, owner: str | None = Non
         return {"status": "failed", "state": st}
 
     try:
-        blocks, warnings = await _validate_and_compose(semantic)
+        blocks, warnings = await _validate_and_compose(semantic, level=config.get("level") or "A2")
     except Exception as exc:  # noqa: BLE001
         st = await _fail_stage(db, job_id, path, attempt, genver, f"compose_error: {exc}", _budget_extra(budget), owner=owner)
         return {"status": "failed", "state": st}
@@ -1311,7 +1328,7 @@ async def _run_chapter(db, job_id: str, chapter_id: str, owner: str | None = Non
                 st = await _fail_terminal(db, job_id, path, attempt, genver, "chapter_not_object_retry", _budget_extra(budget), owner=owner)
                 return {"status": "failed", "state": st}
             try:
-                blocks, warnings = await _validate_and_compose(semantic)
+                blocks, warnings = await _validate_and_compose(semantic, level=config.get("level") or "A2")
             except Exception as exc:  # noqa: BLE001
                 st = await _fail_stage(db, job_id, path, attempt, genver, f"compose_error_retry: {exc}", _budget_extra(budget), owner=owner)
                 return {"status": "failed", "state": st}
@@ -1341,11 +1358,122 @@ async def _run_chapter(db, job_id: str, chapter_id: str, owner: str | None = Non
 
 
 # ── views ──────────────────────────────────────────────────────────────────
+# ── §PART H/I: explicit, teacher-facing cover state ─────────────────────────
+# The raw job.cover.state only ever holds the 7 generic stage states — it
+# cannot distinguish "the feature is off" / "no key" / "no storage" from
+# "claimed" (those preconditions are checked BEFORE a claim is even
+# attempted). This computes the single, unambiguous state + message the
+# teacher should see, covering all 9 documented states.
+_COVER_STATE_MESSAGES = {
+    "featureDisabled": "AI cover generation is not enabled.",
+    "keyUnavailable": "Gemini image service is unavailable.",
+    "storageUnavailable": "Cover storage is not configured — cover was generated but could not be stored.",
+    "pending": "Cover has not been generated yet.",
+    "providerPending": "Generating your cover…",
+    "completed": "AI cover generated.",
+    "retryableFailure": "Cover generation failed — you can retry.",
+    "terminalFailure": "Cover generation failed and will not retry automatically.",
+    "unknownOutcome": "Cover generation outcome is unknown — manual review required before retry.",
+}
+_COVER_RAW_STATE_MAP = {
+    S_PENDING: "pending", S_CLAIMED: "pending", S_PROVIDER_PENDING: "providerPending",
+    S_COMPLETED: "completed", S_FAILED_RETRYABLE: "retryableFailure",
+    S_FAILED_TERMINAL: "terminalFailure", S_UNKNOWN: "unknownOutcome",
+}
+
+
+def cover_teacher_status(doc: dict) -> dict:
+    """Returns {"state": one of the 9 documented states, "message": teacher-
+    facing text, "usingFallback": "manual_url" | "stylized" | None}. Never
+    raises; a missing/malformed job.cover is treated as "pending"."""
+    # NOTE: cover_generation_permitted() conflates "flag off" with "key
+    # missing" into one boolean — checked here individually so the three
+    # distinct precondition states are never collapsed into "featureDisabled".
+    if not _flag("BOOK_FACTORY_COVER_ENABLED"):
+        state = "featureDisabled"
+    elif not bf_image.is_enabled():
+        state = "keyUnavailable"
+    elif not bf_image.storage_configured():
+        state = "storageUnavailable"
+    else:
+        raw = (doc.get("cover") or {}).get("state") or S_PENDING
+        state = _COVER_RAW_STATE_MAP.get(raw, "pending")
+
+    cover_image = (doc.get("cover") or {}).get("coverImage") or ""
+    manual_url = (doc.get("config") or {}).get("coverImage") or ""
+    using_fallback = None
+    if not cover_image:
+        using_fallback = "manual_url" if manual_url else "stylized"
+
+    return {
+        "state": state,
+        "message": _COVER_STATE_MESSAGES.get(state, ""),
+        "usingFallback": using_fallback,
+    }
+
+
 def _job_view(doc: dict) -> dict:
     """Studio-facing job view (progress UI). NOT the canonical export."""
     if not doc:
         return {}
-    return {k: v for k, v in doc.items() if k != "_id"}
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    out["coverTeacherStatus"] = cover_teacher_status(doc)
+    return out
+
+
+# ── §PART B/G: chapter-balance diagnostics (advisory only — never blocks
+# save/publish/export; the teacher decides whether to regenerate a chapter) ─
+_TEXT_BEARING_TYPES = frozenset({"paragraph", "heading", "quote", "markdown", "dialog"})
+_CHAPTER_BALANCE_TOLERANCE = 0.25  # ±25%, per the surgical-pass spec
+
+
+def _chapter_word_count(blocks: list[dict]) -> int:
+    total = 0
+    for b in blocks or []:
+        if not isinstance(b, dict) or b.get("type") not in _TEXT_BEARING_TYPES:
+            continue
+        total += len(str(b.get("text") or "").split())
+    return total
+
+
+def check_chapter_balance(chapters_map: dict, order: list[str]) -> list[dict]:
+    """Compare each NON-review completed chapter's word count against the
+    MEDIAN of its peers. Returns a list of advisory warning dicts (never
+    raises, never blocks anything) for any chapter outside
+    ±_CHAPTER_BALANCE_TOLERANCE of that median.
+
+    Median (not mean) deliberately: a single disproportionately long outlier
+    chapter would otherwise drag the mean far enough that the OTHER, actually
+    well-balanced chapters also appear "too short by comparison" — the median
+    stays anchored to the typical chapter regardless of one outlier.
+    """
+    counted = []
+    for cid in order:
+        ch = chapters_map.get(cid) or {}
+        if ch.get("state") != S_COMPLETED or ch.get("isReview"):
+            continue
+        counted.append((cid, ch.get("title") or cid, _chapter_word_count(ch.get("blocks") or [])))
+    if len(counted) < 2:
+        return []  # nothing to compare a single chapter against
+    word_counts = sorted(c[2] for c in counted)
+    n = len(word_counts)
+    mid = n // 2
+    baseline = word_counts[mid] if n % 2 else (word_counts[mid - 1] + word_counts[mid]) / 2
+    if baseline <= 0:
+        return []
+    warnings = []
+    for cid, title, words in counted:
+        deviation = (words - baseline) / baseline
+        if abs(deviation) > _CHAPTER_BALANCE_TOLERANCE:
+            warnings.append({
+                "type": "chapter_length_imbalance",
+                "chapterId": cid,
+                "title": title,
+                "words": words,
+                "averageWords": round(baseline, 1),
+                "deviationPct": round(deviation * 100, 1),
+            })
+    return warnings
 
 
 def _compute_export(doc: dict) -> dict:
@@ -1378,6 +1506,7 @@ def _compute_export(doc: dict) -> dict:
         "total": len(order),
         "speakers": speakers,
         "chapterIdToSavedIndex": chapter_id_to_index,
+        "chapterBalanceWarnings": check_chapter_balance(chapters_map, order),
     }
 
 
@@ -2138,7 +2267,8 @@ def register_book_factory_routes(
                 "completedChapters": exp["completed"], "totalChapters": exp["total"],
                 "incomplete": exp["completed"] < exp["total"],
                 "cancelled": doc.get("state") == _JOB_CANCELLED,
-                "speakers": exp["speakers"]}
+                "speakers": exp["speakers"],
+                "chapterBalanceWarnings": exp["chapterBalanceWarnings"]}
 
     log.info("book_factory: routes registered")
 

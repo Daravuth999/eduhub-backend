@@ -188,3 +188,209 @@ def assert_blocks_allowed(blocks: list[dict]) -> None:
     bad = disallowed_block_types(blocks)
     if bad:
         raise ValueError(f"disallowed block types reached export: {sorted(set(bad))}")
+
+
+# ── §PART C: CEFR-scaled vocabulary-quantity ceiling (backend-authoritative;
+# book_factory_gemini.py imports this SAME range for prompt guidance so the
+# two can never drift apart) ────────────────────────────────────────────────
+VOCAB_COUNT_BY_LEVEL: dict[str, tuple[int, int]] = {
+    "A1": (3, 4), "A2": (4, 5), "B1": (5, 6), "B2": (6, 8),
+}
+
+
+def vocab_count_range(level: str) -> tuple[int, int]:
+    return VOCAB_COUNT_BY_LEVEL.get((level or "A2").upper(), (4, 5))
+
+
+# ── §PART D: IPA validation — never trust free-form Gemini IPA blindly ─────
+#
+# Gemini may PROPOSE an IPA transcription, but it is never published without
+# passing this validator. On any failure the IPA is OMITTED (not fabricated,
+# not passed through) and the word/definition/example are preserved — a
+# missing IPA is always safer than a wrong or fake one.
+
+# Broad-but-bounded whitelist of characters that legitimately appear inside
+# an English IPA transcription: vowels, consonants, suprasegmentals (stress,
+# length), and the separators multiword phrases legitimately need (space,
+# hyphen, period as a syllable-break in some styles).
+_IPA_ALLOWED_CHARS = frozenset(
+    "ˈˌːˑ.ʰʲʷⁿˡ"                          # suprasegmentals / diacritics
+    "iyɪʏeøɛœæaɶɐɑɒɔʌʊuɨʉɯəɚɝ"             # vowels
+    "pbtdʈɖcɟkɡqɢʔ"                        # plosives
+    "mɱnɳɲŋɴ"                              # nasals
+    "ʙrʀⱱɾɽ"                               # trills / taps
+    "ɸβfvθðszʃʒʂʐçʝxɣχʁħʕhɦ"               # fricatives
+    "ɬɮʋɹɻjɰlɭʎʟ"                          # approximants / laterals
+    "ʍw"
+    " -'"                                  # word/syllable separators
+)
+# Characters whose PRESENCE proves the string is a real phonetic transcription
+# rather than plain English spelling typed into the IPA field by mistake —
+# every genuine IPA rendering of an English word contains at least one of
+# these (a stress mark, length mark, schwa, or a non-ASCII phonetic symbol).
+_IPA_MARKER_CHARS = frozenset("ˈˌːˑəɪʊʃʒθðŋɔæʌɛɜɑɒɡʔɾɹɻɯɨʉɶɐɚɝɸβçʝxɣχʁħʕɦɬɮʋɰɭʎʟʙʀⱱɽʈɖɳɲɴɱɟɢʰʲʷⁿˡ")
+
+_IPA_MIN_LEN = 1      # a single symbol ("/ə/") is a valid, common transcription
+_IPA_MAX_LEN = 80     # generous ceiling for a multiword phrase
+
+
+def _strip_ipa_delimiters(raw: str) -> tuple[str, bool]:
+    """Return (inner_content, had_delimiters). If delimiters are present they
+    must be BALANCED (/ ... / or [ ... ]); mismatched/partial delimiters are
+    signalled by returning had_delimiters=True with the ORIGINAL string
+    unstripped, so the caller can reject it as malformed rather than silently
+    stripping only one side."""
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == "/" and s[-1] == "/":
+        return s[1:-1].strip(), True
+    if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
+        return s[1:-1].strip(), True
+    # Unbalanced: starts with a delimiter char but doesn't close correctly.
+    if s[:1] in ("/", "[") or s[-1:] in ("/", "]"):
+        return s, True
+    return s, False
+
+
+def validate_ipa(raw) -> tuple[bool, str | None, str | None]:
+    """Validate a proposed IPA transcription.
+
+    Returns (ok, normalized_ipa, reason). `normalized_ipa` is the canonical
+    "/…/"-wrapped string ONLY when ok is True; otherwise None — callers must
+    never publish a value when ok is False.
+    """
+    if not isinstance(raw, str):
+        return False, None, "ipa_not_a_string"
+
+    # §1: normalize curly quotes / unicode / whitespace.
+    s = unicodedata.normalize("NFKC", raw)
+    s = "".join(_QUOTE_MAP.get(ch, ch) for ch in s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if not s:
+        return False, None, "ipa_empty"
+    if len(s) > _IPA_MAX_LEN:
+        return False, None, "ipa_too_long"
+
+    inner, had_delims = _strip_ipa_delimiters(s)
+    if had_delims and (not inner or inner[:1] in ("/", "[") or inner[-1:] in ("]", "/")):
+        return False, None, "ipa_malformed_delimiters"
+    if len(inner) < _IPA_MIN_LEN:
+        return False, None, "ipa_too_short"
+    if len(inner) > _IPA_MAX_LEN:
+        return False, None, "ipa_too_long"
+
+    # §2: every character must be an approved IPA symbol or separator.
+    bad_chars = {ch for ch in inner if ch not in _IPA_ALLOWED_CHARS}
+    if bad_chars:
+        return False, None, "ipa_unsupported_symbols"
+
+    # §3: reject ordinary Latin spelling disguised as IPA — a genuine English
+    # IPA transcription contains at least one non-ASCII phonetic marker or a
+    # stress/length mark; plain a-z-only content is almost certainly a
+    # misplaced spelling, not a transcription.
+    if not any(ch in _IPA_MARKER_CHARS for ch in inner):
+        return False, None, "ipa_looks_like_plain_spelling"
+
+    # §4 (contains no ordinary explanatory sentence): reject anything with
+    # digits or punctuation beyond the allowed separator set (already
+    # enforced by the character whitelist) — multi-sentence explanatory text
+    # would contain characters (commas, periods used as sentence enders,
+    # digits) outside _IPA_ALLOWED_CHARS and is rejected above.
+
+    return True, f"/{inner}/", None
+
+
+# Loose stress-guide validator (e.g. "re-co-men-DA-tion") — hyphen-separated
+# syllables, at least one syllable in upper case. Purely advisory content;
+# malformed input is simply omitted (never blocks the rest of the vocab item).
+_STRESS_RE = re.compile(r"^[A-Za-z]+(-[A-Za-z]+)+$")
+
+
+def validate_stress_guide(raw) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s or len(s) > 60:
+        return None
+    if not _STRESS_RE.match(s):
+        return None
+    if not any(part.isupper() for part in s.split("-") if part.isalpha()):
+        return None
+    return s
+
+
+# ── §PART E: Khmer script + bilingual vocabulary validation ────────────────
+# Khmer Unicode block: U+1780–U+17FF.
+_KHMER_RE = re.compile(r"[ក-៿]")
+
+
+def contains_khmer(s) -> bool:
+    return isinstance(s, str) and bool(_KHMER_RE.search(s))
+
+
+_MAX_WORD_LEN = 80
+_MAX_DEFINITION_LEN = 400
+_MAX_KHMER_LEN = 400
+_MAX_EXAMPLE_LEN = 300
+_ALLOWED_POS = frozenset({
+    "noun", "verb", "adjective", "adverb", "preposition", "conjunction",
+    "pronoun", "interjection", "phrase", "expression", "idiom", "",
+})
+
+
+def validate_vocab_item(item: dict) -> tuple[dict | None, list[str]]:
+    """Validate + sanitize one semantic vocabulary item into the canonical
+    shape used by book_factory_composer._vocab_word_block.
+
+    Returns (sanitized_item_or_None, warnings). `sanitized_item_or_None` is
+    None only when the word/definition core is unusable (no salvage
+    possible); IPA and Khmer are independently validated — a bad IPA or a
+    missing/malformed Khmer explanation degrades gracefully (omitted +
+    warned) rather than discarding the whole word.
+    """
+    warnings: list[str] = []
+    if not isinstance(item, dict):
+        return None, ["vocab_item_not_object"]
+
+    word = str(item.get("word") or "").strip()
+    if not word or len(word) > _MAX_WORD_LEN:
+        return None, ["vocab_missing_or_invalid_word"]
+
+    definition = str(item.get("definitionEnglish") or item.get("meaning") or "").strip()
+    if not definition:
+        return None, [f"vocab_missing_definition:{word}"]
+    definition = definition[:_MAX_DEFINITION_LEN]
+
+    pos = str(item.get("partOfSpeech") or "").strip().lower()
+    if pos not in _ALLOWED_POS:
+        warnings.append(f"vocab_pos_dropped:{word}")
+        pos = ""
+
+    out = {"word": word, "partOfSpeech": pos, "definitionEnglish": definition}
+
+    ipa_ok, ipa_norm, ipa_reason = validate_ipa(item.get("ipa"))
+    if ipa_ok:
+        out["ipa"] = ipa_norm
+    elif item.get("ipa"):  # something was proposed but failed — warn, don't fabricate
+        warnings.append(f"vocab_ipa_rejected:{word}:{ipa_reason}")
+
+    stress = validate_stress_guide(item.get("stress"))
+    if stress:
+        out["stress"] = stress
+
+    khmer_raw = item.get("explanationKhmer") or item.get("khmer") or ""
+    khmer = str(khmer_raw).strip()[:_MAX_KHMER_LEN]
+    if khmer and contains_khmer(khmer):
+        out["explanationKhmer"] = khmer
+    elif khmer:
+        # Non-empty but no Khmer script detected — likely a duplicated English
+        # sentence or corrupted output. Never publish it as "Khmer".
+        warnings.append(f"vocab_khmer_missing_script:{word}")
+    else:
+        warnings.append(f"vocab_khmer_missing:{word}")
+
+    example = str(item.get("example") or "").strip()[:_MAX_EXAMPLE_LEN]
+    if example:
+        out["example"] = example
+
+    return out, warnings

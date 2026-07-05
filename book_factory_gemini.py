@@ -417,12 +417,52 @@ Return EXACTLY {total} chapter objects (no more, no fewer) in this JSON schema:
 Return only valid JSON."""
 
 
+# §PART C: CEFR-scaled vocabulary-quantity guidance for the PROMPT. The
+# canonical range lives in book_factory_validator.py (imported here) so the
+# prompt guidance and the backend-authoritative hard cap enforced by
+# book_factory_jobs._validate_and_compose can never drift apart.
+from book_factory_validator import vocab_count_range  # noqa: E402
+
+
+# §PART F: tier influences approved CONTENT depth/curiosity only — never
+# entitlement, price, or ownership (those remain wallet_service's exclusive
+# concern, untouched here).
+_TIER_DEPTH_GUIDANCE: dict[str, str] = {
+    "free": (
+        "Tier: FREE. Keep the chapter SHORT and focused — essential vocabulary only, "
+        "a simple curiosity hook, limited exercises, fast to complete. Prioritize clarity "
+        "over depth."
+    ),
+    "standard": (
+        "Tier: STANDARD. A richer story or conversation with vocabulary and pronunciation "
+        "practice, balanced exercises, and a genuine chapter-ending anticipation for what "
+        "comes next."
+    ),
+    "premium": (
+        "Tier: PREMIUM. Deeper narrative or professional/workplace context, connected-speech "
+        "coaching opportunities, richer speaking practice, and strong chapter-to-chapter "
+        "continuity (callbacks to earlier chapters where natural)."
+    ),
+    "limited": (
+        "Tier: LIMITED (prestige edition). Premium depth PLUS a distinctive, memorable theme "
+        "and a carefully structured progression toward a meaningful final challenge or "
+        "reflection."
+    ),
+}
+
+
+def _tier_depth_guidance(tier: str) -> str:
+    return _TIER_DEPTH_GUIDANCE.get((tier or "free").lower(), _TIER_DEPTH_GUIDANCE["free"])
+
+
 def _chapter_prompt(config: dict, chapter_spec: dict) -> str:
     level = config.get("level") or "A2"
     title = chapter_spec.get("title") or "Chapter"
     outline = chapter_spec.get("outline") or ""
     objective = chapter_spec.get("objective") or ""
     pedagogy = pedagogy_description(config.get("pedagogyProfile"))
+    tier_guidance = _tier_depth_guidance(config.get("tier"))
+    vocab_lo, vocab_hi = vocab_count_range(level)
 
     def _num(key, default):
         v = config.get(key)
@@ -432,7 +472,10 @@ def _chapter_prompt(config: dict, chapter_spec: dict) -> str:
     max_words = _num("maxWordsPerChapter", 320)
     para_guidance = config.get("paragraphGuidance") or "short, learner-friendly paragraphs"
     dialogue_turns = _num("dialogueTurnsPerChapter", 4)
-    vocab_n = _num("vocabularyPerChapter", 6)
+    # Vocabulary quantity is CEFR-driven, not the raw config knob — a config
+    # requesting more than the level supports is capped here (and hard-capped
+    # again, authoritatively, by the composer regardless of this prompt).
+    vocab_n = max(vocab_lo, min(_num("vocabularyPerChapter", vocab_hi), vocab_hi))
     mcq_n = _num("mcqPerChapter", 3)
     fb_n = _num("fillblankPerChapter", 2)
     speak_n = _num("speakingPerChapter", 1)
@@ -453,15 +496,53 @@ CEFR level: {level}
 Pedagogy profile / instructional goals:
 {pedagogy}
 
-Content targets (produce close to these amounts):
+{tier_guidance}
+
+Recommended chapter shape (skip a section entirely rather than force it if it
+would make the chapter too long — a balanced, comfortably-short chapter beats
+a long one that tries to include everything):
+1. A curiosity hook or short opening question.
+2. Main story or conversation content.
+3. A key idea or moment of reflection.
+4. Difficult vocabulary (see below).
+5. Pronunciation focus.
+6. One short speaking activity.
+7. One or two short exercises.
+8. A short chapter-closing hook or preview of what comes next.
+Use ethical engagement only: intriguing openings, unanswered-but-relevant
+questions, progressive discoveries, meaningful choices, chapter-end previews.
+Never use manipulative or dark-pattern techniques.
+
+Content targets (produce close to these amounts — do not exceed the maximums,
+a shorter chapter that stays within bounds is ALWAYS better than a longer one):
 - Total prose {min_words}-{max_words} words across paragraphs.
-- Paragraph guidance: {para_guidance}.
+- Paragraph guidance: {para_guidance}. Keep each paragraph to ONE focused idea.
 - Dialogue lines: about {dialogue_turns}.
-- Vocabulary items: {vocab_n}.
+- Vocabulary items: EXACTLY {vocab_n} difficult words (CEFR {level} target range is
+  {vocab_lo}-{vocab_hi} words) — never more. Fewer than {vocab_n} is fine if the
+  chapter is already dense with dialogue or exercises.
 - Multiple-choice questions: {mcq_n}.
 - Fill-in-the-blank items: {fb_n}.
 - Speaking-practice prompts: {speak_n}.
 - Pronunciation depth: {pron_depth}.{review_note}{focus_note}
+
+Vocabulary quality requirements (EACH word is its own JSON object — never one
+combined block of text):
+- "word": the difficult word or short phrase.
+- "partOfSpeech": noun/verb/adjective/adverb/etc. when it is genuinely useful; "" if not.
+- "ipa": standard IPA in {{/slashes/}} using real IPA symbols (e.g. /ˌrekəmenˈdeɪʃən/).
+  Only include IPA when you are CONFIDENT it is phonetically correct standard IPA —
+  it is safer to OMIT "ipa" entirely (empty string) than to guess or invent one.
+  Never put an ordinary spelled-out word or a full sentence in this field.
+- "stress" (optional): a simple syllable stress guide like "re-co-men-DA-tion"
+  (hyphens between syllables, the stressed syllable in CAPITALS). Omit if unsure.
+- "definitionEnglish": one concise, plain-English definition (no grammar lecture).
+- "explanationKhmer": a NATURAL, concise Khmer explanation a Cambodian learner would
+  actually say — genuine Khmer script, contextually appropriate, NOT a mechanical
+  word-for-word translation, NOT an academic grammar explanation, and NEVER the
+  English sentence copy-pasted or transliterated. If you cannot produce natural
+  Khmer confidently, leave this field as an empty string rather than guessing.
+- "example": ONE short, level-appropriate English sentence using the word naturally.
 
 Rules:
 - Every MCQ MUST include an exact "evidenceQuote": a short verbatim phrase copied
@@ -474,7 +555,13 @@ Return EXACTLY this JSON schema:
   "title": "{title}",
   "paragraphs": ["short paragraph", "..."],
   "dialogueLines": [{{ "speaker": "Name", "text": "line" }}],
-  "vocabulary": [{{ "word": "term", "meaning": "definition" }}],
+  "vocabulary": [
+    {{ "word": "term", "partOfSpeech": "noun", "ipa": "/.../ or empty string",
+       "stress": "syl-LA-ble guide or empty string",
+       "definitionEnglish": "concise definition",
+       "explanationKhmer": "natural Khmer explanation or empty string",
+       "example": "one natural example sentence" }}
+  ],
   "pronunciationTargets": ["sound or word to practice"],
   "speakingPrompts": ["one speaking task"],
   "mcqs": [

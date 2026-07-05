@@ -7,11 +7,14 @@ BFTerminalError exception taxonomy (imported, never redefined) so the job
 orchestrator in book_factory_jobs.py can classify failures identically to a
 text stage.
 
-Model: reads BOOK_FACTORY_COVER_MODEL (default "gemini-3.1-flash-image" — the
-current Google-recommended image-generation model via generateContent as of
-2026-07; confirmed via ai.google.dev docs during planning). Reading the model
-name from the environment means a future Google rename never requires a code
-change.
+Model / endpoint (LOCKED per explicit product decision): the stable Generate
+Content model id "gemini-3.1-flash-image" served under the stable "v1" API
+version — NOT the Interactions API (different endpoint/schema/parser, out of
+scope for this adapter) and NOT a "-preview"-suffixed model id. Both are
+read from BOOK_FACTORY_COVER_MODEL / BOOK_FACTORY_COVER_API_VERSION so either
+can be corrected via a Render env var alone if Google's naming or version
+policy shifts again — no code change required either way. Neither variable
+needs to be SET in Render for the defaults to be correct.
 
 Storage: uploads the generated PNG/JPEG bytes to Cloudflare R2 under an
 isolated `book-covers/` key prefix (never mixed with the existing
@@ -52,8 +55,13 @@ def _model() -> str:
     return os.environ.get("BOOK_FACTORY_COVER_MODEL", "gemini-3.1-flash-image")
 
 
+def _api_version() -> str:
+    """Stable "v1" — see the LOCKED decision note in the module docstring."""
+    return os.environ.get("BOOK_FACTORY_COVER_API_VERSION", "v1")
+
+
 def _endpoint() -> str:
-    return f"https://generativelanguage.googleapis.com/v1/models/{_model()}:generateContent"
+    return f"https://generativelanguage.googleapis.com/{_api_version()}/models/{_model()}:generateContent"
 
 
 HARD_MAX_COVER_TIMEOUT_S: float = 90.0
@@ -131,9 +139,22 @@ async def _call_gemini_image(prompt: str, *, timeout: float) -> dict[str, str]:
     if not key:
         raise BFRetryableError("No image-capable Gemini API key is configured.")
 
+    # LOCKED request shape (Generate Content API, not Interactions): explicitly
+    # requesting a portrait aspect ratio is far more reliable than relying on
+    # prose instructions alone — books need a portrait cover, not whatever
+    # orientation the model defaults to. "2:3" is in the model's supported
+    # aspect-ratio list. imageSize is env-overridable to bound cost.
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "responseFormat": {
+                "image": {
+                    "aspectRatio": "2:3",
+                    "imageSize": os.environ.get("BOOK_FACTORY_COVER_IMAGE_SIZE", "1K"),
+                },
+            },
+        },
     }
 
     try:

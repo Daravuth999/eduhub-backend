@@ -133,15 +133,50 @@ def _safe_list(val) -> list:
     return val if isinstance(val, list) else []
 
 
+def _vocab_word_block(item: dict) -> dict:
+    """Compose ONE canonical markdown block for a single validated vocabulary
+    word (§PART C: a separate, concise content unit — never one giant
+    combined vocabulary dump). `item` is already validated + sanitized by
+    book_factory_validator.validate_vocab_item — this function does no
+    further validation, only formatting, and uses ONLY the existing
+    `markdown` block type (already rendered by ChapterBlocks.jsx — no new
+    Reader component)."""
+    head = f"### 📘 {item['word']}"
+    if item.get("partOfSpeech"):
+        head += f" · *{item['partOfSpeech']}*"
+    lines = [head]
+
+    meta_bits = []
+    if item.get("ipa"):
+        meta_bits.append(f"**IPA:** {item['ipa']}")
+    if item.get("stress"):
+        meta_bits.append(f"**Stress:** {item['stress']}")
+    if meta_bits:
+        lines.append(" &nbsp;·&nbsp; ".join(meta_bits))
+
+    lines.append(f"**Meaning:** {item['definitionEnglish']}")
+    if item.get("explanationKhmer"):
+        lines.append(f"**ខ្មែរ:** {item['explanationKhmer']}")
+    if item.get("example"):
+        lines.append(f"*Example:* {item['example']}")
+
+    return {"type": "markdown", "text": "\n\n".join(lines)}
+
+
 def compose_chapter_blocks(
     semantic: dict,
     validated_mcqs: list[dict],
     fillblanks: list[dict],
+    validated_vocab: list[dict] | None = None,
 ) -> list[dict]:
     """Deterministically compose canonical blocks for one chapter.
 
     `validated_mcqs` are semantic MCQs that already passed validation/repair.
     `fillblanks` are semantic fill-in-the-blank entries already validated.
+    `validated_vocab` are semantic vocabulary items already validated +
+    CEFR-quantity-capped by book_factory_jobs._validate_and_compose (via
+    book_factory_validator.validate_vocab_item / vocab_count_range) — this
+    function only formats them, one markdown block per word.
 
     §PHASE B1: all semantic fields are guarded with _safe_list() so a
     malformed field (e.g. paragraphs="abc") never iterates over characters.
@@ -166,21 +201,11 @@ def compose_chapter_blocks(
             block["speaker"] = speaker.strip()
         blocks.append(block)
 
-    # 3. Vocabulary → markdown list.
-    vocab_lines = []
-    for v in _safe_list(semantic.get("vocabulary")):
-        if isinstance(v, dict):
-            word = str(v.get("word") or "").strip()
-            meaning = str(v.get("meaning") or "").strip()
-            if word and meaning:
-                vocab_lines.append(f"**{word}** — {meaning}")
-            elif word:
-                vocab_lines.append(f"**{word}**")
-        elif isinstance(v, str) and v.strip():
-            vocab_lines.append(v.strip())
-    sec = _markdown_section("Vocabulary", vocab_lines)
-    if sec:
-        blocks.append(sec)
+    # 3. Vocabulary → one markdown block PER validated word (§PART C/G: never
+    # one giant combined blob — a single huge block is exactly what turns the
+    # Reader page into an unbroken wall of scrolling text).
+    for item in (validated_vocab or []):
+        blocks.append(_vocab_word_block(item))
 
     # 4. Pronunciation targets → markdown list.
     pron = [str(x).strip() for x in _safe_list(semantic.get("pronunciationTargets")) if str(x).strip()]
