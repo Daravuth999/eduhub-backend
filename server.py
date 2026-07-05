@@ -5685,6 +5685,15 @@ async def startup():
             "voice_treasure: attempt index ensure failed (non-fatal): %s",
             _vt_attempt_idx_err,
         )
+    # ── Book Factory (Phase 1) — job collection indexes ──
+    try:
+        from book_factory_jobs import ensure_book_factory_indexes
+        await ensure_book_factory_indexes(db)
+    except Exception as _book_factory_idx_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "book_factory: ensure indexes failed (non-fatal): %s",
+            _book_factory_idx_err,
+        )
     try:
         from voice_treasure_reward_tools import ensure_voice_treasure_reward_indexes
         await ensure_voice_treasure_reward_indexes(db)
@@ -6640,6 +6649,18 @@ try:
 except Exception as _artwork_load_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "artwork_campaign_tools: disabled (%s)", _artwork_load_err
+    )
+
+# ── Book Factory (Phase 1, additive isolated module — Author Studio) ───────
+# Gemini-powered draft generator. Feature-flag gated (BOOK_FACTORY_*), admin-
+# only, fail-closed. Never writes db.books (Editor save remains the only path)
+# and never generates media. Dedicated `book_factory_jobs` collection.
+try:
+    from book_factory_jobs import register_book_factory_routes
+    register_book_factory_routes(api, db, require_admin)
+except Exception as _book_factory_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "book_factory_jobs: disabled (%s)", _book_factory_load_err
     )
 
 # ── Login Reward Campaigns (additive, isolated module) ────────────────────
