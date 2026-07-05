@@ -201,7 +201,7 @@ def test_invalid_json_max_two_calls_then_terminal_and_persisted(db, monkeypatch)
 
     async def bad_http(payload, key, timeout):
         http_calls["n"] += 1
-        return "not json at all"
+        return "not json at all", None
 
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     monkeypatch.setattr(bf_gemini, "_gemini_http_once", bad_http)

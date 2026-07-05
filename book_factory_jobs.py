@@ -35,6 +35,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 try:
     from pymongo import ReturnDocument
@@ -117,7 +118,15 @@ S_FAILED_RETRYABLE = "failed_retryable"
 S_FAILED_TERMINAL = "failed_terminal"
 S_UNKNOWN = "unknown_outcome"
 
-_RETRY_ELIGIBLE = (S_FAILED_RETRYABLE, S_UNKNOWN)  # terminal is NOT manually retryable
+_RETRY_ELIGIBLE = (S_FAILED_RETRYABLE, S_UNKNOWN)  # terminal is NOT auto-retryable
+# §HOTFIX: an EXPLICIT, teacher-confirmed recovery action for a chapter that
+# reached failed_terminal/unknown_outcome (e.g. two genuinely malformed/
+# truncated Gemini responses). This is deliberately a SEPARATE, differently-
+# named route from the automatic-eligible /retry above — it is a full
+# lifecycle reset (mirrors /regenerate's reset shape), never invoked
+# automatically (only ever by an explicit POST from a teacher clicking
+# "Retry Chapter"), and never triggered merely by a page reload/resume.
+_TERMINAL_RETRY_ELIGIBLE = (S_FAILED_TERMINAL, S_UNKNOWN)
 _JOB_CANCELLED = "cancelled"
 # §BLOCKER 3: a lock may only be toggled when the chapter is in a STABLE state.
 _LOCKABLE_STATES = (S_PENDING, S_COMPLETED, S_FAILED_TERMINAL, S_FAILED_RETRYABLE, S_UNKNOWN)
@@ -1230,6 +1239,31 @@ async def _validate_and_compose(semantic: dict, level: str = "A2") -> tuple[list
     return blocks, warnings
 
 
+# §HOTFIX: sanitized shape diagnostics for a semantic response that produced
+# zero canonical blocks. NEVER includes raw string content — only top-level
+# field names, per-field TYPE + length/count, so a production failure can be
+# root-caused from the persisted job document without re-running Gemini or
+# logging the actual generated text.
+def _semantic_diagnostics(semantic: Any) -> dict:
+    if not isinstance(semantic, dict):
+        return {"isObject": False, "pythonType": type(semantic).__name__}
+    field_types: dict[str, str] = {}
+    for k, v in semantic.items():
+        if isinstance(v, list):
+            field_types[k] = f"list[{len(v)}]"
+        elif isinstance(v, str):
+            field_types[k] = f"str[{len(v)}]"
+        elif isinstance(v, dict):
+            field_types[k] = f"dict[{len(v)}]"
+        else:
+            field_types[k] = type(v).__name__
+    return {
+        "isObject": True,
+        "topLevelKeys": sorted(semantic.keys()),
+        "fieldTypes": field_types,
+    }
+
+
 async def _run_chapter(db, job_id: str, chapter_id: str, owner: str | None = None) -> dict:
     path = f"chapters.{chapter_id}"
     pre = await db[COLL].find_one({"_id": job_id, **_owner_clause(owner)})
@@ -1334,13 +1368,15 @@ async def _run_chapter(db, job_id: str, chapter_id: str, owner: str | None = Non
                 return {"status": "failed", "state": st}
             if not blocks:
                 # Both calls exhausted — terminal.
-                st = await _fail_terminal(db, job_id, path, attempt, genver, "empty_canonical_blocks", _budget_extra(budget), owner=owner)
+                extra = {**_budget_extra(budget), "diagnostics": _semantic_diagnostics(semantic)}
+                st = await _fail_terminal(db, job_id, path, attempt, genver, "empty_canonical_blocks", extra, owner=owner)
                 return {"status": "failed", "state": st, "reason": "empty_canonical_blocks"}
             # else: second call produced valid blocks — fall through to complete.
         else:
             # Budget exhausted by JSON retries (calls_so_far >= max_total) OR
             # crash recovery (already_used=True from previous run of this claim).
-            st = await _fail_terminal(db, job_id, path, attempt, genver, "empty_canonical_blocks", _budget_extra(budget), owner=owner)
+            extra = {**_budget_extra(budget), "diagnostics": _semantic_diagnostics(semantic)}
+            st = await _fail_terminal(db, job_id, path, attempt, genver, "empty_canonical_blocks", extra, owner=owner)
             return {"status": "failed", "state": st, "reason": "empty_canonical_blocks"}
 
     title = semantic.get("title") or spec.get("title") or "Chapter"
@@ -1847,6 +1883,58 @@ def register_book_factory_routes(
             raise HTTPException(
                 status_code=409,
                 detail=f"Chapter (state '{cur}', locked={bool(locked)}) cannot be regenerated.",
+            )
+        return {"success": True, "job": _job_view(done)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/chapters/{chapter_id}/retry-failed")
+    async def book_factory_retry_failed(job_id: str, chapter_id: str, admin=Depends(require_admin)):
+        # §HOTFIX: explicit, teacher-confirmed recovery for a chapter that
+        # reached failed_terminal / unknown_outcome. Full lifecycle reset
+        # (mirrors /regenerate's reset shape) so the chapter gets a genuinely
+        # fresh attempt budget rather than resuming mid-ladder. Admin-only,
+        # owner-filtered, chapterId-scoped — atomically fenced on the CURRENT
+        # attemptId + generationVersion so a stale request can never win, and
+        # ONLY the targeted chapter is touched (every other chapter — completed
+        # or otherwise — is untouched by this update's dotted path). Never
+        # invoked automatically; only ever reachable via an explicit POST from
+        # a teacher-confirmed "Retry Chapter" click.
+        _need_generation()
+        email = _admin_email(admin)
+        path = f"chapters.{chapter_id}"
+        pre = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+        if not pre or chapter_id not in (pre.get("chapters") or {}):
+            raise HTTPException(status_code=404, detail="Chapter not found")
+        spec = _get_path(pre, path)
+        exp_attempt = spec.get("attemptId")
+        exp_genver = spec.get("generationVersion")
+        now = _now_iso()
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        done = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email), "state": {"$ne": _JOB_CANCELLED},
+             f"{path}.chapterId": chapter_id,
+             f"{path}.attemptId": exp_attempt,
+             f"{path}.generationVersion": exp_genver,
+             f"{path}.state": {"$in": list(_TERMINAL_RETRY_ELIGIBLE)},
+             f"{path}.locked": {"$ne": True}},
+            {"$set": {f"{path}.state": S_PENDING,
+                      f"{path}.attemptId": None,
+                      f"{path}.attemptCount": 0,
+                      f"{path}.blocks": [],
+                      f"{path}.warnings": [],
+                      f"{path}.lastError": None,
+                      f"{path}.diagnostics": None,
+                      f"{path}.providerCallCount": 0,
+                      f"{path}.jsonRetryUsed": False,
+                      f"{path}.malformedRetryUsed": False,
+                      "updatedAt": now}},
+            **kwargs,
+        )
+        if done is None:
+            cur = _get_path(pre, path).get("state")
+            locked = _get_path(pre, path).get("locked")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Chapter (state '{cur}', locked={bool(locked)}) is not eligible for failed-chapter retry.",
             )
         return {"success": True, "job": _job_view(done)}
 

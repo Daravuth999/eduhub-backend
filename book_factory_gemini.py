@@ -127,7 +127,20 @@ _BLUEPRINT_MAX_TOKENS: int = _env_int_clamped(
     "BOOK_FACTORY_BLUEPRINT_MAX_TOKENS", 2048, HARD_MIN_OUTPUT_TOKENS, HARD_MAX_OUTPUT_TOKENS
 )
 _CHAPTER_MAX_TOKENS: int = _env_int_clamped(
-    "BOOK_FACTORY_CHAPTER_MAX_TOKENS", 4096, HARD_MIN_OUTPUT_TOKENS, HARD_MAX_OUTPUT_TOKENS
+    # §HOTFIX: 4096 was sized for the ORIGINAL one-string vocabulary blob. The
+    # Part C/D/E per-word vocabulary schema (word/partOfSpeech/ipa/stress/
+    # definitionEnglish/explanationKhmer/example — up to 8 words at B2, each
+    # its own JSON object) plus the fuller 8-part chapter shape materially
+    # increased typical response size. A response that runs out of tokens is
+    # truncated mid-JSON, which is genuinely unparseable (BFInvalidJSONError)
+    # and consumed BOTH bounded retries on content-dense chapters (observed in
+    # production job bf_job_ae83db98f7 on Participating in Meetings / Giving
+    # and Receiving Feedback / Making and Responding to Requests / Presenting
+    # Information / Networking & Socializing — the more content-dense,
+    # dialogue-heavy topics). Raised to the existing HARD ceiling (8192) —
+    # NOT a new hard-limit value, so §PHASE B3's "env can only reduce, never
+    # raise the ceiling" guarantee is unaffected.
+    "BOOK_FACTORY_CHAPTER_MAX_TOKENS", 8192, HARD_MIN_OUTPUT_TOKENS, HARD_MAX_OUTPUT_TOKENS
 )
 
 _SYSTEM_INSTRUCTION = (
@@ -272,29 +285,39 @@ async def _call_gemini_json(
             # candidates/parts/text) AND unparseable candidate JSON raise
             # BFInvalidJSONError, so every malformed-success form flows through
             # the SAME bounded retry budget (max effective_max calls).
-            text = await _gemini_http_once(payload, key, timeout)
-            return _parse_json_text(text)
-        except BFInvalidJSONError:
+            text, finish_reason = await _gemini_http_once(payload, key, timeout)
+            try:
+                return _parse_json_text(text)
+            except BFInvalidJSONError as exc:
+                # §HOTFIX diagnostics: a truncated response (maxOutputTokens
+                # reached mid-JSON) and a genuinely malformed response are both
+                # BFInvalidJSONError, but `finishReason` distinguishes them
+                # (sanitized reason code only — never the raw candidate text).
+                raise BFInvalidJSONError(f"{exc} (finishReason={finish_reason or 'unknown'})") from exc
+        except BFInvalidJSONError as exc:
             if budget is not None:
                 budget["jsonRetryUsed"] = True
             if calls >= effective_max:
                 raise BFTerminalError(
                     "Gemini returned an unparseable/malformed success response "
                     f"(bounded malformed-response retry exhausted after "
-                    f"{calls}/{effective_max} calls in this invocation)."
-                )
+                    f"{calls}/{effective_max} calls in this invocation): {exc}"
+                ) from exc
             log.warning(
                 "book_factory_gemini: malformed success, one bounded retry "
-                "(extra provider call %d/%d)", calls + 1, effective_max,
+                "(extra provider call %d/%d) — %s", calls + 1, effective_max, exc,
             )
             continue
 
 
-async def _gemini_http_once(payload: dict, key: str, timeout: float) -> str:
+async def _gemini_http_once(payload: dict, key: str, timeout: float) -> tuple[str, Optional[str]]:
     """One HTTP round-trip. Classifies transport + HTTP-status outcomes into
     BFRetryableError / BFUnknownOutcomeError / BFTerminalError.
-    Returns the raw candidate text (JSON parsing is done by the caller).
-    A malformed HTTP-200 envelope raises BFInvalidJSONError (bounded retry)."""
+    Returns (candidate_text, finishReason) — JSON parsing is done by the
+    caller. `finishReason` (e.g. "STOP", "MAX_TOKENS", "SAFETY") is a Gemini
+    reason CODE, safe to log/persist (never raw generated content); it is
+    None when the envelope didn't carry one. A malformed HTTP-200 envelope
+    raises BFInvalidJSONError (bounded retry)."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -331,12 +354,17 @@ async def _gemini_http_once(payload: dict, key: str, timeout: float) -> str:
     raise BFTerminalError(f"Gemini returned HTTP {status} (non-retryable).")
 
 
-def _extract_candidate_text(data: Any) -> str:
+def _extract_candidate_text(data: Any) -> tuple[str, Optional[str]]:
     """§HIGH 11: pull the candidate text out of a Gemini HTTP-200 envelope,
     validating the TYPE of every layer. Any malformed shape — non-object
     envelope, missing/wrong-type candidates, missing/wrong-type content, parts,
     or a non-string text — raises BFInvalidJSONError so it flows through the
-    SAME bounded malformed-response budget (never an AttributeError)."""
+    SAME bounded malformed-response budget (never an AttributeError).
+
+    Returns (text, finishReason). `finishReason` is read best-effort (a
+    missing/wrong-type value never blocks extraction of a valid text part) —
+    it is a Gemini reason CODE ("STOP"/"MAX_TOKENS"/"SAFETY"/...), safe to
+    surface in diagnostics since it is never raw generated content."""
     if not isinstance(data, dict):
         raise BFInvalidJSONError("Gemini response envelope is not an object.")
     candidates = data.get("candidates")
@@ -345,6 +373,9 @@ def _extract_candidate_text(data: Any) -> str:
     cand0 = candidates[0]
     if not isinstance(cand0, dict):
         raise BFInvalidJSONError("Gemini candidate entry is not an object.")
+    finish_reason = cand0.get("finishReason")
+    if not isinstance(finish_reason, str):
+        finish_reason = None
     content = cand0.get("content")
     if not isinstance(content, dict):
         raise BFInvalidJSONError("Gemini candidate content missing or not an object.")
@@ -357,7 +388,7 @@ def _extract_candidate_text(data: Any) -> str:
     text = part0.get("text")
     if not isinstance(text, str):
         raise BFInvalidJSONError("Gemini candidate text missing or not a string.")
-    return text
+    return text, finish_reason
 
 
 def _parse_json_text(text: str) -> dict[str, Any]:
@@ -549,6 +580,12 @@ Rules:
   word-for-word from your own paragraphs or dialogueLines that justifies the answer.
 - Every fill-in-the-blank "text" MUST contain a blank marker: ___ or [blank].
 - Do NOT invent any URLs, image references, or audio.
+- Use EXACTLY the field names shown below — never rename, add, or nest a field.
+- An empty string ("") for an optional field is always preferable to a
+  fabricated or guessed value. Never pad your answer with commentary,
+  repeated instructions, or restated outline text outside the JSON fields.
+- Stay within the content targets above — a shorter, complete JSON response
+  is far more valuable than a longer one that gets cut off before it closes.
 
 Return EXACTLY this JSON schema:
 {{

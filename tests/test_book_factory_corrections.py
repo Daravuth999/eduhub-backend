@@ -108,7 +108,7 @@ def test_invalid_json_retries_once_then_terminal(monkeypatch):
 
     async def bad_once(payload, key, timeout):
         calls["n"] += 1
-        return "this is not json"
+        return "this is not json", None
 
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     monkeypatch.setattr(bf_gemini, "_gemini_http_once", bad_once)
