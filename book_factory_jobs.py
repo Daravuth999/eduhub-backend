@@ -51,6 +51,7 @@ import book_factory_composer as bf_composer
 import book_factory_validator as bf_validator
 import book_factory_image as bf_image
 import book_factory_narration as bf_narration
+import book_factory_conversation as bf_conv
 
 log = logging.getLogger("eduhub.book_factory")
 
@@ -466,6 +467,11 @@ def conversation_audio_automation_permitted() -> bool:
     return _flag("BOOK_FACTORY_CONVERSATION_AUDIO_ENABLED")
 
 
+def conversation_audio_ready() -> bool:
+    """Combined readiness: flag on AND per-line storage (R2) configured."""
+    return conversation_audio_automation_permitted() and bf_conv.storage_configured()
+
+
 def direct_publish_permitted() -> bool:
     return _flag("BOOK_FACTORY_DIRECT_PUBLISH_ENABLED")
 
@@ -483,6 +489,7 @@ def status_payload() -> dict:
         "coverStorageReady": bf_image.storage_configured(),
         "narrationEnabled": narration_automation_permitted(),
         "conversationAudioEnabled": conversation_audio_automation_permitted(),
+        "conversationAudioStorageReady": bf_conv.storage_configured(),
         "directPublishEnabled": direct_publish_permitted(),
     }
 
@@ -771,18 +778,13 @@ async def _run_cover(db, job_id: str, owner: str | None = None) -> dict:
         return {"status": "superseded"}
 
     config = claimed.get("config") or {}
+    cover_kwargs = dict(
+        title=str(config.get("title") or ""), topic=str(config.get("topic") or ""),
+        section=str(config.get("section") or "story"), level=str(config.get("level") or "A2"),
+        tier=str(config.get("tier") or "free"), accent=str(config.get("accent") or "#D4A843"),
+    )
     try:
-        result = await bf_image.generate_and_store_cover(
-            job_id=job_id,
-            attempt_id=attempt,
-            title=str(config.get("title") or ""),
-            topic=str(config.get("topic") or ""),
-            section=str(config.get("section") or "story"),
-            level=str(config.get("level") or "A2"),
-            tier=str(config.get("tier") or "free"),
-            accent=str(config.get("accent") or "#D4A843"),
-            admin_email=owner or "",
-        )
+        gen = await bf_image.generate_cover_image_bytes(**cover_kwargs)
     except BFTerminalError as exc:
         st = await _fail_terminal(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
         return {"status": "failed", "state": st}
@@ -795,6 +797,36 @@ async def _run_cover(db, job_id: str, owner: str | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         st = await _fail_stage(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
         return {"status": "failed", "state": st}
+
+    # The image bytes now exist in memory — a storage failure below must
+    # NEVER trigger a second paid Gemini call. Retry ONLY the upload, bounded,
+    # reusing these SAME bytes (store_cover_image also HEAD-checks first, so
+    # a retry after a PARTIAL failure — upload actually succeeded but the
+    # response was lost — reuses the already-stored object instead of
+    # re-uploading).
+    url = None
+    upload_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            url = await bf_image.store_cover_image(
+                job_id=job_id, attempt_id=attempt, image_bytes=gen["image_bytes"],
+                mime=gen["mimeType"], ext=gen["ext"], admin_email=owner or "",
+                title=cover_kwargs["title"], section=cover_kwargs["section"],
+                level=cover_kwargs["level"], tier=cover_kwargs["tier"],
+            )
+            upload_exc = None
+            break
+        except BFTerminalError as exc:
+            st = await _fail_terminal(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+            return {"status": "failed", "state": st}
+        except Exception as exc:  # noqa: BLE001 — retryable upload failure, same bytes
+            upload_exc = exc
+            continue
+    if url is None:
+        st = await _fail_stage(db, job_id, path, attempt, genver,
+                               f"cover storage failed after retries: {upload_exc}", owner=owner)
+        return {"status": "failed", "state": st}
+    result = {"url": url, "mimeType": gen["mimeType"]}
 
     # The image is already safely stored on R2 at this point. A failure to
     # persist the completion in Mongo (transient write error, brief network
@@ -902,6 +934,245 @@ async def _run_narration_chapter(
     if not ok:
         return {"status": "superseded"}
     return {"status": "completed", "chapterId": chapter_id, "revision": result.get("revision")}
+
+
+# ── Phase 4: persisted line-level conversation-audio automation ────────────
+_CONV_LINE_STAGE_TEMPLATE = {
+    "state": S_PENDING, "attemptId": None, "attemptCount": 0,
+    "generationVersion": 0, "providerCallCount": 0,
+    "speaker": "", "text": "", "voiceId": "", "pauseAfter": 0.35,
+    "audioUrl": "", "wordTimestamps": [], "duration": 0.0,
+}
+_CONV_ASSEMBLY_STAGE_TEMPLATE = {
+    "state": S_PENDING, "attemptId": None, "attemptCount": 0,
+    "generationVersion": 0, "audioUrl": "", "totalDuration": 0.0,
+}
+
+
+def init_conversation_audio_chapter(
+    doc: dict, chapter_id: str, voice_assignments: dict, pause_after: float,
+) -> dict | None:
+    """Build (or safely update) the persisted line map for one chapter's
+    dialog blocks. Returns the `$set` patch to apply, or None if the chapter
+    has no dialog lines. Idempotent + resume-safe:
+      * First call: seeds every line as pending with its assigned voice.
+      * Later calls (e.g. the teacher tweaks a voice mapping, or a lost
+        response is retried): a line already `completed` is NEVER reset —
+        its stored audioUrl/timestamps/state are preserved untouched. Only
+        `pending` / `failed_retryable` / `failed_terminal` / `unknown_outcome`
+        lines pick up a new voiceId/pauseAfter, and only `text`/`speaker`
+        stay in sync with the composed chapter (they never change unless the
+        chapter itself is regenerated, which invalidates this whole map —
+        see the caller's regeneration-detection check).
+    """
+    chapters = doc.get("chapters") or {}
+    chapter = chapters.get(chapter_id)
+    if not chapter:
+        return None
+    lines = bf_conv.extract_dialog_lines(chapter.get("blocks") or [])
+    if not lines:
+        return None
+
+    existing = ((doc.get("conversationAudio") or {}).get(chapter_id) or {})
+    existing_lines = existing.get("lines") or {}
+    existing_line_order = existing.get("lineOrder") or []
+
+    # Regeneration guard: if the persisted lineOrder no longer matches the
+    # CURRENT composed dialog lines (different count/text), the chapter was
+    # regenerated since this map was built — start a fresh map rather than
+    # silently mixing stale completed audio with new text.
+    stale = (
+        existing_line_order
+        and (len(existing_line_order) != len(lines)
+             or any(existing_lines.get(l["lineId"], {}).get("text") != l["text"] for l in lines))
+    )
+
+    new_lines: dict[str, dict] = {}
+    for l in lines:
+        prior = {} if stale else existing_lines.get(l["lineId"], {})
+        if prior.get("state") == S_COMPLETED:
+            new_lines[l["lineId"]] = prior  # never touch a completed line
+            continue
+        voice_id = voice_assignments.get(l["speaker"]) or (prior.get("voiceId") or "")
+        new_lines[l["lineId"]] = {
+            **_CONV_LINE_STAGE_TEMPLATE,
+            **{k: v for k, v in prior.items() if k in ("state", "attemptId", "attemptCount",
+                                                        "generationVersion", "claimExpiresAt",
+                                                        "lastError")},
+            "speaker": l["speaker"], "text": l["text"], "blockIndex": l["blockIndex"],
+            "voiceId": voice_id, "pauseAfter": float(pause_after),
+        }
+
+    return {
+        "lines": new_lines,
+        "lineOrder": [l["lineId"] for l in lines],
+        "assembly": existing.get("assembly") or dict(_CONV_ASSEMBLY_STAGE_TEMPLATE),
+    }
+
+
+async def _run_conversation_line(
+    db, job_id: str, chapter_id: str, line_id: str, owner: str, run_conversation_line_fn,
+) -> dict:
+    """Claim → fence → generate ONE line's audio → persist to R2 → complete.
+    Same generic primitives as every other stage; keyed on the STABLE lineId
+    (never an array position)."""
+    path = f"conversationAudio.{chapter_id}.lines.{line_id}"
+    claimed, attempt = await _claim_stage(db, job_id, path, owner=owner)
+    if claimed is None:
+        doc = await db[COLL].find_one({"_id": job_id})
+        return {"status": "skipped", "reason": _get_path(doc, path).get("state")}
+    genver = int(_get_path(claimed, path).get("generationVersion") or 0)
+
+    if not await _fence_provider(db, job_id, path, attempt, genver, owner=owner):
+        return {"status": "superseded"}
+
+    spec = _get_path(claimed, path)
+    try:
+        result = await run_conversation_line_fn(
+            text=spec.get("text") or "", voice_id=spec.get("voiceId") or "",
+            emotion="neutral", acting_note_extra="", voice_settings=None,
+        )
+    except HTTPException as exc:
+        status = exc.status_code
+        reason = f"HTTPException {status}: {exc.detail}"
+        if status in _NarrationHTTPOutcome.TERMINAL_STATUSES:
+            st = await _fail_terminal(db, job_id, path, attempt, genver, reason, owner=owner)
+            return {"status": "failed", "state": st}
+        if status in _NarrationHTTPOutcome.RETRYABLE_STATUSES:
+            st = await _fail_stage(db, job_id, path, attempt, genver, reason, owner=owner)
+            return {"status": "failed", "state": st}
+        st = await _fail_unknown(db, job_id, path, attempt, genver, reason, owner=owner)
+        return {"status": "unknown", "state": st}
+    except Exception as exc:  # noqa: BLE001 — unclassified: safest default is unknown
+        st = await _fail_unknown(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "unknown", "state": st}
+
+    import base64 as _b64
+    try:
+        audio_bytes = _b64.b64decode(result.get("audio_base64") or "", validate=False)
+        if not audio_bytes:
+            raise ValueError("empty audio")
+    except Exception as exc:  # noqa: BLE001 — malformed success, not retryable by re-calling Gemini/ElevenLabs
+        st = await _fail_terminal(db, job_id, path, attempt, genver, f"empty_or_invalid_audio: {exc}", owner=owner)
+        return {"status": "failed", "state": st}
+
+    # Audio bytes already exist in memory — a storage failure must NEVER
+    # trigger a second paid provider call. Retry ONLY the upload, bounded,
+    # reusing these SAME bytes (store_line_audio also HEAD-checks first, so
+    # a retry after a partial failure reuses the already-stored object).
+    audio_url = None
+    upload_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            audio_url = await bf_conv.store_line_audio(job_id, chapter_id, line_id, attempt, audio_bytes)
+            upload_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            upload_exc = exc
+            continue
+    if audio_url is None:
+        st = await _fail_stage(db, job_id, path, attempt, genver,
+                               f"storage_failed_after_retries: {upload_exc}", owner=owner)
+        return {"status": "failed", "state": st}
+
+    # Audio is safely stored — a completion-write failure must retry ONLY the
+    # DB write, never re-generate (same pattern as the cover stage).
+    ok = False
+    last_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            ok = await _complete_stage(db, job_id, path, attempt, genver, {
+                "audioUrl": audio_url,
+                "wordTimestamps": result.get("word_timestamps") or [],
+                "duration": float(result.get("duration") or 0.0),
+            }, owner=owner)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    if not ok:
+        if last_exc is not None:
+            return {"status": "failed", "state": "unknown_outcome",
+                    "reason": f"line audio stored but completion write failed: {last_exc}",
+                    "audioUrl": audio_url}
+        return {"status": "superseded"}
+    return {"status": "completed", "lineId": line_id, "audioUrl": audio_url}
+
+
+async def _run_conversation_assembly(
+    db, job_id: str, chapter_id: str, saved_index: int, slug: str, owner: str, assemble_fn,
+) -> dict:
+    """Claim → fence → fetch every completed line's stored audio → stitch →
+    save a new book revision → complete. Only invoked by the route AFTER it
+    has verified every required line is `completed` — a stale/incomplete
+    claim can still lose the race to a concurrent request via the generic
+    fencing, but this function does not itself re-check completeness (the
+    route's pre-check + the atomic claim together are sufficient: a stage
+    that reached `pending`/`failed_retryable` can only be claimed once)."""
+    path = f"conversationAudio.{chapter_id}.assembly"
+    claimed, attempt = await _claim_stage(db, job_id, path, owner=owner)
+    if claimed is None:
+        doc = await db[COLL].find_one({"_id": job_id})
+        return {"status": "skipped", "reason": _get_path(doc, path).get("state")}
+    genver = int(_get_path(claimed, path).get("generationVersion") or 0)
+
+    if not await _fence_provider(db, job_id, path, attempt, genver, owner=owner):
+        return {"status": "superseded"}
+
+    conv = (claimed.get("conversationAudio") or {}).get(chapter_id) or {}
+    order = conv.get("lineOrder") or []
+    lines_map = conv.get("lines") or {}
+
+    line_audio_results = []
+    try:
+        for line_id in order:
+            spec = lines_map.get(line_id) or {}
+            if spec.get("state") != S_COMPLETED:
+                raise ValueError(f"line {line_id} is not completed (state={spec.get('state')})")
+            audio_bytes = await bf_conv.fetch_line_audio_bytes(spec["audioUrl"])
+            line_audio_results.append({
+                "blockIndex": spec.get("blockIndex"), "speaker": spec.get("speaker"),
+                "audio_bytes": audio_bytes, "word_timestamps": spec.get("wordTimestamps") or [],
+                "duration": spec.get("duration") or 0.0, "pauseAfter": spec.get("pauseAfter", 0.35),
+            })
+    except Exception as exc:  # noqa: BLE001 — fetch failure is retryable (nothing destructive happened)
+        st = await _fail_stage(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "failed", "state": st}
+
+    try:
+        result = await assemble_fn(
+            slug=slug, chapter_index=saved_index, line_audio_results=line_audio_results, admin_email=owner,
+        )
+    except HTTPException as exc:
+        status = exc.status_code
+        reason = f"HTTPException {status}: {exc.detail}"
+        if status in _NarrationHTTPOutcome.TERMINAL_STATUSES:
+            st = await _fail_terminal(db, job_id, path, attempt, genver, reason, owner=owner)
+            return {"status": "failed", "state": st}
+        st = await _fail_stage(db, job_id, path, attempt, genver, reason, owner=owner)
+        return {"status": "failed", "state": st}
+    except Exception as exc:  # noqa: BLE001
+        st = await _fail_stage(db, job_id, path, attempt, genver, f"{type(exc).__name__}: {exc}", owner=owner)
+        return {"status": "failed", "state": st}
+
+    ok = False
+    last_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            ok = await _complete_stage(db, job_id, path, attempt, genver, {
+                "audioUrl": result["audioUrl"], "totalDuration": result["totalDuration"],
+            }, owner=owner)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    if not ok:
+        if last_exc is not None:
+            return {"status": "failed", "state": "unknown_outcome",
+                    "reason": f"assembly saved but completion write failed: {last_exc}",
+                    "audioUrl": result["audioUrl"], "revision": result.get("revision")}
+        return {"status": "superseded"}
+    return {"status": "completed", "audioUrl": result["audioUrl"], "revision": result.get("revision")}
 
 
 async def _validate_and_compose(semantic: dict) -> tuple[list[dict], list[dict]]:
@@ -1147,7 +1418,7 @@ def _job_summary(doc: dict) -> dict:
 def register_book_factory_routes(
     api, db, require_admin, *,
     save_book_revision=None, publish_book=None, run_elevenlabs_for_chapter=None,
-    get_book_by_slug=None,
+    get_book_by_slug=None, run_conversation_line=None, assemble_conversation_for_chapter=None,
 ) -> None:
     """Register Book Factory admin routes onto the shared /api router.
 
@@ -1686,6 +1957,133 @@ def register_book_factory_routes(
         result = await _run_narration_chapter(
             db, job_id, chapter_id, saved_index, slug, voice_id, email,
             run_elevenlabs_for_chapter,
+        )
+        latest = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+        return {"success": True, "result": result, "job": _job_view(latest)}
+
+    def _conv_preflight(doc: dict, chapter_id: str) -> str:
+        """Shared checks for every conversation-audio route: job not
+        cancelled, chapterId known, saved-book binding present. Returns the
+        bound slug or raises HTTPException."""
+        if doc.get("state") == _JOB_CANCELLED:
+            raise HTTPException(status_code=409, detail="Job is cancelled.")
+        if chapter_id not in (doc.get("chapterOrder") or []):
+            raise HTTPException(status_code=404, detail="Chapter not found in this job's approved outline.")
+        slug = doc.get("savedBookSlug")
+        if not slug:
+            raise HTTPException(status_code=409, detail="Save Draft before generating conversation audio.")
+        return slug
+
+    @api.post("/studio/book-factory/jobs/{job_id}/conversation-audio/{chapter_id}/init")
+    async def book_factory_conversation_init(
+        job_id: str, chapter_id: str, payload: dict = None, admin=Depends(require_admin),
+    ):
+        # §PHASE E: idempotent / resume-safe seeding of the persisted
+        # per-line map. Safe to call repeatedly — a completed line is NEVER
+        # reset (see init_conversation_audio_chapter's docstring).
+        _need_enabled()
+        email = _admin_email(admin)
+        if not conversation_audio_ready():
+            raise HTTPException(status_code=503, detail="Conversation-audio automation is disabled or storage is not configured.")
+        doc = await _owned_or_404(job_id, email)
+        _conv_preflight(doc, chapter_id)
+        voice_assignments = (payload or {}).get("voiceAssignments") or {}
+        if not isinstance(voice_assignments, dict):
+            raise HTTPException(status_code=400, detail="voiceAssignments must be an object.")
+        pause_after = float((payload or {}).get("pauseAfter", 0.35) or 0.35)
+        patch = init_conversation_audio_chapter(doc, chapter_id, voice_assignments, pause_after)
+        if patch is None:
+            raise HTTPException(status_code=409, detail="This chapter has no dialog lines.")
+        now = _now_iso()
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        updated = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email)},
+            {"$set": {f"conversationAudio.{chapter_id}": patch, "updatedAt": now}},
+            **kwargs,
+        )
+        return {"success": True, "job": _job_view(updated or doc)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/conversation-audio/{chapter_id}/lines/{line_id}/generate")
+    async def book_factory_conversation_line_generate(
+        job_id: str, chapter_id: str, line_id: str, admin=Depends(require_admin),
+    ):
+        _need_enabled()
+        email = _admin_email(admin)
+        if not conversation_audio_ready():
+            raise HTTPException(status_code=503, detail="Conversation-audio automation is disabled or storage is not configured.")
+        if run_conversation_line is None:
+            raise HTTPException(status_code=503, detail="Conversation-audio generation is not wired on this server.")
+        doc = await _owned_or_404(job_id, email)
+        _conv_preflight(doc, chapter_id)
+        conv = (doc.get("conversationAudio") or {}).get(chapter_id) or {}
+        if line_id not in (conv.get("lines") or {}):
+            raise HTTPException(status_code=404, detail="Line not found — call init first.")
+        result = await _run_conversation_line(db, job_id, chapter_id, line_id, email, run_conversation_line)
+        latest = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+        return {"success": True, "result": result, "job": _job_view(latest)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/conversation-audio/{chapter_id}/lines/{line_id}/retry")
+    async def book_factory_conversation_line_retry(
+        job_id: str, chapter_id: str, line_id: str, admin=Depends(require_admin),
+    ):
+        # Same eligibility rule as chapter retry: only failed_retryable /
+        # unknown_outcome, fenced on the CURRENT attemptId + generationVersion
+        # — never touches any other line in this chapter.
+        _need_enabled()
+        email = _admin_email(admin)
+        path = f"conversationAudio.{chapter_id}.lines.{line_id}"
+        pre = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
+        if not pre:
+            raise HTTPException(status_code=404, detail="Job not found")
+        spec = _get_path(pre, path)
+        if not spec:
+            raise HTTPException(status_code=404, detail="Line not found")
+        exp_attempt = spec.get("attemptId")
+        exp_genver = spec.get("generationVersion")
+        now = _now_iso()
+        kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
+        done = await db[COLL].find_one_and_update(
+            {"_id": job_id, **_owner_clause(email), "state": {"$ne": _JOB_CANCELLED},
+             f"{path}.attemptId": exp_attempt, f"{path}.generationVersion": exp_genver,
+             f"{path}.state": {"$in": list(_RETRY_ELIGIBLE)}},
+            {"$set": {f"{path}.state": S_PENDING, f"{path}.lastError": None,
+                      f"{path}.providerCallCount": 0, "updatedAt": now}},
+            **kwargs,
+        )
+        if done is None:
+            raise HTTPException(status_code=409, detail=f"Line state '{spec.get('state')}' is not eligible for manual retry.")
+        return {"success": True, "job": _job_view(done)}
+
+    @api.post("/studio/book-factory/jobs/{job_id}/conversation-audio/{chapter_id}/assemble")
+    async def book_factory_conversation_assemble(
+        job_id: str, chapter_id: str, admin=Depends(require_admin),
+    ):
+        # §PHASE E: pre-claim gate — assembly is only ATTEMPTED once every
+        # required line reports completed. This is a pre-check (409 if not
+        # ready) rather than a claimed-then-failed attempt, so an
+        # in-progress chapter never burns an assembly attempt/generationVersion
+        # merely because the teacher checked too early.
+        _need_enabled()
+        email = _admin_email(admin)
+        if not conversation_audio_ready():
+            raise HTTPException(status_code=503, detail="Conversation-audio automation is disabled or storage is not configured.")
+        if assemble_conversation_for_chapter is None:
+            raise HTTPException(status_code=503, detail="Conversation-audio assembly is not wired on this server.")
+        doc = await _owned_or_404(job_id, email)
+        slug = _conv_preflight(doc, chapter_id)
+        saved_index = (doc.get("chapterIdToSavedIndex") or {}).get(chapter_id)
+        if saved_index is None:
+            raise HTTPException(status_code=409, detail="This chapter is not present in the last saved draft — Save Draft again first.")
+        conv = (doc.get("conversationAudio") or {}).get(chapter_id) or {}
+        order = conv.get("lineOrder") or []
+        lines_map = conv.get("lines") or {}
+        if not order:
+            raise HTTPException(status_code=409, detail="No conversation lines initialized for this chapter — call init first.")
+        incomplete = [lid for lid in order if (lines_map.get(lid) or {}).get("state") != S_COMPLETED]
+        if incomplete:
+            raise HTTPException(status_code=409, detail=f"{len(incomplete)} line(s) not yet completed.")
+        result = await _run_conversation_assembly(
+            db, job_id, chapter_id, saved_index, slug, email, assemble_conversation_for_chapter,
         )
         latest = await db[COLL].find_one({"_id": job_id, **_owner_clause(email)})
         return {"success": True, "result": result, "job": _job_view(latest)}

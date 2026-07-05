@@ -62,6 +62,7 @@ def test_status_reports_flags_even_while_disabled(monkeypatch, visible, enabled)
         "visible": visible, "enabled": enabled, "geminiEnabled": False,
         "coverEnabled": False, "coverProviderReady": False, "coverStorageReady": False,
         "narrationEnabled": False, "conversationAudioEnabled": False,
+        "conversationAudioStorageReady": False,
         "directPublishEnabled": False,
     }
 

@@ -6603,6 +6603,121 @@ async def run_conversation_for_chapter(
     }
 
 
+async def run_conversation_line(
+    *, text: str, voice_id: str, emotion: str = "neutral",
+    acting_note_extra: str = "", voice_settings: dict | None = None,
+) -> dict:
+    """Generate ONE conversation line's audio. Additive extraction reusing
+    the SAME primitives (_elevenlabs_generate_line, _emotion_to_acting_note)
+    the existing all-at-once /conversation route already calls inside its
+    own loop — that loop is completely untouched; this is a new sibling
+    entry point for Book Factory's persisted per-line automation.
+    Returns {audio_base64, word_timestamps, duration}. Raises HTTPException
+    (503 missing key, 502 upstream error) exactly like the existing route.
+    """
+    acting_note = _emotion_to_acting_note(emotion, acting_note_extra or "")
+    return await _elevenlabs_generate_line(
+        text=text, voice_id=voice_id, voice_settings=voice_settings, acting_note=acting_note,
+    )
+
+
+async def assemble_conversation_for_chapter(
+    *, slug: str, chapter_index: int, line_audio_results: list[dict], admin_email: str,
+) -> dict:
+    """Stitch already-generated, already-persisted per-line audio into one
+    conversation MP3, update the saved book's dialog blocks, and save a new
+    revision. Additive extraction of the ASSEMBLY half of
+    run_conversation_for_chapter's logic — reused by Book Factory's
+    persisted-line automation once every required line is complete. The
+    manual all-at-once /conversation route keeps its own inline assembly
+    unchanged (zero regression risk); this is a new sibling, not a
+    replacement.
+
+    `line_audio_results`: ordered list of
+        {blockIndex, speaker, audio_bytes, word_timestamps, duration, pauseAfter}
+    already in the FINAL desired playback order.
+    """
+    book = await db.books.find_one({"slug": slug}, {"_id": 0}, sort=[("revision", -1)])
+    if not book:
+        raise HTTPException(status_code=404, detail=f"Book '{slug}' not found.")
+    chapters = book.get("chapters", [])
+    if chapter_index >= len(chapters):
+        raise HTTPException(status_code=400, detail="Chapter index out of range.")
+    chapter = chapters[chapter_index]
+    blocks = list(chapter.get("blocks", []))
+    now = datetime.now(timezone.utc).isoformat()
+
+    accumulated_time = 0.0
+    audio_segments = []
+    shifted_all = []
+    for lr in line_audio_results:
+        shifted_wts = [
+            {"word": w["word"], "start": round(w["start"] + accumulated_time, 3),
+             "end": round(w["end"] + accumulated_time, 3)}
+            for w in (lr.get("word_timestamps") or [])
+        ]
+        line_start = accumulated_time
+        line_end = line_start + float(lr.get("duration") or 0.0)
+        audio_segments.append(lr["audio_bytes"])
+        shifted_all.append({
+            "blockIndex": lr["blockIndex"], "speaker": lr.get("speaker", ""),
+            "start": round(line_start, 3), "end": round(line_end, 3),
+            "wordTimestamps": shifted_wts,
+        })
+        accumulated_time = line_end + max(0.0, float(lr.get("pauseAfter", 0.35)))
+
+    if not audio_segments:
+        raise HTTPException(status_code=400, detail="No line audio to assemble.")
+
+    stitched_bytes = _stitch_mp3_segments(audio_segments)
+    audio_id = str(uuid.uuid4())
+    try:
+        await audio_bucket.upload_from_stream(
+            f"{audio_id}.mp3",
+            io.BytesIO(stitched_bytes),
+            metadata={
+                "slug": slug, "chapter_index": chapter_index, "type": "conversation",
+                "speakers": list({lr.get("speaker", "") for lr in line_audio_results}),
+                "line_count": len(line_audio_results), "created_at": now,
+                "created_by": admin_email, "source": "book_factory_automation",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("conversation-audio assembly: GridFS upload failed for slug=%s", slug)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store assembled conversation audio: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    audio_url = f"{PUBLIC_BACKEND_URL}/api/studio/audio/{audio_id}.mp3"
+
+    for lr in shifted_all:
+        idx = lr["blockIndex"]
+        if 0 <= idx < len(blocks) and blocks[idx].get("type") == "dialog":
+            blocks[idx] = {**blocks[idx], "start": lr["start"], "end": lr["end"],
+                          "wordTimestamps": lr["wordTimestamps"]}
+
+    blocks = [b for b in blocks if not b.get("_conversation_audio")]
+    blocks.append({
+        "type": "audio", "text": audio_url,
+        "heading": f"Conversation — {chapter.get('title', 'Chapter')}",
+        "_elevenlabs_audio": True, "_conversation_audio": True, "_audio_id": audio_id,
+    })
+
+    chapters[chapter_index] = {**chapter, "blocks": blocks}
+    payload_dict = {**book, "chapters": chapters, "slug": slug}
+    result = await _save_book_revision(BookPayload(**payload_dict), admin_email)
+
+    log.info(
+        "conversation-audio assembly: done slug=%s chapter=%d lines=%d duration=%.1fs rev=%s",
+        slug, chapter_index, len(line_audio_results), accumulated_time, result["revision"],
+    )
+    return {
+        "audioUrl": audio_url, "audioId": audio_id,
+        "totalDuration": round(accumulated_time, 3), "revision": result["revision"],
+    }
+
+
 @api.post("/studio/books/{slug}/conversation")
 async def studio_conversation_generate(
     slug: str,
@@ -6728,6 +6843,8 @@ try:
         publish_book=_publish_book,
         run_elevenlabs_for_chapter=run_elevenlabs_for_chapter,
         get_book_by_slug=_bf_get_book_by_slug,
+        run_conversation_line=run_conversation_line,
+        assemble_conversation_for_chapter=assemble_conversation_for_chapter,
     )
 except Exception as _book_factory_load_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(

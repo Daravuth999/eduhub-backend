@@ -185,14 +185,22 @@ def test_repeat_save_draft_with_unchanged_content_recovers_not_duplicates(monkey
     assert len(store.revisions[r1["slug"]]) == 1
 
 
+def _mock_cover_provider(monkeypatch, url="https://covers/x.png"):
+    """Patch the two SPLIT cover seams (_run_cover calls these directly, not
+    the combined generate_and_store_cover convenience wrapper)."""
+    async def fake_generate(**kwargs):
+        return {"image_bytes": b"FAKE-PNG-BYTES", "mimeType": "image/png", "ext": "png"}
+    async def fake_store(**kwargs):
+        return url
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", fake_generate)
+    monkeypatch.setattr(bf_image, "store_cover_image", fake_store)
+
+
 def test_save_draft_after_cover_completes_creates_new_revision_under_same_slug(monkeypatch):
     _enable_all(monkeypatch)
     monkeypatch.setenv("BOOK_FACTORY_COVER_ENABLED", "true")
     monkeypatch.setattr(bf_image, "is_enabled", lambda: True)
-
-    async def fake_cover(**kwargs):
-        return {"url": "https://covers/x.png", "mimeType": "image/png"}
-    monkeypatch.setattr(bf_image, "generate_and_store_cover", fake_cover)
+    _mock_cover_provider(monkeypatch)
 
     client, store = _make_client()
     job_id, _cid = _complete_one_chapter_job(client)
@@ -335,10 +343,13 @@ def test_cover_success_completes_stage_and_export_uses_it(monkeypatch):
     monkeypatch.setattr(bf_image, "is_enabled", lambda: True)
     calls = {"n": 0}
 
-    async def fake_cover(**kwargs):
+    async def fake_generate(**kwargs):
         calls["n"] += 1
-        return {"url": "https://covers/y.png", "mimeType": "image/png"}
-    monkeypatch.setattr(bf_image, "generate_and_store_cover", fake_cover)
+        return {"image_bytes": b"FAKE-PNG", "mimeType": "image/png", "ext": "png"}
+    async def fake_store(**kwargs):
+        return "https://covers/y.png"
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", fake_generate)
+    monkeypatch.setattr(bf_image, "store_cover_image", fake_store)
 
     client, _store = _make_client()
     job_id, _cid = _complete_one_chapter_job(client)
@@ -355,9 +366,12 @@ def test_cover_storage_failure_does_not_get_silently_retried_as_success(monkeypa
     monkeypatch.setenv("BOOK_FACTORY_COVER_ENABLED", "true")
     monkeypatch.setattr(bf_image, "is_enabled", lambda: True)
 
-    async def failing_cover(**kwargs):
+    async def fake_generate(**kwargs):
+        return {"image_bytes": b"FAKE-PNG", "mimeType": "image/png", "ext": "png"}
+    async def failing_store(**kwargs):
         raise BFTerminalError("R2 is not configured — cover-image storage is unavailable.")
-    monkeypatch.setattr(bf_image, "generate_and_store_cover", failing_cover)
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", fake_generate)
+    monkeypatch.setattr(bf_image, "store_cover_image", failing_store)
 
     client, _store = _make_client()
     job_id, _cid = _complete_one_chapter_job(client)
@@ -370,6 +384,62 @@ def test_cover_storage_failure_does_not_get_silently_retried_as_success(monkeypa
     assert exp["book"]["coverImage"] == ""
 
 
+def test_cover_storage_failure_after_successful_gemini_call_never_repeats_the_gemini_call(monkeypatch):
+    """The exact scenario the amendment calls out: Gemini succeeds, but the
+    upload fails (transiently) — a bounded in-process retry of ONLY the
+    upload must resolve it without a second paid Gemini call."""
+    _enable_all(monkeypatch)
+    monkeypatch.setenv("BOOK_FACTORY_COVER_ENABLED", "true")
+    monkeypatch.setattr(bf_image, "is_enabled", lambda: True)
+    gen_calls = {"n": 0}
+    store_attempts = {"n": 0}
+
+    async def fake_generate(**kwargs):
+        gen_calls["n"] += 1
+        return {"image_bytes": b"FAKE-PNG", "mimeType": "image/png", "ext": "png"}
+
+    async def flaky_store(**kwargs):
+        store_attempts["n"] += 1
+        if store_attempts["n"] < 2:
+            raise ConnectionError("transient R2 network blip")
+        return "https://covers/recovered.png"
+
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", fake_generate)
+    monkeypatch.setattr(bf_image, "store_cover_image", flaky_store)
+
+    client, _store = _make_client()
+    job_id, _cid = _complete_one_chapter_job(client)
+    r = client.post(f"/api/studio/book-factory/jobs/{job_id}/cover/generate")
+    assert r.json()["result"]["status"] == "completed"
+    assert gen_calls["n"] == 1          # Gemini paid for exactly once
+    assert store_attempts["n"] == 2     # upload retried once, then succeeded
+
+
+def test_cover_storage_failure_exhausting_retries_fails_retryable_not_terminal(monkeypatch):
+    _enable_all(monkeypatch)
+    monkeypatch.setenv("BOOK_FACTORY_COVER_ENABLED", "true")
+    monkeypatch.setattr(bf_image, "is_enabled", lambda: True)
+    gen_calls = {"n": 0}
+
+    async def fake_generate(**kwargs):
+        gen_calls["n"] += 1
+        return {"image_bytes": b"FAKE-PNG", "mimeType": "image/png", "ext": "png"}
+
+    async def always_fails(**kwargs):
+        raise ConnectionError("persistent R2 outage")
+
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", fake_generate)
+    monkeypatch.setattr(bf_image, "store_cover_image", always_fails)
+
+    client, _store = _make_client()
+    job_id, _cid = _complete_one_chapter_job(client)
+    r = client.post(f"/api/studio/book-factory/jobs/{job_id}/cover/generate")
+    result = r.json()["result"]
+    assert result["status"] == "failed"
+    assert result["state"] == "failed_retryable"
+    assert gen_calls["n"] == 1  # still only ONE paid Gemini call despite 3 failed upload attempts
+
+
 def test_cover_completion_write_failure_does_not_trigger_a_second_gemini_call(monkeypatch):
     """§AMENDMENT 3: image succeeds, but persisting completion fails once —
     must retry ONLY the DB write, never call Gemini again."""
@@ -378,10 +448,13 @@ def test_cover_completion_write_failure_does_not_trigger_a_second_gemini_call(mo
     monkeypatch.setattr(bf_image, "is_enabled", lambda: True)
     calls = {"n": 0}
 
-    async def fake_cover(**kwargs):
+    async def fake_generate(**kwargs):
         calls["n"] += 1
-        return {"url": "https://covers/z.png", "mimeType": "image/png"}
-    monkeypatch.setattr(bf_image, "generate_and_store_cover", fake_cover)
+        return {"image_bytes": b"FAKE-PNG", "mimeType": "image/png", "ext": "png"}
+    async def fake_store(**kwargs):
+        return "https://covers/z.png"
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", fake_generate)
+    monkeypatch.setattr(bf_image, "store_cover_image", fake_store)
 
     client, _store = _make_client()
     job_id, _cid = _complete_one_chapter_job(client)  # uses the REAL _complete_stage
@@ -409,7 +482,7 @@ def test_cover_terminal_and_unknown_classification(monkeypatch):
 
     async def unknown_cover(**kwargs):
         raise BFUnknownOutcomeError("ambiguous 5xx")
-    monkeypatch.setattr(bf_image, "generate_and_store_cover", unknown_cover)
+    monkeypatch.setattr(bf_image, "generate_cover_image_bytes", unknown_cover)
 
     client, _store = _make_client()
     job_id, _cid = _complete_one_chapter_job(client)

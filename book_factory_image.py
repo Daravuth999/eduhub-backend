@@ -309,60 +309,71 @@ async def _upload_cover_to_r2(image_bytes: bytes, key: str, mime: str, metadata:
 
 
 # ── public API (monkeypatched in tests) ────────────────────────────────────
-async def generate_and_store_cover(*, job_id: str, attempt_id: str,
-                                    title: str, topic: str, section: str,
-                                    level: str, tier: str, accent: str,
-                                    admin_email: str = "") -> dict[str, str]:
-    """Generate one cover image via Gemini and store it on R2 at a
-    deterministic (jobId, attemptId) key.
+async def generate_cover_image_bytes(*, title: str, topic: str, section: str,
+                                      level: str, tier: str, accent: str) -> dict:
+    """Call Gemini ONLY — no storage. Returns {"image_bytes": bytes,
+    "mimeType": str, "ext": str}. Raises BFRetryableError /
+    BFUnknownOutcomeError / BFTerminalError.
 
-    Idempotency guard: BEFORE calling Gemini, HEAD-checks whether an object
-    already exists at this exact attempt's key. This only pays off when the
-    SAME claimed attempt calls this function twice in the same process (e.g.
-    an internal retry loop around the caller's DB-completion write) — it
-    deliberately does NOT try to recover across a brand-new claim, because a
-    brand-new claim always means the job orchestrator's attempt-fencing
-    already decided a NEW attempt is warranted (e.g. an explicit "Regenerate
-    Cover"), and a teacher who explicitly asks for a new cover expects a new
-    image, not a cached one.
-
-    Returns {"url": str, "mimeType": str}. Raises BFRetryableError /
-    BFUnknownOutcomeError / BFTerminalError — the caller (book_factory_jobs.
-    _run_cover) classifies these into the same stage states as a text stage.
+    Kept separate from storage so a caller (book_factory_jobs._run_cover) can
+    retry JUST the upload step after a storage failure without ever paying
+    for a second Gemini call — the image bytes already exist in memory.
     """
-    import base64 as _b64
-
-    cfg = _r2_config()
-    if cfg is None:
-        raise BFTerminalError(
-            "R2 is not configured — cover-image storage is unavailable."
-        )
-
-    # Try every plausible extension for this attempt before generating again —
-    # cheap, and makes the "DB write failed after a successful upload" recovery
-    # path work even if the caller's retry doesn't know the exact extension.
-    for probe_ext in ("png", "jpg", "webp"):
-        existing = await _head_exists(cfg, _deterministic_key(job_id, attempt_id, probe_ext))
-        if existing:
-            log.info("book_factory_image: reusing already-stored cover for attempt=%s", attempt_id)
-            mime = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}[probe_ext]
-            return {"url": existing, "mimeType": mime}
-
     prompt = _build_cover_prompt(
         title=title, topic=topic, section=section, level=level, tier=tier, accent=accent,
     )
     result = await _call_gemini_image(prompt, timeout=COVER_TIMEOUT_S)
 
+    import base64 as _b64
     try:
         image_bytes = _b64.b64decode(result["data_b64"], validate=False)
     except Exception as exc:  # noqa: BLE001
         raise BFTerminalError(f"Cover image base64 decode failed: {exc}") from exc
 
     ext = _validate_image_bytes(image_bytes, result["mimeType"])
+    return {"image_bytes": image_bytes, "mimeType": result["mimeType"], "ext": ext}
+
+
+async def store_cover_image(*, job_id: str, attempt_id: str, image_bytes: bytes,
+                             mime: str, ext: str, title: str = "", section: str = "",
+                             level: str = "", tier: str = "", admin_email: str = "") -> str:
+    """Upload already-generated cover bytes to R2 at the deterministic
+    (jobId, attemptId) key. HEAD-checks first so a caller retrying THIS
+    function after a transient upload failure (same bytes, same attempt)
+    never double-uploads. Raises BFTerminalError if R2 is not configured,
+    BFRetryableError on an upload failure (safe to retry — nothing partial
+    is left behind)."""
+    cfg = _r2_config()
+    if cfg is None:
+        raise BFTerminalError("R2 is not configured — cover-image storage is unavailable.")
     key = _deterministic_key(job_id, attempt_id, ext)
-    url = await _upload_cover_to_r2(
-        image_bytes, key, result["mimeType"],
+    existing = await _head_exists(cfg, key)
+    if existing:
+        log.info("book_factory_image: reusing already-stored cover for attempt=%s", attempt_id)
+        return existing
+    return await _upload_cover_to_r2(
+        image_bytes, key, mime,
         {"jobId": job_id, "attemptId": attempt_id, "title": title, "section": section,
          "level": level, "tier": tier, "created_by": admin_email},
     )
-    return {"url": url, "mimeType": result["mimeType"]}
+
+
+async def generate_and_store_cover(*, job_id: str, attempt_id: str,
+                                    title: str, topic: str, section: str,
+                                    level: str, tier: str, accent: str,
+                                    admin_email: str = "") -> dict[str, str]:
+    """Convenience wrapper combining generate + store in one call. Used
+    directly only where the caller does not need to retry the upload
+    independently of the Gemini call — the job orchestrator (_run_cover)
+    calls the two split functions directly instead so a storage failure
+    never triggers a second paid Gemini call.
+    """
+    gen = await generate_cover_image_bytes(
+        title=title, topic=topic, section=section, level=level, tier=tier, accent=accent,
+    )
+    url = await store_cover_image(
+        job_id=job_id, attempt_id=attempt_id, image_bytes=gen["image_bytes"],
+        mime=gen["mimeType"], ext=gen["ext"], title=title, section=section,
+        level=level, tier=tier, admin_email=admin_email,
+    )
+    return {"url": url, "mimeType": gen["mimeType"]}
