@@ -52,7 +52,7 @@ class _FakeCoupons:
     def __init__(self):
         self.docs: dict[str, dict] = {}
 
-    async def find_one(self, q):
+    async def find_one(self, q, projection=None):
         return self.docs.get(q.get("code"))
 
     async def insert_one(self, doc):
@@ -99,6 +99,14 @@ def _load_update_coupon(shared_db=None):
     return ns["update_coupon"], ns["db"]
 
 
+def _load_find_valid_coupon(shared_db=None):
+    src = _extract(SERVER_SRC, "async def _find_valid_coupon(", '@api.post("/coupons")')
+    db = shared_db or _FakeDB()
+    ns = {"HTTPException": HTTPException, "datetime": datetime, "timezone": timezone, "db": db}
+    exec(compile(src, "server.py(_find_valid_coupon)", "exec"), ns)  # noqa: S102
+    return ns["_find_valid_coupon"], db
+
+
 # ── create_coupon: old-style (pre-existing) payload is untouched ──────────
 def test_old_style_book_discount_payload_produces_identical_doc_shape():
     create_coupon, db = _load_create_coupon()
@@ -132,23 +140,27 @@ def test_existing_type_value_validation_still_unconditional_and_unchanged():
 
 
 def test_edutalk_points_coupon_creation_validates_benefit_amount_strictly():
+    # §Checkpoint 3 stabilization: no dummy type/value needed anymore — an
+    # edutalk_points coupon is created WITHOUT any type/value keys at all.
     create_coupon, _ = _load_create_coupon()
     with pytest.raises(HTTPException):
         run(create_coupon({
-            "code": "ET20", "type": "fixed", "value": 1,
-            "benefit_type": "edutalk_points", "benefit_amount": -5,
+            "code": "ET20", "benefit_type": "edutalk_points", "benefit_amount": -5,
         }, admin=_FakeAdmin()))
     with pytest.raises(HTTPException):
         run(create_coupon({
-            "code": "ET20", "type": "fixed", "value": 1,
-            "benefit_type": "edutalk_points", "benefit_amount": "20",
+            "code": "ET20", "benefit_type": "edutalk_points", "benefit_amount": "20",
         }, admin=_FakeAdmin()))
     result = run(create_coupon({
-        "code": "ET20", "type": "fixed", "value": 1,
-        "benefit_type": "edutalk_points", "benefit_amount": 20,
+        "code": "ET20", "benefit_type": "edutalk_points", "benefit_amount": 20,
     }, admin=_FakeAdmin()))
     assert result["coupon"]["benefit_type"] == "edutalk_points"
     assert result["coupon"]["benefit_amount"] == 20
+    # §Checkpoint 3 stabilization: no dummy discount values are ever stored —
+    # type/value are genuinely None, not a fake "fixed"/1 pair, so nothing
+    # downstream can mistake this for a real book-discount coupon.
+    assert result["coupon"]["type"] is None
+    assert result["coupon"]["value"] is None
 
 
 def test_unknown_benefit_type_rejected_at_creation():
@@ -178,3 +190,48 @@ def test_update_rejects_invalid_benefit_amount_when_switching_to_edutalk_points(
     update_coupon, _ = _load_update_coupon(shared_db=db)
     with pytest.raises(HTTPException):
         run(update_coupon("SAVE20", {"benefit_type": "edutalk_points", "benefit_amount": 0}, admin=_FakeAdmin()))
+
+
+# ── _find_valid_coupon: mandatory bidirectional isolation ──────────────────
+# §Checkpoint 3 stabilization: a Live Voice Coach coupon must never be usable
+# as a book discount, and this must not silently crash (the pre-fix behavior
+# would have raised a raw TypeError inside _calc_discount on a None value).
+def test_book_discount_coupon_still_validates_exactly_as_before():
+    db = _FakeDB()
+    run(db.coupons.insert_one({
+        "code": "SAVE20", "type": "percent", "value": 20, "max_uses": None, "uses_count": 0,
+        "assigned_to": [], "book_slugs": [], "valid_from": None, "expires_at": None,
+        "enabled": True, "redemptions": [], "benefit_type": "book_discount", "benefit_amount": None,
+    }))
+    find_valid_coupon, _ = _load_find_valid_coupon(shared_db=db)
+    doc = run(find_valid_coupon("SAVE20", "stu1", "some-book"))
+    assert doc["code"] == "SAVE20"
+    assert doc["type"] == "percent" and doc["value"] == 20
+
+
+def test_old_coupon_missing_benefit_type_entirely_still_validates():
+    db = _FakeDB()
+    run(db.coupons.insert_one({
+        "code": "LEGACY", "type": "fixed", "value": 5, "max_uses": None, "uses_count": 0,
+        "assigned_to": [], "book_slugs": [], "valid_from": None, "expires_at": None,
+        "enabled": True, "redemptions": [],
+        # no benefit_type / benefit_amount keys at all — predates Checkpoint 1
+    }))
+    find_valid_coupon, _ = _load_find_valid_coupon(shared_db=db)
+    doc = run(find_valid_coupon("LEGACY", "stu1", "some-book"))
+    assert doc["code"] == "LEGACY"
+
+
+def test_edutalk_live_coupon_cannot_be_redeemed_as_a_book_discount():
+    db = _FakeDB()
+    run(db.coupons.insert_one({
+        "code": "ETALK1", "type": None, "value": None, "max_uses": 1, "uses_count": 0,
+        "assigned_to": ["stu1"], "book_slugs": [], "valid_from": None, "expires_at": None,
+        "enabled": True, "redemptions": [], "benefit_type": "edutalk_points", "benefit_amount": 20,
+    }))
+    find_valid_coupon, _ = _load_find_valid_coupon(shared_db=db)
+    with pytest.raises(HTTPException) as exc:
+        run(find_valid_coupon("ETALK1", "stu1", "some-book"))
+    # Generic 404 — never leaks that the code exists for a different purpose.
+    assert exc.value.status_code == 404
+    assert "not found" in exc.value.detail.lower()

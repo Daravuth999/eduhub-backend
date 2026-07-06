@@ -5930,6 +5930,17 @@ async def _find_valid_coupon(
     doc = await db.coupons.find_one({"code": code.strip().upper()}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Coupon code not found.")
+    # §EduTalk coupon Checkpoint 3 stabilization: mandatory bidirectional
+    # isolation. An old/missing benefit_type is ALWAYS "book_discount" (every
+    # existing coupon), so this is a no-op for every coupon that predates
+    # this field. A Live Voice Coach coupon (benefit_type="edutalk_points")
+    # has no meaningful type/value (None, not a fake "fixed"/1 pair since the
+    # Checkpoint 3 fix) — without this guard, _calc_discount would receive
+    # value=None and raise a raw TypeError instead of a clean 404. Returning
+    # the SAME generic "not found" here (rather than a distinguishing
+    # message) never leaks that a Live Coach code exists.
+    if (doc.get("benefit_type") or "book_discount") != "book_discount":
+        raise HTTPException(status_code=404, detail="Coupon code not found.")
     if not doc.get("enabled", True):
         raise HTTPException(status_code=400, detail="This coupon has been disabled.")
     now_iso = datetime.now(timezone.utc)
@@ -5970,34 +5981,45 @@ async def _find_valid_coupon(
 
 @api.post("/coupons")
 async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
-    """Create a new coupon. Set code='' to auto-generate."""
+    """Create a new coupon. Set code='' to auto-generate.
+
+    §EduTalk coupon Checkpoint 3 stabilization: benefit_type branches the
+    validation explicitly instead of requiring a dummy type/value pair for a
+    non-book coupon. An absent/omitted benefit_type is ALWAYS "book_discount"
+    — every existing creation payload (no benefit_type key) hits the EXACT
+    same "book_discount" branch with the EXACT same checks/error messages as
+    before this change, producing the identical document shape (proven by
+    tests/test_coupon_schema_backward_compat.py, re-executed against this
+    branched version). An edutalk_points coupon no longer semantically
+    depends on type/value at all — they are stored as None, never a fake
+    "fixed"/1 pair — so nothing downstream can mistake them for a real
+    discount.
+    """
     code = (payload.get("code") or "").strip().upper() or _generate_coupon_code()
     if await db.coupons.find_one({"code": code}):
         raise HTTPException(status_code=409, detail=f"Coupon code '{code}' already exists.")
-    discount_type = payload.get("type", "percent")
-    if discount_type not in ("percent", "fixed"):
-        raise HTTPException(status_code=400, detail="type must be 'percent' or 'fixed'.")
-    value = float(payload.get("value", 0))
-    if value <= 0:
-        raise HTTPException(status_code=400, detail="value must be > 0.")
-    if discount_type == "percent" and value > 100:
-        raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
-    # §EduTalk coupon Checkpoint 1: additive, optional, default-safe fields.
-    # An absent/omitted benefit_type is ALWAYS "book_discount" — every
-    # existing creation payload (no benefit_type key) produces the EXACT
-    # same document shape as before this change, byte-for-byte except for
-    # these two new keys. type/value validation above is completely
-    # unconditional and unchanged — an edutalk_points coupon still supplies
-    # a (unused) type/value pair, so no existing code path is touched.
+
     benefit_type = payload.get("benefit_type") or "book_discount"
     if benefit_type not in ("book_discount", "edutalk_points"):
         raise HTTPException(status_code=400, detail="benefit_type must be 'book_discount' or 'edutalk_points'.")
-    benefit_amount = payload.get("benefit_amount")
-    if benefit_type == "edutalk_points":
+
+    if benefit_type == "book_discount":
+        discount_type = payload.get("type", "percent")
+        if discount_type not in ("percent", "fixed"):
+            raise HTTPException(status_code=400, detail="type must be 'percent' or 'fixed'.")
+        value = float(payload.get("value", 0))
+        if value <= 0:
+            raise HTTPException(status_code=400, detail="value must be > 0.")
+        if discount_type == "percent" and value > 100:
+            raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
+        benefit_amount = None
+    else:  # edutalk_points — does NOT depend on book-discount fields at all
+        discount_type = None
+        value = None
+        benefit_amount = payload.get("benefit_amount")
         if not isinstance(benefit_amount, int) or isinstance(benefit_amount, bool) or not (1 <= benefit_amount <= 1000):
             raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
-    else:
-        benefit_amount = None
+
     now_iso = datetime.now(timezone.utc).isoformat()
     doc = {
         "code":        code,

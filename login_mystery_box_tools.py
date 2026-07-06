@@ -165,12 +165,17 @@ class _LMBRewardItemIn(BaseModel):
     weight: int = Field(default=10, ge=0, le=10_000)
 
     # Reward type — only backend-supported types.
-    #   points          → credit `points` to wallet via _lrc_credit_via_treasury
-    #   voucher         → mint a coupon + student_vouchers row (login-reward shape)
-    #   edutalk_session → grant edutalk_session pass via _mbt_grant_edutalk_pass
-    #   edutalk_voice   → grant edutalk_voice pass via _mbt_grant_edutalk_pass
+    #   points             → credit `points` to wallet via _lrc_credit_via_treasury
+    #   voucher            → mint a coupon + student_vouchers row (login-reward shape)
+    #   edutalk_session    → grant edutalk_session pass via _mbt_grant_edutalk_pass
+    #   edutalk_voice      → grant edutalk_voice pass via _mbt_grant_edutalk_pass
+    #   edutalk_live_coupon → mint a student-scoped Live Voice Coach Coupon
+    #                        (benefit_type="edutalk_points" on the EXISTING
+    #                        db.coupons collection — see _lmb_grant_edutalk_live_coupon).
+    #                        User-facing label is ALWAYS "Live Voice Coach Coupon";
+    #                        the internal benefit_type name is never exposed.
     reward_type: Literal[
-        "points", "voucher", "edutalk_session", "edutalk_voice"
+        "points", "voucher", "edutalk_session", "edutalk_voice", "edutalk_live_coupon"
     ] = "points"
 
     # ── points ────────────────────────────────────────────────────────────
@@ -192,6 +197,11 @@ class _LMBRewardItemIn(BaseModel):
     edutalk_expires_in_days: int = Field(default=30, ge=1, le=365)
     edutalk_eligible_book_slugs: Optional[List[str]] = None
     edutalk_title: Optional[str] = "EduTalk Pass"
+
+    # ── Live Voice Coach Coupon (edutalk_live_coupon) ──────────────────────
+    edutalk_live_coupon_amount: int = Field(default=20, ge=1, le=1000)
+    edutalk_live_coupon_expires_in_days: Optional[int] = Field(default=30, ge=1, le=365)
+    edutalk_live_coupon_title: Optional[str] = "Live Voice Coach Coupon"
 
 
 class _LMBCampaignIn(BaseModel):
@@ -300,6 +310,13 @@ def _lmb_validate_payload(p: _LMBCampaignIn) -> dict:
                 raise HTTPException(
                     status_code=400,
                     detail=f"reward_pool[{idx}]: edutalk_quantity must be > 0",
+                )
+        elif rtype == "edutalk_live_coupon":
+            amt = int(item.get("edutalk_live_coupon_amount") or 0)
+            if amt <= 0 or amt > 1000:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"reward_pool[{idx}]: edutalk_live_coupon_amount must be between 1 and 1000",
                 )
         cleaned.append(item)
 
@@ -441,6 +458,9 @@ def _lmb_public_reward_view(reward: dict, *, hidden: bool = False) -> dict:
     elif rtype in ("edutalk_session", "edutalk_voice"):
         q = int(reward.get("edutalk_quantity") or 1)
         display_value = f"{q}× EduTalk {'voice' if rtype == 'edutalk_voice' else 'session'}"
+    elif rtype == "edutalk_live_coupon":
+        amt = int(reward.get("edutalk_live_coupon_amount") or 0)
+        display_value = f"{amt} EduTalk pts"
     return {
         "label": reward.get("label") or "Reward",
         "description": reward.get("description") or "",
@@ -665,6 +685,142 @@ async def _lmb_issue_voucher(*, reward: dict, sid_clean: str, sid_norm: str,
             "discount_label": label,
             "expires_at": exp_iso,
             "title": row["title"],
+        }
+
+
+async def _lmb_grant_edutalk_live_coupon(*, reward: dict, sid_clean: str, sid_norm: str,
+                                         campaign: dict, claim_id: str) -> Optional[dict]:
+    """Mint a brand-new, student-scoped Live Voice Coach Coupon + a companion
+    student_vouchers row, mirroring _lmb_issue_voucher's pattern exactly but
+    on the edutalk_points benefit_type added in the Live Voice Coach Coupon
+    Checkpoint 1/3 work — NOT the book-discount type/value fields at all.
+
+    Never auto-redeems: the student later redeems this code themselves
+    inside the Live Voice Coach dashboard, through the existing, untouched
+    edutalk_coupon_tools.py validate/redeem routes. Returns the composed
+    receipt payload (matches the login-reward voucher shape so the SAME
+    generic composer/listing code can display it), or None on failure.
+    """
+    gen_code = globals().get("_lrc_gen_coupon_code")
+    compose = globals().get("_lrc_compose_voucher_payload")
+    student_vouchers = globals().get("_lrc_student_vouchers")
+
+    if not (callable(gen_code) and callable(compose) and student_vouchers is not None):
+        _LMB_LOG.warning("login_mystery_box: edutalk_live_coupon issuer missing (login_reward_tools not loaded)")
+        return None
+
+    try:
+        amount = int(reward.get("edutalk_live_coupon_amount") or 0)
+    except Exception:
+        amount = 0
+    if amount <= 0 or amount > 1000:
+        _LMB_LOG.warning("login_mystery_box: edutalk_live_coupon misconfigured amount claim=%s", claim_id)
+        return None
+
+    # Generate a unique coupon code using the existing generator + retry loop
+    # (the SAME code-space as book coupons — code uniqueness is global across
+    # ALL benefit_type values, exactly like today).
+    code = gen_code(8)
+    for _ in range(6):
+        if not await db.coupons.find_one({"code": code}, {"_id": 0}):  # noqa: F821
+            break
+        code = gen_code(8)
+    else:
+        _LMB_LOG.error("login_mystery_box: could not mint unique coupon claim=%s", claim_id)
+        return None
+
+    now = _lmb_now()
+    now_iso = _lmb_iso(now)
+
+    exp_iso = None
+    edays = reward.get("edutalk_live_coupon_expires_in_days")
+    if edays:
+        try:
+            exp_iso = _lmb_iso(now + timedelta(days=int(edays)))  # noqa: F821
+        except Exception:
+            exp_iso = None
+    if not exp_iso:
+        d = _lmb_parse_iso(campaign.get("end_at"))
+        exp_iso = _lmb_iso(d) if d else None
+
+    title = reward.get("edutalk_live_coupon_title") or "Live Voice Coach Coupon"
+
+    # §Live Voice Coach Coupon separation (Checkpoint 3 stabilization): NO
+    # type/value dummy values at all — benefit_type/benefit_amount are the
+    # only meaningful fields, exactly matching a manually-created Author
+    # Studio Live Voice Coach Coupon. max_uses=1 and assigned_to=[sid_clean]
+    # per the locked reward-issued-coupon requirement (stricter than the
+    # manual-creation default, which allows an admin to leave it open).
+    coupon_doc = {
+        "code": code,
+        "type": None,
+        "value": None,
+        "max_uses": 1,
+        "uses_count": 0,
+        "assigned_to": [sid_clean],
+        "book_slugs": [],
+        "valid_from": now_iso,
+        "expires_at": exp_iso,
+        "enabled": True,
+        "created_by": "login_mystery_box",
+        "created_at": now_iso,
+        "redemptions": [],
+        "benefit_type": "edutalk_points",
+        "benefit_amount": amount,
+        "source": "login_mystery_box_edutalk_live_coupon",
+        "campaign_id": campaign.get("id") or campaign.get("campaign_id"),
+    }
+    try:
+        await db.coupons.insert_one(coupon_doc)  # noqa: F821
+    except Exception as _e:
+        _LMB_LOG.warning("login_mystery_box: edutalk_live_coupon coupon insert failed claim=%s err=%s", claim_id, _e)
+        return None
+
+    discount_label = f"{amount} EduTalk points"
+
+    row = {
+        "id": "lmbv_" + _lmb_secrets.token_hex(8),
+        "campaign_id": campaign.get("id") or campaign.get("campaign_id"),
+        "campaign_name": campaign.get("name") or "",
+        "student_id": sid_clean,
+        "student_id_norm": sid_norm,
+        "coupon_code": code,
+        "reward_kind": "edutalk_live_coupon",
+        "title": "Live Voice Coach Coupon unlocked",
+        "subtitle": "Apply this code inside EduTalk Live Voice Coach.",
+        "discount_label": discount_label,
+        "discount_type": None,
+        "discount_value": None,
+        "template": "royal_purple_gold",
+        "accent_color": "#D4A843",
+        "artwork_url": "",
+        "cta_label": "Open Live Voice Coach",
+        "eligible_books": [],
+        "applies_to_all_books": False,
+        "expires_at": exp_iso,
+        "valid_from": now_iso,
+        "claimed_at": now_iso,
+        "used_at": None,
+        "redeemed_book_slug": None,
+        "status": "active",
+        "source": "login_mystery_box_edutalk_live_coupon",
+        "claim_id": claim_id,
+    }
+    try:
+        await student_vouchers.insert_one(row)
+    except Exception as _e:
+        _LMB_LOG.warning("login_mystery_box: edutalk_live_coupon student_vouchers insert failed claim=%s err=%s", claim_id, _e)
+        # The coupon row exists; surface the code so the student isn't lost.
+    try:
+        return await compose(row)
+    except Exception:
+        return {
+            "voucher_id": row["id"],
+            "coupon_code": code,
+            "discount_label": discount_label,
+            "expires_at": exp_iso,
+            "title": row["title"],
+            "cta_label": row["cta_label"],
         }
 
 
@@ -945,6 +1101,7 @@ def _lmb_compose_student_status_response(
     already_claimed: bool = False,
     voucher: Optional[dict] = None,
     edutalk_pass: Optional[dict] = None,
+    edutalk_live_coupon: Optional[dict] = None,
 ) -> dict:
     return {
         "eligible": bool(eligible),
@@ -958,6 +1115,7 @@ def _lmb_compose_student_status_response(
         "revealed_rewards": revealed or [],
         "voucher": voucher,
         "edutalk_pass": edutalk_pass,
+        "edutalk_live_coupon": edutalk_live_coupon,
         "box_count": _LMB_BOX_COUNT,
     }
 
@@ -1014,6 +1172,7 @@ async def lmb_student_status(
             revealed=revealed,
             voucher=existing.get("voucher_payload"),
             edutalk_pass=existing.get("edutalk_payload"),
+            edutalk_live_coupon=existing.get("edutalk_live_coupon_payload"),
         )
 
     # No credited claim yet. Lock outcomes via idempotent upsert.
@@ -1082,6 +1241,7 @@ async def lmb_student_status(
                     revealed=revealed,
                     voucher=existing.get("voucher_payload"),
                     edutalk_pass=existing.get("edutalk_payload"),
+                    edutalk_live_coupon=existing.get("edutalk_live_coupon_payload"),
                 )
             claim_id = existing.get("id") or claim_id
             outcomes = existing.get("box_outcomes") or outcomes
@@ -1148,6 +1308,7 @@ async def lmb_student_select(
             "post_claim_message": camp.get("post_claim_message") or "",
             "voucher": claim.get("voucher_payload"),
             "edutalk_pass": claim.get("edutalk_payload"),
+            "edutalk_live_coupon": claim.get("edutalk_live_coupon_payload"),
         }
     if status_now != "preview":
         raise HTTPException(status_code=409, detail=f"Claim in unexpected state: {status_now or 'unknown'}")  # noqa: F821
@@ -1199,12 +1360,14 @@ async def lmb_student_select(
                 "post_claim_message": camp.get("post_claim_message") or "",
                 "voucher": latest.get("voucher_payload"),
                 "edutalk_pass": latest.get("edutalk_payload"),
+                "edutalk_live_coupon": latest.get("edutalk_live_coupon_payload"),
             }
         raise HTTPException(status_code=409, detail="Claim already in flight")  # noqa: F821
 
     # ── credit only the selected reward ────────────────────────────────
     voucher_payload = None
     edutalk_payload = None
+    edutalk_live_coupon_payload = None
     credit_error: Optional[str] = None
 
     try:
@@ -1252,6 +1415,13 @@ async def lmb_student_select(
             )
             if not edutalk_payload:
                 credit_error = "edutalk_pass_grant_failed"
+        elif rtype == "edutalk_live_coupon":
+            edutalk_live_coupon_payload = await _lmb_grant_edutalk_live_coupon(
+                reward=selected, sid_clean=sid_clean, sid_norm=sid_norm,
+                campaign=camp, claim_id=claim.get("id"),
+            )
+            if not edutalk_live_coupon_payload:
+                credit_error = "edutalk_live_coupon_grant_failed"
         else:
             credit_error = f"unsupported reward_type: {rtype}"
     except Exception as _e:
@@ -1287,6 +1457,8 @@ async def lmb_student_select(
         set_doc["voucher_payload"] = voucher_payload
     if edutalk_payload:
         set_doc["edutalk_payload"] = edutalk_payload
+    if edutalk_live_coupon_payload:
+        set_doc["edutalk_live_coupon_payload"] = edutalk_live_coupon_payload
 
     finalized = await _lmb_claims.update_one(
         {"id": claim.get("id"), "attempt_id": attempt_id, "status": "pending"},
@@ -1312,6 +1484,7 @@ async def lmb_student_select(
                 "post_claim_message": camp.get("post_claim_message") or "",
                 "voucher": latest.get("voucher_payload"),
                 "edutalk_pass": latest.get("edutalk_payload"),
+                "edutalk_live_coupon": latest.get("edutalk_live_coupon_payload"),
             }
 
     # ── celebration push (best-effort) ─────────────────────────────────
@@ -1332,6 +1505,8 @@ async def lmb_student_select(
                     rtitle = f"+{int(selected.get('points') or 0)} pts"
                 elif rtype == "voucher":
                     rtitle = "Book Voucher"
+                elif rtype == "edutalk_live_coupon":
+                    rtitle = "Live Voice Coach Coupon"
                 else:
                     rtitle = selected.get("edutalk_title") or "EduTalk Pass"
                 await fan_out(
@@ -1362,6 +1537,7 @@ async def lmb_student_select(
         "reveal_remaining": bool(camp.get("reveal_remaining", True)),
         "voucher": voucher_payload,
         "edutalk_pass": edutalk_payload,
+        "edutalk_live_coupon": edutalk_live_coupon_payload,
     }
 
 
