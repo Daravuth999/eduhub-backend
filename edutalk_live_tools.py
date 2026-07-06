@@ -2046,6 +2046,14 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             "topup_nudge_cap_available": bool(cap_available),
             "topup_nudge_cap_reason": cap_reason,
             "topup_nudge_previews_by_mode": topup_previews,
+            # §EduTalk coupon Checkpoint 1: additive-only. Reads its own env
+            # flag directly (no cross-module import) — mirrors this file's
+            # existing self-contained-per-module convention. Zero effect on
+            # any other field above when the flag is off (default).
+            "couponRedemptionEnabled": (
+                os.environ.get("EDUTALK_COUPON_REDEMPTION_ENABLED", "false").strip().lower()
+                in ("1", "true", "yes", "on")
+            ),
         }
 
     @api.post("/student/edutalk-live/session/start")

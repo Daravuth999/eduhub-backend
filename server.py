@@ -5982,6 +5982,22 @@ async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="value must be > 0.")
     if discount_type == "percent" and value > 100:
         raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
+    # §EduTalk coupon Checkpoint 1: additive, optional, default-safe fields.
+    # An absent/omitted benefit_type is ALWAYS "book_discount" — every
+    # existing creation payload (no benefit_type key) produces the EXACT
+    # same document shape as before this change, byte-for-byte except for
+    # these two new keys. type/value validation above is completely
+    # unconditional and unchanged — an edutalk_points coupon still supplies
+    # a (unused) type/value pair, so no existing code path is touched.
+    benefit_type = payload.get("benefit_type") or "book_discount"
+    if benefit_type not in ("book_discount", "edutalk_points"):
+        raise HTTPException(status_code=400, detail="benefit_type must be 'book_discount' or 'edutalk_points'.")
+    benefit_amount = payload.get("benefit_amount")
+    if benefit_type == "edutalk_points":
+        if not isinstance(benefit_amount, int) or isinstance(benefit_amount, bool) or not (1 <= benefit_amount <= 1000):
+            raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
+    else:
+        benefit_amount = None
     now_iso = datetime.now(timezone.utc).isoformat()
     doc = {
         "code":        code,
@@ -5997,6 +6013,8 @@ async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
         "created_by":  admin.email,
         "created_at":  now_iso,
         "redemptions": [],
+        "benefit_type":   benefit_type,
+        "benefit_amount": benefit_amount,
     }
     await db.coupons.insert_one(doc)
     doc.pop("_id", None)
@@ -6022,11 +6040,17 @@ async def get_coupon(code: str, admin: User = Depends(require_admin)):
 
 @api.patch("/coupons/{code}")
 async def update_coupon(code: str, payload: dict, admin: User = Depends(require_admin)):
-    """Update coupon fields. Supports: enabled, expires_at, max_uses, assigned_to, book_slugs, value."""
-    allowed = {"enabled", "expires_at", "max_uses", "assigned_to", "book_slugs", "value", "valid_from"}
+    """Update coupon fields. Supports: enabled, expires_at, max_uses, assigned_to, book_slugs, value,
+    benefit_type, benefit_amount."""
+    allowed = {"enabled", "expires_at", "max_uses", "assigned_to", "book_slugs", "value", "valid_from",
+               "benefit_type", "benefit_amount"}
     updates = {k: v for k, v in payload.items() if k in allowed}
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update.")
+    if updates.get("benefit_type") == "edutalk_points":
+        amt = updates.get("benefit_amount")
+        if not isinstance(amt, int) or isinstance(amt, bool) or not (1 <= amt <= 1000):
+            raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
     res = await db.coupons.update_one({"code": code.upper()}, {"$set": updates})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Coupon not found.")
@@ -7011,6 +7035,18 @@ except Exception as _edutalk_live_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "edutalk_live_tools route registration failed (feature disabled): %s",
         _edutalk_live_err,
+    )
+
+# ── EduTalk Live Voice Coach coupon redemption (Checkpoint 1, additive) ────
+# Flag-gated (EDUTALK_COUPON_REDEMPTION_ENABLED, default false). Reuses the
+# existing db.coupons collection via two new optional fields; never touches
+# the existing book-discount coupon routes/_find_valid_coupon/_calc_discount.
+try:
+    from edutalk_coupon_tools import register_edutalk_coupon_routes
+    register_edutalk_coupon_routes(api, db, require_admin, require_student)
+except Exception as _edutalk_coupon_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "edutalk_coupon_tools: disabled (%s)", _edutalk_coupon_err
     )
 
 # ── EDUTALK LIVE COACH SURPRISE REWARDS (Phase 1, corrected) ─────────────
