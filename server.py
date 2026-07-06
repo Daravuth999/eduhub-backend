@@ -5730,6 +5730,15 @@ async def startup():
             "book_factory: ensure indexes failed (non-fatal): %s",
             _book_factory_idx_err,
         )
+    # ── Signature Smart Interactive Book, Checkpoint 1 — progress indexes ──
+    try:
+        from interaction_progress_tools import ensure_interaction_progress_indexes
+        await ensure_interaction_progress_indexes(db)
+    except Exception as _interaction_progress_idx_err:  # noqa: BLE001
+        logging.getLogger("eduhub").warning(
+            "interaction_progress: ensure indexes failed (non-fatal): %s",
+            _interaction_progress_idx_err,
+        )
     try:
         from voice_treasure_reward_tools import ensure_voice_treasure_reward_indexes
         await ensure_voice_treasure_reward_indexes(db)
@@ -6849,6 +6858,19 @@ try:
 except Exception as _book_factory_load_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "book_factory_jobs: disabled (%s)", _book_factory_load_err
+    )
+
+# ── Signature Smart Interactive Book, Checkpoint 1 (additive, isolated) ────
+# Student-facing local/server progress sync for the nine premium interaction
+# block types. Flag-gated (BOOK_PREMIUM_INTERACTIONS_ENABLED, default false),
+# dedicated `book_interaction_progress` collection — never touches wallet,
+# points, ownership, or the existing chapter_progress collection.
+try:
+    from interaction_progress_tools import register_interaction_progress_routes
+    register_interaction_progress_routes(api, db, require_admin, require_student)
+except Exception as _interaction_progress_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "interaction_progress_tools: disabled (%s)", _interaction_progress_load_err
     )
 
 # ── Login Reward Campaigns (additive, isolated module) ────────────────────

@@ -64,6 +64,7 @@ def test_status_reports_flags_even_while_disabled(monkeypatch, visible, enabled)
         "narrationEnabled": False, "conversationAudioEnabled": False,
         "conversationAudioStorageReady": False,
         "directPublishEnabled": False,
+        "premiumInteractionsEnabled": False,
     }
 
 

@@ -485,6 +485,17 @@ def direct_publish_permitted() -> bool:
     return _flag("BOOK_FACTORY_DIRECT_PUBLISH_ENABLED")
 
 
+# ── Signature Smart Interactive Book, Checkpoint 1 — master flag only.
+# Default false. While false: Book Factory emits none of the nine new
+# interaction block types, the Editor hides the grouped menu, old books are
+# unchanged, and the progress routes (interaction_progress_tools.py) 503.
+# Per-interaction internal readiness flags (if any are added during later
+# checkpoints) stay backend-only and default false — never exposed here
+# unless a later checkpoint explicitly adds them.
+def premium_interactions_permitted() -> bool:
+    return _flag("BOOK_PREMIUM_INTERACTIONS_ENABLED")
+
+
 def status_payload() -> dict:
     return {
         "visible": factory_visible(),
@@ -500,6 +511,7 @@ def status_payload() -> dict:
         "conversationAudioEnabled": conversation_audio_automation_permitted(),
         "conversationAudioStorageReady": bf_conv.storage_configured(),
         "directPublishEnabled": direct_publish_permitted(),
+        "premiumInteractionsEnabled": premium_interactions_permitted(),
     }
 
 
