@@ -163,8 +163,8 @@ def _parse_iso(v):
 # --------------------------------------------------------------------------- #
 # Parallel, independent validator — NEVER shares code with, or modifies,      #
 # server.py's _find_valid_coupon(). Returns (coupon_doc | None, reason_code). #
-# reason_code is one of: not_found, wrong_benefit_type, disabled, not_yet_active,
-# expired, limit_reached, not_assigned, invalid_benefit_amount. Never raises. #
+# reason_code is one of the SAFE reason enum values documented on            #
+# _FRIENDLY_MESSAGES below. Never raises.                                    #
 # --------------------------------------------------------------------------- #
 async def _find_edutalk_coupon(db, code: str, student_id: str) -> tuple[dict | None, str]:
     doc = await db.coupons.find_one({"code": code}, {"_id": 0})
@@ -189,7 +189,7 @@ async def _find_edutalk_coupon(db, code: str, student_id: str) -> tuple[dict | N
     max_uses = doc.get("max_uses")
     already_redeemed = _student_redemption(doc, student_id)
     if max_uses is not None and doc.get("uses_count", 0) >= max_uses and not already_redeemed:
-        return None, "limit_reached"
+        return None, "global_limit_reached"
     return doc, ""
 
 
@@ -200,16 +200,29 @@ def _student_redemption(doc: dict, student_id: str) -> dict | None:
     return None
 
 
+# Safe reason enum → student-facing message. Every value here is safe to
+# show verbatim: none leak the coupon's internal id, the DB document, or
+# whether a differently-purposed code exists — "not_found" stays
+# deliberately generic (never distinguished from a code that exists for a
+# different purpose), matching the isolation policy. Every OTHER reason
+# here is now distinct and specific (Step 3 of the "no assumptions" patch
+# authorization) so a "code doesn't work" report is diagnosable from the
+# API response alone, without needing DB/log access.
 _FRIENDLY_MESSAGES = {
     "not_found": "This code could not be used. Please check it and try again.",
-    "wrong_benefit_type": "This code could not be used. Please check it and try again.",
-    "invalid_benefit_amount": "This code could not be used. Please check it and try again.",
-    "disabled": "This code has already been redeemed.",
-    "not_yet_active": "This code could not be used. Please check it and try again.",
+    "wrong_benefit_type": "This code is not a Live Voice Coach Coupon.",
+    "invalid_benefit_amount": "This code is not configured correctly. Please contact your teacher.",
+    # "disabled" means an admin explicitly turned the code off — this is
+    # NOT necessarily the same thing as "already redeemed" (that conflation
+    # was a pre-existing inaccuracy; global_limit_reached is the correct
+    # reason for "someone already used up this code's uses").
+    "disabled": "This code is not currently active.",
+    "not_yet_active": "This code is not active yet.",
     "expired": "This code has expired.",
-    "limit_reached": "This code has already been redeemed.",
-    "not_assigned": "This code could not be used. Please check it and try again.",
-    "feature_disabled": "Coupon redemption is not available right now.",
+    "global_limit_reached": "This code has already reached its usage limit.",
+    "not_assigned": "This code is not assigned to this account.",
+    "flag_disabled": "Coupon redemption is not available right now.",
+    "credit_failed": "Your code was accepted, but the points could not be applied yet. Please try again.",
 }
 
 
@@ -248,7 +261,7 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
 
     def _need_flag():
         if not coupon_redemption_enabled():
-            raise HTTPException(status_code=503, detail=_FRIENDLY_MESSAGES["feature_disabled"])
+            raise HTTPException(status_code=503, detail=_FRIENDLY_MESSAGES["flag_disabled"])
 
     @api.post("/student/edutalk-live/coupon/validate")
     async def edutalk_coupon_validate(payload: dict, student=Depends(require_student)):
@@ -256,7 +269,7 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
         student_id = _norm_sid(getattr(student, "clean_id", ""))
         code = normalize_code((payload or {}).get("code") or "")
         if not code:
-            return {"ok": False, "state": "invalid", "message": _FRIENDLY_MESSAGES["not_found"]}
+            return {"ok": False, "state": "not_found", "message": _FRIENDLY_MESSAGES["not_found"]}
         doc, reason = await _find_edutalk_coupon(db, code, student_id)
         if not doc:
             # Server-log-only diagnostic: the exact rejection reason is
@@ -265,11 +278,11 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
             # doesn't work" report without guessing from wording alone.
             log.info("edutalk_coupon: validate rejected code=%s student=%s reason=%s",
                       code, student_id, reason)
-            return {"ok": False, "state": reason or "invalid",
+            return {"ok": False, "state": reason or "not_found",
                     "message": _FRIENDLY_MESSAGES.get(reason, _FRIENDLY_MESSAGES["not_found"])}
         existing = _student_redemption(doc, student_id)
         if existing and existing.get("status") == "credited":
-            return {"ok": True, "state": "already_credited", "benefit_amount": existing.get("benefit_amount"),
+            return {"ok": True, "state": "already_redeemed", "benefit_amount": existing.get("benefit_amount"),
                     "credited_at": existing.get("credited_at")}
         if existing and existing.get("status") in ("pending_credit", "credit_failed"):
             return {"ok": True, "state": "pending_retry", "benefit_amount": existing.get("benefit_amount")}
@@ -281,21 +294,21 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
         student_id = _norm_sid(getattr(student, "clean_id", ""))
         code = normalize_code((payload or {}).get("code") or "")
         if not code:
-            return {"ok": False, "state": "invalid", "message": _FRIENDLY_MESSAGES["not_found"]}
+            return {"ok": False, "state": "not_found", "message": _FRIENDLY_MESSAGES["not_found"]}
 
         doc, reason = await _find_edutalk_coupon(db, code, student_id)
         if not doc:
             # §IDEMPOTENT RETRY: even if the coupon is now globally exhausted
             # or disabled, THIS student's own prior redemption (if any) is
             # still returned as a successful receipt rather than an error.
-            if reason == "limit_reached":
+            if reason == "global_limit_reached":
                 stale = await db.coupons.find_one({"code": code}, {"_id": 0})
                 existing = _student_redemption(stale, student_id) if stale else None
                 if existing:
                     return await _resolve_existing(db, code, student_id, existing)
             log.info("edutalk_coupon: redeem rejected code=%s student=%s reason=%s",
                       code, student_id, reason)
-            return {"ok": False, "state": reason or "invalid",
+            return {"ok": False, "state": reason or "not_found",
                     "message": _FRIENDLY_MESSAGES.get(reason, _FRIENDLY_MESSAGES["not_found"])}
 
         existing = _student_redemption(doc, student_id)
@@ -334,7 +347,7 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
             _, reason2 = await _find_edutalk_coupon(db, code, student_id)
             log.info("edutalk_coupon: redeem race-lost code=%s student=%s reason=%s",
                       code, student_id, reason2)
-            return {"ok": False, "state": reason2 or "invalid",
+            return {"ok": False, "state": reason2 or "not_found",
                     "message": _FRIENDLY_MESSAGES.get(reason2, _FRIENDLY_MESSAGES["not_found"])}
 
         result = await _apply_credit_and_finalize(db, code, student_id, amount)
@@ -342,7 +355,7 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
             return {"ok": True, "state": "credited", "benefit_amount": amount,
                     "credited_at": result["credited_at"]}
         return {"ok": False, "state": "credit_failed",
-                "message": "Your code was accepted, but the benefit could not be applied yet. Please try again."}
+                "message": _FRIENDLY_MESSAGES["credit_failed"]}
 
     log.info("edutalk_coupon_tools: routes registered (flag-gated, default off)")
 
@@ -360,4 +373,4 @@ async def _resolve_existing(db, code: str, student_id: str, existing: dict) -> d
         return {"ok": True, "state": "credited", "benefit_amount": amount,
                 "credited_at": result["credited_at"]}
     return {"ok": False, "state": "credit_failed",
-            "message": "Your code was accepted, but the benefit could not be applied yet. Please try again."}
+            "message": _FRIENDLY_MESSAGES["credit_failed"]}

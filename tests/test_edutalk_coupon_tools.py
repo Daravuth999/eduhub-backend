@@ -239,6 +239,62 @@ def test_disabled_code():
     client = _make_client(db)
     body = _validate(client, "EDUTALK20").json()
     assert body["state"] == "disabled"
+    # §Safe reason codes: "disabled" (an admin toggle) must NOT claim the
+    # code was "already redeemed" — that conflation was a pre-existing
+    # inaccuracy. global_limit_reached is the correct reason for exhaustion.
+    assert "already" not in body["message"].lower()
+    assert "redeemed" not in body["message"].lower()
+
+
+def test_global_limit_reached_message_is_distinct_from_disabled():
+    db = _DB()
+    _seed_coupon(db, max_uses=1, uses_count=1)
+    client = _make_client(db)
+    body = _redeem(client, "EDUTALK20").json()
+    assert body["state"] == "global_limit_reached"
+    assert "usage limit" in body["message"].lower()
+
+
+def test_wrong_benefit_type_and_invalid_amount_have_specific_safe_messages():
+    db = _DB()
+    _seed_coupon(db, benefit_type="book_discount", benefit_amount=None)
+    client = _make_client(db)
+    body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "wrong_benefit_type"
+    assert "not a live voice coach coupon" in body["message"].lower()
+
+    db2 = _DB()
+    _seed_coupon(db2, benefit_amount=99999)
+    client2 = _make_client(db2)
+    body2 = _validate(client2, "EDUTALK20").json()
+    assert body2["state"] == "invalid_benefit_amount"
+    assert "contact your teacher" in body2["message"].lower()
+
+
+def test_not_assigned_and_not_yet_active_have_specific_safe_messages():
+    db = _DB()
+    _seed_coupon(db, assigned_to=["someone-else"])
+    client = _make_client(db, student_id="stu1")
+    body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "not_assigned"
+    assert "not assigned to this account" in body["message"].lower()
+
+    db2 = _DB()
+    _seed_coupon(db2, valid_from="2999-01-01T00:00:00+00:00")
+    client2 = _make_client(db2)
+    body2 = _validate(client2, "EDUTALK20").json()
+    assert body2["state"] == "not_yet_active"
+    assert "not active yet" in body2["message"].lower()
+
+
+def test_flag_disabled_returns_flag_disabled_reason_via_503(monkeypatch):
+    monkeypatch.setenv("EDUTALK_COUPON_REDEMPTION_ENABLED", "false")
+    db = _DB()
+    _seed_coupon(db)
+    client = _make_client(db)
+    r = _validate(client, "EDUTALK20")
+    assert r.status_code == 503
+    assert "not available right now" in r.json()["detail"].lower()
 
 
 def test_wrong_benefit_type_rejected():
@@ -302,6 +358,24 @@ def test_assigned_to_still_rejects_a_genuinely_different_student():
     client = _make_client(db, student_id="stu1")
     body = _validate(client, "EDUTALK20").json()
     assert body["state"] == "not_assigned"
+
+
+def test_assigned_to_trim_normalized_match_isolated():
+    """Whitespace-only mismatch (no case difference) is accepted."""
+    db = _DB()
+    _seed_coupon(db, assigned_to=[" stu1 "])
+    client = _make_client(db, student_id="stu1")
+    body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "valid"
+
+
+def test_assigned_to_lowercase_normalized_match_isolated():
+    """Case-only mismatch (no whitespace difference) is accepted."""
+    db = _DB()
+    _seed_coupon(db, assigned_to=["STU1"])
+    client = _make_client(db, student_id="stu1")
+    body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "valid"
 
 
 # ── 2c. safe server-log-only diagnostics ────────────────────────────────────
@@ -379,7 +453,7 @@ def test_global_max_uses_limit():
     client = _make_client(db)
     body = _redeem(client, "EDUTALK20").json()
     assert body["ok"] is False
-    assert body["state"] == "limit_reached"
+    assert body["state"] == "global_limit_reached"
 
 
 def test_per_student_redemption_guard_second_student_blocked_by_global_limit():
@@ -390,7 +464,7 @@ def test_per_student_redemption_guard_second_student_blocked_by_global_limit():
     assert _redeem(client_a, "EDUTALK20").json()["ok"] is True
     body_b = _redeem(client_b, "EDUTALK20").json()
     assert body_b["ok"] is False
-    assert body_b["state"] == "limit_reached"
+    assert body_b["state"] == "global_limit_reached"
 
 
 # ── 5. concurrency: only one reservation is ever created ──────────────────
@@ -430,7 +504,7 @@ def test_validate_reports_already_credited_state():
     client = _make_client(db)
     _redeem(client, "EDUTALK20")
     body = _validate(client, "EDUTALK20").json()
-    assert body["state"] == "already_credited"
+    assert body["state"] == "already_redeemed"
 
 
 # ── 7. credit failure never permanently burns the code ─────────────────────
