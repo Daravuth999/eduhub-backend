@@ -170,6 +170,26 @@ def test_unknown_benefit_type_rejected_at_creation():
                            admin=_FakeAdmin()))
 
 
+# ── assigned_to normalization: edutalk_points only, book_discount untouched ─
+def test_book_discount_assigned_to_never_normalized_at_creation():
+    create_coupon, _ = _load_create_coupon()
+    result = run(create_coupon({
+        "code": "SAVE20", "type": "percent", "value": 20,
+        "assigned_to": ["  StuMixedCase ", "OTHER"],
+    }, admin=_FakeAdmin()))
+    # Book-discount coupons are completely unaffected by this fix.
+    assert result["coupon"]["assigned_to"] == ["  StuMixedCase ", "OTHER"]
+
+
+def test_edutalk_points_assigned_to_normalized_at_creation():
+    create_coupon, _ = _load_create_coupon()
+    result = run(create_coupon({
+        "code": "ET20", "benefit_type": "edutalk_points", "benefit_amount": 20,
+        "assigned_to": ["  StuMixedCase ", "OTHER"],
+    }, admin=_FakeAdmin()))
+    assert result["coupon"]["assigned_to"] == ["stumixedcase", "other"]
+
+
 # ── update_coupon: old fields still updatable exactly as before ───────────
 def test_old_style_update_fields_still_work():
     db = _FakeDB()
@@ -190,6 +210,24 @@ def test_update_rejects_invalid_benefit_amount_when_switching_to_edutalk_points(
     update_coupon, _ = _load_update_coupon(shared_db=db)
     with pytest.raises(HTTPException):
         run(update_coupon("SAVE20", {"benefit_type": "edutalk_points", "benefit_amount": 0}, admin=_FakeAdmin()))
+
+
+def test_update_normalizes_assigned_to_for_an_existing_edutalk_points_coupon():
+    # benefit_type is NOT in this update payload — the effective type must be
+    # read from the coupon's EXISTING benefit_type, not assumed/omitted.
+    db = _FakeDB()
+    run(db.coupons.insert_one({"code": "ET20", "benefit_type": "edutalk_points", "benefit_amount": 20}))
+    update_coupon, _ = _load_update_coupon(shared_db=db)
+    run(update_coupon("ET20", {"assigned_to": ["  Foo ", "BAR"]}, admin=_FakeAdmin()))
+    assert db.coupons.docs["ET20"]["assigned_to"] == ["foo", "bar"]
+
+
+def test_update_never_normalizes_assigned_to_for_a_book_discount_coupon():
+    db = _FakeDB()
+    run(db.coupons.insert_one({"code": "SAVE20", "benefit_type": "book_discount", "benefit_amount": None}))
+    update_coupon, _ = _load_update_coupon(shared_db=db)
+    run(update_coupon("SAVE20", {"assigned_to": ["  Foo ", "BAR"]}, admin=_FakeAdmin()))
+    assert db.coupons.docs["SAVE20"]["assigned_to"] == ["  Foo ", "BAR"]
 
 
 # ── _find_valid_coupon: mandatory bidirectional isolation ──────────────────

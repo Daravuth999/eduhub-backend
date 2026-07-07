@@ -6021,13 +6021,23 @@ async def create_coupon(payload: dict, admin: User = Depends(require_admin)):
             raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    assigned_to = payload.get("assigned_to") or []
+    if benefit_type == "edutalk_points":
+        # §Live Voice Coach Coupon diagnostics: assigned_to is free-typed by
+        # an admin (CouponStudio's CSV field has no normalization), and
+        # _find_edutalk_coupon compares it against the student's own
+        # clean_id. Normalizing at storage time here (book_discount coupons
+        # are completely unaffected — this branch never runs for them)
+        # prevents a case/whitespace mismatch from ever being written in
+        # the first place.
+        assigned_to = [str(x).strip().lower() for x in assigned_to if x]
     doc = {
         "code":        code,
         "type":        discount_type,
         "value":       value,
         "max_uses":    payload.get("max_uses"),           # None = unlimited
         "uses_count":  0,
-        "assigned_to": payload.get("assigned_to") or [],  # [] = public
+        "assigned_to": assigned_to,                       # [] = public
         "book_slugs":  payload.get("book_slugs") or [],   # [] = all books
         "valid_from":  payload.get("valid_from") or now_iso,
         "expires_at":  payload.get("expires_at"),         # None = never
@@ -6073,6 +6083,17 @@ async def update_coupon(code: str, payload: dict, admin: User = Depends(require_
         amt = updates.get("benefit_amount")
         if not isinstance(amt, int) or isinstance(amt, bool) or not (1 <= amt <= 1000):
             raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
+    if "assigned_to" in updates:
+        # §Live Voice Coach Coupon diagnostics: normalize only for an
+        # edutalk_points coupon (this update payload's own benefit_type if
+        # given, else the coupon's EXISTING benefit_type) — a book_discount
+        # coupon's assigned_to is completely unaffected.
+        effective_benefit_type = updates.get("benefit_type")
+        if effective_benefit_type is None:
+            existing_doc = await db.coupons.find_one({"code": code.upper()}, {"_id": 0, "benefit_type": 1})
+            effective_benefit_type = (existing_doc or {}).get("benefit_type") or "book_discount"
+        if effective_benefit_type == "edutalk_points":
+            updates["assigned_to"] = [str(x).strip().lower() for x in (updates.get("assigned_to") or []) if x]
     res = await db.coupons.update_one({"code": code.upper()}, {"$set": updates})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Coupon not found.")

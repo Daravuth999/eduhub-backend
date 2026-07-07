@@ -283,6 +283,51 @@ def test_assigned_to_allows_the_assigned_student():
     assert body["state"] == "valid"
 
 
+# ── 2b. assigned_to normalization — case/whitespace mismatch protection ─────
+def test_assigned_to_matches_despite_case_and_whitespace_mismatch():
+    """A Live Voice Coach Coupon's assigned_to is free-typed by an admin
+    (CouponStudio's CSV field has no normalization). Without normalized
+    comparison, "  STU1 " stored vs a clean_id of "stu1" would silently
+    reject with not_assigned — this proves the fix."""
+    db = _DB()
+    _seed_coupon(db, assigned_to=["  STU1 "])
+    client = _make_client(db, student_id="stu1")
+    body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "valid"
+
+
+def test_assigned_to_still_rejects_a_genuinely_different_student():
+    db = _DB()
+    _seed_coupon(db, assigned_to=["STU2"])
+    client = _make_client(db, student_id="stu1")
+    body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "not_assigned"
+
+
+# ── 2c. safe server-log-only diagnostics ────────────────────────────────────
+def test_rejection_reason_is_logged_server_side_but_not_in_client_response(caplog):
+    import logging
+    db = _DB()
+    _seed_coupon(db, assigned_to=["someone-else"])
+    client = _make_client(db, student_id="stu1")
+    with caplog.at_level(logging.INFO, logger="eduhub.edutalk_coupon"):
+        body = _validate(client, "EDUTALK20").json()
+    assert body["state"] == "not_assigned"
+    assert "not_assigned" not in body["message"]  # client message stays generic
+    assert any("reason=not_assigned" in r.message for r in caplog.records)
+
+
+def test_redeem_rejection_reason_is_also_logged(caplog):
+    import logging
+    db = _DB()
+    _seed_coupon(db, enabled=False)
+    client = _make_client(db, student_id="stu1")
+    with caplog.at_level(logging.INFO, logger="eduhub.edutalk_coupon"):
+        body = _redeem(client, "EDUTALK20").json()
+    assert body["state"] == "disabled"
+    assert any("reason=disabled" in r.message for r in caplog.records)
+
+
 # ── 3. redeem: happy path + credit + ledger ─────────────────────────────────
 def test_successful_redeem_sets_credited_and_records_ledger():
     db = _DB()

@@ -132,6 +132,21 @@ def _is_valid_benefit_amount(v) -> bool:
     return _MIN_BENEFIT_AMOUNT <= v <= _MAX_BENEFIT_AMOUNT
 
 
+def _norm_sid(value) -> str:
+    """Canonical student-id form for assigned_to comparisons — trims and
+    lowercases. A Live Voice Coach Coupon's `assigned_to` list is free-typed
+    by an admin (CouponStudio's CSV field has no normalization), so without
+    this, a case/whitespace mismatch against the student's own `clean_id`
+    silently produces the same generic "could not be used" message as a
+    genuinely wrong code. This module keeps its own private copy rather than
+    importing server.py's `_norm_student_id`, matching this file's existing
+    isolation convention (edutalk_coupon_tools.py has no dependency on
+    server.py's globals)."""
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -169,7 +184,7 @@ async def _find_edutalk_coupon(db, code: str, student_id: str) -> tuple[dict | N
     if ex and now > ex:
         return None, "expired"
     assigned_to = doc.get("assigned_to") or []
-    if assigned_to and student_id not in assigned_to:
+    if assigned_to and _norm_sid(student_id) not in {_norm_sid(x) for x in assigned_to}:
         return None, "not_assigned"
     max_uses = doc.get("max_uses")
     already_redeemed = _student_redemption(doc, student_id)
@@ -205,6 +220,9 @@ async def _apply_credit_and_finalize(db, code: str, student_id: str, amount: int
     existing entry matching (student_id, benefit_type='edutalk_points')."""
     ok, reason = await _credit_edutalk_points(student_id, amount)
     now_iso = _now_iso()
+    if not ok:
+        log.info("edutalk_coupon: credit failed code=%s student=%s reason=%s",
+                  code, student_id, reason)
     array_filters = [{"elem.student_id": student_id, "elem.benefit_type": "edutalk_points"}]
     if ok:
         await db.coupons.update_one(
@@ -235,12 +253,18 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
     @api.post("/student/edutalk-live/coupon/validate")
     async def edutalk_coupon_validate(payload: dict, student=Depends(require_student)):
         _need_flag()
-        student_id = str(getattr(student, "clean_id", ""))
+        student_id = _norm_sid(getattr(student, "clean_id", ""))
         code = normalize_code((payload or {}).get("code") or "")
         if not code:
             return {"ok": False, "state": "invalid", "message": _FRIENDLY_MESSAGES["not_found"]}
         doc, reason = await _find_edutalk_coupon(db, code, student_id)
         if not doc:
+            # Server-log-only diagnostic: the exact rejection reason is
+            # never sent to the client (student-facing message stays
+            # generic), but is observable here for debugging a "code
+            # doesn't work" report without guessing from wording alone.
+            log.info("edutalk_coupon: validate rejected code=%s student=%s reason=%s",
+                      code, student_id, reason)
             return {"ok": False, "state": reason or "invalid",
                     "message": _FRIENDLY_MESSAGES.get(reason, _FRIENDLY_MESSAGES["not_found"])}
         existing = _student_redemption(doc, student_id)
@@ -254,7 +278,7 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
     @api.post("/student/edutalk-live/coupon/redeem")
     async def edutalk_coupon_redeem(payload: dict, student=Depends(require_student)):
         _need_flag()
-        student_id = str(getattr(student, "clean_id", ""))
+        student_id = _norm_sid(getattr(student, "clean_id", ""))
         code = normalize_code((payload or {}).get("code") or "")
         if not code:
             return {"ok": False, "state": "invalid", "message": _FRIENDLY_MESSAGES["not_found"]}
@@ -269,6 +293,8 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
                 existing = _student_redemption(stale, student_id) if stale else None
                 if existing:
                     return await _resolve_existing(db, code, student_id, existing)
+            log.info("edutalk_coupon: redeem rejected code=%s student=%s reason=%s",
+                      code, student_id, reason)
             return {"ok": False, "state": reason or "invalid",
                     "message": _FRIENDLY_MESSAGES.get(reason, _FRIENDLY_MESSAGES["not_found"])}
 
@@ -306,6 +332,8 @@ def register_edutalk_coupon_routes(api: APIRouter, db, require_admin, require_st
             if existing2:
                 return await _resolve_existing(db, code, student_id, existing2)
             _, reason2 = await _find_edutalk_coupon(db, code, student_id)
+            log.info("edutalk_coupon: redeem race-lost code=%s student=%s reason=%s",
+                      code, student_id, reason2)
             return {"ok": False, "state": reason2 or "invalid",
                     "message": _FRIENDLY_MESSAGES.get(reason2, _FRIENDLY_MESSAGES["not_found"])}
 
