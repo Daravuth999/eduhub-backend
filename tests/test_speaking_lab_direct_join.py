@@ -287,17 +287,6 @@ class PushRecorder:
                 "no_subscribers": False, "error": ""}
 
 
-async def _enable_flags(db, *, direct_join=True, ab=False):
-    await db["speaking_lab_settings"].insert_one({
-        "_id": "feature_flags",
-        "speaking_lab_direct_join_enabled": direct_join,
-        "speaking_lab_ab_schedule_enabled": ab,
-    })
-    import os
-    os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = "true" if direct_join else "false"
-    os.environ["SPEAKING_LAB_AB_SCHEDULE_ENABLED"] = "true" if ab else "false"
-
-
 @pytest.fixture(autouse=True)
 def _clean_env():
     import os
@@ -1083,7 +1072,6 @@ async def test_32_feature_flags_default_off():
         "speaking_lab_direct_join_enabled": False,
         "speaking_lab_wallet_payout_enabled": False,
         "speaking_lab_wallet_cutover_enabled": False,
-        "speaking_lab_ab_schedule_enabled": False,
     }
 
 

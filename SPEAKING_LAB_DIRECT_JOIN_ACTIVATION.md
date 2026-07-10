@@ -20,13 +20,13 @@ at every step.
 | Wallet session composability | `wallet_service.py` | Lets a caller pass its own Mongo session into `credit()` / `debit()` / `transfer()` so multiple writes commit atomically together. Zero change to any existing caller (session omitted = old behavior, unchanged). |
 | Lucky code persist/publish split | `lucky_draw.py` | Separates the pure Mongo write (`persist_lucky_code`) from the post-commit SSE broadcast (`publish_lucky_code_events`), so a caller can put the write inside its own transaction. `generate_and_publish_lucky_code`'s existing public contract is unchanged. |
 | Shared schedule eligibility | `teacher_admission.py` | `session_schedule_eligibility()` now understands a session-level `"AB"` value (admits A, B, and unassigned students) in addition to the existing `"A"`/`"B"` exact-match behavior. Reused by both Missing Code Rescue and Direct Join. |
-| Feature flags | `speaking_lab_feature_flags.py` | Four AND-gated flags (env var **and** `speaking_lab_settings` DB doc field must both be true). Missing either means OFF. |
+| Feature flags | `speaking_lab_feature_flags.py` | Three AND-gated financial flags (env var **and** `speaking_lab_settings` DB doc field must both be true). Missing either means OFF. Combined A+B scheduling is **not** one of these — it is a standard, permanent session mode, unconditionally available. |
 | Direct Join core | `speaking_lab_direct_join.py` | The atomic "tap to join" flow: one Mongo transaction that validates eligibility, charges the student via `WalletService.transfer()`, creates/links the pool entry, and persists the lucky code — all committed together or none of it. |
 | Dark wallet payout transport | `speaking_lab_wallet_payout.py` + `lucky_draw._select_transfer_outcome` | A minimal transport-selection seam inside `_process_winner`'s ONE payout-provider call site. `speaking_lab_wallet_payout.wallet_transfer_outcome()` is a WalletService-backed drop-in replacement for `_provider_transfer`, with the identical outcome contract — `_process_winner`'s claim / persist / push / retry / manual-review state machine is completely unaware of which transport ran. **Never referenced by server.py**; only reachable through `_select_transfer_outcome`, which defaults to the existing GAS path whenever `speaking_lab_wallet_payout_enabled` is off (including if the flag check itself errors). |
 | Migration / index tooling | `speaking_lab_wallet_migration.py` | A CLI, dry-run by default, that reports (never writes) which active students lack a `points_wallets` row and which indexes exist. `--apply` requires an exact confirmation phrase and only ever creates **zero-balance** wallets — it never guesses or imports an opening balance from anywhere. |
 | Server wiring | `server.py` | Registers the Direct Join routes, the read-only `/speaking-lab/feature-flags` status route, and the `schedule` field (`"A"`/`"B"`/`"AB"`) on session creation. All additive; no existing route's behavior changed. |
 | PWA student UI | `eduhub-studio-test` → `JoinPrizePool.tsx` + `speakingLabApi.ts` | An isolated, **not wired into any existing route**, component that calls `/direct-join` and `/my-entry`. Degrades cleanly (friendly message, no crash) while the backend flag is off. |
-| Teacher UI | `speaking-lab-game (Live)` → `ScheduleSelector.jsx`, `LiveRosterGate.jsx` | A "Combined A+B" schedule button with a live "Not enabled" badge sourced from the new read-only flags route, and a friendly disabled-state message if a teacher tries to start an AB session before it's turned on. |
+| Teacher UI | `speaking-lab-game (Live)` → `ScheduleSelector.jsx` | A "Combined A+B" schedule button that behaves exactly like Schedule A/B — no flag, no badge, no lock. Admits Schedule A, Schedule B, and Unassigned students into one shared pool/Lucky Draw. |
 
 Everything above ships with its own test suite. See §5 for exact counts.
 
@@ -120,13 +120,13 @@ ahead of time.
    flow keeps working exactly as it did before this delivery (nothing
    about the legacy path was changed).
 
-### Step 4 — Combined A+B scheduling (independent of Step 3)
+### Step 4 — Combined A+B scheduling
 
-1. Set `SPEAKING_LAB_AB_SCHEDULE_ENABLED=true` (env) and the matching
-   `speaking_lab_ab_schedule_enabled: true` DB field.
-2. The teacher app's "Combined A+B" button will stop showing "Not
-   enabled" (it polls the same flags route) and session creation with
-   `schedule="AB"` will succeed instead of 403ing.
+Combined A+B is a standard, permanent session mode — no flag, no
+activation step. It works the moment both a Schedule A and a Schedule B
+roster exist to combine. A stale `SPEAKING_LAB_AB_SCHEDULE_ENABLED` env
+var or `speaking_lab_ab_schedule_enabled` DB field from an earlier
+revision is silently ignored and does not need to be removed.
 
 ### Step 5 — Dark wallet payout transport for Lucky Draw (only after Steps 1–4 have run cleanly for a while)
 
@@ -237,9 +237,9 @@ data cleanup required:
 
 - Direct Join off → `/direct-join` and `/my-entry` return 503;
   no mutation ever happened for sessions created while it was off.
-- Combined A+B off → session creation with `schedule="AB"` 403s again;
-  existing A/B-only sessions are entirely unaffected (they never used
-  `"AB"`).
+- Combined A+B is not one of these flags — it is a standard, permanent
+  session mode with no toggle. Disabling it would require a code change
+  (re-adding a gate to `sl_create_session`), not a config flip.
 - Dark wallet payout — not wired into any route, so there is nothing to
   roll back; the flag being on or off currently has zero effect.
 - Wallet cutover — same as above, reserved/unused.

@@ -5139,8 +5139,9 @@ async def sl_save_attendance(
 
 @api.get("/speaking-lab/feature-flags")
 async def sl_feature_flags(admin: User = Depends(require_admin)):
-    """Read-only status for the teacher UI's disabled-state badges (e.g.
-    the Combined A+B schedule button). Never mutates anything."""
+    """Read-only status of the financial feature flags (direct-join wallet
+    payout/cutover). Combined A+B scheduling is a standard mode, not a
+    flag reported here. Never mutates anything."""
     import speaking_lab_feature_flags as _sl_flags
     return await _sl_flags.all_flags(db)
 
@@ -5154,14 +5155,10 @@ async def sl_create_session(
     schedule_norm = (payload.schedule or "").strip().upper()
     if schedule_norm and schedule_norm not in ("A", "B", "AB"):
         raise HTTPException(status_code=400, detail="schedule must be 'A', 'B', 'AB', or empty")
-    if schedule_norm == "AB":
-        import speaking_lab_feature_flags as _sl_flags
-        if not await _sl_flags.ab_schedule_enabled(db):
-            raise HTTPException(
-                status_code=403,
-                detail={"error": "ab_schedule_disabled",
-                        "message": "Combined A+B sessions are not enabled yet."},
-            )
+    # Combined A+B is a standard, permanent schedule mode — not gated by a
+    # feature flag. It admits Schedule A, Schedule B, and Unassigned
+    # students into one shared session/pool/draw (see
+    # session_schedule_eligibility() in teacher_admission.py).
     session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
     await SL_SESSIONS.insert_one({
         "session_id": session_id,

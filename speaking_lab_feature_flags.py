@@ -67,7 +67,7 @@ async def _flag(db, env_name: str, db_field: str) -> bool:
     return await _db_flag(db, db_field)
 
 
-# ── the four mandatory hard-off flags ───────────────────────────────────────
+# ── the three mandatory hard-off financial flags ────────────────────────────
 async def direct_join_enabled(db) -> bool:
     """speaking_lab_direct_join_enabled — gates POST .../direct-join
     actually performing a wallet transfer + entry + code. When False, the
@@ -99,24 +99,19 @@ async def wallet_cutover_enabled(db) -> bool:
     )
 
 
-async def ab_schedule_enabled(db) -> bool:
-    """speaking_lab_ab_schedule_enabled — gates whether Combined A+B is a
-    creatable/joinable session schedule at all. Not directly financial,
-    but gated the same way since it changes who is eligible to trigger a
-    (currently-disabled) charge."""
-    return await _flag(
-        db, "SPEAKING_LAB_AB_SCHEDULE_ENABLED", "speaking_lab_ab_schedule_enabled",
-    )
-
-
 async def all_flags(db) -> dict:
     """Snapshot of every flag's live value — used by tests and the
     activation runbook, never by product logic (each gate re-checks its
     own flag independently so there's no risk of a stale snapshot being
-    used to make a decision)."""
+    used to make a decision).
+
+    Combined A+B scheduling is NOT one of these flags — it's a standard,
+    permanent session mode (see server.py's sl_create_session), not a
+    financially-gated feature. A stale `SPEAKING_LAB_AB_SCHEDULE_ENABLED`
+    env var or `speaking_lab_ab_schedule_enabled` DB field from an earlier
+    revision is simply ignored; nothing here reads it."""
     return {
         "speaking_lab_direct_join_enabled": await direct_join_enabled(db),
         "speaking_lab_wallet_payout_enabled": await wallet_payout_enabled(db),
         "speaking_lab_wallet_cutover_enabled": await wallet_cutover_enabled(db),
-        "speaking_lab_ab_schedule_enabled": await ab_schedule_enabled(db),
     }

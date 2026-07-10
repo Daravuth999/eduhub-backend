@@ -1,7 +1,13 @@
 """
 Tests for the POST /api/speaking-lab/sessions route (server.py's
-sl_create_session) — specifically the "AB" combined-schedule validation
-and flag-gating logic, which had ZERO test coverage before this file.
+sl_create_session) — specifically the "AB" combined-schedule validation.
+
+Combined A+B is now a standard, permanent schedule mode — not gated by
+`SPEAKING_LAB_AB_SCHEDULE_ENABLED` / `speaking_lab_settings.
+speaking_lab_ab_schedule_enabled`. Session creation for schedule "AB"
+must succeed unconditionally, exactly like "A" and "B", regardless of
+whatever value that legacy env var/DB field happens to hold (they are
+fully ignored — no owner action is required to clear them).
 
 server.py requires live infra env vars at import time, so this test
 exercises the EXACT route body (copied verbatim from server.py at the
@@ -19,8 +25,6 @@ import pytest
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
-
-import speaking_lab_feature_flags as flags
 
 
 class SLSessionCreate(BaseModel):
@@ -73,14 +77,6 @@ def _build_app(db):
         schedule_norm = (payload.schedule or "").strip().upper()
         if schedule_norm and schedule_norm not in ("A", "B", "AB"):
             raise HTTPException(status_code=400, detail="schedule must be 'A', 'B', 'AB', or empty")
-        if schedule_norm == "AB":
-            import speaking_lab_feature_flags as _sl_flags
-            if not await _sl_flags.ab_schedule_enabled(db):
-                raise HTTPException(
-                    status_code=403,
-                    detail={"error": "ab_schedule_disabled",
-                            "message": "Combined A+B sessions are not enabled yet."},
-                )
         session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
         await db["speaking_lab_sessions"].insert_one({
             "session_id": session_id,
@@ -109,56 +105,43 @@ def _clean_env():
 
 def test_0_route_body_matches_server_py():
     """Guards against silent drift between this test's copied route body
-    and the real one in server.py."""
+    and the real one in server.py — and proves the old AB feature-flag
+    gate is genuinely gone from the real route, not just from this copy."""
     with open("server.py", encoding="utf-8") as f:
         src = f.read()
     assert 'if schedule_norm and schedule_norm not in ("A", "B", "AB"):' in src
-    assert '"error": "ab_schedule_disabled"' in src
-    assert 'await _sl_flags.ab_schedule_enabled(db)' in src
+    assert "ab_schedule_disabled" not in src
+    assert "ab_schedule_enabled(db)" not in src
 
 
-def test_1_ab_rejected_when_flag_off():
+def test_1_ab_accepted_with_no_env_var_and_no_db_doc_at_all():
     os.environ.pop("SPEAKING_LAB_AB_SCHEDULE_ENABLED", None)
-    db = _FakeDB()
+    db = _FakeDB()  # settings doc never created
     client = TestClient(_build_app(db))
 
     resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 4})
 
-    assert resp.status_code == 403
-    assert resp.json()["detail"]["error"] == "ab_schedule_disabled"
-    assert db.sessions._docs == []  # zero mutation on rejection
+    assert resp.status_code == 200
+    assert resp.json()["schedule"] == "AB"
+    assert len(db.sessions._docs) == 1
 
 
-def test_2_ab_rejected_with_only_env_set_no_db_doc():
-    os.environ["SPEAKING_LAB_AB_SCHEDULE_ENABLED"] = "true"
-    db = _FakeDB()  # settings doc still missing -> AND-gate off
-    client = TestClient(_build_app(db))
-
-    resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 4})
-
-    assert resp.status_code == 403
-    assert db.sessions._docs == []
-
-
-def test_3_ab_accepted_when_flag_fully_enabled():
-    os.environ["SPEAKING_LAB_AB_SCHEDULE_ENABLED"] = "true"
+def test_2_ab_accepted_even_if_the_legacy_flag_is_explicitly_false():
+    """The old env var / DB field are fully ignored — an operator is never
+    required to delete stale legacy configuration for AB to work."""
+    os.environ["SPEAKING_LAB_AB_SCHEDULE_ENABLED"] = "false"
     db = _FakeDB()
-    db.settings.doc = {"speaking_lab_ab_schedule_enabled": True}
+    db.settings.doc = {"speaking_lab_ab_schedule_enabled": False}
     client = TestClient(_build_app(db))
 
     resp = client.post("/api/speaking-lab/sessions", json={"schedule": "ab", "entry_fee": 4})
 
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["schedule"] == "AB"  # normalized to uppercase
-    assert len(db.sessions._docs) == 1
-    assert db.sessions._docs[0]["schedule"] == "AB"
+    assert resp.json()["schedule"] == "AB"  # normalized to uppercase
 
 
-def test_4_ab_persists_as_the_session_schedule():
-    os.environ["SPEAKING_LAB_AB_SCHEDULE_ENABLED"] = "true"
+def test_3_ab_persists_as_the_session_schedule():
     db = _FakeDB()
-    db.settings.doc = {"speaking_lab_ab_schedule_enabled": True}
     client = TestClient(_build_app(db))
 
     client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 4})
@@ -168,10 +151,8 @@ def test_4_ab_persists_as_the_session_schedule():
     assert stored["status"] == "waiting"
 
 
-def test_5_each_session_gets_a_fresh_unique_session_id():
-    os.environ["SPEAKING_LAB_AB_SCHEDULE_ENABLED"] = "true"
+def test_4_each_session_gets_a_fresh_unique_session_id():
     db = _FakeDB()
-    db.settings.doc = {"speaking_lab_ab_schedule_enabled": True}
     client = TestClient(_build_app(db))
 
     r1 = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 4})
@@ -181,8 +162,7 @@ def test_5_each_session_gets_a_fresh_unique_session_id():
     assert len(db.sessions._docs) == 2
 
 
-def test_6_plain_a_and_b_sessions_are_never_gated_by_the_ab_flag():
-    os.environ.pop("SPEAKING_LAB_AB_SCHEDULE_ENABLED", None)  # flag OFF
+def test_5_plain_a_and_b_sessions_are_unaffected():
     db = _FakeDB()
     client = TestClient(_build_app(db))
 
@@ -195,7 +175,7 @@ def test_6_plain_a_and_b_sessions_are_never_gated_by_the_ab_flag():
     assert resp_b.json()["schedule"] == "B"
 
 
-def test_7_invalid_schedule_value_rejected():
+def test_6_invalid_schedule_value_rejected():
     db = _FakeDB()
     client = TestClient(_build_app(db))
 
