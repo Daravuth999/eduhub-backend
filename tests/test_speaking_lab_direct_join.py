@@ -866,6 +866,113 @@ async def test_23_ab_accepts_unassigned_without_mutating_group():
     assert student.get("group") == ""  # still Unassigned — never mutated
 
 
+@pytest.mark.asyncio
+async def test_23b_ab_session_uses_one_shared_pool_for_a_b_and_unassigned():
+    """A, B, and Unassigned entrants in the SAME AB session must land in
+    ONE shared pool/draw (keyed only by session_id) — never three
+    per-schedule pools. This is what makes "one shared pool and Lucky
+    Draw" true for Combined A+B sessions."""
+    db = _build_db()
+    await _seed_session(db, sid="sAB", fee=4, schedule="AB")
+    await _seed_student(db, "stuA", group="A")
+    await _seed_student(db, "stuB", group="B")
+    await _seed_student(db, "stuU", group="")
+    for sid in ("stuA", "stuB", "stuU"):
+        await _seed_wallet(db, sid, 10)
+    await _seed_wallet(db, "stu092", 0)
+
+    await _join(db, "sAB", "stuA", "uuid-a", display_name="Alice")
+    await _join(db, "sAB", "stuB", "uuid-b", display_name="Bella")
+    await _join(db, "sAB", "stuU", "uuid-u", display_name="Uma")
+
+    snap = await dj._pool_snapshot(db, "sAB")
+    assert snap["player_count"] == 3
+    assert snap["pool_total"] == 12  # 3 entrants x 4-point entry fee, one shared treasury pool
+
+    entries = [e async for e in db.speaking_lab_entries.find({"session_id": "sAB"})]
+    assert len(entries) == 3  # one shared entries collection scoped by session_id only
+
+    codes = [c async for c in db.speaking_lab_lucky_codes.find({"session_id": "sAB"})]
+    assert len(codes) == 3  # all three winners are drawn from the SAME lucky-code pool
+
+
+@pytest.mark.asyncio
+async def test_23c_plain_a_session_still_rejects_b_and_unassigned():
+    """Confirms normal (non-AB) sessions retain their existing
+    restrictions even after Combined A+B was added — the shared
+    eligibility function's new "AB" branch is additive, not a relaxation
+    of the "A"/"B" exact-match rule."""
+    db = _build_db()
+    await _seed_session(db, sid="sA", fee=4, schedule="A")
+    await _seed_student(db, "stuB", group="B")
+    await _seed_student(db, "stuU", group="")
+    await _seed_wallet(db, "stuB", 10)
+    await _seed_wallet(db, "stuU", 10)
+    await _seed_wallet(db, "stu092", 0)
+
+    with pytest.raises(dj.DirectJoinError) as exc_b:
+        await _join(db, "sA", "stuB", "uuid-1")
+    assert exc_b.value.code == "wrong_schedule"
+
+    with pytest.raises(dj.DirectJoinError) as exc_u:
+        await _join(db, "sA", "stuU", "uuid-2")
+    assert exc_u.value.code == "schedule_assignment_required"
+
+
+@pytest.mark.asyncio
+async def test_23d_route_ignores_a_client_supplied_student_id():
+    """DirectJoinRequest has no student_id field at all (extra="ignore"),
+    and the route resolves identity exclusively from the authenticated
+    `student` dependency — proving a malicious or buggy client cannot
+    charge or credit an entry to anyone but the authenticated caller,
+    even if it tries to smuggle a different student_id into the JSON
+    body."""
+    from fastapi import APIRouter, FastAPI
+    from fastapi.testclient import TestClient
+
+    db = _build_db()
+    await _seed_session(db, sid="s1", fee=4)
+    await _seed_student(db, "stu777")
+    await _seed_student(db, "stu999")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu999", 10)
+    await _seed_wallet(db, "stu092", 0)
+
+    import os
+    os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = "true"
+    await db["speaking_lab_settings"].insert_one(
+        {"_id": "feature_flags", "speaking_lab_direct_join_enabled": True})
+
+    api = APIRouter(prefix="/api")
+
+    async def _require_student_777():
+        return _Student("stu777")
+
+    dj.register_speaking_lab_direct_join_routes(
+        api, db, db.speaking_lab_sessions, db.speaking_lab_entries,
+        _noop_publish, _require_student_777, _norm,
+    )
+    app = FastAPI()
+    app.include_router(api)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/speaking-lab/sessions/s1/direct-join",
+        json={"idempotency_key": "uuid-spoof", "student_id": "stu999"},
+    )
+
+    assert resp.status_code == 200
+    # The charge/entry landed on the AUTHENTICATED student (stu777), never
+    # on the body-supplied "stu999" — proving the extra field was ignored.
+    wallet_777 = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
+    wallet_999 = await db[ws.COLL_WALLETS].find_one({"student_id": "stu999"})
+    assert wallet_777["balance"] == 6   # charged
+    assert wallet_999["balance"] == 10  # untouched
+    entries = [e for e in db.speaking_lab_entries._docs if e["session_id"] == "s1"]
+    assert len(entries) == 1
+    assert entries[0]["student_id"] == "stu777"
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 24-27. Legacy convergence
 # ═════════════════════════════════════════════════════════════════════════════

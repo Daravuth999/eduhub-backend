@@ -1459,6 +1459,41 @@ async def _send_winner_push_idempotent(
                         "ref=%s err=%s", stable_ref, err)
 
 
+async def _select_transfer_outcome(
+    db, gas_url: str, treasury_id: str, treasury_password: str,
+    student_id: str, amount: int, *, use_mock: bool, stable_reference: str,
+    attempt_id: str, log,
+) -> dict:
+    """Transport-selection seam (dark, flag-gated) for the ONE payout
+    provider call inside `_process_winner`. Every other part of the
+    winner-processing state machine (claim / persist / push / retry /
+    manual-review) is completely unaware of which transport ran here — it
+    only ever sees this function's outcome contract, identical either way.
+
+    speaking_lab_wallet_payout_enabled is OFF by default (AND-gated env +
+    DB doc, see speaking_lab_feature_flags.py). While OFF, this is
+    byte-for-byte equivalent to calling `_provider_transfer` directly —
+    same arguments, same call, same return shape. No other code path
+    calls speaking_lab_wallet_payout — flipping the flag on has no effect
+    anywhere else."""
+    try:
+        import speaking_lab_feature_flags as _flags
+        wallet_on = await _flags.wallet_payout_enabled(db)
+    except Exception:  # noqa: BLE001 — fail safe: default OFF (GAS path)
+        wallet_on = False
+    if wallet_on:
+        import speaking_lab_wallet_payout as _swp
+        return await _swp.wallet_transfer_outcome(
+            db, treasury_id, student_id, amount,
+            stable_reference=stable_reference, attempt_id=attempt_id,
+        )
+    return await _provider_transfer(
+        gas_url, treasury_id, treasury_password, student_id, amount,
+        use_mock=use_mock, stable_reference=stable_reference,
+        attempt_id=attempt_id, log=log,
+    )
+
+
 async def _process_winner(
     db, SL_DRAWS, sl_publish, session_id: str, draw_id: str, rank: int,
     rec: dict, gas_url: str, treasury_id: str, treasury_password: str,
@@ -1505,9 +1540,11 @@ async def _process_winner(
                 return dict(w)
         return dict(rec)
 
-    # ── 2. We own the claim — call the provider ───────────────────────────
-    outcome = await _provider_transfer(
-        gas_url, treasury_id, treasury_password, student_id, amount,
+    # ── 2. We own the claim — call the provider (transport-selection seam;
+    #      see _select_transfer_outcome — dark WalletService path is OFF
+    #      by default, GAS behavior below is unchanged while it's off) ───
+    outcome = await _select_transfer_outcome(
+        db, gas_url, treasury_id, treasury_password, student_id, amount,
         use_mock=use_mock, stable_reference=stable_ref, attempt_id=attempt_id,
         log=log,
     )

@@ -472,3 +472,94 @@ def test_22_no_status_ever_claims_verification(db, client, credits):
     ).json()
     blob = str(cand_body) + str(restore_body)
     assert "verified" not in blob.lower()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. Combined A+B schedule support (Missing Code Rescue)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_23_ab_session_makes_a_group_student_restorable(db, client, credits):
+    _seed_session_sync(db, sid="sAB", fee=4, schedule="AB")
+    _seed_student_sync(db, sid="stu_a", name="A Student", group="A")
+    credits.add(sender="stu_a", amount=4, transfer_id="tid_ab_a")
+    r = client.get(URL_CAND.format(sid="sAB"))
+    cand = r.json()["candidates"][0]
+    assert cand["status"] == "review_required"
+    assert cand["restorable"] is True
+    assert cand["reason"] == ""
+
+
+def test_24_ab_session_makes_b_group_student_restorable(db, client, credits):
+    _seed_session_sync(db, sid="sAB", fee=4, schedule="AB")
+    _seed_student_sync(db, sid="stu_b", name="B Student", group="B")
+    credits.add(sender="stu_b", amount=4, transfer_id="tid_ab_b")
+    r = client.get(URL_CAND.format(sid="sAB"))
+    cand = r.json()["candidates"][0]
+    assert cand["status"] == "review_required"
+    assert cand["restorable"] is True
+    assert cand["reason"] == ""
+
+
+def test_25_ab_session_makes_unassigned_student_restorable_without_mutating_group(
+    db, client, credits,
+):
+    _seed_session_sync(db, sid="sAB", fee=4, schedule="AB")
+    _seed_student_sync(db, sid="stu_u", name="Unassigned Student", group="")
+    credits.add(sender="stu_u", amount=4, transfer_id="tid_ab_u")
+    r = client.get(URL_CAND.format(sid="sAB"))
+    cand = r.json()["candidates"][0]
+    assert cand["restorable"] is True
+    assert cand["reason"] == ""
+    assert cand["student_schedule"] == ""  # still Unassigned in the candidate view
+
+    student = _run(db["students"].find_one({"clean_id": "stu_u"}))
+    assert student.get("group") == ""  # never mutated by Missing Code Rescue
+
+
+def test_26_plain_a_session_still_blocks_b_group_student(db, client, credits):
+    """Confirms adding "AB" support did not relax the existing exact-match
+    rule for normal (non-combined) sessions."""
+    _seed_session_sync(db, sid="sA", fee=4, schedule="A")
+    _seed_student_sync(db, sid="stu_b2", name="B Student", group="B")
+    credits.add(sender="stu_b2", amount=4, transfer_id="tid_a_b2")
+    r = client.get(URL_CAND.format(sid="sA"))
+    cand = r.json()["candidates"][0]
+    assert cand["status"] == "manual_review_required"
+    assert cand["restorable"] is False
+    assert cand["reason"] == "wrong_schedule"
+
+
+def test_27_plain_a_session_still_blocks_unassigned_student(db, client, credits):
+    _seed_session_sync(db, sid="sA", fee=4, schedule="A")
+    _seed_student_sync(db, sid="stu_u2", name="Unassigned Student", group="")
+    credits.add(sender="stu_u2", amount=4, transfer_id="tid_a_u2")
+    r = client.get(URL_CAND.format(sid="sA"))
+    cand = r.json()["candidates"][0]
+    assert cand["status"] == "manual_review_required"
+    assert cand["restorable"] is False
+    assert cand["reason"] == "schedule_assignment_required"
+
+
+def test_28_ab_session_restore_creates_exactly_one_entry_and_code_per_student(
+    db, client, credits,
+):
+    """End-to-end: Missing Code Rescue's restore action works for an AB
+    session exactly like a normal session — one entry, one code."""
+    _seed_session_sync(db, sid="sAB", fee=4, schedule="AB")
+    _seed_student_sync(db, sid="stu_ab_r", name="Restorable Student", group="B")
+    credits.add(sender="stu_ab_r", amount=4, transfer_id="tid_ab_restore")
+
+    resp = client.post(
+        URL_ONE.format(sid="sAB"),
+        json={"student_id": "stu_ab_r", "teacher_confirmed": True},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["outcome"] == "restored"
+    entries = [d for d in db["speaking_lab_entries"]._docs
+               if d["session_id"] == "sAB" and d["student_id"] == "stu_ab_r"]
+    lucky = [d for d in db["speaking_lab_lucky_codes"]._docs
+             if d["session_id"] == "sAB" and d["student_id"] == "stu_ab_r"]
+    assert len(entries) == 1
+    assert len(lucky) == 1

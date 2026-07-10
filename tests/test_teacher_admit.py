@@ -424,6 +424,40 @@ def test_10_wrong_group_blocked(db, client):
     assert client.post(URL.format(sid="sl_test_1"), json=_body()).status_code == 403
 
 
+def test_10b_ab_session_accepts_a_group_student(db, client):
+    _seed_session_sync(db, schedule="AB", fee=10); _seed_student_sync(db, group="A")
+    assert client.post(URL.format(sid="sl_test_1"), json=_body()).status_code == 200
+
+
+def test_10c_ab_session_accepts_b_group_student(db, client):
+    _seed_session_sync(db, schedule="AB", fee=10); _seed_student_sync(db, group="B")
+    assert client.post(URL.format(sid="sl_test_1"), json=_body()).status_code == 200
+
+
+def test_10d_ab_session_accepts_unassigned_student_without_override(db, client):
+    """Combined A+B sessions admit Unassigned students automatically —
+    unlike a plain "A"/"B" session, no external-verification override or
+    authoritative payment evidence is required just to pass the schedule
+    gate for an AB session."""
+    _seed_session_sync(db, schedule="AB", fee=10); _seed_student_sync(db, group="")
+    resp = client.post(URL.format(sid="sl_test_1"), json=_body())
+    assert resp.status_code == 200
+
+
+def test_10e_ab_session_never_mutates_student_group(db, client):
+    _seed_session_sync(db, schedule="AB", fee=10); _seed_student_sync(db, group="")
+    client.post(URL.format(sid="sl_test_1"), json=_body())
+    student = _run(db["students"].find_one({"clean_id": "stu100"}))
+    assert student.get("group") == ""  # still Unassigned — never mutated
+
+
+def test_10f_plain_a_session_still_blocks_b_after_ab_support_added(db, client):
+    """Confirms the AB bypass is scoped to schedule == "AB" only — a
+    plain "A" session still rejects a "B" student exactly as before."""
+    _seed_session_sync(db, schedule="A", fee=10); _seed_student_sync(db, group="B")
+    assert client.post(URL.format(sid="sl_test_1"), json=_body()).status_code == 403
+
+
 def test_12_underpayment_blocked(db, client):
     _seed_session_sync(db, fee=20); _seed_student_sync(db)
     assert client.post(URL.format(sid="sl_test_1"),

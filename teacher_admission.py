@@ -929,7 +929,11 @@ def register_teacher_admission_routes(
         )
         session_treasury_id = norm_student_id(sess.get("treasury_id") or "")
         enrollment_override: Optional[dict] = None
-        if session_schedule:
+        # Combined "AB" sessions accept A, B, and Unassigned students
+        # automatically (same rule as session_schedule_eligibility(), used
+        # by Missing Code Rescue and Direct Join) — the schedule gate below
+        # only applies to a plain "A"/"B" session.
+        if session_schedule and session_schedule != "AB":
             if not student_schedule:
                 # Same-session supporting records (necessary but NOT sufficient).
                 code_doc = await db[COLLECTION_CODES].find_one(

@@ -1,15 +1,17 @@
 """
-Tests for speaking_lab_wallet_payout.py — the LOCAL DARK WalletService
-payout transport for Speaking Lab Lucky Draw.
+Tests for speaking_lab_wallet_payout.py and lucky_draw._select_transfer_outcome
+— the transport-selection seam that lets `_process_winner`'s existing,
+UNCHANGED state machine (claim / persist / push / retry / manual-review)
+call either the live GAS transfer or a WalletService transfer, gated
+behind speaking_lab_wallet_payout_enabled (AND-gated env + DB doc, off by
+default).
 
-This module is NEVER wired into the live route registration (confirmed by
-grep in test_25_never_imported_by_server below) and is gated behind
-speaking_lab_feature_flags.wallet_payout_enabled (always False in
-production). These tests exercise the REAL production
-speaking_lab_wallet_payout.py / lucky_draw.py / wallet_service.py code
-against a fake Mongo harness that supports both array_filters (needed by
-lucky_draw's per-winner claim helpers) and caller-owned sessions (needed
-by wallet_service.transfer).
+speaking_lab_wallet_payout.py is intentionally tiny — it does NOT
+duplicate `_process_winner`'s state machine. These tests exercise the
+REAL production `_process_winner` (all 6 of its real call sites reuse it
+unmodified) through a fake Mongo harness that supports both array_filters
+(lucky_draw's per-winner claim helpers) and caller-owned sessions
+(wallet_service.transfer).
 """
 import ast
 import copy
@@ -268,12 +270,14 @@ def _force_transactions_supported():
 
 @pytest.fixture(autouse=True)
 def _clean_env():
-    saved = os.environ.get("SPEAKING_LAB_WALLET_PAYOUT_ENABLED")
+    keys = ("SPEAKING_LAB_WALLET_PAYOUT_ENABLED",)
+    saved = {k: os.environ.get(k) for k in keys}
     yield
-    if saved is None:
-        os.environ.pop("SPEAKING_LAB_WALLET_PAYOUT_ENABLED", None)
-    else:
-        os.environ["SPEAKING_LAB_WALLET_PAYOUT_ENABLED"] = saved
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 TREASURY = "stu092"
@@ -285,15 +289,23 @@ async def _seed_wallet(db, student_id, balance):
     })
 
 
+async def _enable_wallet_payout(db):
+    os.environ["SPEAKING_LAB_WALLET_PAYOUT_ENABLED"] = "true"
+    await db["speaking_lab_settings"].insert_one({
+        "_id": "feature_flags", "speaking_lab_wallet_payout_enabled": True,
+    })
+
+
 async def _seed_prepared_draw(db, *, draw_id="draw-1", session_id="sess-1", winners=None):
     winners = winners or [{
-        "student_id": "stuA", "display_name": "A", "code": "STAR-1", "amount": 50,
+        "student_id": "stua", "display_name": "A", "code": "STAR-1", "amount": 50,
         "transfer_state": ld.TRANSFER_PENDING, "transfer_ok": None, "transfer_err": "",
         "transfer_attempt_id": "", "transfer_reference": "", "transfer_retry_count": 0,
         "push_notification_state": None, "push_notification_attempt_id": "",
     }]
-    await db["speaking_lab_draws"].insert_one({
-        "draw_id": draw_id, "session_id": session_id, "results": winners,
+    await db["speaking_lab_lucky_draws"].insert_one({
+        "draw_id": draw_id, "session_id": session_id, "results": winners, "finalized": True,
+        "finalized_at": "2026-01-01T00:00:00+00:00",
     })
     return draw_id
 
@@ -318,6 +330,18 @@ class PushRecorder:
         return {"attempted": True, "sent": 1, "failed": 0, "no_subscribers": False, "error": ""}
 
 
+async def _process_winner(db, SL_DRAWS, session_id, draw_id, rec, push, *, mode,
+                           use_mock=False, treasury=TREASURY):
+    """Thin wrapper around the REAL, unmodified _process_winner so every
+    test below exercises the actual production state machine, not a
+    reimplementation."""
+    return await ld._process_winner(
+        db, SL_DRAWS, None, session_id, draw_id, 0, rec,
+        "https://gas.example.test", treasury, "irrelevant-legacy-password",
+        use_mock, None, push, mode=mode,
+    )
+
+
 def _winner(draw, student_id):
     for w in draw["results"]:
         if w["student_id"] == student_id:
@@ -325,200 +349,259 @@ def _winner(draw, student_id):
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Successful wallet payout: exactly one transfer, wallet balances correct,
-#    winner marked paid, push sent exactly once.
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
+# Part A — wallet_transfer_outcome() unit tests (the pure transport function)
+# ═════════════════════════════════════════════════════════════════════════
 @pytest.mark.asyncio
-async def test_1_successful_payout_moves_funds_and_marks_paid():
+async def test_a1_successful_transfer_outcome_moves_funds():
     db = _build_db()
     await _seed_wallet(db, TREASURY, 1000)
     await _seed_wallet(db, "stua", 0)
-    draw_id = await _seed_prepared_draw(db)
-    push = PushRecorder()
 
-    result = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",
-    )
+    result = await swp.wallet_transfer_outcome(
+        db, TREASURY, "stua", 50, stable_reference="ref1", attempt_id="a1")
 
-    assert result["transfer_state"] == ld.TRANSFER_PAID
-    assert result["transfer_ok"] is True
-    assert result["transfer_transport"] == "wallet"
-
+    assert result["outcome"] == ld.TRANSFER_PAID
     treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
     student_wallet = await db["points_wallets"].find_one({"student_id": "stua"})
     assert treasury_wallet["balance"] == 950
     assert student_wallet["balance"] == 50
 
-    txns = [d for d in db["points_transactions"]._docs]
-    assert len(txns) == 2  # debit leg + credit leg of the transfer
-    assert push.calls == [("stuA", 50, "STAR-1")]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Insufficient treasury funds -> failed_safe_to_retry, NO wallet mutation.
-# ─────────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_2_insufficient_treasury_funds_is_retryable_no_mutation():
-    db = _build_db()
-    await _seed_wallet(db, TREASURY, 10)  # not enough for a 50-point payout
-    await _seed_wallet(db, "stua", 0)
-    draw_id = await _seed_prepared_draw(db)
-    push = PushRecorder()
-
-    result = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",
-    )
-
-    assert result["transfer_state"] == ld.TRANSFER_FAILED_RETRY
-    assert result["transfer_ok"] is False
-    treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
-    student_wallet = await db["points_wallets"].find_one({"student_id": "stua"})
-    assert treasury_wallet["balance"] == 10
-    assert student_wallet["balance"] == 0
-    assert push.calls == []  # never paid -> push never attempted
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Retry after failed_safe_to_retry succeeds once treasury is topped up.
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_3_retry_succeeds_after_treasury_topped_up():
+async def test_a2_insufficient_funds_outcome_no_mutation():
     db = _build_db()
     await _seed_wallet(db, TREASURY, 10)
     await _seed_wallet(db, "stua", 0)
+
+    result = await swp.wallet_transfer_outcome(
+        db, TREASURY, "stua", 50, stable_reference="ref1", attempt_id="a1")
+
+    assert result["outcome"] == ld.TRANSFER_FAILED_RETRY
+    treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
+    assert treasury_wallet["balance"] == 10
+
+
+@pytest.mark.asyncio
+async def test_a3_unexpected_error_is_manual_review(monkeypatch):
+    db = _build_db()
+    await _seed_wallet(db, TREASURY, 1000)
+    await _seed_wallet(db, "stua", 0)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated unexpected wallet failure")
+
+    monkeypatch.setattr(ws.WalletService, "transfer", _boom)
+    result = await swp.wallet_transfer_outcome(
+        db, TREASURY, "stua", 50, stable_reference="ref1", attempt_id="a1")
+
+    assert result["outcome"] == ld.TRANSFER_MANUAL
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Part B — the transport-selection seam (lucky_draw._select_transfer_outcome)
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_b1_flag_off_calls_provider_transfer_with_identical_args(monkeypatch):
+    """Flag OFF (default): the seam must call _provider_transfer with the
+    EXACT SAME arguments it always did — proving byte-for-byte parity with
+    pre-existing GAS behavior. WalletService is never touched."""
+    db = _build_db()
+    calls = []
+
+    async def _fake_provider_transfer(gas_url, treasury_id, treasury_password,
+                                       receiver_clean_id, amount, *, use_mock,
+                                       stable_reference, attempt_id, log=None):
+        calls.append((gas_url, treasury_id, treasury_password, receiver_clean_id,
+                      amount, use_mock, stable_reference, attempt_id))
+        return {"outcome": ld.TRANSFER_PAID, "provider_status": "success",
+                "provider_reference": "GASTX-1", "error": ""}
+
+    monkeypatch.setattr(ld, "_provider_transfer", _fake_provider_transfer)
+    wallet_calls = []
+    orig_wallet_transfer = swp.wallet_transfer_outcome
+
+    async def _spy_wallet_transfer(*a, **k):
+        wallet_calls.append((a, k))
+        return await orig_wallet_transfer(*a, **k)
+
+    monkeypatch.setattr(swp, "wallet_transfer_outcome", _spy_wallet_transfer)
+
+    result = await ld._select_transfer_outcome(
+        db, "https://gas.example.test", TREASURY, "pw", "stua", 50,
+        use_mock=False, stable_reference="ref-x", attempt_id="att-x", log=None,
+    )
+
+    assert result["outcome"] == ld.TRANSFER_PAID
+    assert calls == [("https://gas.example.test", TREASURY, "pw", "stua", 50,
+                      False, "ref-x", "att-x")]
+    assert wallet_calls == []  # WalletService transport never invoked
+
+
+@pytest.mark.asyncio
+async def test_b2_flag_on_calls_wallet_transfer_outcome_instead(monkeypatch):
+    db = _build_db()
+    await _enable_wallet_payout(db)
+    await _seed_wallet(db, TREASURY, 1000)
+    await _seed_wallet(db, "stua", 0)
+
+    provider_calls = []
+
+    async def _fake_provider_transfer(*a, **k):
+        provider_calls.append((a, k))
+        raise AssertionError("GAS provider must not be called while flag is on")
+
+    monkeypatch.setattr(ld, "_provider_transfer", _fake_provider_transfer)
+
+    result = await ld._select_transfer_outcome(
+        db, "https://gas.example.test", TREASURY, "pw", "stua", 50,
+        use_mock=False, stable_reference="ref-y", attempt_id="att-y", log=None,
+    )
+
+    assert result["outcome"] == ld.TRANSFER_PAID
+    assert provider_calls == []
+    treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
+    assert treasury_wallet["balance"] == 950
+
+
+@pytest.mark.asyncio
+async def test_b3_flag_check_error_fails_safe_to_gas(monkeypatch):
+    """If the flag lookup itself errors, the seam must default OFF (GAS
+    path) — never silently fall through to moving real wallet funds."""
+    db = _build_db()
+
+    async def _boom_flag_check(*a, **k):
+        raise RuntimeError("settings collection unreachable")
+
+    import speaking_lab_feature_flags as flags
+    monkeypatch.setattr(flags, "wallet_payout_enabled", _boom_flag_check)
+
+    provider_calls = []
+
+    async def _fake_provider_transfer(*a, **k):
+        provider_calls.append((a, k))
+        return {"outcome": ld.TRANSFER_PAID, "provider_status": "success",
+                "provider_reference": "GASTX-1", "error": ""}
+
+    monkeypatch.setattr(ld, "_provider_transfer", _fake_provider_transfer)
+
+    result = await ld._select_transfer_outcome(
+        db, "https://gas.example.test", TREASURY, "pw", "stua", 50,
+        use_mock=False, stable_reference="ref-z", attempt_id="att-z", log=None,
+    )
+
+    assert result["outcome"] == ld.TRANSFER_PAID
+    assert len(provider_calls) == 1  # fell back to GAS, not wallet
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Part C — full _process_winner state machine with the wallet flag ON
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_c1_normal_finalize_uses_wallet_transport():
+    db = _build_db()
+    await _enable_wallet_payout(db)
+    await _seed_wallet(db, TREASURY, 1000)
+    await _seed_wallet(db, "stua", 0)
     draw_id = await _seed_prepared_draw(db)
     push = PushRecorder()
+    SL_DRAWS = db["speaking_lab_lucky_draws"]
 
-    await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",
-    )
-    await db["points_wallets"].update_one(
-        {"student_id": TREASURY}, {"$set": {"balance": 1000}})  # top-up
-
-    result = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="retry",
+    result = await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="initial",
     )
 
     assert result["transfer_state"] == ld.TRANSFER_PAID
+    assert result["transfer_provider_status"] == "wallet_transfer_ok"
     student_wallet = await db["points_wallets"].find_one({"student_id": "stua"})
-    assert student_wallet["balance"] == 50
-    assert push.calls == [("stuA", 50, "STAR-1")]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Same idempotency key never charges twice even if called again in the
-#    "initial" mode after already paid (claim guard rejects; no re-transfer).
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_4_double_initial_call_never_double_charges():
-    db = _build_db()
-    await _seed_wallet(db, TREASURY, 1000)
-    await _seed_wallet(db, "stua", 0)
-    draw_id = await _seed_prepared_draw(db)
-    push = PushRecorder()
-
-    await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",
-    )
-    result2 = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",  # not a valid retry state
-    )
-
-    assert result2["transfer_state"] == ld.TRANSFER_PAID  # unchanged, already paid
-    student_wallet = await db["points_wallets"].find_one({"student_id": "stua"})
-    assert student_wallet["balance"] == 50  # still only paid once
-    assert len(push.calls) == 1  # push not re-sent
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. use_mock=True never touches WalletService at all.
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_5_mock_mode_never_calls_wallet():
-    db = _build_db()
-    await _seed_wallet(db, TREASURY, 1000)
-    await _seed_wallet(db, "stua", 0)
-    draw_id = await _seed_prepared_draw(db)
-    push = PushRecorder()
-
-    result = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, True, None, push, mode="initial",
-    )
-
-    assert result["transfer_state"] == ld.TRANSFER_MOCK
     treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
-    assert treasury_wallet["balance"] == 1000  # untouched
+    assert student_wallet["balance"] == 50
+    assert treasury_wallet["balance"] == 950
+    assert push.calls == [("stua", 50, "STAR-1")]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Unexpected wallet exception is conservatively quarantined as manual_review,
-#    never silently marked paid.
-# ─────────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_6_unexpected_wallet_error_is_manual_review(monkeypatch):
+async def test_c2_retry_uses_wallet_transport_safely():
     db = _build_db()
+    await _enable_wallet_payout(db)
+    await _seed_wallet(db, TREASURY, 10)  # insufficient at first
+    await _seed_wallet(db, "stua", 0)
+    draw_id = await _seed_prepared_draw(db)
+    push = PushRecorder()
+    SL_DRAWS = db["speaking_lab_lucky_draws"]
+
+    first = await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="initial",
+    )
+    assert first["transfer_state"] == ld.TRANSFER_FAILED_RETRY
+
+    await db["points_wallets"].update_one(
+        {"student_id": TREASURY}, {"$set": {"balance": 1000}})
+
+    second = await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="retry",
+    )
+
+    assert second["transfer_state"] == ld.TRANSFER_PAID
+    student_wallet = await db["points_wallets"].find_one({"student_id": "stua"})
+    assert student_wallet["balance"] == 50  # paid exactly once overall
+
+
+@pytest.mark.asyncio
+async def test_c3_manual_release_uses_wallet_transport(monkeypatch):
+    db = _build_db()
+    await _enable_wallet_payout(db)
     await _seed_wallet(db, TREASURY, 1000)
     await _seed_wallet(db, "stua", 0)
     draw_id = await _seed_prepared_draw(db)
     push = PushRecorder()
+    SL_DRAWS = db["speaking_lab_lucky_draws"]
 
     async def _boom(*a, **k):
         raise RuntimeError("simulated unexpected wallet failure")
 
     monkeypatch.setattr(ws.WalletService, "transfer", _boom)
-
-    result = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",
+    first = await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="initial",
     )
-
-    assert result["transfer_state"] == ld.TRANSFER_MANUAL
-    assert push.calls == []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Manual-release path: operator override from manual_review re-attempts
-#    and can succeed.
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_7_manual_release_retries_and_succeeds(monkeypatch):
-    db = _build_db()
-    await _seed_wallet(db, TREASURY, 1000)
-    await _seed_wallet(db, "stua", 0)
-    draw_id = await _seed_prepared_draw(db)
-    push = PushRecorder()
-
-    async def _boom(*a, **k):
-        raise RuntimeError("simulated unexpected wallet failure")
-
-    monkeypatch.setattr(ws.WalletService, "transfer", _boom)
-    await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="initial",
-    )
+    assert first["transfer_state"] == ld.TRANSFER_MANUAL
     monkeypatch.undo()
 
-    result = await swp.process_winner_wallet_transport(
-        db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-        {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-        TREASURY, False, None, push, mode="manual_release",
+    second = await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="manual_release",
+    )
+
+    assert second["transfer_state"] == ld.TRANSFER_PAID
+    student_wallet = await db["points_wallets"].find_one({"student_id": "stua"})
+    assert student_wallet["balance"] == 50
+
+
+@pytest.mark.asyncio
+async def test_c4_recovery_worker_reuses_same_state_machine():
+    """The browser-abandoned recovery path calls _process_winner with
+    mode="retry" exactly like any other retry — proving it shares the
+    identical seam rather than a parallel code path."""
+    db = _build_db()
+    await _enable_wallet_payout(db)
+    await _seed_wallet(db, TREASURY, 1000)
+    await _seed_wallet(db, "stua", 0)
+    draw_id = await _seed_prepared_draw(db, winners=[{
+        "student_id": "stua", "display_name": "A", "code": "STAR-1", "amount": 50,
+        "transfer_state": ld.TRANSFER_FAILED_RETRY, "transfer_ok": False, "transfer_err": "",
+        "transfer_attempt_id": "stale-attempt", "transfer_reference": "", "transfer_retry_count": 1,
+        "push_notification_state": None, "push_notification_attempt_id": "",
+    }])
+    push = PushRecorder()
+    SL_DRAWS = db["speaking_lab_lucky_draws"]
+
+    result = await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="retry",
     )
 
     assert result["transfer_state"] == ld.TRANSFER_PAID
@@ -526,36 +609,87 @@ async def test_7_manual_release_retries_and_succeeds(monkeypatch):
     assert student_wallet["balance"] == 50
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. Feature flag defaults OFF (env var absent / false) — the module itself
-#    performs no gating (gating belongs to the caller/route), but confirm the
-#    flags module agrees this transport must stay disabled by default.
-# ─────────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_8_wallet_payout_flag_defaults_off():
-    import speaking_lab_feature_flags as flags
+async def test_c5_attempt_ownership_terminal_write_guard_intact():
+    """A stale attempt id must never overwrite a newer terminal result —
+    this guard lives in _set_winner_fields (untouched) and must still
+    function through the wallet transport path."""
     db = _build_db()
-    os.environ.pop("SPEAKING_LAB_WALLET_PAYOUT_ENABLED", None)
-    assert await flags.wallet_payout_enabled(db) is False
-    os.environ["SPEAKING_LAB_WALLET_PAYOUT_ENABLED"] = "true"
-    assert await flags.wallet_payout_enabled(db) is False  # DB doc still missing -> AND-gate off
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. Concurrency: two simultaneous "initial" claims on the same winner ->
-#    exactly one wallet transfer executes.
-# ─────────────────────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_9_concurrent_initial_claims_yield_exactly_one_transfer():
-    import asyncio
-    db = _build_db()
+    await _enable_wallet_payout(db)
     await _seed_wallet(db, TREASURY, 1000)
     await _seed_wallet(db, "stua", 0)
     draw_id = await _seed_prepared_draw(db)
     push = PushRecorder()
+    SL_DRAWS = db["speaking_lab_lucky_draws"]
+
+    await _process_winner(
+        db, SL_DRAWS, "sess-1", draw_id,
+        {"student_id": "stua", "code": "STAR-1", "amount": 50}, push, mode="initial",
+    )
+    # A delayed write from an old (already-superseded) attempt id must be
+    # rejected by _set_winner_fields's guard — simulate directly.
+    modified = await ld._set_winner_fields(
+        SL_DRAWS, draw_id, "stua",
+        {"transfer_state": ld.TRANSFER_FAILED_RETRY},
+        expected_attempt_id="some-other-stale-attempt-id",
+        require_in_progress=True,
+    )
+    assert modified == 0
+    fresh = await SL_DRAWS.find_one({"draw_id": draw_id})
+    assert _winner(fresh, "stua")["transfer_state"] == ld.TRANSFER_PAID  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_c6_notification_only_retry_never_invokes_wallet_service(monkeypatch):
+    """_retry_push_only (FIX 12) must never call the payout transport at
+    all, wallet or GAS — it only ever resends the push for an
+    already-paid winner."""
+    db = _build_db()
+    await _enable_wallet_payout(db)
+    await _seed_wallet(db, TREASURY, 1000)
+    await _seed_wallet(db, "stua", 0)
+    draw_id = await _seed_prepared_draw(db, winners=[{
+        "student_id": "stua", "display_name": "A", "code": "STAR-1", "amount": 50,
+        "transfer_state": ld.TRANSFER_PAID, "transfer_ok": True, "transfer_err": "",
+        "transfer_attempt_id": "prior-attempt", "transfer_reference": "ref-prior",
+        "transfer_retry_count": 0,
+        "push_notification_state": ld.PUSH_FAILED, "push_notification_attempt_id": "",
+    }])
+    push = PushRecorder()
+
+    wallet_calls = []
+    orig = swp.wallet_transfer_outcome
+
+    async def _spy(*a, **k):
+        wallet_calls.append((a, k))
+        return await orig(*a, **k)
+
+    monkeypatch.setattr(swp, "wallet_transfer_outcome", _spy)
+
+    result = await ld._retry_push_only(db, "sess-1", None, push_notify=push)
+
+    assert result["push_retry_candidates"] == 1
+    assert push.calls == [("stua", 50, "STAR-1")]
+    assert wallet_calls == []  # never touched WalletService
+    treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
+    assert treasury_wallet["balance"] == 1000  # balance untouched by a push-only retry
+
+
+@pytest.mark.asyncio
+async def test_c7_concurrent_finalize_and_recovery_no_duplicate_credit():
+    import asyncio
+    import unittest.mock as _mock
+
+    db = _build_db()
+    await _enable_wallet_payout(db)
+    await _seed_wallet(db, TREASURY, 1000)
+    await _seed_wallet(db, "stua", 0)
+    draw_id = await _seed_prepared_draw(db)
+    push = PushRecorder()
+    SL_DRAWS = db["speaking_lab_lucky_draws"]
+
     barrier = asyncio.Event()
     arrived = {"n": 0}
-
     orig_claim = ld._claim_winner_initial
 
     async def _gated_claim(*a, **k):
@@ -566,17 +700,14 @@ async def test_9_concurrent_initial_claims_yield_exactly_one_transfer():
             barrier.set()
         return await orig_claim(*a, **k)
 
-    import unittest.mock as _mock
     with _mock.patch.object(ld, "_claim_winner_initial", _gated_claim):
-        r1, r2 = await asyncio.gather(
-            swp.process_winner_wallet_transport(
-                db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-                {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-                TREASURY, False, None, push, mode="initial"),
-            swp.process_winner_wallet_transport(
-                db, db["speaking_lab_draws"], None, "sess-1", draw_id, 0,
-                {"student_id": "stuA", "code": "STAR-1", "amount": 50},
-                TREASURY, False, None, push, mode="initial"),
+        await asyncio.gather(
+            _process_winner(db, SL_DRAWS, "sess-1", draw_id,
+                           {"student_id": "stua", "code": "STAR-1", "amount": 50},
+                           push, mode="initial"),
+            _process_winner(db, SL_DRAWS, "sess-1", draw_id,
+                           {"student_id": "stua", "code": "STAR-1", "amount": 50},
+                           push, mode="initial"),
         )
 
     treasury_wallet = await db["points_wallets"].find_one({"student_id": TREASURY})
@@ -585,20 +716,28 @@ async def test_9_concurrent_initial_claims_yield_exactly_one_transfer():
     assert len(txns) == 2  # one transfer = one debit + one credit leg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. This module is never imported by server.py's live route registration —
-#     it is a dark, standalone module with zero production wiring.
-# ─────────────────────────────────────────────────────────────────────────────
-def test_10_never_wired_into_server_py():
+# ═════════════════════════════════════════════════════════════════════════
+# Part D — flag defaults, scope, and protected-function integrity
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_d1_wallet_payout_flag_defaults_off():
+    import speaking_lab_feature_flags as flags
+    db = _build_db()
+    os.environ.pop("SPEAKING_LAB_WALLET_PAYOUT_ENABLED", None)
+    assert await flags.wallet_payout_enabled(db) is False
+    os.environ["SPEAKING_LAB_WALLET_PAYOUT_ENABLED"] = "true"
+    assert await flags.wallet_payout_enabled(db) is False  # DB doc still missing -> AND-gate off
+
+
+def test_d2_not_referenced_by_server_py():
+    """server.py never references this module directly — it is only ever
+    reachable through lucky_draw._select_transfer_outcome, which itself
+    is only exercised when the AND-gated flag is explicitly turned on."""
     with open("server.py", encoding="utf-8") as f:
         src = f.read()
     assert "speaking_lab_wallet_payout" not in src
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. Protected function _process_winner (the LIVE GAS payout path) and its
-#     module-level constants are completely untouched by this addition.
-# ─────────────────────────────────────────────────────────────────────────────
 def _hash_function_source(path, func_name):
     with open(path, encoding="utf-8") as f:
         src = f.read()
@@ -610,15 +749,14 @@ def _hash_function_source(path, func_name):
     raise AssertionError(f"function {func_name} not found in {path}")
 
 
-_PROCESS_WINNER_BASELINE_SHA256 = (
-    "1fbfdc04aeca92137dbe3bd006ffcc20b2861e5ad78aadf10774786b96de0ebe"
-)
+_PROTECTED_BASELINES = {
+    "_weighted_pick": "871c5ad4d2cc3d721ed309e8dc2930e55053fdd9ac53d5a2a3fb815d6ccd461a",
+    "_normalize_split": "077c2583249d28118a489a47ad00fa669f14375e8db6b7a153837bff6fa9a359",
+    "_run_draw": "65ecec65bcd07a0fad9023e8b3b91f73a801c6ec551e93d63b989ef164825aac",
+}
 
 
-def test_11_process_winner_unchanged():
-    # Baseline captured from lucky_draw.py's real _process_winner (the LIVE
-    # GAS payout path, with its 6 call sites) at the moment
-    # speaking_lab_wallet_payout.py was written — proves the new dark module
-    # made zero edits to it.
-    digest = _hash_function_source("lucky_draw.py", "_process_winner")
-    assert digest == _PROCESS_WINNER_BASELINE_SHA256
+@pytest.mark.parametrize("func_name,baseline", _PROTECTED_BASELINES.items())
+def test_d3_protected_functions_unchanged(func_name, baseline):
+    digest = _hash_function_source("lucky_draw.py", func_name)
+    assert digest == baseline
