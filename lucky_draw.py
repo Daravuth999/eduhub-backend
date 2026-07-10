@@ -65,7 +65,7 @@ import secrets
 import string
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
@@ -93,11 +93,14 @@ def _all_codes() -> list[str]:
     return [f"{w}-{d}" for w in _LUCKY_WORDS for d in _LUCKY_DIGITS]
 
 
-async def _pick_unused_code(db, session_id: str) -> str:
+async def _pick_unused_code(db, session_id: str, *, session=None) -> str:
     """Return a code not yet used in this session. O(1) expected; falls back
-    to suffix if the whole 144-pool is exhausted (very large class)."""
+    to suffix if the whole 144-pool is exhausted (very large class).
+
+    ``session`` is optional and additive (caller-owned Mongo transaction
+    composability) — every existing caller omits it and is unaffected."""
     used_cursor = db.speaking_lab_lucky_codes.find(
-        {"session_id": session_id}, {"_id": 0, "code": 1},
+        {"session_id": session_id}, {"_id": 0, "code": 1}, session=session,
     )
     used: set[str] = set()
     async for row in used_cursor:
@@ -329,6 +332,102 @@ async def _pool_state(db, session_id: str) -> dict:
     return {"pool_total": total, "player_count": count}
 
 
+async def persist_lucky_code(
+    db,
+    session_id: str,
+    student_id: str,
+    display_name: str,
+    *,
+    amount: int = 0,
+    session=None,
+) -> Optional[dict]:
+    """Pure, transaction-safe lucky-code persistence — NO SSE/publication
+    side effects. Idempotent: returns the EXISTING code doc if one already
+    exists for (session_id, student_id) rather than creating a second one.
+
+    Safe to call inside a caller-owned Mongo transaction by passing
+    ``session=`` (e.g. Speaking Lab Direct Join's atomic join). Raises on
+    a genuine, unrecoverable persistence error rather than swallowing it —
+    callers running inside a transaction need the failure to propagate so
+    the whole transaction rolls back; ``generate_and_publish_lucky_code``
+    (below) re-wraps this in its own historical never-raises contract for
+    existing fire-and-forget callers."""
+    existing = await db.speaking_lab_lucky_codes.find_one(
+        {"session_id": session_id, "student_id": student_id}, {"_id": 0},
+        session=session,
+    )
+    if existing:
+        return existing
+
+    code = await _pick_unused_code(db, session_id, session=session)
+    awarded_at = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "session_id":  session_id,
+        "student_id":  student_id,
+        "display_name": display_name,
+        "code":         code,
+        "entry_fee":    int(amount or 0),
+        "awarded_at":   awarded_at,
+    }
+    try:
+        await db.speaking_lab_lucky_codes.insert_one(dict(doc), session=session)
+    except Exception:
+        # Most likely a unique-index race — fetch the winning insert. This
+        # keeps the operation idempotent even under concurrency.
+        existing = await db.speaking_lab_lucky_codes.find_one(
+            {"session_id": session_id, "student_id": student_id}, {"_id": 0},
+            session=session,
+        )
+        return existing
+    return doc
+
+
+async def publish_lucky_code_events(
+    db,
+    sl_publish: Callable[[str, dict], Awaitable[None]],
+    session_id: str,
+    student_id: str,
+    display_name: str,
+    code_doc: Mapping[str, Any],
+    *,
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """Post-commit SSE publication for an ALREADY-persisted code doc.
+
+    MUST NEVER be called from inside a Mongo transaction — it performs
+    network/event side effects (`sl_publish`), which the protected atomic
+    join/payout transactions must not contain. Never raises; SSE delivery
+    is best-effort and must never affect whether a join/admission is
+    considered successful."""
+    try:
+        state = await _pool_state(db, session_id)
+        amount = int((code_doc or {}).get("entry_fee") or 0)
+        code = (code_doc or {}).get("code")
+        await sl_publish(session_id, {
+            "type":         "lucky_code",
+            "student_id":   student_id,
+            "display_name": display_name,
+            "code":         code,
+            "entry_fee":    amount,
+            "pool_total":   state["pool_total"],
+            "player_count": state["player_count"],
+            "awarded_at":   (code_doc or {}).get("awarded_at"),
+        })
+        await sl_publish(session_id, {
+            "type":         "pool_update",
+            "pool_total":   state["pool_total"],
+            "player_count": state["player_count"],
+        })
+        if log:
+            log.info("lucky_draw: %s got code %s in %s (pool=%d, n=%d)",
+                     display_name, code, session_id,
+                     state["pool_total"], state["player_count"])
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log.warning("lucky_draw: publish_lucky_code_events error: %s",
+                        str(exc)[:200])
+
+
 async def generate_and_publish_lucky_code(
     db,
     sl_publish: Callable[[str, dict], Awaitable[None]],
@@ -339,65 +438,24 @@ async def generate_and_publish_lucky_code(
     amount: int = 0,
     log: Optional[logging.Logger] = None,
 ) -> Optional[dict]:
-    """Public helper for `_sl_try_auto_enter` to call. Idempotent.
+    """Public helper for `_sl_try_auto_enter` and other fire-and-forget
+    callers. Idempotent. UNCHANGED CONTRACT: persist + publish in one
+    call, never raises into the caller.
 
-    Returns the lucky code doc (or None on error — never raises into the
-    caller, since this is fire-and-forget)."""
+    Implemented as persist (`persist_lucky_code`) followed by publish
+    (`publish_lucky_code_events`) — the exact same two operations a
+    transaction-aware caller uses separately (persist inside its
+    transaction, publish only after commit)."""
     try:
-        # Deduplicate
-        existing = await db.speaking_lab_lucky_codes.find_one(
-            {"session_id": session_id, "student_id": student_id}, {"_id": 0},
+        doc = await persist_lucky_code(
+            db, session_id, student_id, display_name, amount=amount,
         )
-        if existing:
-            return existing
-
-        code = await _pick_unused_code(db, session_id)
-        awarded_at = datetime.now(timezone.utc).isoformat()
-        doc = {
-            "session_id":  session_id,
-            "student_id":  student_id,
-            "display_name": display_name,
-            "code":         code,
-            "entry_fee":    int(amount or 0),
-            "awarded_at":   awarded_at,
-        }
-        try:
-            await db.speaking_lab_lucky_codes.insert_one(dict(doc))
-        except Exception as exc:
-            # Most likely a unique-index race — fetch the winning insert.
-            if log:
-                log.info("lucky_draw: insert race for %s/%s: %s",
-                         session_id, student_id, str(exc)[:120])
-            existing = await db.speaking_lab_lucky_codes.find_one(
-                {"session_id": session_id, "student_id": student_id}, {"_id": 0},
-            )
-            return existing
-
-        # Pool snapshot (after this entry)
-        state = await _pool_state(db, session_id)
-
-        # SSE: detailed code reveal (drives LuckyCodeSplash on the teacher screen)
-        await sl_publish(session_id, {
-            "type":         "lucky_code",
-            "student_id":   student_id,
-            "display_name": display_name,
-            "code":         code,
-            "entry_fee":    int(amount or 0),
-            "pool_total":   state["pool_total"],
-            "player_count": state["player_count"],
-            "awarded_at":   awarded_at,
-        })
-        # SSE: lightweight ticker update (drives PoolTicker)
-        await sl_publish(session_id, {
-            "type":         "pool_update",
-            "pool_total":   state["pool_total"],
-            "player_count": state["player_count"],
-        })
-
-        if log:
-            log.info("lucky_draw: %s got code %s in %s (pool=%d, n=%d)",
-                     display_name, code, session_id,
-                     state["pool_total"], state["player_count"])
+        if doc is None:
+            return None
+        await publish_lucky_code_events(
+            db, sl_publish, session_id, student_id, display_name, doc,
+            log=log,
+        )
         return doc
     except Exception as exc:  # noqa: BLE001
         if log:

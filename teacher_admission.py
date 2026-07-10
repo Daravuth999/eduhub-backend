@@ -482,6 +482,35 @@ async def _lookup_student_record(db, norm_id: str) -> dict:
     return student_doc or {}
 
 
+def session_schedule_eligibility(
+    student_group_raw: Optional[str], session_schedule_raw: Optional[str],
+) -> tuple[bool, str]:
+    """Single shared eligibility rule, reused by Missing Code Rescue
+    (``_gather_candidate``) and Speaking Lab Direct Join so both surfaces
+    enforce the IDENTICAL rule rather than two hand-maintained copies.
+
+    ``session_schedule_raw`` may be "A", "B", "AB" (Combined), or blank
+    (no restriction — every student eligible, matching pre-Schedule-
+    Assignment behavior). Returns ``(eligible, reason)`` where reason is
+    one of "" | "schedule_assignment_required" | "wrong_schedule".
+
+    Combined ("AB") sessions accept A, B, AND Unassigned students
+    automatically for that session — this function never mutates
+    anything, so an Unassigned student accepted here remains Unassigned
+    afterward by construction."""
+    session_schedule = _normalize_schedule(session_schedule_raw)
+    if not session_schedule:
+        return True, ""
+    if session_schedule == "AB":
+        return True, ""
+    student_schedule = _normalize_schedule(student_group_raw)
+    if not student_schedule:
+        return False, "schedule_assignment_required"
+    if student_schedule != session_schedule:
+        return False, "wrong_schedule"
+    return True, ""
+
+
 async def _gather_candidate(
     db, SL_ENTRIES, session_id: str, entry_fee: int, norm_id: str,
     row: Optional[dict], session_schedule: str = "",
@@ -535,15 +564,13 @@ async def _gather_candidate(
     # Persistent schedule assignment gate — a student must be assigned to
     # THIS session's schedule before Missing Code Rescue may restore them.
     # Never inferred/auto-assigned here; see the schedule-assignment routes.
-    session_schedule_norm = _normalize_schedule(session_schedule)
-    if session_schedule_norm:
-        if not student_schedule:
-            return {**base, "status": "manual_review_required",
-                    "restorable": False,
-                    "reason": "schedule_assignment_required"}
-        if student_schedule != session_schedule_norm:
-            return {**base, "status": "manual_review_required",
-                    "restorable": False, "reason": "wrong_schedule"}
+    # Shared with Speaking Lab Direct Join via `session_schedule_eligibility`
+    # so both surfaces enforce the identical rule (including Combined A+B).
+    eligible, ineligible_reason = session_schedule_eligibility(
+        student_schedule, session_schedule)
+    if not eligible:
+        return {**base, "status": "manual_review_required",
+                "restorable": False, "reason": ineligible_reason}
 
     if not raw_ref:
         return {**base, "status": "manual_review_required",

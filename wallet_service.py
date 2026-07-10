@@ -343,24 +343,34 @@ class WalletService:
         return [doc async for doc in cur]
 
     # ---------- common path ---------------------------------------------- #
-    async def _idempotency_hit(self, key: str | None) -> Mapping[str, Any] | None:
+    async def _idempotency_hit(
+        self, key: str | None, *, session: Any = None,
+    ) -> Mapping[str, Any] | None:
         """If a ledger row with this idempotency_key already exists, return
         it. Otherwise return None. The unique sparse index guarantees
-        idempotent replays cannot double-apply."""
+        idempotent replays cannot double-apply.
+
+        ``session`` is optional and additive — when a caller-owned Mongo
+        session is supplied (composability path, see ``debit``/``credit``/
+        ``transfer``), the read participates in that session's snapshot;
+        when omitted (every existing caller), behavior is unchanged."""
         if not key:
             return None
         doc = await self.txns.find_one(
-            {"idempotency_key": key}, {"_id": 0}
+            {"idempotency_key": key}, {"_id": 0}, session=session,
         )
         return doc
 
     async def _ensure_wallet(
-        self, student_id: str, *, clean_id: str | None = None
+        self, student_id: str, *, clean_id: str | None = None,
+        session: Any = None,
     ) -> dict[str, Any]:
         """Idempotently make sure a wallet row exists with status=active.
-        Never resets the balance of an existing wallet."""
+        Never resets the balance of an existing wallet.
+
+        ``session`` is optional and additive (see ``_idempotency_hit``)."""
         existing = await self.wallets.find_one(
-            {"student_id": student_id}, {"_id": 0}
+            {"student_id": student_id}, {"_id": 0}, session=session,
         )
         if existing:
             return existing
@@ -374,11 +384,11 @@ class WalletService:
             "updated_at": now,
         }
         try:
-            await self.wallets.insert_one(seed)
+            await self.wallets.insert_one(seed, session=session)
         except Exception:  # duplicate key — race with concurrent init
             pass
         doc = await self.wallets.find_one(
-            {"student_id": student_id}, {"_id": 0}
+            {"student_id": student_id}, {"_id": 0}, session=session,
         )
         return doc or seed
 
@@ -444,10 +454,16 @@ class WalletService:
         allow_status: bool = False,
         clean_id: str | None = None,
         admin_bypass_status: bool = False,
+        session: Any = None,
     ) -> dict[str, Any]:
+        """``session`` (optional, additive): when a caller-owned Mongo
+        ClientSession already inside a transaction is supplied, this call
+        participates in that transaction instead of opening/committing its
+        own — see the "Caller-owned session composability" section below.
+        Every existing caller (session omitted) behaves exactly as before."""
         sid = _norm_id(student_id)
         amt = _coerce_amount(amount)
-        hit = await self._idempotency_hit(idempotency_key)
+        hit = await self._idempotency_hit(idempotency_key, session=session)
         if hit:
             return {
                 "ok": True,
@@ -455,14 +471,27 @@ class WalletService:
                 "balance_after": float(hit.get("balance_after") or 0),
                 "transaction": hit,
             }
-        await self._ensure_wallet(sid, clean_id=clean_id)
-        wallet = await self.wallets.find_one({"student_id": sid}, {"_id": 0})
+        await self._ensure_wallet(sid, clean_id=clean_id, session=session)
+        wallet = await self.wallets.find_one(
+            {"student_id": sid}, {"_id": 0}, session=session)
         self._enforce_status(wallet or {"student_id": sid}, "credit", allow_status)
         # BLOCKER 2: `admin_bypass_status` (explicit) OR an admin-marked
         # `allow_status` path that survived _enforce_status bypasses the
         # in-filter status guard. Default student flows do NEITHER.
         bypass = bool(admin_bypass_status) or bool(allow_status)
 
+        if session is not None:
+            if not MONGO_SUPPORTS_TRANSACTIONS:
+                raise TransferNotAtomic()
+            return await self._mutation_body(
+                sid, "credit", delta=+amt, amount=amt,
+                source=source, source_ref=source_ref,
+                idempotency_key=idempotency_key,
+                payload=payload or {},
+                from_id=None, to_id=sid,
+                admin_bypass_status=bypass,
+                session=session,
+            )
         if MONGO_SUPPORTS_TRANSACTIONS:
             return await self._atomic_mutation(
                 sid, "credit", delta=+amt, amount=amt,
@@ -493,10 +522,13 @@ class WalletService:
         allow_status: bool = False,
         allow_negative: bool = False,
         admin_bypass_status: bool = False,
+        session: Any = None,
     ) -> dict[str, Any]:
+        """``session``: see ``credit()`` docstring — optional, additive,
+        caller-owned-transaction composability only."""
         sid = _norm_id(student_id)
         amt = _coerce_amount(amount)
-        hit = await self._idempotency_hit(idempotency_key)
+        hit = await self._idempotency_hit(idempotency_key, session=session)
         if hit:
             return {
                 "ok": True,
@@ -504,8 +536,9 @@ class WalletService:
                 "balance_after": float(hit.get("balance_after") or 0),
                 "transaction": hit,
             }
-        await self._ensure_wallet(sid)
-        wallet = await self.wallets.find_one({"student_id": sid}, {"_id": 0})
+        await self._ensure_wallet(sid, session=session)
+        wallet = await self.wallets.find_one(
+            {"student_id": sid}, {"_id": 0}, session=session)
         self._enforce_status(wallet or {"student_id": sid}, "debit", allow_status)
         bypass = bool(admin_bypass_status) or bool(allow_status)
 
@@ -513,6 +546,19 @@ class WalletService:
         if not allow_negative and bal < amt:
             raise InsufficientFunds(sid, bal, amt)
 
+        if session is not None:
+            if not MONGO_SUPPORTS_TRANSACTIONS:
+                raise TransferNotAtomic()
+            return await self._mutation_body(
+                sid, "debit", delta=-amt, amount=amt,
+                source=source, source_ref=source_ref,
+                idempotency_key=idempotency_key,
+                payload=payload or {},
+                from_id=sid, to_id=None,
+                guard_balance=None if allow_negative else amt,
+                admin_bypass_status=bypass,
+                session=session,
+            )
         if MONGO_SUPPORTS_TRANSACTIONS:
             return await self._atomic_mutation(
                 sid, "debit", delta=-amt, amount=amt,
@@ -546,29 +592,39 @@ class WalletService:
         allow_status: bool = False,
         durable_repair: bool = False,
         admin_bypass_status: bool = False,
+        session: Any = None,
     ) -> dict[str, Any]:
         """Atomic two-sided transfer. In ledger-first mode this is HARD
         BLOCKED unless the caller passes ``durable_repair=True``, which
         means the caller has wired a ``migration_sync_events`` row that
         will replay the missing leg if a crash leaves the wallet in a
         torn state. Phase 2's sync replayer is the only authorised caller
-        that sets ``durable_repair=True``."""
+        that sets ``durable_repair=True``.
+
+        ``session`` (optional, additive): when a caller-owned Mongo
+        ClientSession already inside a transaction is supplied, this call
+        performs its two wallet updates + ledger inserts INSIDE that
+        transaction — it never opens its own session, never calls
+        ``with_transaction``, and never commits or aborts anything itself.
+        Every existing caller (session omitted) is completely unaffected."""
         f_id = _norm_id(from_id, "from_id")
         t_id = _norm_id(to_id, "to_id")
         if f_id == t_id:
             raise WalletError("SELF_TRANSFER", "Cannot transfer to self")
         amt = _coerce_amount(amount)
-        hit = await self._idempotency_hit(idempotency_key)
+        hit = await self._idempotency_hit(idempotency_key, session=session)
         if hit:
             return {
                 "ok": True,
                 "duplicate": True,
                 "transaction": hit,
             }
-        await self._ensure_wallet(f_id)
-        await self._ensure_wallet(t_id)
-        wf = await self.wallets.find_one({"student_id": f_id}, {"_id": 0})
-        wt = await self.wallets.find_one({"student_id": t_id}, {"_id": 0})
+        await self._ensure_wallet(f_id, session=session)
+        await self._ensure_wallet(t_id, session=session)
+        wf = await self.wallets.find_one(
+            {"student_id": f_id}, {"_id": 0}, session=session)
+        wt = await self.wallets.find_one(
+            {"student_id": t_id}, {"_id": 0}, session=session)
         self._enforce_status(wf or {"student_id": f_id}, "transfer", allow_status)
         self._enforce_status(wt or {"student_id": t_id}, "transfer", allow_status)
         bypass = bool(admin_bypass_status) or bool(allow_status)
@@ -577,6 +633,17 @@ class WalletService:
         if bal_from < amt:
             raise InsufficientFunds(f_id, bal_from, amt)
 
+        if session is not None:
+            if not MONGO_SUPPORTS_TRANSACTIONS:
+                raise TransferNotAtomic()
+            return await self._transfer_body(
+                f_id, t_id, amt,
+                source=source, source_ref=source_ref,
+                idempotency_key=idempotency_key,
+                payload=payload or {},
+                admin_bypass_status=bypass,
+                session=session,
+            )
         if MONGO_SUPPORTS_TRANSACTIONS:
             return await self._atomic_transfer(
                 f_id, t_id, amt,
@@ -653,6 +720,91 @@ class WalletService:
         )
 
     # ---------- atomic transaction-mode implementation ------------------- #
+    async def _mutation_body(
+        self,
+        sid: str,
+        operation: str,
+        *,
+        delta: int,
+        amount: int,
+        source: str,
+        source_ref: str | None,
+        idempotency_key: str | None,
+        payload: Mapping[str, Any],
+        from_id: str | None,
+        to_id: str | None,
+        guard_balance: int | None = None,
+        admin_bypass_status: bool = False,
+        session: Any,
+    ) -> dict[str, Any]:
+        """Pure single-side mutation body — no session/transaction
+        lifecycle management. Runs the wallet update + ledger insert
+        against whatever ``session`` it is given, and never commits,
+        aborts, or opens a session itself. Shared by both:
+          * ``_atomic_mutation`` (self-managed — opens its own session
+            and wraps this in ``with_transaction``), and
+          * ``credit``/``debit`` when the CALLER supplies a session
+            (composability path — the caller owns commit/abort)."""
+        now = _utcnow()
+        # BLOCKER 2 FIX: wallet status guard lives inside the actual
+        # Mongo find_one_and_update filter so a concurrent admin
+        # freeze cannot be raced past. ``admin_bypass_status=True``
+        # is the only documented way to skip the guard and is used
+        # only by explicit admin reconcile/repair paths.
+        base_filter: dict[str, Any] = {"student_id": sid}
+        if not admin_bypass_status:
+            base_filter["status"] = STATUS_ACTIVE
+        if guard_balance is not None:
+            # debit guard inside the txn — catch concurrent debits
+            upd_filter = dict(base_filter)
+            upd_filter["balance"] = {"$gte": guard_balance}
+            upd = await self.wallets.find_one_and_update(
+                upd_filter,
+                {"$inc": {"balance": delta}, "$set": {"updated_at": now}},
+                return_document=ReturnDocument.AFTER,
+                projection={"_id": 0, "balance": 1, "status": 1},
+                session=session,
+            )
+            if not upd:
+                await self._diagnose_no_match(
+                    sid, was_debit=True, needed_balance=guard_balance,
+                    session=session,
+                )
+        else:
+            upd = await self.wallets.find_one_and_update(
+                base_filter,
+                {"$inc": {"balance": delta}, "$set": {"updated_at": now}},
+                return_document=ReturnDocument.AFTER,
+                projection={"_id": 0, "balance": 1, "status": 1},
+                session=session,
+            )
+            if not upd:
+                await self._diagnose_no_match(
+                    sid, was_debit=False, session=session,
+                )
+        balance_after = float(upd.get("balance") or 0)
+        rec = TransactionRecord(
+            student_id=sid,
+            operation=operation,
+            amount=amount,
+            delta=delta,
+            balance_after=balance_after,
+            source=source,
+            source_ref=source_ref,
+            idempotency_key=idempotency_key,
+            from_id=from_id,
+            to_id=to_id,
+            payload=payload,
+            created_at=now,
+        )
+        await self.txns.insert_one(rec.to_doc(), session=session)
+        return {
+            "ok": True,
+            "duplicate": False,
+            "balance_after": balance_after,
+            "mode": "transaction",
+        }
+
     async def _atomic_mutation(
         self,
         sid: str,
@@ -669,70 +821,105 @@ class WalletService:
         guard_balance: int | None = None,
         admin_bypass_status: bool = False,
     ) -> dict[str, Any]:
+        """Self-managed: opens its own session/transaction and commits it.
+        Unchanged behavior for every existing caller — now implemented as
+        a thin wrapper around the shared ``_mutation_body``."""
         client: AsyncIOMotorClient = self.db.client
-        now = _utcnow()
+        result_holder: dict[str, Any] = {}
         async with await client.start_session() as session:
-            balance_after_holder: dict[str, int] = {}
-
             async def _runner(s):
-                # BLOCKER 2 FIX: wallet status guard lives inside the actual
-                # Mongo find_one_and_update filter so a concurrent admin
-                # freeze cannot be raced past. ``admin_bypass_status=True``
-                # is the only documented way to skip the guard and is used
-                # only by explicit admin reconcile/repair paths.
-                base_filter: dict[str, Any] = {"student_id": sid}
-                if not admin_bypass_status:
-                    base_filter["status"] = STATUS_ACTIVE
-                if guard_balance is not None:
-                    # debit guard inside the txn — catch concurrent debits
-                    upd_filter = dict(base_filter)
-                    upd_filter["balance"] = {"$gte": guard_balance}
-                    upd = await self.wallets.find_one_and_update(
-                        upd_filter,
-                        {"$inc": {"balance": delta}, "$set": {"updated_at": now}},
-                        return_document=ReturnDocument.AFTER,
-                        projection={"_id": 0, "balance": 1, "status": 1},
-                        session=s,
-                    )
-                    if not upd:
-                        await self._diagnose_no_match(
-                            sid, was_debit=True, needed_balance=guard_balance,
-                            session=s,
-                        )
-                else:
-                    upd = await self.wallets.find_one_and_update(
-                        base_filter,
-                        {"$inc": {"balance": delta}, "$set": {"updated_at": now}},
-                        return_document=ReturnDocument.AFTER,
-                        projection={"_id": 0, "balance": 1, "status": 1},
-                        session=s,
-                    )
-                    if not upd:
-                        await self._diagnose_no_match(
-                            sid, was_debit=False, session=s,
-                        )
-                balance_after_holder["v"] = float(upd.get("balance") or 0)
-                rec = TransactionRecord(
-                    student_id=sid,
-                    operation=operation,
-                    amount=amount,
-                    delta=delta,
-                    balance_after=balance_after_holder["v"],
-                    source=source,
-                    source_ref=source_ref,
-                    idempotency_key=idempotency_key,
-                    from_id=from_id,
-                    to_id=to_id,
-                    payload=payload,
-                    created_at=now,
+                result_holder["v"] = await self._mutation_body(
+                    sid, operation, delta=delta, amount=amount,
+                    source=source, source_ref=source_ref,
+                    idempotency_key=idempotency_key, payload=payload,
+                    from_id=from_id, to_id=to_id,
+                    guard_balance=guard_balance,
+                    admin_bypass_status=admin_bypass_status,
+                    session=s,
                 )
-                await self.txns.insert_one(rec.to_doc(), session=s)
-
             await session.with_transaction(_runner)
+        return result_holder["v"]
+
+    async def _transfer_body(
+        self,
+        f_id: str,
+        t_id: str,
+        amt: int,
+        *,
+        source: str,
+        source_ref: str | None,
+        idempotency_key: str | None,
+        payload: Mapping[str, Any],
+        admin_bypass_status: bool = False,
+        session: Any,
+    ) -> dict[str, Any]:
+        """Pure two-sided transfer body — no session/transaction lifecycle
+        management. Shared by ``_atomic_transfer`` (self-managed) and
+        ``transfer()`` when the CALLER supplies a session (composability
+        path). Never opens a session, never commits/aborts."""
+        now = _utcnow()
+        # BLOCKER 2 FIX: status guard lives in the Mongo update filter so
+        # a concurrent freeze on either side cannot be raced past.
+        from_filter: dict[str, Any] = {
+            "student_id": f_id,
+            "balance": {"$gte": amt},
+        }
+        to_filter: dict[str, Any] = {"student_id": t_id}
+        if not admin_bypass_status:
+            from_filter["status"] = STATUS_ACTIVE
+            to_filter["status"] = STATUS_ACTIVE
+        upd_from = await self.wallets.find_one_and_update(
+            from_filter,
+            {"$inc": {"balance": -amt}, "$set": {"updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+            projection={"_id": 0, "balance": 1, "status": 1},
+            session=session,
+        )
+        if not upd_from:
+            await self._diagnose_no_match(
+                f_id, was_debit=True, needed_balance=amt, session=session,
+            )
+        f_bal = float(upd_from.get("balance") or 0)
+
+        upd_to = await self.wallets.find_one_and_update(
+            to_filter,
+            {"$inc": {"balance": +amt}, "$set": {"updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+            projection={"_id": 0, "balance": 1, "status": 1},
+            session=session,
+        )
+        if not upd_to:
+            await self._diagnose_no_match(
+                t_id, was_debit=False, session=session,
+            )
+        t_bal = float(upd_to.get("balance") or 0)
+
+        # Two ledger rows — one debit, one credit, sharing the
+        # idempotency_key suffix so a replay short-circuits.
+        debit_rec = TransactionRecord(
+            student_id=f_id, operation="transfer_debit",
+            amount=amt, delta=-amt, balance_after=f_bal,
+            source=source, source_ref=source_ref,
+            idempotency_key=idempotency_key,
+            from_id=f_id, to_id=t_id, payload=payload,
+            created_at=now,
+        ).to_doc()
+        credit_rec = TransactionRecord(
+            student_id=t_id, operation="transfer_credit",
+            amount=amt, delta=+amt, balance_after=t_bal,
+            source=source, source_ref=source_ref,
+            idempotency_key=(
+                f"{idempotency_key}:credit" if idempotency_key else None
+            ),
+            from_id=f_id, to_id=t_id, payload=payload,
+            created_at=now,
+        ).to_doc()
+        await self.txns.insert_many([debit_rec, credit_rec], session=session)
         return {
             "ok": True,
             "duplicate": False,
-            "balance_after": balance_after_holder["v"],
+            "from_balance_after": f_bal,
+            "to_balance_after": t_bal,
             "mode": "transaction",
         }
 
@@ -748,79 +935,22 @@ class WalletService:
         payload: Mapping[str, Any],
         admin_bypass_status: bool = False,
     ) -> dict[str, Any]:
+        """Self-managed: opens its own session/transaction and commits it.
+        Unchanged behavior for every existing caller — now implemented as
+        a thin wrapper around the shared ``_transfer_body``."""
         client: AsyncIOMotorClient = self.db.client
-        now = _utcnow()
-        f_bal: dict[str, int] = {}
-        t_bal: dict[str, int] = {}
+        result_holder: dict[str, Any] = {}
         async with await client.start_session() as session:
             async def _runner(s):
-                # BLOCKER 2 FIX: status guard lives in the Mongo update
-                # filter so a concurrent freeze on either side cannot be
-                # raced past.
-                from_filter: dict[str, Any] = {
-                    "student_id": f_id,
-                    "balance": {"$gte": amt},
-                }
-                to_filter: dict[str, Any] = {"student_id": t_id}
-                if not admin_bypass_status:
-                    from_filter["status"] = STATUS_ACTIVE
-                    to_filter["status"] = STATUS_ACTIVE
-                upd_from = await self.wallets.find_one_and_update(
-                    from_filter,
-                    {"$inc": {"balance": -amt}, "$set": {"updated_at": now}},
-                    return_document=ReturnDocument.AFTER,
-                    projection={"_id": 0, "balance": 1, "status": 1},
+                result_holder["v"] = await self._transfer_body(
+                    f_id, t_id, amt,
+                    source=source, source_ref=source_ref,
+                    idempotency_key=idempotency_key, payload=payload,
+                    admin_bypass_status=admin_bypass_status,
                     session=s,
                 )
-                if not upd_from:
-                    await self._diagnose_no_match(
-                        f_id, was_debit=True, needed_balance=amt, session=s,
-                    )
-                f_bal["v"] = float(upd_from.get("balance") or 0)
-
-                upd_to = await self.wallets.find_one_and_update(
-                    to_filter,
-                    {"$inc": {"balance": +amt}, "$set": {"updated_at": now}},
-                    return_document=ReturnDocument.AFTER,
-                    projection={"_id": 0, "balance": 1, "status": 1},
-                    session=s,
-                )
-                if not upd_to:
-                    await self._diagnose_no_match(
-                        t_id, was_debit=False, session=s,
-                    )
-                t_bal["v"] = float(upd_to.get("balance") or 0)
-
-                # Two ledger rows — one debit, one credit, sharing the
-                # idempotency_key suffix so a replay short-circuits.
-                debit_rec = TransactionRecord(
-                    student_id=f_id, operation="transfer_debit",
-                    amount=amt, delta=-amt, balance_after=f_bal["v"],
-                    source=source, source_ref=source_ref,
-                    idempotency_key=idempotency_key,
-                    from_id=f_id, to_id=t_id, payload=payload,
-                    created_at=now,
-                ).to_doc()
-                credit_rec = TransactionRecord(
-                    student_id=t_id, operation="transfer_credit",
-                    amount=amt, delta=+amt, balance_after=t_bal["v"],
-                    source=source, source_ref=source_ref,
-                    idempotency_key=(
-                        f"{idempotency_key}:credit" if idempotency_key else None
-                    ),
-                    from_id=f_id, to_id=t_id, payload=payload,
-                    created_at=now,
-                ).to_doc()
-                await self.txns.insert_many([debit_rec, credit_rec], session=s)
-
             await session.with_transaction(_runner)
-        return {
-            "ok": True,
-            "duplicate": False,
-            "from_balance_after": f_bal["v"],
-            "to_balance_after": t_bal["v"],
-            "mode": "transaction",
-        }
+        return result_holder["v"]
 
     # ---------- ledger-first implementation ------------------------------ #
     async def _ledger_first_mutation(

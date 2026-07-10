@@ -26,6 +26,10 @@ from teacher_admission import (
     ensure_missing_code_recovery_indexes,
     ensure_schedule_assignment_indexes,
 )
+from speaking_lab_direct_join import (
+    register_speaking_lab_direct_join_routes,
+    ensure_direct_join_indexes,
+)
 from lucky_draw import (
     register_lucky_draw_routes,
     generate_and_publish_lucky_code,
@@ -5133,6 +5137,13 @@ async def sl_save_attendance(
 
 # â”€â”€ Live sessions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+@api.get("/speaking-lab/feature-flags")
+async def sl_feature_flags(admin: User = Depends(require_admin)):
+    """Read-only status for the teacher UI's disabled-state badges (e.g.
+    the Combined A+B schedule button). Never mutates anything."""
+    import speaking_lab_feature_flags as _sl_flags
+    return await _sl_flags.all_flags(db)
+
 @api.post("/speaking-lab/sessions")
 async def sl_create_session(
     payload: SLSessionCreate,
@@ -5140,18 +5151,29 @@ async def sl_create_session(
 ):
     if not 0 <= payload.entry_fee <= 500:
         raise HTTPException(status_code=400, detail="entry_fee out of range")
+    schedule_norm = (payload.schedule or "").strip().upper()
+    if schedule_norm and schedule_norm not in ("A", "B", "AB"):
+        raise HTTPException(status_code=400, detail="schedule must be 'A', 'B', 'AB', or empty")
+    if schedule_norm == "AB":
+        import speaking_lab_feature_flags as _sl_flags
+        if not await _sl_flags.ab_schedule_enabled(db):
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "ab_schedule_disabled",
+                        "message": "Combined A+B sessions are not enabled yet."},
+            )
     session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
     await SL_SESSIONS.insert_one({
         "session_id": session_id,
-        "schedule":   payload.schedule,
+        "schedule":   schedule_norm,
         "entry_fee":  payload.entry_fee,
         "treasury_id":"stu092",
         "status":     "waiting",
         "created_by": admin.email,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    log.info("sl.session.create: %s schedule=%s fee=%s", session_id, payload.schedule, payload.entry_fee)
-    return {"session_id": session_id, "schedule": payload.schedule, "entry_fee": payload.entry_fee}
+    log.info("sl.session.create: %s schedule=%s fee=%s", session_id, schedule_norm, payload.entry_fee)
+    return {"session_id": session_id, "schedule": schedule_norm, "entry_fee": payload.entry_fee}
 
 @api.post("/speaking-lab/sessions/{session_id}/enter")
 async def sl_enter_session(session_id: str, body: SLEnterRequest):
@@ -5633,6 +5655,52 @@ register_teacher_admission_routes(
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+# ── Speaking Lab Direct Join (v1.0, DARK — speaking_lab_direct_join_enabled
+# defaults OFF; see speaking_lab_feature_flags.py). Additive, narrowly
+# scoped: reuses the same _sl_publish/COLLECTION_CODES/SL_SESSIONS/
+# SL_ENTRIES surface as teacher_admission.py, and the same push-delivery
+# helper pattern as Lucky Draw / Mystery Box.
+async def _speaking_lab_direct_join_push_notify(student_id: str, title: str, body: str) -> dict:
+    """Reuses the EXISTING subscription normalization + `_fan_out_push`
+    (both unchanged, shared with Lucky Draw/Mystery Box) — never a second
+    push delivery system."""
+    norm = _norm_student_id(student_id)
+    candidates: list[str] = []
+    for c in (student_id, norm, norm.upper()):
+        if c and c not in candidates:
+            candidates.append(c)
+    query = {"studentId": {"$in": candidates}}
+    try:
+        sub_count = await push_subscriptions.count_documents(query)
+    except Exception:  # noqa: BLE001
+        sub_count = None
+    if sub_count == 0:
+        return {"attempted": False, "sent": 0, "failed": 0,
+                "no_subscribers": True, "error": ""}
+    try:
+        sent, failed = await _fan_out_push(query, title=title, body=body, url="/portal")
+    except Exception as exc:  # noqa: BLE001
+        return {"attempted": True, "sent": 0, "failed": 0,
+                "no_subscribers": False, "error": str(exc)[:200]}
+    sent = int(sent or 0)
+    failed = int(failed or 0)
+    return {"attempted": True, "sent": sent, "failed": failed,
+            "no_subscribers": (sent == 0 and failed == 0), "error": ""}
+
+
+register_speaking_lab_direct_join_routes(
+    api,
+    db,
+    SL_SESSIONS,
+    SL_ENTRIES,
+    _sl_publish,
+    require_student,
+    _norm_student_id,
+    push_notify=_speaking_lab_direct_join_push_notify,
+    log=log,
+)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -5697,6 +5765,7 @@ async def startup():
     await ensure_teacher_admission_indexes(db)
     await ensure_missing_code_recovery_indexes(db)
     await ensure_schedule_assignment_indexes(db)
+    await ensure_direct_join_indexes(db)
     # ── Voice Treasure (Phase 2) — seed default config doc if absent ──
     try:
         from voice_treasure_config_tools import ensure_voice_treasure_indexes
