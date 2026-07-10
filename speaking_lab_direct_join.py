@@ -142,6 +142,30 @@ class MyEntryResponse(BaseModel):
     source: str = ""  # "direct_join" | "legacy" | ""
 
 
+class JoinPreviewExistingEntry(BaseModel):
+    lucky_code: str
+    status: str = "confirmed"
+
+
+class JoinPreviewResponse(BaseModel):
+    """Read-only, pre-join session preview. Never mutates anything — no
+    wallet transfer, no entry creation, no code generation, no push.
+    Lets the PWA distinguish an invalid/nonexistent code (404) from a
+    valid session that simply isn't open for entry yet, which
+    `/my-entry` cannot do (it only ever reports the CALLING student's
+    own entry, never validates the session itself exists)."""
+    ok: bool = True
+    session_id: str
+    session_code: str
+    schedule: str = ""
+    status: str  # "waiting" | "active" | "closed"
+    entry_fee: int = 0
+    pool_total: int = 0
+    player_count: int = 0
+    direct_join_enabled: bool = False
+    existing_entry: Optional[JoinPreviewExistingEntry] = None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Notification — exactly-once, atomic claim on the join record itself
 # ──────────────────────────────────────────────────────────────────────────────
@@ -707,3 +731,77 @@ def register_speaking_lab_direct_join_routes(
             )
 
         return MyEntryResponse(found=False, session_id=session_id)
+
+    @api.get(
+        "/speaking-lab/sessions/{session_or_code}/join-preview",
+        response_model=JoinPreviewResponse,
+        summary="Read-only session preview before a student joins (DARK, no mutation)",
+    )
+    async def join_preview(
+        session_or_code: str,
+        student=Depends(require_student_dep),
+    ) -> JoinPreviewResponse:
+        canonical_student_id = norm_student_id(
+            getattr(student, "clean_id", None) or getattr(student, "student_id", None)
+        )
+        if not canonical_student_id:
+            raise HTTPException(status_code=401, detail="student identity required")
+        session_id = _resolve_session_id(session_or_code)
+        if not session_id:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "session_not_found",
+                        "message": "We couldn't find that session. Check the code with your teacher."},
+            )
+
+        sess = await SL_SESSIONS.find_one({"session_id": session_id}, {"_id": 0})
+        if not sess:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "session_not_found",
+                        "message": "We couldn't find that session. Check the code with your teacher."},
+            )
+
+        # Same rules _direct_join_txn_body uses to decide join eligibility —
+        # a preview must never claim "open" for a session that would 409
+        # the instant the student actually tapped Join.
+        raw_status = (sess.get("status") or "").strip().lower()
+        if _draw_locked(sess) or raw_status not in ALLOWED_SESSION_STATES:
+            preview_status = "closed"
+        else:
+            preview_status = raw_status
+
+        snap = await _pool_snapshot(db, session_id)
+
+        existing_entry: Optional[JoinPreviewExistingEntry] = None
+        join = await db[COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": session_id, "student_id": canonical_student_id,
+             "status": "committed"},
+            {"_id": 0, "lucky_code": 1},
+        )
+        if join and join.get("lucky_code"):
+            existing_entry = JoinPreviewExistingEntry(lucky_code=join["lucky_code"])
+        else:
+            legacy_entry = await SL_ENTRIES.find_one(
+                {"session_id": session_id, "student_id": canonical_student_id,
+                 "paid_entry": True},
+                {"_id": 0},
+            )
+            code_doc = await db[COLLECTION_CODES].find_one(
+                {"session_id": session_id, "student_id": canonical_student_id},
+                {"_id": 0},
+            )
+            if legacy_entry and code_doc and code_doc.get("code"):
+                existing_entry = JoinPreviewExistingEntry(lucky_code=code_doc["code"])
+
+        return JoinPreviewResponse(
+            session_id=session_id,
+            session_code=session_id,
+            schedule=(sess.get("schedule") or ""),
+            status=preview_status,
+            entry_fee=int(sess.get("entry_fee") or 0),
+            pool_total=snap["pool_total"],
+            player_count=snap["player_count"],
+            direct_join_enabled=await flags.direct_join_enabled(db),
+            existing_entry=existing_entry,
+        )
