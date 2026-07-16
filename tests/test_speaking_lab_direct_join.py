@@ -1299,3 +1299,173 @@ async def test_36d_idempotent_replay_is_audited_as_a_held_ticket():
     # And the wallet was only ever charged once.
     wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
     assert wallet["balance"] == 6
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 37. One-tap flow — GET active-session + POST join-active (server-resolved)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_one_tap_client(db, *, as_student="stu777"):
+    from fastapi import APIRouter, FastAPI
+    from fastapi.testclient import TestClient
+
+    api = APIRouter(prefix="/api")
+
+    async def _require_student_dyn():
+        return _Student(as_student)
+
+    dj.register_speaking_lab_direct_join_routes(
+        api, db, db.speaking_lab_sessions, db.speaking_lab_entries,
+        _noop_publish, _require_student_dyn, _norm,
+    )
+    app = FastAPI()
+    app.include_router(api)
+    return TestClient(app)
+
+
+@pytest.mark.asyncio
+async def test_37_active_session_reports_no_session_when_none_live():
+    db = _build_db()
+    await _seed_student(db, "stu777", group="A")
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.get("/api/speaking-lab/active-session")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active"] is False
+    # Never errors, never leaks — just "nothing live". Card hides on this.
+
+
+@pytest.mark.asyncio
+async def test_37b_active_session_resolves_the_live_session_for_the_student():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    db.speaking_lab_sessions._docs[0]["created_at"] = "2026-01-01T00:00:00+00:00"
+    await _seed_student(db, "stu777", group="A")
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.get("/api/speaking-lab/active-session")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active"] is True
+    assert body["session_id"] == "s1"
+    assert body["schedule"] == "A"
+    assert body["entry_fee"] == 4
+    assert body["direct_join_enabled"] is True
+    assert body["existing_entry"] is None
+
+
+@pytest.mark.asyncio
+async def test_37c_active_session_ignores_a_session_the_student_cannot_join():
+    db = _build_db()
+    # Only a Schedule B session is live; a Schedule A student is not eligible.
+    await _seed_session(db, sid="sB", schedule="B", fee=4, status="waiting")
+    await _seed_student(db, "stuA", group="A")
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stuA")
+
+    r = client.get("/api/speaking-lab/active-session")
+    assert r.json()["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_37d_join_active_enrolls_without_a_typed_code_and_assigns_a_ticket():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.post("/api/speaking-lab/join-active", json={"idempotency_key": "uuid-1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_id"] == "s1"
+    assert body["lucky_code"]  # a ticket was assigned
+    # Charged exactly once via the atomic core.
+    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
+    assert wallet["balance"] == 6
+    # And it was audited.
+    rows = db["speaking_lab_enrollment_audit"]._docs
+    assert any(row["outcome"] == "committed" and row["lucky_code_assigned"] for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_37e_join_active_is_idempotent_never_double_charges():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r1 = client.post("/api/speaking-lab/join-active", json={"idempotency_key": "uuid-1"})
+    r2 = client.post("/api/speaking-lab/join-active", json={"idempotency_key": "uuid-2"})
+    assert r1.status_code == 200 and r2.status_code == 200
+    # Same ticket both times, charged only once — even with a DIFFERENT
+    # client idempotency key, because the wallet key is server-derived.
+    assert r1.json()["lucky_code"] == r2.json()["lucky_code"]
+    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
+    assert wallet["balance"] == 6
+
+
+@pytest.mark.asyncio
+async def test_37f_join_active_404s_clearly_when_no_session_is_live():
+    db = _build_db()
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.post("/api/speaking-lab/join-active", json={"idempotency_key": "uuid-1"})
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "no_active_session"
+
+
+@pytest.mark.asyncio
+async def test_37g_join_active_503s_when_direct_join_disabled():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    # flag NOT enabled
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.post("/api/speaking-lab/join-active", json={"idempotency_key": "uuid-1"})
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "direct_join_disabled"
+
+
+@pytest.mark.asyncio
+async def test_37h_active_session_surfaces_the_students_own_existing_ticket():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stu777")
+    client.post("/api/speaking-lab/join-active", json={"idempotency_key": "uuid-1"})
+
+    r = client.get("/api/speaking-lab/active-session")
+    body = r.json()
+    assert body["active"] is True
+    assert body["existing_entry"] is not None
+    assert body["existing_entry"]["lucky_code"]
+
+
+@pytest.mark.asyncio
+async def test_37i_active_session_picks_the_most_recent_when_several_are_live():
+    db = _build_db()
+    await _seed_session(db, sid="old", schedule="AB", fee=4, status="waiting")
+    db.speaking_lab_sessions._docs[-1]["created_at"] = "2026-01-01T00:00:00+00:00"
+    await _seed_session(db, sid="new", schedule="AB", fee=4, status="waiting")
+    db.speaking_lab_sessions._docs[-1]["created_at"] = "2026-06-01T00:00:00+00:00"
+    await _seed_student(db, "stu777", group="A")  # AB admits A
+    await _enable_direct_join(db)
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.get("/api/speaking-lab/active-session")
+    assert r.json()["session_id"] == "new"

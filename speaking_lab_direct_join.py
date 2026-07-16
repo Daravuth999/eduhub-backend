@@ -167,6 +167,24 @@ class JoinPreviewResponse(BaseModel):
     existing_entry: Optional[JoinPreviewExistingEntry] = None
 
 
+class ActiveSessionResponse(BaseModel):
+    """Read-only "is there a live session for me right now?" answer that
+    drives the one-tap My Portal card. The card fires this on open and
+    silently HIDES itself if it fails or ``active`` is false — it never
+    shows an error on the student's main screen. No session code is ever
+    typed: the server resolves the student's eligible live session from
+    their schedule. Never mutates anything."""
+    ok: bool = True
+    active: bool
+    session_id: str = ""
+    schedule: str = ""
+    entry_fee: int = 0
+    pool_total: int = 0
+    player_count: int = 0
+    direct_join_enabled: bool = False
+    existing_entry: Optional[JoinPreviewExistingEntry] = None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Notification — exactly-once, atomic claim on the join record itself
 # ──────────────────────────────────────────────────────────────────────────────
@@ -569,32 +587,51 @@ def register_speaking_lab_direct_join_routes(
         # itself, shown/scanned by the teacher, IS the join code).
         return (session_or_code or "").strip()
 
-    @api.post(
-        "/speaking-lab/sessions/{session_or_code}/direct-join",
-        response_model=DirectJoinResponse,
-        summary="Direct Join — authenticated, atomic Prize Pool entry (DARK)",
-    )
-    async def direct_join(
-        session_or_code: str,
-        body: DirectJoinRequest,
-        student=Depends(require_student_dep),
-    ) -> DirectJoinResponse:
-        if not await flags.direct_join_enabled(db):
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "direct_join_disabled",
-                        "message": "Direct Join is not enabled yet."},
-            )
-        canonical_student_id = norm_student_id(
-            getattr(student, "clean_id", None) or getattr(student, "student_id", None)
+    async def _resolve_active_session(canonical_student_id: str):
+        """Find the ONE live session this student is eligible to join,
+        server-side, so the student never types a code. A session is a
+        candidate when its status is open for entry (waiting/active),
+        its draw is not locked, and the shared schedule-eligibility rule
+        admits this student's group. When several qualify, the most
+        recently created wins (teachers run one session at a time in
+        practice; newest = the one they just started). Read-only."""
+        student_doc = await db.students.find_one(
+            {"$or": [{"clean_id": canonical_student_id},
+                     {"student_id": canonical_student_id}]},
+            {"_id": 0, "group": 1, "schedule": 1},
         )
-        if not canonical_student_id:
-            raise HTTPException(status_code=401, detail="student identity required")
-        display_name = getattr(student, "display_name", None) or canonical_student_id
-        session_id = _resolve_session_id(session_or_code)
-        if not session_id:
-            raise HTTPException(status_code=404, detail="Session not found")
+        student_group = (
+            (student_doc or {}).get("group")
+            or (student_doc or {}).get("schedule")
+            or ""
+        )
+        candidates = []
+        cur = SL_SESSIONS.find({"status": {"$in": list(ALLOWED_SESSION_STATES)}})
+        async for sess in cur:
+            if _draw_locked(sess):
+                continue
+            eligible, _reason = session_schedule_eligibility(
+                student_group, sess.get("schedule"))
+            if eligible:
+                candidates.append(sess)
+        if not candidates:
+            return None
+        # created_at is stored as an ISO-8601 string, which sorts
+        # lexicographically in timestamp order — newest first.
+        candidates.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+        return candidates[0]
 
+    async def _perform_join(
+        session_id: str,
+        canonical_student_id: str,
+        display_name: str,
+        idempotency_key: str,
+    ) -> DirectJoinResponse:
+        """The single atomic enrollment + Lucky Ticket assignment, shared
+        by the code-based `direct-join` route and the one-tap
+        `join-active` route. Behavior is IDENTICAL for both — the only
+        difference upstream is how the session_id was obtained (typed
+        code vs server-resolved active session)."""
         # Shared identifiers for the durable enrollment audit trail. The
         # audit write is purely additive/observability, always fails
         # open, and runs OUTSIDE the payment transaction — a rolled-back
@@ -603,14 +640,14 @@ def register_speaking_lab_direct_join_routes(
         _audit_ctx = {
             "session_id": session_id,
             "student_id": canonical_student_id,
-            "idempotency_key": body.idempotency_key,
+            "idempotency_key": idempotency_key,
         }
 
         try:
             outcome = await _run_direct_join(
                 db, SL_SESSIONS, SL_ENTRIES, norm_student_id,
                 session_id, canonical_student_id, display_name,
-                body.idempotency_key,
+                idempotency_key,
             )
         except DirectJoinError as exc:
             await enroll_audit.record_enrollment_attempt(
@@ -715,6 +752,124 @@ def register_speaking_lab_direct_join_routes(
             player_count=snap["player_count"],
             idempotent_replay=is_replay,
         )
+
+    @api.post(
+        "/speaking-lab/sessions/{session_or_code}/direct-join",
+        response_model=DirectJoinResponse,
+        summary="Direct Join — authenticated, atomic Prize Pool entry (DARK)",
+    )
+    async def direct_join(
+        session_or_code: str,
+        body: DirectJoinRequest,
+        student=Depends(require_student_dep),
+    ) -> DirectJoinResponse:
+        if not await flags.direct_join_enabled(db):
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "direct_join_disabled",
+                        "message": "Direct Join is not enabled yet."},
+            )
+        canonical_student_id = norm_student_id(
+            getattr(student, "clean_id", None) or getattr(student, "student_id", None)
+        )
+        if not canonical_student_id:
+            raise HTTPException(status_code=401, detail="student identity required")
+        display_name = getattr(student, "display_name", None) or canonical_student_id
+        session_id = _resolve_session_id(session_or_code)
+        if not session_id:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return await _perform_join(
+            session_id, canonical_student_id, display_name, body.idempotency_key)
+
+    @api.get(
+        "/speaking-lab/active-session",
+        response_model=ActiveSessionResponse,
+        summary="One-tap driver: is there a live session for me right now? (read-only)",
+    )
+    async def active_session(
+        student=Depends(require_student_dep),
+    ) -> ActiveSessionResponse:
+        canonical_student_id = norm_student_id(
+            getattr(student, "clean_id", None) or getattr(student, "student_id", None)
+        )
+        if not canonical_student_id:
+            raise HTTPException(status_code=401, detail="student identity required")
+
+        dj_enabled = await flags.direct_join_enabled(db)
+        sess = await _resolve_active_session(canonical_student_id)
+        if not sess:
+            return ActiveSessionResponse(active=False, direct_join_enabled=dj_enabled)
+
+        session_id = sess["session_id"]
+        # Surface the student's OWN existing ticket if they already joined
+        # (direct-join record first, then a legacy-paid entry) — never
+        # another student's.
+        existing: Optional[JoinPreviewExistingEntry] = None
+        join = await db[COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": session_id, "student_id": canonical_student_id,
+             "status": "committed"},
+            {"_id": 0, "lucky_code": 1},
+        )
+        if join and join.get("lucky_code"):
+            existing = JoinPreviewExistingEntry(lucky_code=join["lucky_code"])
+        else:
+            legacy_entry = await SL_ENTRIES.find_one(
+                {"session_id": session_id, "student_id": canonical_student_id,
+                 "paid_entry": True},
+                {"_id": 0},
+            )
+            code_doc = await db[COLLECTION_CODES].find_one(
+                {"session_id": session_id, "student_id": canonical_student_id},
+                {"_id": 0},
+            )
+            if legacy_entry and code_doc and code_doc.get("code"):
+                existing = JoinPreviewExistingEntry(lucky_code=code_doc["code"])
+
+        snap = await _pool_snapshot(db, session_id)
+        return ActiveSessionResponse(
+            active=True,
+            session_id=session_id,
+            schedule=(sess.get("schedule") or ""),
+            entry_fee=int(sess.get("entry_fee") or 0),
+            pool_total=snap["pool_total"],
+            player_count=snap["player_count"],
+            direct_join_enabled=dj_enabled,
+            existing_entry=existing,
+        )
+
+    @api.post(
+        "/speaking-lab/join-active",
+        response_model=DirectJoinResponse,
+        summary="One-tap join — server resolves the live session, then atomic entry (DARK)",
+    )
+    async def join_active(
+        body: DirectJoinRequest,
+        student=Depends(require_student_dep),
+    ) -> DirectJoinResponse:
+        if not await flags.direct_join_enabled(db):
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "direct_join_disabled",
+                        "message": "Direct Join is not enabled yet."},
+            )
+        canonical_student_id = norm_student_id(
+            getattr(student, "clean_id", None) or getattr(student, "student_id", None)
+        )
+        if not canonical_student_id:
+            raise HTTPException(status_code=401, detail="student identity required")
+        display_name = getattr(student, "display_name", None) or canonical_student_id
+
+        sess = await _resolve_active_session(canonical_student_id)
+        if not sess:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "no_active_session",
+                        "message": "There's no live Speaking Lab session right now."},
+            )
+        # Identical atomic enrollment as the code-based route — same
+        # exactly-once, idempotent, audited guarantees.
+        return await _perform_join(
+            sess["session_id"], canonical_student_id, display_name, body.idempotency_key)
 
     @api.get(
         "/speaking-lab/sessions/{session_or_code}/my-entry",
