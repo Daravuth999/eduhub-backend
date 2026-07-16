@@ -5763,6 +5763,13 @@ async def startup():
     await ensure_missing_code_recovery_indexes(db)
     await ensure_schedule_assignment_indexes(db)
     await ensure_direct_join_indexes(db)
+    # ── Speaking Lab enrollment audit trail (additive/observability) ──
+    try:
+        import speaking_lab_enrollment_audit as _sl_enroll_audit
+        await _sl_enroll_audit.ensure_enrollment_audit_indexes(db)
+    except Exception as _sl_audit_idx_err:  # noqa: BLE001 — never fatal at startup
+        logging.getLogger("eduhub").warning(
+            "speaking_lab_enrollment_audit: index setup skipped: %s", _sl_audit_idx_err)
     # ── Voice Treasure (Phase 2) — seed default config doc if absent ──
     try:
         from voice_treasure_config_tools import ensure_voice_treasure_indexes

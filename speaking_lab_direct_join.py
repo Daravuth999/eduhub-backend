@@ -56,6 +56,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import wallet_service as ws
 import speaking_lab_feature_flags as flags
+import speaking_lab_enrollment_audit as enroll_audit
 from teacher_admission import (
     ALLOWED_SESSION_STATES,
     COLLECTION_CODES,
@@ -594,6 +595,17 @@ def register_speaking_lab_direct_join_routes(
         if not session_id:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        # Shared identifiers for the durable enrollment audit trail. The
+        # audit write is purely additive/observability, always fails
+        # open, and runs OUTSIDE the payment transaction — a rolled-back
+        # attempt still leaves a row explaining why (see
+        # speaking_lab_enrollment_audit.py).
+        _audit_ctx = {
+            "session_id": session_id,
+            "student_id": canonical_student_id,
+            "idempotency_key": body.idempotency_key,
+        }
+
         try:
             outcome = await _run_direct_join(
                 db, SL_SESSIONS, SL_ENTRIES, norm_student_id,
@@ -601,11 +613,18 @@ def register_speaking_lab_direct_join_routes(
                 body.idempotency_key,
             )
         except DirectJoinError as exc:
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="rejected", reason_code=exc.code,
+                http_status=exc.http_status, lucky_code_assigned=False, log=L)
             raise HTTPException(
                 status_code=exc.http_status,
                 detail={"error": exc.code, "message": exc.message},
             ) from exc
         except ws.InsufficientFunds as exc:
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="insufficient_points",
+                reason_code="insufficient_points", http_status=402,
+                lucky_code_assigned=False, log=L)
             raise HTTPException(
                 status_code=402,
                 detail={"error": "insufficient_points",
@@ -614,18 +633,30 @@ def register_speaking_lab_direct_join_routes(
             ) from exc
         except ws.WalletStatusBlocked as exc:
             status_val = getattr(exc, "status", "blocked")
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="wallet_blocked",
+                reason_code=f"wallet_{status_val}", http_status=403,
+                lucky_code_assigned=False, log=L)
             raise HTTPException(
                 status_code=403,
                 detail={"error": f"wallet_{status_val}",
                         "message": "Your wallet cannot be used right now."},
             ) from exc
         except ws.TransferNotAtomic as exc:
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="join_temporarily_unavailable",
+                reason_code="join_temporarily_unavailable", http_status=503,
+                lucky_code_assigned=False, log=L)
             raise HTTPException(
                 status_code=503,
                 detail={"error": "join_temporarily_unavailable",
                         "message": "Please try again shortly."},
             ) from exc
         except ws.WalletNotFound as exc:
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="wallet_not_ready",
+                reason_code="wallet_not_ready", http_status=503,
+                lucky_code_assigned=False, log=L)
             raise HTTPException(
                 status_code=503,
                 detail={"error": "wallet_not_ready",
@@ -661,7 +692,19 @@ def register_speaking_lab_direct_join_routes(
         if not join.get("lucky_code"):
             # Defense in depth — this should be structurally impossible,
             # but HTTP 200 is forbidden without a durable code, no exceptions.
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="server_error",
+                reason_code="join_code_missing", http_status=500,
+                idempotent_replay=is_replay, lucky_code_assigned=False,
+                join_id=join.get("join_id"), log=L)
             raise HTTPException(status_code=500, detail="join_code_missing")
+
+        # Terminal success — the student holds a durable Lucky Ticket.
+        await enroll_audit.record_enrollment_attempt(
+            db, **_audit_ctx, outcome=outcome["outcome"],
+            reason_code=outcome["outcome"], http_status=200,
+            idempotent_replay=is_replay, lucky_code_assigned=True,
+            join_id=join.get("join_id"), log=L)
 
         return DirectJoinResponse(
             session_id=session_id,

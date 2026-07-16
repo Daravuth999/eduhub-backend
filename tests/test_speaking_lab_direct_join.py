@@ -1170,3 +1170,132 @@ def test_35b_sl_try_auto_enter_unchanged():
             assert digest == BASELINE, "PROTECTED FUNCTION CHANGED: _sl_try_auto_enter"
             return
     pytest.fail("_sl_try_auto_enter not found in server.py")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 36. Durable enrollment audit trail — every terminal path writes a row
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_direct_join_client(db, *, as_student="stu777"):
+    from fastapi import APIRouter, FastAPI
+    from fastapi.testclient import TestClient
+
+    api = APIRouter(prefix="/api")
+
+    async def _require_student_dyn():
+        return _Student(as_student)
+
+    dj.register_speaking_lab_direct_join_routes(
+        api, db, db.speaking_lab_sessions, db.speaking_lab_entries,
+        _noop_publish, _require_student_dyn, _norm,
+    )
+    app = FastAPI()
+    app.include_router(api)
+    return TestClient(app)
+
+
+async def _enable_direct_join(db):
+    import os
+    os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = "true"
+    await db["speaking_lab_settings"].insert_one(
+        {"_id": "feature_flags", "speaking_lab_direct_join_enabled": True})
+
+
+def _audit_rows(db):
+    return db["speaking_lab_enrollment_audit"]._docs
+
+
+@pytest.mark.asyncio
+async def test_36_audit_row_written_on_successful_enrollment():
+    db = _build_db()
+    await _seed_session(db, sid="s1", fee=4)
+    await _seed_student(db, "stu777")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+
+    client = _build_direct_join_client(db, as_student="stu777")
+    resp = client.post("/api/speaking-lab/sessions/s1/direct-join",
+                       json={"idempotency_key": "uuid-1"})
+    assert resp.status_code == 200
+
+    rows = _audit_rows(db)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["outcome"] == "committed"
+    assert row["http_status"] == 200
+    assert row["lucky_code_assigned"] is True
+    assert row["session_id"] == "s1"
+    assert row["student_id"] == "stu777"
+    # The audit trail records that a ticket was assigned, never the code itself.
+    assert "lucky_code" not in row
+
+
+@pytest.mark.asyncio
+async def test_36b_audit_row_written_on_rejection_no_ticket():
+    db = _build_db()
+    # No session seeded -> the txn raises DirectJoinError(session_not_found).
+    await _seed_student(db, "stu777")
+    await _seed_wallet(db, "stu777", 10)
+    await _enable_direct_join(db)
+
+    client = _build_direct_join_client(db, as_student="stu777")
+    resp = client.post("/api/speaking-lab/sessions/ghost/direct-join",
+                       json={"idempotency_key": "uuid-2"})
+    assert resp.status_code == 404
+
+    rows = _audit_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "rejected"
+    assert rows[0]["reason_code"] == "session_not_found"
+    assert rows[0]["http_status"] == 404
+    assert rows[0]["lucky_code_assigned"] is False
+
+
+@pytest.mark.asyncio
+async def test_36c_audit_row_written_on_insufficient_points():
+    db = _build_db()
+    await _seed_session(db, sid="s1", fee=50)
+    await _seed_student(db, "stu777")
+    await _seed_wallet(db, "stu777", 3)  # far below the 50 fee
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+
+    client = _build_direct_join_client(db, as_student="stu777")
+    resp = client.post("/api/speaking-lab/sessions/s1/direct-join",
+                       json={"idempotency_key": "uuid-3"})
+    assert resp.status_code == 402
+
+    rows = _audit_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "insufficient_points"
+    assert rows[0]["http_status"] == 402
+    assert rows[0]["lucky_code_assigned"] is False
+
+
+@pytest.mark.asyncio
+async def test_36d_idempotent_replay_is_audited_as_a_held_ticket():
+    db = _build_db()
+    await _seed_session(db, sid="s1", fee=4)
+    await _seed_student(db, "stu777")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+
+    client = _build_direct_join_client(db, as_student="stu777")
+    r1 = client.post("/api/speaking-lab/sessions/s1/direct-join",
+                     json={"idempotency_key": "uuid-1"})
+    r2 = client.post("/api/speaking-lab/sessions/s1/direct-join",
+                     json={"idempotency_key": "uuid-1"})
+    assert r1.status_code == 200 and r2.status_code == 200
+
+    rows = _audit_rows(db)
+    # Two attempts recorded; the replay still confirms the student holds a
+    # ticket (lucky_code_assigned True) and is flagged idempotent_replay.
+    assert len(rows) == 2
+    replay = rows[1]
+    assert replay["lucky_code_assigned"] is True
+    assert replay["idempotent_replay"] is True
+    # And the wallet was only ever charged once.
+    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
+    assert wallet["balance"] == 6
