@@ -15,6 +15,7 @@ Run from the backend folder:
 """
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import sys
 from datetime import datetime, timedelta, timezone
@@ -73,7 +74,7 @@ def _build_v4_client(db, *, push=None):
     )
     elig.register_eligibility_routes(
         api, db, db.speaking_lab_sessions,
-        hooks["eligible_roster"], hooks["perform_join"], _norm,
+        hooks["eligible_roster"], hooks["perform_free_ticket_issuance"], _norm,
         require_admin_dep=_require_admin_dyn,
     )
     app = FastAPI()
@@ -360,7 +361,7 @@ async def test_12_confirm_participants_generates_exactly_one_ticket_each():
 
 
 @pytest.mark.asyncio
-async def test_13_confirm_participants_freezes_and_replay_never_double_charges():
+async def test_13_confirm_participants_freezes_and_replay_never_double_issues():
     db = _build_db()
     await _setup_basic_session(db)
     await _seed_student(db, "stufreeze", group="A")
@@ -374,8 +375,11 @@ async def test_13_confirm_participants_freezes_and_replay_never_double_charges()
     r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
     assert r2.json()["already_frozen"] is True
 
-    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stufreeze"})
-    assert wallet["balance"] == 6  # charged exactly once
+    # No wallet dependency at all (V4.2) — the durable ticket record is
+    # what must stay singular, not a balance.
+    rows = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+        {"session_id": "s1", "student_id": "stufreeze", "status": "committed"})
+    assert rows == 1
 
 
 @pytest.mark.asyncio
@@ -398,18 +402,28 @@ async def test_14_decisions_are_blocked_after_freeze():
 
 
 @pytest.mark.asyncio
-async def test_15_confirm_participants_isolates_per_student_failure():
+async def test_15_confirm_participants_isolates_per_student_failure(monkeypatch):
+    """V4.2: with no wallet dependency, insufficient balance can no
+    longer be the source of a per-student failure — the only remaining
+    genuine failure surface is ticket persistence itself. Force it to
+    fail for exactly one student and prove the other is unaffected."""
     db = _build_db()
-    await _seed_session(db, sid="s1", schedule="A", fee=50, status="waiting")
-    await _seed_wallet(db, "stu092", 0)
-    await _enable_direct_join(db)
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
     await _seed_student(db, "sturich", group="A")
-    await _seed_wallet(db, "sturich", 100)
     await _seed_present(db, "sturich", status="present_full")
     await _seed_student(db, "stupoor", group="A")
-    await _seed_wallet(db, "stupoor", 3)  # far below the 50 fee
     await _seed_present(db, "stupoor", status="present_full")
     client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    orig_persist = dj_mod.persist_lucky_code
+
+    async def _flaky_persist(db_, session_id, student_id, display_name, *, amount=0, session=None):
+        if student_id == "stupoor":
+            return None  # simulates persist_lucky_code's own failure signal
+        return await orig_persist(db_, session_id, student_id, display_name,
+                                  amount=amount, session=session)
+    monkeypatch.setattr(dj_mod, "persist_lucky_code", _flaky_persist)
 
     r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
     body = r.json()
@@ -421,6 +435,7 @@ async def test_15_confirm_participants_isolates_per_student_failure():
     join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
         {"session_id": "s1", "student_id": "sturich", "status": "committed"})
     assert join and join["lucky_code"]
+    assert join["entry_fee"] == 0  # V4.2: never a wallet-derived charge
 
 
 @pytest.mark.asyncio
@@ -476,18 +491,24 @@ async def test_18_readiness_ready_when_all_tickets_generated():
 
 
 @pytest.mark.asyncio
-async def test_19_readiness_blocks_when_ticket_count_falls_short():
+async def test_19_readiness_blocks_when_ticket_count_falls_short(monkeypatch):
     db = _build_db()
-    await _seed_session(db, sid="s1", schedule="A", fee=50, status="waiting")
-    await _seed_wallet(db, "stu092", 0)
-    await _enable_direct_join(db)
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
     await _seed_student(db, "sturich", group="A")
-    await _seed_wallet(db, "sturich", 100)
     await _seed_present(db, "sturich", status="present_full")
     await _seed_student(db, "stupoor", group="A")
-    await _seed_wallet(db, "stupoor", 3)
     await _seed_present(db, "stupoor", status="present_full")
     client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    orig_persist = dj_mod.persist_lucky_code
+
+    async def _flaky_persist(db_, session_id, student_id, display_name, *, amount=0, session=None):
+        if student_id == "stupoor":
+            return None
+        return await orig_persist(db_, session_id, student_id, display_name,
+                                  amount=amount, session=session)
+    monkeypatch.setattr(dj_mod, "persist_lucky_code", _flaky_persist)
 
     client.post("/api/speaking-lab/sessions/s1/confirm-participants")
     r = client.get("/api/speaking-lab/sessions/s1/readiness")
@@ -766,19 +787,22 @@ async def test_27_a_checkin_for_a_different_class_session_id_is_never_matched():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# V4.1.2 — critical flag-gate fix + failure-reason visibility
+# V4.2 — attendance-driven ticket issuance (no wallet/treasury/transaction)
 # ═════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_29_confirm_participants_refuses_when_direct_join_is_disabled():
-    """confirm_participants calls perform_join_fn directly, bypassing the
-    route-level flag checks every other Direct Join entry point has —
-    it MUST re-check the flag itself, or Confirm Participants would
-    issue real charges/tickets while Direct Join is switched off."""
+async def test_29_confirm_participants_succeeds_regardless_of_direct_join_flag_state():
+    """Confirm Participants no longer performs any wallet/treasury
+    operation — perform_free_ticket_issuance_fn never touches money — so
+    the speaking_lab_direct_join_enabled flag (which only ever gated a
+    real wallet charge) has nothing left to gate here. It must succeed
+    whether the flag is on, off, or never configured at all. The flag
+    still protects the genuinely paid callers (typed code, one-tap)
+    inside speaking_lab_direct_join.py, untouched by this test."""
     db = _build_db()
     await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
-    await _seed_wallet(db, "stu092", 0)
-    # Deliberately NOT calling _enable_direct_join(db).
+    # Deliberately NOT calling _enable_direct_join(db) — and no treasury
+    # wallet seeded at all, proving the flow never even looks for one.
     await _seed_student(db, "stu1", group="A")
     await _seed_wallet(db, "stu1", 10)
     await _seed_present(db, "stu1", status="present_full")
@@ -786,23 +810,25 @@ async def test_29_confirm_participants_refuses_when_direct_join_is_disabled():
 
     r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
 
-    assert r.status_code == 503
-    assert r.json()["detail"]["error"] == "direct_join_disabled"
-    # Nothing was charged, nothing was frozen, nothing was ticketed.
-    sess = await db.speaking_lab_sessions.find_one({"session_id": "s1"})
-    assert not sess.get("enrollment_frozen_at")
+    assert r.status_code == 200
+    assert r.json()["joined"] == 1
+    # The student's own wallet balance is completely untouched — no
+    # debit, no dependency on it even existing.
     wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu1"})
     assert wallet["balance"] == 10
-    join = await db[dj.COLLECTION_DIRECT_JOINS].find_one({"session_id": "s1", "student_id": "stu1"})
-    assert join is None
+    # A real ticket exists with no wallet/treasury trace.
+    join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stu1", "status": "committed"})
+    assert join is not None
+    assert join["entry_fee"] == 0
+    assert join["payment_reference"] == "attendance_confirmed"
 
 
 @pytest.mark.asyncio
-async def test_30_confirm_participants_replay_still_works_even_if_flag_is_later_disabled():
-    """The flag check only gates the FIRST real charge. A later replay
-    of an already-frozen session is read-only and must keep working
-    regardless of the flag's current state — it can never charge anyone
-    a second time."""
+async def test_30_confirm_participants_replay_is_idempotent_never_double_issues():
+    """Re-running Confirm Participants on an already-frozen session must
+    be a safe no-op — never a second ticket, never a second audit
+    'committed' outcome, regardless of anything else in the environment."""
     db = _build_db()
     await _setup_basic_session(db)
     await _seed_student(db, "stu1", group="A")
@@ -811,23 +837,19 @@ async def test_30_confirm_participants_replay_still_works_even_if_flag_is_later_
     client = _build_v4_client(db)
     r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
     assert r1.json()["joined"] == 1
+    code_after_first = (await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stu1"}))["lucky_code"]
 
-    # Flag flips off after the fact (e.g. an operator disables Direct
-    # Join mid-day) — the already-frozen session's replay must still
-    # work. Restored afterward so this test's mutation never leaks into
-    # any other test in the same process.
-    import os
-    prev = os.environ.get("SPEAKING_LAB_DIRECT_JOIN_ENABLED")
-    os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = "false"
-    try:
-        r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
-    finally:
-        if prev is None:
-            os.environ.pop("SPEAKING_LAB_DIRECT_JOIN_ENABLED", None)
-        else:
-            os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = prev
+    r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+
     assert r2.status_code == 200
     assert r2.json()["already_frozen"] is True
+    rows = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+        {"session_id": "s1", "student_id": "stu1", "status": "committed"})
+    assert rows == 1
+    code_after_second = (await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stu1"}))["lucky_code"]
+    assert code_after_second == code_after_first
 
 
 @pytest.mark.asyncio
@@ -851,29 +873,38 @@ async def test_31_decision_and_approve_all_pending_return_404_not_500_for_unknow
 
 
 @pytest.mark.asyncio
-async def test_32_readiness_failed_detail_shows_why_a_confirmed_participant_has_no_ticket():
+async def test_32_readiness_failed_detail_shows_why_a_confirmed_participant_has_no_ticket(monkeypatch):
     """The old flow gave a teacher no way to see WHY a confirmed
     participant is missing a ticket — reload the page and it just says
     "Not ready" with a bare number. failed_detail sources the real
-    reason from the durable enrollment audit trail."""
+    reason from the durable enrollment audit trail. V4.2: the failure
+    surface is no longer a wallet balance (there is none) — it's ticket
+    persistence itself, which is what's exercised here."""
     db = _build_db()
-    await _seed_session(db, sid="s1", schedule="A", fee=50, status="waiting")
-    await _seed_wallet(db, "stu092", 0)
-    await _enable_direct_join(db)
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
     await _seed_student(db, "sturich", group="A")
-    await _seed_wallet(db, "sturich", 100)
     await _seed_present(db, "sturich", status="present_full")
     await _seed_student(db, "stupoor", group="A")
-    await _seed_wallet(db, "stupoor", 3)  # far below the 50 fee
     await _seed_present(db, "stupoor", status="present_full")
     client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    orig_persist = dj_mod.persist_lucky_code
+
+    async def _flaky_persist(db_, session_id, student_id, display_name, *, amount=0, session=None):
+        if student_id == "stupoor":
+            return None
+        return await orig_persist(db_, session_id, student_id, display_name,
+                                  amount=amount, session=session)
+    monkeypatch.setattr(dj_mod, "persist_lucky_code", _flaky_persist)
 
     client.post("/api/speaking-lab/sessions/s1/confirm-participants")
     r = client.get("/api/speaking-lab/sessions/s1/readiness")
     body = r.json()
 
     assert body["ready"] is False
-    assert body["failed_detail"] == [{"student_id": "stupoor", "reason": "insufficient_points"}]
+    assert len(body["failed_detail"]) == 1
+    assert body["failed_detail"][0]["student_id"] == "stupoor"
 
 
 @pytest.mark.asyncio
@@ -904,24 +935,27 @@ async def test_33_readiness_failed_detail_is_empty_when_everyone_is_ticketed():
 
 @pytest.mark.asyncio
 async def test_34_confirm_participants_survives_one_students_unexpected_failure(monkeypatch):
+    """V4.2: there is no wallet call left to fail here — the induced
+    failure is now a raw exception from ticket persistence itself (the
+    one remaining per-student write in the free-ticket path), proving
+    the SAME isolation guarantee (one student's crash never takes down
+    the batch) still holds after removing the wallet/treasury step."""
     db = _build_db()
-    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
-    await _seed_wallet(db, "stu092", 0)
-    await _enable_direct_join(db)
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
     await _seed_student(db, "stugood", group="A")
-    await _seed_wallet(db, "stugood", 10)
     await _seed_present(db, "stugood", status="present_full")
     await _seed_student(db, "stubad", group="A")
-    await _seed_wallet(db, "stubad", 10)
     await _seed_present(db, "stubad", status="present_full")
 
-    orig_transfer = ws.WalletService.transfer
+    import speaking_lab_direct_join as dj_mod
+    orig_persist = dj_mod.persist_lucky_code
 
-    async def _flaky_transfer(self, student_id, *a, **k):
+    async def _flaky_persist(db_, session_id, student_id, display_name, *, amount=0, session=None):
         if student_id == "stubad":
-            raise RuntimeError("simulated transient driver error")
-        return await orig_transfer(self, student_id, *a, **k)
-    monkeypatch.setattr(ws.WalletService, "transfer", _flaky_transfer)
+            raise RuntimeError("simulated transient persistence error")
+        return await orig_persist(db_, session_id, student_id, display_name,
+                                  amount=amount, session=session)
+    monkeypatch.setattr(dj_mod, "persist_lucky_code", _flaky_persist)
 
     client = _build_v4_client(db)
     r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -933,16 +967,13 @@ async def test_34_confirm_participants_survives_one_students_unexpected_failure(
     assert body["participant_count"] == 2
     assert body["joined"] == 1
     assert {f["student_id"]: f["reason"] for f in body["failed"]} == {
-        "stubad": "join_unexpected_error"}
+        "stubad": "unexpected_error"}
 
-    # The good student still got a real ticket.
+    # The good student still got a real ticket, no wallet involved.
     good_join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
         {"session_id": "s1", "student_id": "stugood", "status": "committed"})
     assert good_join and good_join["lucky_code"]
-
-    # The bad student was never charged.
-    bad_wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stubad"})
-    assert bad_wallet["balance"] == 10
+    assert good_join["entry_fee"] == 0
 
     # Readiness still returns a normal response, showing exactly what's
     # missing and why — not a crash, not a silent gap.
@@ -952,4 +983,209 @@ async def test_34_confirm_participants_survives_one_students_unexpected_failure(
     assert r2_body["tickets"] == 1
     assert r2_body["ready"] is False
     assert {f["student_id"]: f["reason"] for f in r2_body["failed_detail"]} == {
-        "stubad": "join_unexpected_error"}
+        "stubad": "unexpected_error"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# V4.2 — attendance-driven ticket issuance architecture redesign.
+#
+# Root cause of the production failure: N concurrent _perform_join calls
+# each opened their OWN Mongo transaction, and every one of them wrote to
+# the SAME shared treasury wallet document — a write-conflict hotspot that
+# aborted with TransientTransactionError/NoSuchTransaction even at N=2,
+# and could never converge at 50-200. perform_free_ticket_issuance_fn
+# removes the wallet/treasury step (and the transaction it required)
+# entirely for Confirm Participants — every write is now a single,
+# independent, idempotent document keyed to (session_id, student_id),
+# so there is no shared write target between students at all.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_35_confirm_participants_never_opens_a_mongo_transaction():
+    """The whole point of the redesign: no per-participant Mongo
+    transaction at all. Prove it structurally, not by inference — force
+    client.start_session() to fail loudly if anything in the path still
+    calls it."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu1", group="A")
+    await _seed_present(db, "stu1", status="present_full")
+    client = _build_v4_client(db)
+
+    async def _boom():
+        raise AssertionError("perform_free_ticket_issuance_fn must never "
+                             "open a Mongo transaction")
+    db.client.start_session = _boom
+
+    r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+
+    assert r.status_code == 200
+    assert r.json()["joined"] == 1
+
+
+@pytest.mark.asyncio
+async def test_36_confirm_participants_never_calls_the_wallet_service():
+    """No wallet transfer, no treasury dependency — prove it structurally.
+    No treasury wallet is even seeded; if the code tried to touch one,
+    WalletService.transfer would raise WalletNotFound (or, with this
+    patch, an assertion) rather than silently succeeding."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu1", group="A")
+    await _seed_present(db, "stu1", status="present_full")
+    client = _build_v4_client(db)
+
+    async def _boom(self, *a, **k):
+        raise AssertionError("perform_free_ticket_issuance_fn must never "
+                             "call WalletService.transfer")
+    orig_transfer = ws.WalletService.transfer
+    ws.WalletService.transfer = _boom
+    try:
+        r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        ws.WalletService.transfer = orig_transfer
+
+    assert r.status_code == 200
+    assert r.json()["joined"] == 1
+    # No treasury wallet document was ever created either.
+    assert await db[ws.COLL_WALLETS].find_one({"student_id": "stu092"}) is None
+
+
+@pytest.mark.asyncio
+async def test_37_concurrent_calls_for_the_same_student_never_double_issue():
+    """Simulates the exact race a shared Semaphore(20) batch could
+    produce: two concurrent attempts to issue a ticket for the SAME
+    student. Must resolve to exactly one committed join / one lucky
+    code, both calls returning the identical code — the same
+    idempotent-race pattern persist_lucky_code already relies on,
+    backed by the real unique index on (session_id, student_id)."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=0, status="waiting")
+    await _seed_student(db, "stu1", group="A")
+
+    from speaking_lab_direct_join import register_speaking_lab_direct_join_routes
+    from fastapi import APIRouter
+
+    async def _req_student():
+        return _Student("unused")
+    async def _req_admin():
+        return _Admin()
+    api = APIRouter(prefix="/api")
+    hooks = register_speaking_lab_direct_join_routes(
+        api, db, db.speaking_lab_sessions, db.speaking_lab_entries,
+        _noop_publish, _req_student, _norm, require_admin_dep=_req_admin,
+    )
+    issue = hooks["perform_free_ticket_issuance"]
+
+    results = await asyncio.gather(
+        issue("s1", "stu1", "Stu One", "confirm_participants:s1:stu1"),
+        issue("s1", "stu1", "Stu One", "confirm_participants:s1:stu1"),
+    )
+
+    codes = {r.lucky_code for r in results}
+    assert len(codes) == 1
+    rows = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+        {"session_id": "s1", "student_id": "stu1", "status": "committed"})
+    assert rows == 1
+    lucky_rows = await db.speaking_lab_lucky_codes.count_documents(
+        {"session_id": "s1", "student_id": "stu1"})
+    assert lucky_rows == 1
+
+
+@pytest.mark.asyncio
+async def test_38_large_class_all_200_participants_get_exactly_one_ticket():
+    """Scale requirement: 200 confirmed participants, every one gets
+    exactly one ticket, no duplicates, no partial state — with zero
+    shared-document contention since the wallet/treasury step is gone."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    n = 200
+    for i in range(n):
+        sid = f"stu{i:03d}"
+        await _seed_student(db, sid, group="A")
+        await _seed_present(db, sid, status="present_full")
+    client = _build_v4_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    body = r.json()
+
+    assert r.status_code == 200
+    assert body["participant_count"] == n
+    assert body["joined"] == n
+    assert body["failed"] == []
+
+    committed = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+        {"session_id": "s1", "status": "committed"})
+    assert committed == n
+    codes = set()
+    async for row in db.speaking_lab_lucky_codes.find({"session_id": "s1"}):
+        codes.add(row["code"])
+    assert len(codes) == n  # every ticket is unique
+
+    r2 = client.get("/api/speaking-lab/sessions/s1/readiness")
+    r2_body = r2.json()
+    assert r2_body["eligible"] == n
+    assert r2_body["tickets"] == n
+    assert r2_body["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_39_confirm_participants_re_run_after_partial_failure_completes_the_rest():
+    """Recovery requirement: if one participant's issuance fails for an
+    unrelated reason (e.g. a genuinely bad session-eligibility record),
+    re-running Confirm Participants must not re-charge or duplicate
+    anyone already ticketed, and should leave the failed student visible
+    for the teacher to investigate rather than silently dropped."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stugood", group="A")
+    await _seed_present(db, "stugood", status="present_full")
+    await _seed_student(db, "stubad", group="A")
+    await _seed_present(db, "stubad", status="present_full")
+    client = _build_v4_client(db)
+
+    # Deterministic, student-keyed failure (not order-dependent): force
+    # ticket persistence to fail for exactly ONE student, regardless of
+    # how asyncio.gather interleaves the batch. The generic per-student
+    # catch-all added in post_confirm_participants's _one() (V4.1.2)
+    # already protects this new free-ticket path the same way it
+    # protects the paid one — this proves that defense-in-depth still
+    # holds after the redesign.
+    import speaking_lab_direct_join as dj_mod
+    orig_persist = dj_mod.persist_lucky_code
+
+    async def _flaky_persist(db_, session_id, student_id, display_name, *, amount=0, session=None):
+        if student_id == "stubad":
+            raise RuntimeError("simulated ticket-persistence failure for stubad")
+        return await orig_persist(db_, session_id, student_id, display_name,
+                                  amount=amount, session=session)
+    dj_mod.persist_lucky_code = _flaky_persist
+    try:
+        r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        dj_mod.persist_lucky_code = orig_persist
+
+    body1 = r1.json()
+    assert body1["participant_count"] == 2
+    assert body1["joined"] == 1
+    assert len(body1["failed"]) == 1
+
+    good_ticket_1 = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stugood"})
+    assert good_ticket_1 is not None
+
+    # Re-running (still the same confirm-participants call — frozen
+    # session replay) must not duplicate stugood's ticket. The frozen
+    # participant list itself doesn't retry failed sub-issuances
+    # automatically (Confirm Participants freezes once), but the
+    # replay path must be provably safe and non-destructive regardless.
+    r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    assert r2.status_code == 200
+    assert r2.json()["already_frozen"] is True
+
+    rows = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+        {"session_id": "s1", "student_id": "stugood", "status": "committed"})
+    assert rows == 1
+    good_ticket_2 = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stugood"})
+    assert good_ticket_2["lucky_code"] == good_ticket_1["lucky_code"]

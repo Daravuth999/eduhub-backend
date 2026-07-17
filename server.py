@@ -5734,7 +5734,7 @@ register_eligibility_routes(
     db,
     SL_SESSIONS,
     _sl_direct_join_hooks.get("eligible_roster"),
-    _sl_direct_join_hooks.get("perform_join"),
+    _sl_direct_join_hooks.get("perform_free_ticket_issuance"),
     _norm_student_id,
     require_admin_dep=require_admin,
     log=log,

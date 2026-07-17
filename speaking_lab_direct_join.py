@@ -821,6 +821,204 @@ def register_speaking_lab_direct_join_routes(
             idempotent_replay=is_replay,
         )
 
+    async def _perform_free_ticket_issuance(
+        session_id: str,
+        canonical_student_id: str,
+        display_name: str,
+        idempotency_key: str,
+    ) -> DirectJoinResponse:
+        """Attendance-driven ticket issuance for Speaking Lab V4 Confirm
+        Participants — NO wallet transfer, NO treasury, NO Mongo
+        multi-document transaction. Every write here is a single,
+        idempotent operation on a document keyed uniquely to (session_id,
+        canonical_student_id), so N concurrent students never contend on
+        a shared document the way _perform_join's per-student treasury
+        debit did — that contention (every participant's transaction
+        writing the SAME treasury wallet doc) is what caused repeated
+        TransientTransactionError/NoSuchTransaction aborts in production
+        at just 2 concurrent participants, and would only get worse at
+        50-200.
+
+        _perform_join (paid, wallet-backed) is completely untouched and
+        stays the only path for any genuinely-paid Direct Join caller
+        (typed code, one-tap). This is a new, parallel sibling — never a
+        replacement, never a second ticket format.
+
+        Ticket format and delivery are byte-identical to the paid path:
+        persist_lucky_code / notify_speaking_lab_join are reused
+        unchanged, so Lucky Draw, Mystery Box, and reward payout — all of
+        which read only speaking_lab_lucky_codes / speaking_lab_direct_joins
+        — cannot tell the two paths apart."""
+        _audit_ctx = {
+            "session_id": session_id,
+            "student_id": canonical_student_id,
+            "idempotency_key": idempotency_key,
+        }
+
+        # 1) Idempotent replay — a committed ticket already exists. No
+        #    transaction needed for this check: it's a single read on a
+        #    document keyed to this exact student, nothing to race with.
+        existing_join = await db[COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": session_id, "student_id": canonical_student_id,
+             "status": "committed"},
+            {"_id": 0},
+        )
+        if existing_join:
+            snap = await _pool_snapshot(db, session_id)
+            return DirectJoinResponse(
+                session_id=session_id,
+                lucky_code=existing_join["lucky_code"],
+                position=0,  # _perform_join's own replay branch also omits position
+                entry_fee=0,
+                pool_total=snap["pool_total"],
+                player_count=snap["player_count"],
+                idempotent_replay=True,
+            )
+
+        # 2) Session state + schedule eligibility — read-only validation.
+        #    No transaction: nothing is written until every check passes.
+        try:
+            sess = await SL_SESSIONS.find_one({"session_id": session_id})
+            if not sess:
+                raise DirectJoinError("session_not_found", http_status=404)
+            locked = _draw_locked(sess)
+            if locked:
+                raise DirectJoinError(
+                    "draw_locked", f"Session is locked ({locked}).", http_status=409)
+            sess_status = (sess.get("status") or "").strip().lower()
+            if sess_status not in ALLOWED_SESSION_STATES:
+                raise DirectJoinError(
+                    "session_not_open",
+                    f"Session state '{sess_status}' does not accept enrollment.",
+                    http_status=422)
+            student_doc = await db.students.find_one(
+                {"$or": [{"clean_id": canonical_student_id},
+                         {"student_id": canonical_student_id}]},
+                {"_id": 0, "group": 1, "schedule": 1},
+            )
+            student_group = (student_doc or {}).get("group") or (student_doc or {}).get("schedule") or ""
+            elig_ok, reason = session_schedule_eligibility(student_group, sess.get("schedule"))
+            if not elig_ok:
+                raise DirectJoinError(reason, http_status=409)
+        except DirectJoinError as exc:
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="rejected", reason_code=exc.code,
+                http_status=exc.http_status, lucky_code_assigned=False, log=L)
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={"error": exc.code, "message": exc.message},
+            ) from exc
+
+        display_name_key = display_name.lower()
+
+        # 3) Upsert exactly one entry doc — no wallet/treasury fields.
+        #    A single-document upsert on a per-student filter is atomic
+        #    regardless of concurrency; there is no cross-student overlap
+        #    to contend on (every other participant upserts a DIFFERENT
+        #    (session_id, student_id) document).
+        entry_id = "ent_" + uuid.uuid4().hex
+        position = (await SL_ENTRIES.count_documents({"session_id": session_id})) + 1
+        await SL_ENTRIES.update_one(
+            {"session_id": session_id, "student_id": canonical_student_id},
+            {"$set": {
+                "session_id": session_id, "student_id": canonical_student_id,
+                "entry_id": entry_id, "display_name": display_name,
+                "display_name_key": display_name_key, "position": position,
+                "paid_entry": True, "eligible": True,
+                "source": "speaking_lab_attendance_confirmed",
+                "entered_at": utcnow().isoformat(),
+            }},
+            upsert=True,
+        )
+
+        # 4) Persist exactly one lucky code — UNCHANGED, already
+        #    idempotent (a concurrent/duplicate insert race resolves to
+        #    the winning row via its own internal re-fetch).
+        code_doc = await persist_lucky_code(
+            db, session_id, canonical_student_id, display_name, amount=0,
+        )
+        if not code_doc or not code_doc.get("code"):
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="server_error",
+                reason_code="code_persist_failed", http_status=500,
+                lucky_code_assigned=False, log=L)
+            raise HTTPException(status_code=500, detail="code_persist_failed")
+        code_id = code_doc.get("code_id")
+
+        # 5) Insert exactly one committed join record. The unique index
+        #    on (session_id, student_id) already backing
+        #    speaking_lab_direct_joins (ensure_direct_join_indexes) makes
+        #    a concurrent duplicate insert fail at the DB layer — resolved
+        #    by re-reading the winner, the same idempotent-race pattern
+        #    persist_lucky_code already uses just above.
+        join_id = "djn_" + uuid.uuid4().hex
+        now = utcnow()
+        join_doc = {
+            "join_id": join_id, "session_id": session_id,
+            "student_id": canonical_student_id,
+            "idempotency_key": idempotency_key,
+            "entry_fee": 0,
+            "payment_reference": "attendance_confirmed",
+            "entry_id": entry_id,
+            "lucky_code_id": code_id,
+            "lucky_code": code_doc["code"],
+            "status": "committed",
+            "adopted_legacy": False,
+            "created_at": now.isoformat(),
+            "committed_at": now.isoformat(),
+            "notification_status": None,
+            "notification_attempt_id": None,
+            "notification_attempted_at": None,
+            "notification_sent_at": None,
+            "notification_error": None,
+        }
+        is_replay = False
+        try:
+            await db[COLLECTION_DIRECT_JOINS].insert_one(dict(join_doc))
+        except Exception:
+            winner = await db[COLLECTION_DIRECT_JOINS].find_one(
+                {"session_id": session_id, "student_id": canonical_student_id,
+                 "status": "committed"},
+                {"_id": 0},
+            )
+            if not winner:
+                raise
+            join_doc = winner
+            is_replay = True
+
+        # ── Post-commit side effects only — never blocking ticket success ──
+        if not is_replay:
+            await publish_lucky_code_events(
+                db, sl_publish, session_id, canonical_student_id,
+                display_name, code_doc, log=L,
+            )
+        try:
+            await notify_speaking_lab_join(
+                db, push_notify, join_doc["join_id"], canonical_student_id,
+                join_doc["lucky_code"], log=L,
+            )
+        except Exception as exc:  # noqa: BLE001
+            L.warning("speaking_lab_direct_join: free-ticket notify raised "
+                     "(join stays committed) join_id=%s err=%s",
+                     join_doc.get("join_id"), str(exc)[:200])
+
+        snap = await _pool_snapshot(db, session_id)
+        await enroll_audit.record_enrollment_attempt(
+            db, **_audit_ctx, outcome="committed" if not is_replay else "replayed",
+            reason_code="committed" if not is_replay else "replayed", http_status=200,
+            idempotent_replay=is_replay, lucky_code_assigned=True,
+            join_id=join_doc.get("join_id"), log=L)
+
+        return DirectJoinResponse(
+            session_id=session_id,
+            lucky_code=join_doc["lucky_code"],
+            position=position,
+            entry_fee=0,
+            pool_total=snap["pool_total"],
+            player_count=snap["player_count"],
+            idempotent_replay=is_replay,
+        )
+
     async def _eligible_roster(sess: dict) -> list[dict]:
         """Every student eligible for THIS session's schedule, per the
         exact same session_schedule_eligibility rule _perform_join
@@ -1248,4 +1446,8 @@ def register_speaking_lab_direct_join_routes(
         # implementation.
         "eligible_roster": _eligible_roster,
         "perform_join": _perform_join,
+        # V4.2: attendance-confirmed ticket issuance — no wallet/treasury,
+        # no Mongo transaction. A separate sibling, not a replacement;
+        # _perform_join above stays untouched for any genuinely-paid caller.
+        "perform_free_ticket_issuance": _perform_free_ticket_issuance,
     }

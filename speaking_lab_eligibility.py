@@ -76,7 +76,6 @@ from typing import Any, Awaitable, Callable, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-import speaking_lab_feature_flags as flags
 import speaking_lab_enrollment_audit as enroll_audit
 
 logger = logging.getLogger("eduhub.speaking_lab_eligibility")
@@ -328,14 +327,19 @@ def register_eligibility_routes(
     db,
     SL_SESSIONS,
     eligible_roster_fn: Callable[[dict], Awaitable[list[dict]]],
-    perform_join_fn: Callable[[str, str, str, str], Awaitable[Any]],
+    perform_free_ticket_issuance_fn: Callable[[str, str, str, str], Awaitable[Any]],
     norm_student_id: Callable[[Any], str],
     require_admin_dep,
     log: Optional[logging.Logger] = None,
 ) -> None:
-    """``eligible_roster_fn`` and ``perform_join_fn`` are the SAME closures
-    speaking_lab_direct_join.py's route factory returns — this module
-    never re-implements schedule eligibility or the atomic join core."""
+    """``eligible_roster_fn`` and ``perform_free_ticket_issuance_fn`` are
+    SAME closures speaking_lab_direct_join.py's route factory returns —
+    this module never re-implements schedule eligibility or ticket
+    issuance. ``perform_free_ticket_issuance_fn`` (V4.2) is the
+    attendance-driven, no-wallet, no-transaction sibling of
+    ``_perform_join`` — Confirm Participants never touches a wallet,
+    treasury, or Mongo multi-document transaction; the paid
+    ``_perform_join`` core stays completely separate and unused here."""
     L = log or logger
 
     async def _session_or_404(session_id: str) -> dict:
@@ -546,19 +550,16 @@ def register_eligibility_routes(
                 already_had_ticket=r["tickets"], failed=[],
             )
 
-        # This is a real financial action about to happen (per-student
-        # wallet charges via _perform_join) — it MUST re-check the same
-        # AND-gated flag every other Direct Join entry point enforces.
-        # perform_join_fn itself does not check this flag (by design —
-        # every CALLER is responsible for its own gating), so skipping
-        # this check here would let Confirm Participants issue real
-        # charges/tickets even while Direct Join is switched off.
-        if not await flags.direct_join_enabled(db):
-            raise HTTPException(
-                status_code=503,
-                detail={"error": "direct_join_disabled",
-                        "message": "Direct Join is not enabled yet."},
-            )
+        # NOTE (V4.2): this used to re-check speaking_lab_direct_join_enabled
+        # here, because confirming participants used to trigger a real
+        # per-student wallet charge via _perform_join. It no longer does —
+        # perform_free_ticket_issuance_fn performs no wallet/treasury
+        # operation at all, so there is no financial action left for that
+        # flag to gate. Keeping the check would only block free ticket
+        # issuance for no reason (and reproduce the exact "Direct Join is
+        # not enabled yet" confusion this flag was never meant to cause
+        # for a non-financial flow). The flag still gates the genuinely
+        # paid callers (typed code, one-tap) inside speaking_lab_direct_join.py.
 
         # Computed and stored ONCE, here, at the moment of freeze. Every
         # later read (readiness, a replayed confirm call) uses this stored
@@ -583,7 +584,7 @@ def register_eligibility_routes(
             async with sem:
                 idem_key = f"confirm_participants:{session_id}:{entry['student_id']}"
                 try:
-                    result = await perform_join_fn(
+                    result = await perform_free_ticket_issuance_fn(
                         session_id, entry["student_id"], entry["display_name"], idem_key,
                     )
                     if getattr(result, "idempotent_replay", False):
