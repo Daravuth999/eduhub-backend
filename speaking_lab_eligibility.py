@@ -76,6 +76,9 @@ from typing import Any, Awaitable, Callable, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
+import speaking_lab_feature_flags as flags
+import speaking_lab_enrollment_audit as enroll_audit
+
 logger = logging.getLogger("eduhub.speaking_lab_eligibility")
 
 COLLECTION_OVERRIDES = "speaking_lab_eligibility_overrides"
@@ -183,9 +186,12 @@ class ReadinessResponse(BaseModel):
     ready: bool
     # The durable, frozen-at-confirm-time participant set (never
     # recomputed from live roster state) — the exact student IDs a
-    # teacher-app "Start Lucky Draw" action should hand off to the game.
+    # teacher-app "Start Session" action should hand off to the game.
     # Empty before freeze.
     participant_ids: list[str] = []
+    # Why a confirmed participant is missing a ticket, sourced from the
+    # durable enrollment audit trail (never a guess) — empty when ready.
+    failed_detail: list[dict] = []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -439,7 +445,13 @@ def register_eligibility_routes(
             raise HTTPException(status_code=422, detail="student_id is required")
         if decision not in VALID_DECISIONS:
             raise HTTPException(status_code=422, detail=f"decision must be one of {sorted(VALID_DECISIONS)}")
-        sess = await _session_or_404(session_id)
+        try:
+            sess = await _session_or_404(session_id)
+        except EligibilityError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={"error": exc.code, "message": exc.message},
+            ) from exc
         if sess.get("enrollment_frozen_at"):
             raise HTTPException(
                 status_code=409,
@@ -470,7 +482,13 @@ def register_eligibility_routes(
     async def post_approve_all_pending(
         session_id: str, admin=Depends(require_admin_dep),
     ) -> dict:
-        sess = await _session_or_404(session_id)
+        try:
+            sess = await _session_or_404(session_id)
+        except EligibilityError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={"error": exc.code, "message": exc.message},
+            ) from exc
         if sess.get("enrollment_frozen_at"):
             raise HTTPException(
                 status_code=409,
@@ -509,15 +527,37 @@ def register_eligibility_routes(
     async def post_confirm_participants(
         session_id: str, admin=Depends(require_admin_dep), max_concurrency: int = 20,
     ) -> ConfirmParticipantsResponse:
-        sess = await _session_or_404(session_id)
+        try:
+            sess = await _session_or_404(session_id)
+        except EligibilityError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={"error": exc.code, "message": exc.message},
+            ) from exc
         if sess.get("enrollment_frozen_at"):
-            # Idempotent replay — never re-enroll, never regenerate. Report
-            # the durable, originally-frozen state.
+            # Idempotent replay — never re-enroll, never regenerate. Purely
+            # read-only, so it's safe regardless of the CURRENT flag state
+            # (nothing is charged here). Report the durable, originally-
+            # frozen state.
             r = await _readiness(session_id)
             return ConfirmParticipantsResponse(
                 session_id=session_id, already_frozen=True,
                 participant_count=r["eligible"], joined=0,
                 already_had_ticket=r["tickets"], failed=[],
+            )
+
+        # This is a real financial action about to happen (per-student
+        # wallet charges via _perform_join) — it MUST re-check the same
+        # AND-gated flag every other Direct Join entry point enforces.
+        # perform_join_fn itself does not check this flag (by design —
+        # every CALLER is responsible for its own gating), so skipping
+        # this check here would let Confirm Participants issue real
+        # charges/tickets even while Direct Join is switched off.
+        if not await flags.direct_join_enabled(db):
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "direct_join_disabled",
+                        "message": "Direct Join is not enabled yet."},
             )
 
         # Computed and stored ONCE, here, at the moment of freeze. Every
@@ -571,28 +611,59 @@ def register_eligibility_routes(
         if not frozen:
             return {"session_id": session_id, "frozen": False,
                     "eligible": 0, "tickets": 0, "notifications_sent": 0, "ready": False,
-                    "participant_ids": []}
+                    "participant_ids": [], "failed_detail": []}
         # The durable, frozen-at-confirm-time list — NEVER recomputed from
         # live roster/override state, so a post-freeze roster change can
         # never move this number.
         participants = sess.get("enrollment_frozen_participants") or []
         participant_ids = [e["student_id"] for e in participants]
         eligible = len(participant_ids)
-        tickets = await db[COLLECTION_DIRECT_JOINS].count_documents(
+
+        ticketed_ids: set[str] = set()
+        cur = db[COLLECTION_DIRECT_JOINS].find(
             {"session_id": session_id, "status": "committed",
              "student_id": {"$in": participant_ids or [""]}},
+            {"_id": 0, "student_id": 1},
         )
+        async for row in cur:
+            ticketed_ids.add(row["student_id"])
+        tickets = len(ticketed_ids)
+
         notifications_sent = await db[COLLECTION_DIRECT_JOINS].count_documents(
             {"session_id": session_id, "status": "committed",
              "notification_status": "sent",
              "student_id": {"$in": participant_ids or [""]}},
         )
+
+        # Why each confirmed-but-unticketed participant failed, sourced
+        # from the durable, always-fails-open enrollment audit trail —
+        # never a guess, and never blocks readiness itself if this read
+        # fails (a diagnostic nicety, not load-bearing).
+        missing_ids = [sid for sid in participant_ids if sid not in ticketed_ids]
+        failed_detail: list[dict] = []
+        if missing_ids:
+            try:
+                latest_reason: dict[str, str] = {}
+                audit_cur = db[enroll_audit.COLLECTION_ENROLLMENT_AUDIT].find(
+                    {"session_id": session_id, "student_id": {"$in": missing_ids}},
+                    {"_id": 0, "student_id": 1, "reason_code": 1, "ts": 1},
+                ).sort("ts", 1)
+                async for row in audit_cur:
+                    latest_reason[row["student_id"]] = row.get("reason_code") or "unknown"
+                failed_detail = [
+                    {"student_id": sid, "reason": latest_reason.get(sid, "no_attempt_recorded")}
+                    for sid in missing_ids
+                ]
+            except Exception:  # noqa: BLE001
+                failed_detail = [{"student_id": sid, "reason": "unknown"} for sid in missing_ids]
+
         return {
             "session_id": session_id, "frozen": True,
             "eligible": eligible, "tickets": tickets,
             "notifications_sent": notifications_sent,
             "ready": eligible > 0 and tickets == eligible,
             "participant_ids": participant_ids,
+            "failed_detail": failed_detail,
         }
 
     @api.get(

@@ -763,3 +763,130 @@ async def test_27_a_checkin_for_a_different_class_session_id_is_never_matched():
     body = r.json()
     assert body["auto_eligible"] == []
     assert [e["student_id"] for e in body["needs_review"]] == ["stuwrongsession"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# V4.1.2 — critical flag-gate fix + failure-reason visibility
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_29_confirm_participants_refuses_when_direct_join_is_disabled():
+    """confirm_participants calls perform_join_fn directly, bypassing the
+    route-level flag checks every other Direct Join entry point has —
+    it MUST re-check the flag itself, or Confirm Participants would
+    issue real charges/tickets while Direct Join is switched off."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_wallet(db, "stu092", 0)
+    # Deliberately NOT calling _enable_direct_join(db).
+    await _seed_student(db, "stu1", group="A")
+    await _seed_wallet(db, "stu1", 10)
+    await _seed_present(db, "stu1", status="present_full")
+    client = _build_v4_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "direct_join_disabled"
+    # Nothing was charged, nothing was frozen, nothing was ticketed.
+    sess = await db.speaking_lab_sessions.find_one({"session_id": "s1"})
+    assert not sess.get("enrollment_frozen_at")
+    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu1"})
+    assert wallet["balance"] == 10
+    join = await db[dj.COLLECTION_DIRECT_JOINS].find_one({"session_id": "s1", "student_id": "stu1"})
+    assert join is None
+
+
+@pytest.mark.asyncio
+async def test_30_confirm_participants_replay_still_works_even_if_flag_is_later_disabled():
+    """The flag check only gates the FIRST real charge. A later replay
+    of an already-frozen session is read-only and must keep working
+    regardless of the flag's current state — it can never charge anyone
+    a second time."""
+    db = _build_db()
+    await _setup_basic_session(db)
+    await _seed_student(db, "stu1", group="A")
+    await _seed_wallet(db, "stu1", 10)
+    await _seed_present(db, "stu1", status="present_full")
+    client = _build_v4_client(db)
+    r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    assert r1.json()["joined"] == 1
+
+    # Flag flips off after the fact (e.g. an operator disables Direct
+    # Join mid-day) — the already-frozen session's replay must still
+    # work. Restored afterward so this test's mutation never leaks into
+    # any other test in the same process.
+    import os
+    prev = os.environ.get("SPEAKING_LAB_DIRECT_JOIN_ENABLED")
+    os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = "false"
+    try:
+        r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        if prev is None:
+            os.environ.pop("SPEAKING_LAB_DIRECT_JOIN_ENABLED", None)
+        else:
+            os.environ["SPEAKING_LAB_DIRECT_JOIN_ENABLED"] = prev
+    assert r2.status_code == 200
+    assert r2.json()["already_frozen"] is True
+
+
+@pytest.mark.asyncio
+async def test_31_decision_and_approve_all_pending_return_404_not_500_for_unknown_session():
+    """_session_or_404 raises EligibilityError, which every route must
+    catch and convert to a clean HTTPException — an uncaught
+    EligibilityError falls through as an unhandled 500."""
+    db = _build_db()
+    client = _build_v4_client(db)
+
+    r1 = client.post("/api/speaking-lab/sessions/ghost/eligibility/decision",
+                      json={"student_id": "stu1", "decision": "approve"})
+    assert r1.status_code == 404
+    assert r1.json()["detail"]["error"] == "session_not_found"
+
+    r2 = client.post("/api/speaking-lab/sessions/ghost/eligibility/approve-all-pending")
+    assert r2.status_code == 404
+
+    r3 = client.post("/api/speaking-lab/sessions/ghost/confirm-participants")
+    assert r3.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_32_readiness_failed_detail_shows_why_a_confirmed_participant_has_no_ticket():
+    """The old flow gave a teacher no way to see WHY a confirmed
+    participant is missing a ticket — reload the page and it just says
+    "Not ready" with a bare number. failed_detail sources the real
+    reason from the durable enrollment audit trail."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=50, status="waiting")
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    await _seed_student(db, "sturich", group="A")
+    await _seed_wallet(db, "sturich", 100)
+    await _seed_present(db, "sturich", status="present_full")
+    await _seed_student(db, "stupoor", group="A")
+    await _seed_wallet(db, "stupoor", 3)  # far below the 50 fee
+    await _seed_present(db, "stupoor", status="present_full")
+    client = _build_v4_client(db)
+
+    client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    r = client.get("/api/speaking-lab/sessions/s1/readiness")
+    body = r.json()
+
+    assert body["ready"] is False
+    assert body["failed_detail"] == [{"student_id": "stupoor", "reason": "insufficient_points"}]
+
+
+@pytest.mark.asyncio
+async def test_33_readiness_failed_detail_is_empty_when_everyone_is_ticketed():
+    db = _build_db()
+    await _setup_basic_session(db)
+    await _seed_student(db, "stu1", group="A")
+    await _seed_wallet(db, "stu1", 10)
+    await _seed_present(db, "stu1", status="present_full")
+    client = _build_v4_client(db)
+
+    client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    r = client.get("/api/speaking-lab/sessions/s1/readiness")
+
+    assert r.json()["ready"] is True
+    assert r.json()["failed_detail"] == []
