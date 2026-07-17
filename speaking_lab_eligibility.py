@@ -594,6 +594,26 @@ def register_eligibility_routes(
                     detail = exc.detail
                     reason = (detail.get("error") if isinstance(detail, dict) else None) or "error"
                     failed.append({"student_id": entry["student_id"], "reason": reason})
+                except Exception as exc:  # noqa: BLE001
+                    # Defense in depth: perform_join_fn now converts every
+                    # exception type it knows about into HTTPException (see
+                    # speaking_lab_direct_join.py's _perform_join), but this
+                    # one-student failure must NEVER be allowed to blow up
+                    # asyncio.gather and take down the whole Confirm
+                    # Participants response for every OTHER student in the
+                    # same batch — the teacher must always get a readiness
+                    # result, not an opaque "Failed to fetch".
+                    L.error(
+                        "speaking_lab_eligibility: confirm_participants "
+                        "unexpected failure session_id=%s student_id=%s err=%s",
+                        session_id, entry["student_id"], exc, exc_info=True,
+                    )
+                    await enroll_audit.record_enrollment_attempt(
+                        db, session_id=session_id, student_id=entry["student_id"],
+                        idempotency_key=idem_key, outcome="unexpected_error",
+                        reason_code="unexpected_error", http_status=500,
+                        lucky_code_assigned=False, log=L)
+                    failed.append({"student_id": entry["student_id"], "reason": "unexpected_error"})
 
         await asyncio.gather(*(_one(e) for e in participants))
 

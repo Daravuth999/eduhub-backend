@@ -5763,6 +5763,48 @@ app.add_middleware(
 )
 
 
+def _cors_headers_for(request: Request) -> dict:
+    """Starlette installs a bare-Exception handler on ServerErrorMiddleware,
+    which sits OUTSIDE add_middleware(CORSMiddleware, ...) — so a response
+    built here never passes back through that middleware and never gets
+    Access-Control-Allow-Origin attached automatically. Without this, any
+    unhandled exception anywhere in the app comes back to the browser with
+    no CORS header at all, which fetch() reports as an opaque, undebuggable
+    "Failed to fetch" instead of a readable error — regardless of the
+    actual HTTP status code the server sent. Mirrors the same CORS_ORIGINS
+    allowlist the CORSMiddleware above uses.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    allowed = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")]
+    if "*" not in allowed and origin not in allowed:
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Last-resort safety net for any exception no route/dependency already
+    converted to an HTTPException. Guarantees the browser always receives a
+    CORS-visible, parseable JSON error instead of a network-level failure —
+    see _cors_headers_for for why the CORS header has to be added by hand
+    here specifically."""
+    log.error(
+        "unhandled exception: %s %s", request.method, request.url.path,
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_server_error",
+                 "message": "Something went wrong. Please try again."},
+        headers=_cors_headers_for(request),
+    )
+
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 

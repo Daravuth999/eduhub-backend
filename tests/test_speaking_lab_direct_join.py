@@ -1728,3 +1728,48 @@ async def test_38j_auto_enroll_on_session_create_enrolls_immediately():
     join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
         {"session_id": "s1", "student_id": "stu777", "status": "committed"})
     assert join and join["lucky_code"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 39. Unexpected exceptions in the transaction must never escape _perform_join
+#     as a raw, unconverted error — root-caused from a production "Failed to
+#     fetch" report on Confirm Participants: an untyped exception (not
+#     DirectJoinError, not one of the specific wallet exceptions) escaping
+#     _perform_join propagates all the way to FastAPI uncaught, and with no
+#     app-level exception handler the response never gets a CORS header,
+#     so the browser reports it as an opaque network failure instead of a
+#     readable error.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_39_unexpected_exception_is_converted_to_structured_503_not_raised_raw(monkeypatch):
+    db = _build_db()
+    await _seed_session(db, sid="s1", fee=4)
+    await _seed_student(db, "stu777")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated transient driver error, not a known DirectJoinError/wallet exception")
+    monkeypatch.setattr(ws.WalletService, "transfer", _boom)
+
+    client = _build_direct_join_client(db, as_student="stu777")
+    resp = client.post("/api/speaking-lab/sessions/s1/direct-join",
+                       json={"idempotency_key": "uuid-1"})
+
+    # Must come back as a normal, structured HTTP response — never an
+    # unhandled 500 that TestClient (or a real ASGI server) would instead
+    # surface as an uncaught exception / CORS-less failure.
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["error"] == "join_unexpected_error"
+
+    # Nothing was charged — the transaction rolled back before the raw
+    # exception was converted.
+    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
+    assert wallet["balance"] == 10
+
+    # The durable audit trail still records why, even for this catch-all path.
+    rows = _audit_rows(db)
+    assert rows[-1]["reason_code"] == "join_unexpected_error"
+    assert rows[-1]["http_status"] == 503

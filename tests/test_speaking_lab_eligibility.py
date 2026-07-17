@@ -890,3 +890,66 @@ async def test_33_readiness_failed_detail_is_empty_when_everyone_is_ticketed():
 
     assert r.json()["ready"] is True
     assert r.json()["failed_detail"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 34. Root-cause fix — an unexpected exception for ONE participant must never
+#     crash the whole Confirm Participants call. Before this fix, an untyped
+#     exception escaping _perform_join propagated out of asyncio.gather,
+#     out of the route handler, uncaught by FastAPI, and (with no app-level
+#     exception handler) came back to the browser with no CORS header —
+#     which fetch() reports as "Failed to fetch", not a readable error. The
+#     teacher must always get a real response with per-student results.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_34_confirm_participants_survives_one_students_unexpected_failure(monkeypatch):
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    await _seed_student(db, "stugood", group="A")
+    await _seed_wallet(db, "stugood", 10)
+    await _seed_present(db, "stugood", status="present_full")
+    await _seed_student(db, "stubad", group="A")
+    await _seed_wallet(db, "stubad", 10)
+    await _seed_present(db, "stubad", status="present_full")
+
+    orig_transfer = ws.WalletService.transfer
+
+    async def _flaky_transfer(self, student_id, *a, **k):
+        if student_id == "stubad":
+            raise RuntimeError("simulated transient driver error")
+        return await orig_transfer(self, student_id, *a, **k)
+    monkeypatch.setattr(ws.WalletService, "transfer", _flaky_transfer)
+
+    client = _build_v4_client(db)
+    r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+
+    # The call itself must succeed with a real, structured body — never an
+    # unhandled crash — even though one of the two students failed.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["participant_count"] == 2
+    assert body["joined"] == 1
+    assert {f["student_id"]: f["reason"] for f in body["failed"]} == {
+        "stubad": "join_unexpected_error"}
+
+    # The good student still got a real ticket.
+    good_join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stugood", "status": "committed"})
+    assert good_join and good_join["lucky_code"]
+
+    # The bad student was never charged.
+    bad_wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stubad"})
+    assert bad_wallet["balance"] == 10
+
+    # Readiness still returns a normal response, showing exactly what's
+    # missing and why — not a crash, not a silent gap.
+    r2 = client.get("/api/speaking-lab/sessions/s1/readiness")
+    r2_body = r2.json()
+    assert r2_body["eligible"] == 2
+    assert r2_body["tickets"] == 1
+    assert r2_body["ready"] is False
+    assert {f["student_id"]: f["reason"] for f in r2_body["failed_detail"]} == {
+        "stubad": "join_unexpected_error"}

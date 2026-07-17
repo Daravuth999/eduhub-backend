@@ -740,6 +740,33 @@ def register_speaking_lab_direct_join_routes(
                 detail={"error": "wallet_not_ready",
                         "message": "Please try again shortly."},
             ) from exc
+        except Exception as exc:  # noqa: BLE001
+            # Last-resort safety net: _run_direct_join can re-raise an
+            # untyped driver/transaction error (e.g. a transient Mongo
+            # failure that isn't labeled UnknownTransactionCommitResult)
+            # that none of the specific excepts above cover. Letting that
+            # escape uncaught here means it propagates past every caller
+            # (single-student /direct-join, bulk enroll-all, V4 Confirm
+            # Participants) with no HTTPException conversion — which is
+            # invisible to FastAPI's own error handling and surfaces to
+            # the browser as an opaque, undiagnosable "Failed to fetch"
+            # instead of a readable JSON error. Always log + audit + turn
+            # it into the same safe, retryable shape as the typed cases.
+            L.error(
+                "speaking_lab_direct_join: unexpected exception in "
+                "_perform_join session_id=%s student_id=%s err=%s",
+                session_id, canonical_student_id, exc, exc_info=True,
+            )
+            await enroll_audit.record_enrollment_attempt(
+                db, **_audit_ctx, outcome="join_unexpected_error",
+                reason_code="join_unexpected_error", http_status=503,
+                lucky_code_assigned=False, log=L)
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "join_unexpected_error",
+                        "message": "Something went wrong enrolling this "
+                                   "student. Please try again."},
+            ) from exc
 
         join = outcome["join"]
         is_replay = outcome["outcome"] != "committed"
