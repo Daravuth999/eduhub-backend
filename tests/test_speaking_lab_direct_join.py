@@ -1469,3 +1469,255 @@ async def test_37i_active_session_picks_the_most_recent_when_several_are_live():
 
     r = client.get("/api/speaking-lab/active-session")
     assert r.json()["session_id"] == "new"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 38. Bulk enroll — "Enroll All Eligible Students" / Auto Enroll / status panel
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _Admin:
+    def __init__(self, email="teacher@eduhub.test"):
+        self.email = email
+        self.is_admin = True
+
+
+def _build_bulk_enroll_client(db, *, push=None):
+    """Registers the same routes as production, WITH require_admin_dep
+    wired to an always-admin dependency (mirrors server.py's real
+    require_admin) so the enroll-all/enrollment-status routes exist.
+    Also returns the raw hooks dict so tests can call
+    enroll_all_eligible/_enrollment_status directly without HTTP."""
+    from fastapi import APIRouter, FastAPI
+    from fastapi.testclient import TestClient
+
+    api = APIRouter(prefix="/api")
+
+    async def _require_student_dyn():
+        return _Student("unused")
+
+    async def _require_admin_dyn():
+        return _Admin()
+
+    hooks = dj.register_speaking_lab_direct_join_routes(
+        api, db, db.speaking_lab_sessions, db.speaking_lab_entries,
+        push or _noop_publish, _require_student_dyn, _norm,
+        push_notify=push, require_admin_dep=_require_admin_dyn,
+    )
+    app = FastAPI()
+    app.include_router(api)
+    return TestClient(app), hooks
+
+
+@pytest.mark.asyncio
+async def test_38_enroll_all_enrolls_the_whole_eligible_roster():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    for sid in ("stua1", "stua2", "stua3"):
+        await _seed_student(db, sid, group="A")
+        await _seed_wallet(db, sid, 10)
+    await _seed_student(db, "stub1", group="B")  # ineligible for schedule A
+    await _seed_wallet(db, "stub1", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client, _hooks = _build_bulk_enroll_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["attempted"] == 3  # roster is schedule-A only
+    assert body["joined"] == 3
+    assert body["already_had_ticket"] == 0
+    assert body["failed"] == []
+
+    for sid in ("stua1", "stua2", "stua3"):
+        join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": "s1", "student_id": sid, "status": "committed"})
+        assert join and join["lucky_code"]
+    assert await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stub1"}) is None
+
+
+@pytest.mark.asyncio
+async def test_38b_enroll_all_isolates_per_student_failures():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=50, status="waiting")
+    await _seed_student(db, "sturich", group="A")
+    await _seed_wallet(db, "sturich", 100)
+    await _seed_student(db, "stupoor", group="A")
+    await _seed_wallet(db, "stupoor", 3)  # far below the 50 fee
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client, _hooks = _build_bulk_enroll_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    body = r.json()
+    assert body["attempted"] == 2
+    assert body["joined"] == 1
+    assert len(body["failed"]) == 1
+    assert body["failed"][0]["student_id"] == "stupoor"
+    assert body["failed"][0]["reason"] == "insufficient_points"
+
+    # The rich student's ticket is unaffected by the poor student's failure.
+    join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "sturich", "status": "committed"})
+    assert join and join["lucky_code"]
+
+
+@pytest.mark.asyncio
+async def test_38c_enroll_all_is_idempotent_never_double_charges():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="AB", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client, _hooks = _build_bulk_enroll_client(db)
+
+    r1 = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    r2 = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    assert r1.json()["joined"] == 1
+    assert r2.json()["joined"] == 0
+    assert r2.json()["already_had_ticket"] == 1
+
+    wallet = await db[ws.COLL_WALLETS].find_one({"student_id": "stu777"})
+    assert wallet["balance"] == 6  # charged exactly once across both runs
+
+
+@pytest.mark.asyncio
+async def test_38d_enroll_all_respects_ab_combined_roster_including_unassigned():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="AB", fee=1, status="waiting")
+    await _seed_student(db, "stuaba", group="A")
+    await _seed_student(db, "stuabb", group="B")
+    await _seed_student(db, "stuabu", group="")
+    for sid in ("stuaba", "stuabb", "stuabu"):
+        await _seed_wallet(db, sid, 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client, _hooks = _build_bulk_enroll_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    body = r.json()
+    assert body["attempted"] == 3
+    assert body["joined"] == 3
+
+
+@pytest.mark.asyncio
+async def test_38e_enroll_all_never_fires_while_direct_join_disabled():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    # NOT enabling direct join.
+    client, _hooks = _build_bulk_enroll_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "direct_join_disabled"
+    assert await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stu777"}) is None
+
+
+@pytest.mark.asyncio
+async def test_38f_enroll_all_never_cross_enrolls_a_different_session():
+    """Multi-class safety: two simultaneous sessions on the same
+    schedule never bleed into each other — enroll-all only ever
+    targets the ONE session_id in the URL."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_session(db, sid="s2", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client, _hooks = _build_bulk_enroll_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    assert r.json()["joined"] == 1
+    assert await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s2", "student_id": "stu777"}) is None
+
+
+@pytest.mark.asyncio
+async def test_38g_enroll_all_sends_the_lucky_code_push_per_student():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    push = PushRecorder(mode="sent")
+    client, _hooks = _build_bulk_enroll_client(db, push=push)
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    assert r.json()["joined"] == 1
+    assert len(push.calls) == 1
+    assert push.calls[0][0] == "stu777"
+    assert "lucky code" in push.calls[0][2].lower()
+
+
+@pytest.mark.asyncio
+async def test_38h_enroll_all_requires_admin():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _enable_direct_join(db)
+    # Built WITHOUT require_admin_dep -> route never registered.
+    client = _build_one_tap_client(db, as_student="stu777")
+
+    r = client.post("/api/speaking-lab/sessions/s1/enroll-all")
+    assert r.status_code == 404  # route doesn't exist without admin wiring
+
+
+@pytest.mark.asyncio
+async def test_38i_enrollment_status_reports_joined_pending_failed():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=10, status="waiting")
+    await _seed_student(db, "stujoined", group="A")
+    await _seed_wallet(db, "stujoined", 20)
+    await _seed_student(db, "stufailed", group="A")
+    await _seed_wallet(db, "stufailed", 1)  # will fail insufficient_points
+    await _seed_student(db, "stupending", group="A")
+    await _seed_wallet(db, "stupending", 20)  # eligible, never attempted
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    client, hooks = _build_bulk_enroll_client(db)
+
+    # Manually join one, manually fail one, leave one untouched — via
+    # the student-scoped one-tap client for each specific student.
+    one_tap = _build_one_tap_client(db, as_student="stujoined")
+    r_join = one_tap.post("/api/speaking-lab/join-active", json={"idempotency_key": "k1"})
+    assert r_join.status_code == 200
+
+    one_tap_fail = _build_one_tap_client(db, as_student="stufailed")
+    r_fail = one_tap_fail.post("/api/speaking-lab/join-active", json={"idempotency_key": "k2"})
+    assert r_fail.status_code == 402
+
+    r = client.get("/api/speaking-lab/sessions/s1/enrollment-status")
+    body = r.json()
+    assert body["roster_size"] == 3
+    assert body["joined"] == 1
+    assert body["failed"] == 1
+    assert body["pending"] == 1
+    assert body["failed_detail"][0]["student_id"] == "stufailed"
+    assert body["failed_detail"][0]["reason"] == "insufficient_points"
+
+
+@pytest.mark.asyncio
+async def test_38j_auto_enroll_on_session_create_enrolls_immediately():
+    """Mode B — teacher's Auto Enroll: reuses the SAME enroll_all_eligible
+    hook server.py wires to session creation. Exercised directly against
+    the returned hook (server.py's own wiring is a thin, untested-here
+    call site) to prove the hook is create-session-ready."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", fee=4, status="waiting")
+    await _seed_student(db, "stu777", group="A")
+    await _seed_wallet(db, "stu777", 10)
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    _client, hooks = _build_bulk_enroll_client(db)
+
+    summary = await hooks["enroll_all_eligible"]("s1")
+    assert summary["joined"] == 1
+    join = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stu777", "status": "committed"})
+    assert join and join["lucky_code"]

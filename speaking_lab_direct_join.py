@@ -46,6 +46,7 @@ Design summary
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -183,6 +184,41 @@ class ActiveSessionResponse(BaseModel):
     player_count: int = 0
     direct_join_enabled: bool = False
     existing_entry: Optional[JoinPreviewExistingEntry] = None
+
+
+class EnrollAllFailure(BaseModel):
+    student_id: str
+    reason: str
+
+
+class EnrollAllResponse(BaseModel):
+    """Teacher "Enroll All Eligible Students" result. Every entry in
+    ``failed`` came from the SAME per-student _perform_join call the
+    manual one-tap route uses — no second success/failure taxonomy."""
+    ok: bool = True
+    session_id: str
+    attempted: int
+    joined: int
+    already_had_ticket: int
+    failed: list[EnrollAllFailure] = []
+
+
+class EnrollmentStatusFailure(BaseModel):
+    student_id: str
+    reason: str
+
+
+class EnrollmentStatusResponse(BaseModel):
+    """Teacher control-panel counters, computed live from the roster +
+    direct-join + audit collections — never a separately-maintained
+    status field that could drift from reality."""
+    ok: bool = True
+    session_id: str
+    roster_size: int
+    joined: int
+    pending: int
+    failed: int
+    failed_detail: list[EnrollmentStatusFailure] = []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -578,7 +614,12 @@ def register_speaking_lab_direct_join_routes(
     norm_student_id: Callable[[Any], str],
     push_notify: Optional[Callable[[str, str, str], Awaitable[dict]]] = None,
     log: Optional[logging.Logger] = None,
-) -> None:
+    require_admin_dep=None,
+) -> dict:
+    """Returns a dict of internally-callable hooks (currently just
+    ``enroll_all_eligible``) so server.py can trigger Auto Enroll
+    synchronously right after session creation, without a second HTTP
+    round-trip."""
     L = log or logger
 
     def _resolve_session_id(session_or_code: str) -> str:
@@ -752,6 +793,174 @@ def register_speaking_lab_direct_join_routes(
             player_count=snap["player_count"],
             idempotent_replay=is_replay,
         )
+
+    async def _eligible_roster(sess: dict) -> list[dict]:
+        """Every student eligible for THIS session's schedule, per the
+        exact same session_schedule_eligibility rule _perform_join
+        re-validates per student. There is no "online"/presence concept
+        anywhere in this codebase — eligibility here is schedule
+        membership only, same as manual Join Now. Read-only."""
+        schedule = sess.get("schedule") or ""
+        roster: list[dict] = []
+        cur = db.students.find(
+            {},
+            {"_id": 0, "clean_id": 1, "student_id": 1, "group": 1,
+             "schedule": 1, "display_name": 1, "name": 1},
+        )
+        async for doc in cur:
+            student_group = doc.get("group") or doc.get("schedule") or ""
+            eligible, _reason = session_schedule_eligibility(student_group, schedule)
+            if not eligible:
+                continue
+            canonical = norm_student_id(doc.get("clean_id") or doc.get("student_id"))
+            if not canonical:
+                continue
+            roster.append({
+                "student_id": canonical,
+                "display_name": doc.get("display_name") or doc.get("name") or canonical,
+            })
+        return roster
+
+    async def enroll_all_eligible(session_id: str, *, max_concurrency: int = 20) -> dict:
+        """Teacher "Enroll All Eligible Students" / Auto Enroll core.
+        Every eligible student is run through the IDENTICAL _perform_join
+        used by the code-based and one-tap routes — one independent
+        atomic transaction per student, never one mega-transaction. One
+        student's failure (insufficient points, wrong schedule, already
+        drawn-locked, ...) never blocks or rolls back anyone else's."""
+        if not await flags.direct_join_enabled(db):
+            raise DirectJoinError("direct_join_disabled", http_status=503)
+        sess = await SL_SESSIONS.find_one({"session_id": session_id})
+        if not sess:
+            raise DirectJoinError("session_not_found", http_status=404)
+
+        roster = await _eligible_roster(sess)
+        sem = asyncio.Semaphore(max_concurrency)
+        counters = {"joined": 0, "already_had_ticket": 0}
+        failed: list[dict] = []
+
+        async def _one(entry: dict) -> None:
+            async with sem:
+                idem_key = f"bulk_enroll:{session_id}:{entry['student_id']}"
+                try:
+                    result = await _perform_join(
+                        session_id, entry["student_id"], entry["display_name"], idem_key,
+                    )
+                    if result.idempotent_replay:
+                        counters["already_had_ticket"] += 1
+                    else:
+                        counters["joined"] += 1
+                except HTTPException as exc:
+                    detail = exc.detail
+                    reason = (detail.get("error") if isinstance(detail, dict) else None) or "error"
+                    failed.append({"student_id": entry["student_id"], "reason": reason})
+
+        await asyncio.gather(*(_one(e) for e in roster))
+
+        return {
+            "ok": True, "session_id": session_id,
+            "attempted": len(roster),
+            "joined": counters["joined"],
+            "already_had_ticket": counters["already_had_ticket"],
+            "failed": failed,
+        }
+
+    async def _enrollment_status(session_id: str) -> dict:
+        """Live-computed Joined / Pending / Failed counters for the
+        teacher control panel — derived entirely from the roster,
+        direct-join, legacy-entry, and audit collections. No separate
+        mutable status field to drift from reality."""
+        sess = await SL_SESSIONS.find_one({"session_id": session_id})
+        if not sess:
+            raise DirectJoinError("session_not_found", http_status=404)
+
+        roster = await _eligible_roster(sess)
+        roster_ids = {e["student_id"] for e in roster}
+        if not roster_ids:
+            return {"ok": True, "session_id": session_id, "roster_size": 0,
+                    "joined": 0, "pending": 0, "failed": 0, "failed_detail": []}
+
+        joined_ids: set[str] = set()
+        cur = db[COLLECTION_DIRECT_JOINS].find(
+            {"session_id": session_id, "status": "committed",
+             "student_id": {"$in": list(roster_ids)}},
+            {"_id": 0, "student_id": 1},
+        )
+        async for row in cur:
+            joined_ids.add(row["student_id"])
+
+        remaining = roster_ids - joined_ids
+        if remaining:
+            cur2 = SL_ENTRIES.find(
+                {"session_id": session_id, "paid_entry": True,
+                 "student_id": {"$in": list(remaining)}},
+                {"_id": 0, "student_id": 1},
+            )
+            async for row in cur2:
+                joined_ids.add(row["student_id"])
+            remaining = roster_ids - joined_ids
+
+        failed_detail: list[dict] = []
+        if remaining:
+            latest_reason: dict[str, str] = {}
+            cur3 = db[enroll_audit.COLLECTION_ENROLLMENT_AUDIT].find(
+                {"session_id": session_id, "student_id": {"$in": list(remaining)}},
+                {"_id": 0, "student_id": 1, "reason_code": 1, "ts": 1},
+            ).sort("ts", 1)
+            async for row in cur3:
+                latest_reason[row["student_id"]] = row.get("reason_code") or "unknown"
+            failed_detail = [
+                {"student_id": sid, "reason": reason}
+                for sid, reason in latest_reason.items()
+            ]
+        attempted_ids = {d["student_id"] for d in failed_detail}
+        pending_count = len(remaining) - len(attempted_ids)
+
+        return {
+            "ok": True, "session_id": session_id,
+            "roster_size": len(roster_ids),
+            "joined": len(joined_ids),
+            "pending": pending_count,
+            "failed": len(attempted_ids),
+            "failed_detail": failed_detail,
+        }
+
+    if require_admin_dep is not None:
+        @api.post(
+            "/speaking-lab/sessions/{session_id}/enroll-all",
+            response_model=EnrollAllResponse,
+            summary="Teacher: enroll every eligible student on the roster at once (DARK)",
+        )
+        async def enroll_all_route(
+            session_id: str,
+            _admin=Depends(require_admin_dep),
+        ) -> EnrollAllResponse:
+            try:
+                summary = await enroll_all_eligible(session_id)
+            except DirectJoinError as exc:
+                raise HTTPException(
+                    status_code=exc.http_status,
+                    detail={"error": exc.code, "message": exc.message},
+                ) from exc
+            return EnrollAllResponse(**summary)
+
+        @api.get(
+            "/speaking-lab/sessions/{session_id}/enrollment-status",
+            response_model=EnrollmentStatusResponse,
+            summary="Teacher control panel: Joined / Pending / Failed counters",
+        )
+        async def enrollment_status_route(
+            session_id: str,
+            _admin=Depends(require_admin_dep),
+        ) -> EnrollmentStatusResponse:
+            try:
+                summary = await _enrollment_status(session_id)
+            except DirectJoinError as exc:
+                raise HTTPException(
+                    status_code=exc.http_status,
+                    detail={"error": exc.code, "message": exc.message},
+                ) from exc
+            return EnrollmentStatusResponse(**summary)
 
     @api.post(
         "/speaking-lab/sessions/{session_or_code}/direct-join",
@@ -1003,3 +1212,8 @@ def register_speaking_lab_direct_join_routes(
             direct_join_enabled=await flags.direct_join_enabled(db),
             existing_entry=existing_entry,
         )
+
+    return {
+        "enroll_all_eligible": enroll_all_eligible,
+        "enrollment_status": _enrollment_status,
+    }

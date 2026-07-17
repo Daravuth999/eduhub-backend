@@ -4898,12 +4898,20 @@ async def _sl_try_auto_enter(
 SL_SESSIONS = db.speaking_lab_sessions
 SL_ENTRIES  = db.speaking_lab_entries
 
+# Populated by register_speaking_lab_direct_join_routes(...) further down —
+# looked up at request time (not import time), so declaring it here and
+# reading it inside sl_create_session (defined before that registration
+# call) is safe: registration always runs once at startup, before any
+# request is served.
+_sl_direct_join_hooks: dict = {}
+
 # â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SLSessionCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     schedule: str
     entry_fee: int = 0
+    auto_enroll: bool = False
 
 class SLEnterRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -5168,9 +5176,24 @@ async def sl_create_session(
         "status":     "waiting",
         "created_by": admin.email,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "auto_enroll": bool(payload.auto_enroll),
     })
-    log.info("sl.session.create: %s schedule=%s fee=%s", session_id, schedule_norm, payload.entry_fee)
-    return {"session_id": session_id, "schedule": schedule_norm, "entry_fee": payload.entry_fee}
+    log.info("sl.session.create: %s schedule=%s fee=%s auto_enroll=%s",
+              session_id, schedule_norm, payload.entry_fee, payload.auto_enroll)
+    response = {"session_id": session_id, "schedule": schedule_norm, "entry_fee": payload.entry_fee}
+    if payload.auto_enroll:
+        enroll_all = _sl_direct_join_hooks.get("enroll_all_eligible")
+        if enroll_all is not None:
+            try:
+                response["enrollment_summary"] = await enroll_all(session_id)
+            except Exception as exc:  # noqa: BLE001
+                # Auto Enroll failing (e.g. flag still off) must never
+                # block session creation itself — the teacher can still
+                # fall back to manual "Enroll All" or students can tap
+                # Join Now once Direct Join is enabled.
+                log.warning("sl.session.create: auto_enroll failed: %s", str(exc)[:200])
+                response["enrollment_summary"] = {"ok": False, "error": str(exc)[:200]}
+    return response
 
 @api.post("/speaking-lab/sessions/{session_id}/enter")
 async def sl_enter_session(session_id: str, body: SLEnterRequest):
@@ -5685,7 +5708,7 @@ async def _speaking_lab_direct_join_push_notify(student_id: str, title: str, bod
             "no_subscribers": (sent == 0 and failed == 0), "error": ""}
 
 
-register_speaking_lab_direct_join_routes(
+_sl_direct_join_hooks.update(register_speaking_lab_direct_join_routes(
     api,
     db,
     SL_SESSIONS,
@@ -5695,7 +5718,8 @@ register_speaking_lab_direct_join_routes(
     _norm_student_id,
     push_notify=_speaking_lab_direct_join_push_notify,
     log=log,
-)
+    require_admin_dep=require_admin,
+) or {})
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.add_middleware(
