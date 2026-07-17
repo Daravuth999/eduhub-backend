@@ -81,12 +81,47 @@ def _build_v4_client(db, *, push=None):
     return TestClient(app)
 
 
-async def _seed_attendance(db, student_id, *, status="present_full", hours_ago=1.0, class_id="c1"):
-    checked_in_at = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+async def _seed_attendance_class(db, class_id, *, group="A"):
+    # Idempotent: many students in the same test share one default
+    # class_id — inserting it twice would create two distinct-looking
+    # docs in the fake DB (which enforces no uniqueness on its own) and
+    # corrupt the ambiguity check the real resolver relies on.
+    existing = await db["attendance_classes"].find_one({"class_id": class_id})
+    if not existing:
+        await db["attendance_classes"].insert_one({"class_id": class_id, "group": group})
+
+
+async def _seed_attendance_session(db, session_id, *, class_id, date=None):
+    existing = await db["attendance_sessions"].find_one({"session_id": session_id})
+    if not existing:
+        await db["attendance_sessions"].insert_one({
+            "session_id": session_id, "class_id": class_id, "date": date or _today(),
+        })
+
+
+async def _seed_attendance_record(db, session_id, student_id, *, status="present_full", class_id="c1"):
+    sid = _norm(student_id)
     await db["attendance_records"].insert_one({
-        "student_id": _norm(student_id), "class_id": class_id,
-        "status": status, "checked_in_at": checked_in_at,
+        "_id": f"{session_id}:{sid}", "student_id": sid, "session_id": session_id,
+        "class_id": class_id, "status": status,
     })
+
+
+async def _seed_present(db, student_id, *, group="A", status="present_full",
+                        class_id=None, session_id=None, date=None):
+    """Convenience: builds the full deterministic chain (class tagged for
+    `group` -> today's session for that class -> a present-type check-in
+    record for `student_id`) in one call, matching the real
+    attendance_tools.py write shape exactly."""
+    class_id = class_id or f"cls_{group}"
+    session_id = session_id or f"as_{group}_{date or _today()}"
+    await _seed_attendance_class(db, class_id, group=group)
+    await _seed_attendance_session(db, session_id, class_id=class_id, date=date)
+    await _seed_attendance_record(db, session_id, student_id, status=status, class_id=class_id)
 
 
 async def _setup_basic_session(db, *, fee=4, schedule="A"):
@@ -105,7 +140,7 @@ async def test_1_auto_eligible_when_roster_and_recent_attendance():
     await _setup_basic_session(db)
     await _seed_student(db, "stupresent", group="A")
     await _seed_wallet(db, "stupresent", 10)
-    await _seed_attendance(db, "stupresent", status="present_full", hours_ago=1)
+    await _seed_present(db, "stupresent", status="present_full")
     client = _build_v4_client(db)
 
     r = client.get("/api/speaking-lab/sessions/s1/eligibility")
@@ -129,18 +164,23 @@ async def test_2_needs_review_when_no_attendance_record():
 
 
 @pytest.mark.asyncio
-async def test_3_needs_review_when_attendance_is_stale():
+async def test_3_needs_review_when_attendance_session_is_from_a_different_date():
+    """A check-in tied to YESTERDAY'S attendance session for this class
+    must never count toward TODAY'S Speaking Lab session — dates are an
+    exact match, never a rolling window."""
     db = _build_db()
     await _setup_basic_session(db)
     await _seed_student(db, "stustale", group="A")
     await _seed_wallet(db, "stustale", 10)
-    await _seed_attendance(db, "stustale", status="present_full", hours_ago=20)  # beyond 8h window
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+    await _seed_present(db, "stustale", status="present_full", date=yesterday)
     client = _build_v4_client(db)
 
     r = client.get("/api/speaking-lab/sessions/s1/eligibility")
     body = r.json()
     assert body["auto_eligible"] == []
     assert [e["student_id"] for e in body["needs_review"]] == ["stustale"]
+    assert body["attendance_binding"] == "no_attendance_session_today"
 
 
 @pytest.mark.asyncio
@@ -149,10 +189,10 @@ async def test_4_partial_and_late_also_count_as_present():
     await _setup_basic_session(db)
     await _seed_student(db, "stupartial", group="A")
     await _seed_wallet(db, "stupartial", 10)
-    await _seed_attendance(db, "stupartial", status="present_partial", hours_ago=1)
+    await _seed_present(db, "stupartial", status="present_partial")
     await _seed_student(db, "stulate", group="A")
     await _seed_wallet(db, "stulate", 10)
-    await _seed_attendance(db, "stulate", status="late", hours_ago=1)
+    await _seed_present(db, "stulate", status="late")
     client = _build_v4_client(db)
 
     r = client.get("/api/speaking-lab/sessions/s1/eligibility")
@@ -166,7 +206,7 @@ async def test_5_absent_status_does_not_count_as_present():
     await _setup_basic_session(db)
     await _seed_student(db, "stuabsent", group="A")
     await _seed_wallet(db, "stuabsent", 10)
-    await _seed_attendance(db, "stuabsent", status="absent", hours_ago=1)
+    await _seed_present(db, "stuabsent", status="absent")
     client = _build_v4_client(db)
 
     r = client.get("/api/speaking-lab/sessions/s1/eligibility")
@@ -221,7 +261,7 @@ async def test_8_reject_removes_a_present_student_from_auto_eligible():
     await _setup_basic_session(db)
     await _seed_student(db, "sturejected", group="A")
     await _seed_wallet(db, "sturejected", 10)
-    await _seed_attendance(db, "sturejected", status="present_full", hours_ago=1)
+    await _seed_present(db, "sturejected", status="present_full")
     client = _build_v4_client(db)
 
     r1 = client.get("/api/speaking-lab/sessions/s1/eligibility")
@@ -303,7 +343,7 @@ async def test_12_confirm_participants_generates_exactly_one_ticket_each():
     for sid in ("stua1", "stua2", "stua3"):
         await _seed_student(db, sid, group="A")
         await _seed_wallet(db, sid, 10)
-        await _seed_attendance(db, sid, status="present_full", hours_ago=1)
+        await _seed_present(db, sid, status="present_full")
     client = _build_v4_client(db)
 
     r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -325,7 +365,7 @@ async def test_13_confirm_participants_freezes_and_replay_never_double_charges()
     await _setup_basic_session(db)
     await _seed_student(db, "stufreeze", group="A")
     await _seed_wallet(db, "stufreeze", 10)
-    await _seed_attendance(db, "stufreeze", status="present_full", hours_ago=1)
+    await _seed_present(db, "stufreeze", status="present_full")
     client = _build_v4_client(db)
 
     r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -365,10 +405,10 @@ async def test_15_confirm_participants_isolates_per_student_failure():
     await _enable_direct_join(db)
     await _seed_student(db, "sturich", group="A")
     await _seed_wallet(db, "sturich", 100)
-    await _seed_attendance(db, "sturich", status="present_full", hours_ago=1)
+    await _seed_present(db, "sturich", status="present_full")
     await _seed_student(db, "stupoor", group="A")
     await _seed_wallet(db, "stupoor", 3)  # far below the 50 fee
-    await _seed_attendance(db, "stupoor", status="present_full", hours_ago=1)
+    await _seed_present(db, "stupoor", status="present_full")
     client = _build_v4_client(db)
 
     r = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -389,7 +429,7 @@ async def test_16_confirm_participants_sends_the_lucky_code_push_per_student():
     await _setup_basic_session(db)
     await _seed_student(db, "stupush", group="A")
     await _seed_wallet(db, "stupush", 10)
-    await _seed_attendance(db, "stupush", status="present_full", hours_ago=1)
+    await _seed_present(db, "stupush", status="present_full")
     push = PushRecorder(mode="sent")
     client = _build_v4_client(db, push=push)
 
@@ -422,7 +462,7 @@ async def test_18_readiness_ready_when_all_tickets_generated():
     for sid in ("stua1", "stua2"):
         await _seed_student(db, sid, group="A")
         await _seed_wallet(db, sid, 10)
-        await _seed_attendance(db, sid, status="present_full", hours_ago=1)
+        await _seed_present(db, sid, status="present_full")
     client = _build_v4_client(db)
 
     client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -442,10 +482,10 @@ async def test_19_readiness_blocks_when_ticket_count_falls_short():
     await _enable_direct_join(db)
     await _seed_student(db, "sturich", group="A")
     await _seed_wallet(db, "sturich", 100)
-    await _seed_attendance(db, "sturich", status="present_full", hours_ago=1)
+    await _seed_present(db, "sturich", status="present_full")
     await _seed_student(db, "stupoor", group="A")
     await _seed_wallet(db, "stupoor", 3)
-    await _seed_attendance(db, "stupoor", status="present_full", hours_ago=1)
+    await _seed_present(db, "stupoor", status="present_full")
     client = _build_v4_client(db)
 
     client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -466,7 +506,7 @@ async def test_20_readiness_unaffected_by_roster_growth_after_freeze():
     await _setup_basic_session(db)
     await _seed_student(db, "stuoriginal", group="A")
     await _seed_wallet(db, "stuoriginal", 10)
-    await _seed_attendance(db, "stuoriginal", status="present_full", hours_ago=1)
+    await _seed_present(db, "stuoriginal", status="present_full")
     client = _build_v4_client(db)
 
     r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
@@ -475,7 +515,7 @@ async def test_20_readiness_unaffected_by_roster_growth_after_freeze():
     # A brand-new eligible student appears AFTER the freeze.
     await _seed_student(db, "stulate_addition", group="A")
     await _seed_wallet(db, "stulate_addition", 10)
-    await _seed_attendance(db, "stulate_addition", status="present_full", hours_ago=1)
+    await _seed_present(db, "stulate_addition", status="present_full")
 
     r2 = client.get("/api/speaking-lab/sessions/s1/readiness")
     body = r2.json()
@@ -498,7 +538,7 @@ async def test_21_notifications_sent_count_reflects_push_delivery():
     await _setup_basic_session(db)
     await _seed_student(db, "stunotify", group="A")
     await _seed_wallet(db, "stunotify", 10)
-    await _seed_attendance(db, "stunotify", status="present_full", hours_ago=1)
+    await _seed_present(db, "stunotify", status="present_full")
     push = PushRecorder(mode="no_subscribers")  # tickets succeed, push doesn't
     client = _build_v4_client(db, push=push)
 
@@ -545,3 +585,125 @@ async def test_22_eligibility_and_confirm_reject_a_non_admin_caller():
     assert r1.status_code == 403
     r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
     assert r2.status_code == 403
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Session-bound attendance mapping (v1.1) — proves the passport can only
+# ever count attendance that provably belongs to THIS Speaking Lab
+# session's schedule, never an unrelated class or a different date.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_23_attendance_from_an_unrelated_class_never_grants_auto_eligibility():
+    """A student checked into a genuinely different class (tagged for a
+    DIFFERENT group) today must never leak into Schedule A's eligibility
+    — proving the passport is class-bound, not just date-bound."""
+    db = _build_db()
+    await _setup_basic_session(db, schedule="A")
+    await _seed_student(db, "stucrossclass", group="A")
+    await _seed_wallet(db, "stucrossclass", 10)
+    # Present today, but in a class tagged for Schedule B — unrelated to
+    # this Schedule A session.
+    await _seed_present(db, "stucrossclass", group="B", status="present_full")
+    client = _build_v4_client(db)
+
+    r = client.get("/api/speaking-lab/sessions/s1/eligibility")
+    body = r.json()
+    assert body["auto_eligible"] == []
+    assert [e["student_id"] for e in body["needs_review"]] == ["stucrossclass"]
+
+
+@pytest.mark.asyncio
+async def test_24_fails_closed_when_no_attendance_class_is_tagged_for_the_schedule():
+    """No attendance_classes doc has group="A" at all -> every Schedule A
+    student is Needs Review, never a guessed Auto Eligible, and the
+    reason is surfaced to the teacher."""
+    db = _build_db()
+    await _setup_basic_session(db, schedule="A")
+    await _seed_student(db, "stu1", group="A")
+    await _seed_wallet(db, "stu1", 10)
+    client = _build_v4_client(db)
+
+    r = client.get("/api/speaking-lab/sessions/s1/eligibility")
+    body = r.json()
+    assert body["auto_eligible"] == []
+    assert [e["student_id"] for e in body["needs_review"]] == ["stu1"]
+    assert body["attendance_binding"] == "no_attendance_class_for_group"
+
+
+@pytest.mark.asyncio
+async def test_25_fails_closed_when_multiple_candidate_sessions_today_are_ambiguous():
+    """Two different classes are both tagged group="A" and BOTH have a
+    session today -> the binding is genuinely ambiguous, so it fails
+    closed rather than guessing which one is the real Speaking Lab
+    class."""
+    db = _build_db()
+    await _setup_basic_session(db, schedule="A")
+    await _seed_student(db, "stuambiguous", group="A")
+    await _seed_wallet(db, "stuambiguous", 10)
+    await _seed_attendance_class(db, "cls_x", group="A")
+    await _seed_attendance_session(db, "as_x", class_id="cls_x")
+    await _seed_attendance_class(db, "cls_y", group="A")
+    await _seed_attendance_session(db, "as_y", class_id="cls_y")
+    # Check the student into ONE of the two ambiguous sessions — even so,
+    # the resolver cannot know which class is "the" Schedule A class.
+    await _seed_attendance_record(db, "as_x", "stuambiguous", status="present_full", class_id="cls_x")
+    client = _build_v4_client(db)
+
+    r = client.get("/api/speaking-lab/sessions/s1/eligibility")
+    body = r.json()
+    assert body["auto_eligible"] == []
+    assert [e["student_id"] for e in body["needs_review"]] == ["stuambiguous"]
+    assert body["attendance_binding"] == "ambiguous_multiple_sessions_today"
+
+
+@pytest.mark.asyncio
+async def test_26_combined_ab_session_resolves_attendance_per_student_own_group():
+    """A Combined A+B Speaking Lab session has no single schedule to bind
+    against, so each student's OWN group resolves their attendance class
+    independently — a Schedule A student's presence in the A class, and
+    a Schedule B student's presence in the B class, both count; neither
+    can be satisfied by the other's class."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="AB", fee=4, status="waiting")
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    await _seed_student(db, "stua", group="A")
+    await _seed_wallet(db, "stua", 10)
+    await _seed_present(db, "stua", group="A", status="present_full")
+    await _seed_student(db, "stub", group="B")
+    await _seed_wallet(db, "stub", 10)
+    await _seed_present(db, "stub", group="B", status="present_full")
+    await _seed_student(db, "stunosignal_ab", group="A")
+    await _seed_wallet(db, "stunosignal_ab", 10)
+    client = _build_v4_client(db)
+
+    r = client.get("/api/speaking-lab/sessions/s1/eligibility")
+    body = r.json()
+    auto_ids = {e["student_id"] for e in body["auto_eligible"]}
+    review_ids = {e["student_id"] for e in body["needs_review"]}
+    assert auto_ids == {"stua", "stub"}
+    assert review_ids == {"stunosignal_ab"}
+
+
+@pytest.mark.asyncio
+async def test_27_a_checkin_for_a_different_class_session_id_is_never_matched():
+    """Defense in depth on the exact composite-key lookup: a present
+    record that exists under a DIFFERENT session_id (even same class,
+    same date, wrong session identity) is never treated as a match."""
+    db = _build_db()
+    await _setup_basic_session(db, schedule="A")
+    await _seed_student(db, "stuwrongsession", group="A")
+    await _seed_wallet(db, "stuwrongsession", 10)
+    await _seed_attendance_class(db, "cls_A", group="A")
+    await _seed_attendance_session(db, "as_A_real", class_id="cls_A")
+    # Record exists, but keyed to a session_id that was never resolved as
+    # THE class's session (simulates a stale/duplicate session record).
+    await _seed_attendance_record(db, "as_A_impostor", "stuwrongsession",
+                                   status="present_full", class_id="cls_A")
+    client = _build_v4_client(db)
+
+    r = client.get("/api/speaking-lab/sessions/s1/eligibility")
+    body = r.json()
+    assert body["auto_eligible"] == []
+    assert [e["student_id"] for e in body["needs_review"]] == ["stuwrongsession"]

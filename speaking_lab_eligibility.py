@@ -19,17 +19,29 @@ Eligibility engine (hybrid — attendance ASSISTS, teacher decides)
    never appears in the reviewable list at all — unless the teacher uses
    Manual Admit, an explicit escape hatch.
 2. Attendance Passport (this module, read-only) is the SECOND signal,
-   applied only within the roster: does this student have a RECENT
-   attendance_records entry (default: last 8 hours) with a present-type
-   status (present_full / present_partial / late)? If yes -> AUTO
-   ELIGIBLE. If no record at all, or the record is stale -> NEEDS REVIEW.
-   This is deliberately NOT a rigid 1:1 binding to one specific
-   attendance class/session (the two systems have no such binding today
-   — see the architecture review) — it is a class-agnostic "did this
-   student prove presence recently" signal, which is what lets the
-   teacher trust auto-eligibility for the common case while still
-   reviewing genuine exceptions (attendance sync delay, different class,
-   partial attendance).
+   applied only within the roster — DETERMINISTIC and SESSION-BOUND
+   (v1.1, replacing an earlier class-agnostic recency check that could
+   not prove which class an attendance record came from):
+     a. Resolve the ONE attendance_classes doc whose ``group`` field
+        equals the schedule ("A"/"B") the roster came from — for a
+        Combined "AB" Speaking Lab session, or a student with no
+        Speaking Lab schedule, this falls back to the STUDENT'S OWN
+        ``students.group``, mirroring the same substitution
+        session_schedule_eligibility already applies elsewhere.
+     b. Resolve the ONE attendance_sessions doc for that class dated
+        TODAY (server UTC date — Speaking Lab sessions are created
+        live, same-day, so "today" is the only unambiguous anchor).
+     c. A student counts as AUTO ELIGIBLE only if their
+        attendance_records entry for THAT EXACT session_id (an O(1)
+        lookup on the composite ``{session_id}:{student_id}`` key
+        attendance_tools.py already writes) has a present-type status.
+   If step (a) or (b) cannot be resolved to EXACTLY ONE match — no
+   attendance class tagged for this group, no session today, or
+   multiple candidate sessions today — the resolution FAILS CLOSED:
+   every student in that group lands in NEEDS REVIEW, never a false
+   AUTO ELIGIBLE. This never scans other classes, other dates, or a
+   rolling time window, so a check-in from an unrelated class or a
+   stale prior day can never leak into this session's eligibility.
 3. The teacher has final authority over both buckets via per-student
    overrides (approve / reject / manual_admit), always reviewable and
    reversible until the session is frozen.
@@ -58,7 +70,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -68,16 +80,20 @@ logger = logging.getLogger("eduhub.speaking_lab_eligibility")
 
 COLLECTION_OVERRIDES = "speaking_lab_eligibility_overrides"
 COLLECTION_ATTENDANCE_RECORDS = "attendance_records"
+COLLECTION_ATTENDANCE_CLASSES = "attendance_classes"
+COLLECTION_ATTENDANCE_SESSIONS = "attendance_sessions"
 COLLECTION_DIRECT_JOINS = "speaking_lab_direct_joins"
 
-# Attendance Passport recency window — a student's most recent present-type
-# check-in must fall within this many hours to count as an automatic
-# eligibility signal. Deliberately generous (covers same-day, any class)
-# rather than a rigid same-session binding, since no such binding exists
-# between the Attendance system and Speaking Lab today.
-ATTENDANCE_PASSPORT_WINDOW_HOURS = 8
-
 PRESENT_STATUSES = {"present_full", "present_partial", "late"}
+
+# Attendance-binding resolution outcomes surfaced to the teacher so a
+# roster full of Needs Review has an explicit, honest reason rather than
+# looking like a bug.
+BINDING_NOT_BINDABLE = "not_bindable"
+BINDING_NO_CLASS = "no_attendance_class_for_group"
+BINDING_NO_SESSION_TODAY = "no_attendance_session_today"
+BINDING_AMBIGUOUS = "ambiguous_multiple_sessions_today"
+BINDING_RESOLVED = "resolved"
 
 DECISION_APPROVE = "approve"
 DECISION_REJECT = "reject"
@@ -132,6 +148,11 @@ class EligibilityResponse(BaseModel):
     manual_admits: list[EligibilityStudent] = []
     rejected: list[str] = []
     frozen: bool = False
+    # Why the attendance passport did/didn't resolve for this session's
+    # schedule — "resolved", or a fail-closed reason (no tagged class, no
+    # session today, ambiguous). None for AB/blank-schedule sessions,
+    # which resolve per-student instead of once for the whole roster.
+    attendance_binding: Optional[str] = None
 
 
 class DecisionResponse(BaseModel):
@@ -163,21 +184,95 @@ class ReadinessResponse(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Attendance Passport — read-only, class-agnostic recency check
+# Attendance Passport — read-only, DETERMINISTIC, session-bound resolution.
+#
+# Never scans across classes or dates and never uses a rolling time
+# window. A student can only ever be AUTO ELIGIBLE via an attendance
+# record that provably belongs to (a) a class tagged for this exact
+# schedule group and (b) that class's session dated today. Any ambiguity
+# (no tagged class, no session today, more than one candidate session)
+# fails CLOSED to Needs Review — it never guesses, and it never lets an
+# unrelated class's check-in count.
 # ──────────────────────────────────────────────────────────────────────────────
-async def _has_attendance_passport(
-    db, canonical_student_id: str, *, window_hours: int = ATTENDANCE_PASSPORT_WINDOW_HOURS,
-) -> bool:
-    cutoff = (utcnow() - timedelta(hours=window_hours)).isoformat()
-    rec = await db[COLLECTION_ATTENDANCE_RECORDS].find_one(
-        {
-            "student_id": canonical_student_id,
-            "status": {"$in": list(PRESENT_STATUSES)},
-            "checked_in_at": {"$gte": cutoff},
-        },
-        {"_id": 0, "student_id": 1},
+async def _resolve_attendance_session_id(
+    db, group: str, *, today: str,
+) -> tuple[Optional[str], str]:
+    group_norm = (group or "").strip().upper()
+    if group_norm not in ("A", "B"):
+        return None, BINDING_NOT_BINDABLE
+
+    class_ids: list[str] = []
+    cur = db[COLLECTION_ATTENDANCE_CLASSES].find(
+        {"group": group_norm}, {"_id": 0, "class_id": 1})
+    async for c in cur:
+        cid = c.get("class_id")
+        if cid:
+            class_ids.append(cid)
+    if not class_ids:
+        return None, BINDING_NO_CLASS
+
+    session_ids: list[str] = []
+    cur2 = db[COLLECTION_ATTENDANCE_SESSIONS].find(
+        {"class_id": {"$in": class_ids}, "date": today},
+        {"_id": 0, "session_id": 1})
+    async for s in cur2:
+        sid = s.get("session_id")
+        if sid:
+            session_ids.append(sid)
+    if not session_ids:
+        return None, BINDING_NO_SESSION_TODAY
+    if len(session_ids) > 1:
+        return None, BINDING_AMBIGUOUS
+    return session_ids[0], BINDING_RESOLVED
+
+
+async def _student_group(db, canonical_student_id: str) -> str:
+    doc = await db.students.find_one(
+        {"$or": [{"clean_id": canonical_student_id}, {"student_id": canonical_student_id}]},
+        {"_id": 0, "group": 1, "schedule": 1},
     )
-    return rec is not None
+    return (doc or {}).get("group") or (doc or {}).get("schedule") or ""
+
+
+async def _attendance_binding_for_session(db, sess: dict) -> dict:
+    """Resolved ONCE per Speaking Lab session for the common A/B case —
+    every roster student shares the same binding. Combined "AB" (or a
+    blank schedule) has no single group to bind against, so resolution
+    is deferred to per-student (see _has_attendance_passport below)."""
+    schedule = (sess.get("schedule") or "").strip().upper()
+    today = utcnow().date().isoformat()
+    if schedule in ("A", "B"):
+        session_id, reason = await _resolve_attendance_session_id(db, schedule, today=today)
+        return {"mode": "fixed", "session_id": session_id, "reason": reason, "today": today}
+    return {"mode": "per_student", "today": today}
+
+
+async def _has_attendance_passport(
+    db, canonical_student_id: str, attendance_ctx: dict,
+) -> tuple[bool, str]:
+    if attendance_ctx["mode"] == "fixed":
+        attendance_session_id = attendance_ctx["session_id"]
+        if not attendance_session_id:
+            return False, attendance_ctx["reason"]
+    else:
+        group = await _student_group(db, canonical_student_id)
+        attendance_session_id, reason = await _resolve_attendance_session_id(
+            db, group, today=attendance_ctx["today"])
+        if not attendance_session_id:
+            return False, reason
+
+    # Exact O(1) lookup on the composite key attendance_tools.py already
+    # writes (`{session_id}:{student_id}`) — never a query that could
+    # match a different session or class.
+    rec = await db[COLLECTION_ATTENDANCE_RECORDS].find_one(
+        {"_id": f"{attendance_session_id}:{canonical_student_id}"},
+        {"_id": 0, "status": 1},
+    )
+    if not rec:
+        return False, "no_checkin_for_session"
+    if rec.get("status") not in PRESENT_STATUSES:
+        return False, "checked_in_but_not_present"
+    return True, BINDING_RESOLVED
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -215,6 +310,7 @@ def register_eligibility_routes(
         sess = await _session_or_404(session_id)
         roster = await eligible_roster_fn(sess)
         overrides = await _overrides_for(session_id)
+        attendance_ctx = await _attendance_binding_for_session(db, sess)
 
         auto_eligible: list[dict] = []
         needs_review: list[dict] = []
@@ -225,7 +321,7 @@ def register_eligibility_routes(
             ov = overrides.get(sid)
             if ov and ov["decision"] == DECISION_REJECT:
                 continue  # explicitly excluded by teacher, drop from both lists
-            has_passport = await _has_attendance_passport(db, sid)
+            has_passport, _reason = await _has_attendance_passport(db, sid, attendance_ctx)
             if has_passport or (ov and ov["decision"] == DECISION_APPROVE):
                 auto_eligible.append(entry)
             else:
@@ -238,6 +334,10 @@ def register_eligibility_routes(
         ]
         rejected = [sid for sid, ov in overrides.items() if ov["decision"] == DECISION_REJECT]
 
+        # Diagnostic only for the fixed (A/B) case — an AB/blank-schedule
+        # session resolves per-student, so no single note applies.
+        binding_note = attendance_ctx.get("reason") if attendance_ctx["mode"] == "fixed" else None
+
         return {
             "session_id": session_id,
             "roster_size": len(roster),
@@ -247,6 +347,7 @@ def register_eligibility_routes(
             "manual_admits": manual_admits,
             "rejected": rejected,
             "frozen": bool(sess.get("enrollment_frozen_at")),
+            "attendance_binding": binding_note,
         }
 
     async def _final_participant_ids(session_id: str) -> list[dict]:
