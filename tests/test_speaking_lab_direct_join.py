@@ -127,6 +127,13 @@ class _FakeCollection:
             await self.insert_one(doc, session=session)
         return _Result()
 
+    async def delete_one(self, query, session=None):
+        for i, d in enumerate(self._docs):
+            if _match(d, query):
+                del self._docs[i]
+                return _Result(matched=1, modified=1)
+        return _Result()
+
     async def find_one(self, query, projection=None, session=None):
         for d in self._docs:
             if _match(d, query):

@@ -1216,4 +1216,9 @@ def register_speaking_lab_direct_join_routes(
     return {
         "enroll_all_eligible": enroll_all_eligible,
         "enrollment_status": _enrollment_status,
+        # Exposed for speaking_lab_eligibility.py (V4 attendance-assisted
+        # enrollment) to reuse UNCHANGED — never a second roster/enrollment
+        # implementation.
+        "eligible_roster": _eligible_roster,
+        "perform_join": _perform_join,
     }

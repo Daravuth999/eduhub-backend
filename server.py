@@ -30,6 +30,10 @@ from speaking_lab_direct_join import (
     register_speaking_lab_direct_join_routes,
     ensure_direct_join_indexes,
 )
+from speaking_lab_eligibility import (
+    register_eligibility_routes,
+    ensure_eligibility_indexes,
+)
 from lucky_draw import (
     register_lucky_draw_routes,
     generate_and_publish_lucky_code,
@@ -5720,6 +5724,21 @@ _sl_direct_join_hooks.update(register_speaking_lab_direct_join_routes(
     log=log,
     require_admin_dep=require_admin,
 ) or {})
+
+# ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
+# Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
+# Join factory above via the hooks dict — no second enrollment system, no
+# change to Lucky Draw/Mystery Box/treasury/reward code.
+register_eligibility_routes(
+    api,
+    db,
+    SL_SESSIONS,
+    _sl_direct_join_hooks.get("eligible_roster"),
+    _sl_direct_join_hooks.get("perform_join"),
+    _norm_student_id,
+    require_admin_dep=require_admin,
+    log=log,
+)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.add_middleware(
@@ -5794,6 +5813,7 @@ async def startup():
     except Exception as _sl_audit_idx_err:  # noqa: BLE001 — never fatal at startup
         logging.getLogger("eduhub").warning(
             "speaking_lab_enrollment_audit: index setup skipped: %s", _sl_audit_idx_err)
+    await ensure_eligibility_indexes(db)
     # ── Voice Treasure (Phase 2) — seed default config doc if absent ──
     try:
         from voice_treasure_config_tools import ensure_voice_treasure_indexes
