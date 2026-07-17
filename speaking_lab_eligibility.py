@@ -231,53 +231,87 @@ async def _resolve_attendance_session_id(
     return session_ids[0], BINDING_RESOLVED
 
 
-async def _student_group(db, canonical_student_id: str) -> str:
-    doc = await db.students.find_one(
-        {"$or": [{"clean_id": canonical_student_id}, {"student_id": canonical_student_id}]},
-        {"_id": 0, "group": 1, "schedule": 1},
+async def _bulk_student_groups(db, student_ids: list[str]) -> dict[str, str]:
+    """One round trip for every roster student's group, instead of one
+    query per student — the same clean_id/student_id/group/schedule
+    lookup pattern used elsewhere in this codebase (e.g.
+    speaking_lab_direct_join.py's per-student resolution), batched via
+    $in for an entire roster at once."""
+    out = {sid: "" for sid in student_ids}
+    if not student_ids:
+        return out
+    cur = db.students.find(
+        {"$or": [{"clean_id": {"$in": student_ids}}, {"student_id": {"$in": student_ids}}]},
+        {"_id": 0, "clean_id": 1, "student_id": 1, "group": 1, "schedule": 1},
     )
-    return (doc or {}).get("group") or (doc or {}).get("schedule") or ""
+    async for doc in cur:
+        key = doc.get("clean_id") or doc.get("student_id")
+        if key in out:
+            out[key] = doc.get("group") or doc.get("schedule") or ""
+    return out
 
 
-async def _attendance_binding_for_session(db, sess: dict) -> dict:
-    """Resolved ONCE per Speaking Lab session for the common A/B case —
-    every roster student shares the same binding. Combined "AB" (or a
-    blank schedule) has no single group to bind against, so resolution
-    is deferred to per-student (see _has_attendance_passport below)."""
+async def _bulk_attendance_passports(
+    db, sess: dict, roster: list[dict],
+) -> tuple[dict[str, tuple[bool, str]], dict[str, tuple[Optional[str], str]]]:
+    """Batched, cached equivalent of checking each roster student's
+    attendance passport one at a time. A single roster of 500 students
+    resolves in a small constant number of round trips — one group
+    lookup, one binding resolution PER DISTINCT GROUP (at most a
+    handful: "A", "B", unassigned — never per student), and one batched
+    attendance_records lookup — instead of up to 4 sequential round
+    trips PER STUDENT, which made a 60+ student Combined A+B roster
+    (identical binding recomputed redundantly for every single student)
+    take many seconds and made "Approve All Pending" appear to hang.
+    Same fail-closed semantics and reason codes throughout."""
+    student_ids = [e["student_id"] for e in roster]
+    if not student_ids:
+        return {}, {}
+
     schedule = (sess.get("schedule") or "").strip().upper()
     today = utcnow().date().isoformat()
+
     if schedule in ("A", "B"):
-        session_id, reason = await _resolve_attendance_session_id(db, schedule, today=today)
-        return {"mode": "fixed", "session_id": session_id, "reason": reason, "today": today}
-    return {"mode": "per_student", "today": today}
-
-
-async def _has_attendance_passport(
-    db, canonical_student_id: str, attendance_ctx: dict,
-) -> tuple[bool, str]:
-    if attendance_ctx["mode"] == "fixed":
-        attendance_session_id = attendance_ctx["session_id"]
-        if not attendance_session_id:
-            return False, attendance_ctx["reason"]
+        group_by_student = {sid: schedule for sid in student_ids}
     else:
-        group = await _student_group(db, canonical_student_id)
-        attendance_session_id, reason = await _resolve_attendance_session_id(
-            db, group, today=attendance_ctx["today"])
-        if not attendance_session_id:
-            return False, reason
+        group_by_student = await _bulk_student_groups(db, student_ids)
 
-    # Exact O(1) lookup on the composite key attendance_tools.py already
-    # writes (`{session_id}:{student_id}`) — never a query that could
-    # match a different session or class.
-    rec = await db[COLLECTION_ATTENDANCE_RECORDS].find_one(
-        {"_id": f"{attendance_session_id}:{canonical_student_id}"},
-        {"_id": 0, "status": 1},
-    )
-    if not rec:
-        return False, "no_checkin_for_session"
-    if rec.get("status") not in PRESENT_STATUSES:
-        return False, "checked_in_but_not_present"
-    return True, BINDING_RESOLVED
+    binding_cache: dict[str, tuple[Optional[str], str]] = {}
+    for group in set(group_by_student.values()):
+        binding_cache[group] = await _resolve_attendance_session_id(db, group, today=today)
+
+    wanted_ids: list[str] = []
+    id_to_student: dict[str, str] = {}
+    for sid in student_ids:
+        session_id, _reason = binding_cache.get(group_by_student.get(sid, ""), (None, BINDING_NOT_BINDABLE))
+        if session_id:
+            composite = f"{session_id}:{sid}"
+            wanted_ids.append(composite)
+            id_to_student[composite] = sid
+
+    status_by_student: dict[str, str] = {}
+    if wanted_ids:
+        cur = db[COLLECTION_ATTENDANCE_RECORDS].find(
+            {"_id": {"$in": wanted_ids}}, {"_id": 1, "status": 1})
+        async for row in cur:
+            sid = id_to_student.get(row["_id"])
+            if sid:
+                status_by_student[sid] = row.get("status")
+
+    result: dict[str, tuple[bool, str]] = {}
+    for sid in student_ids:
+        session_id, reason = binding_cache.get(group_by_student.get(sid, ""), (None, BINDING_NOT_BINDABLE))
+        if not session_id:
+            result[sid] = (False, reason)
+            continue
+        status = status_by_student.get(sid)
+        if status is None:
+            result[sid] = (False, "no_checkin_for_session")
+        elif status not in PRESENT_STATUSES:
+            result[sid] = (False, "checked_in_but_not_present")
+        else:
+            result[sid] = (True, BINDING_RESOLVED)
+    return result, binding_cache
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -315,7 +349,9 @@ def register_eligibility_routes(
         sess = await _session_or_404(session_id)
         roster = await eligible_roster_fn(sess)
         overrides = await _overrides_for(session_id)
-        attendance_ctx = await _attendance_binding_for_session(db, sess)
+        # Batched: one small constant number of round trips for the
+        # WHOLE roster, never one per student — see _bulk_attendance_passports.
+        passports, binding_cache = await _bulk_attendance_passports(db, sess, roster)
 
         auto_eligible: list[dict] = []
         needs_review: list[dict] = []
@@ -326,7 +362,7 @@ def register_eligibility_routes(
             ov = overrides.get(sid)
             if ov and ov["decision"] == DECISION_REJECT:
                 continue  # explicitly excluded by teacher, drop from both lists
-            has_passport, _reason = await _has_attendance_passport(db, sid, attendance_ctx)
+            has_passport, _reason = passports.get(sid, (False, BINDING_NOT_BINDABLE))
             if has_passport or (ov and ov["decision"] == DECISION_APPROVE):
                 auto_eligible.append(entry)
             else:
@@ -340,8 +376,14 @@ def register_eligibility_routes(
         rejected = [sid for sid, ov in overrides.items() if ov["decision"] == DECISION_REJECT]
 
         # Diagnostic only for the fixed (A/B) case — an AB/blank-schedule
-        # session resolves per-student, so no single note applies.
-        binding_note = attendance_ctx.get("reason") if attendance_ctx["mode"] == "fixed" else None
+        # session resolves per-student (each may have a different
+        # group), so no single note applies.
+        schedule_norm = (sess.get("schedule") or "").strip().upper()
+        binding_note = None
+        if schedule_norm in ("A", "B") and schedule_norm in binding_cache:
+            _resolved_session_id, binding_note = binding_cache[schedule_norm]
+            if binding_note == BINDING_RESOLVED:
+                binding_note = None
 
         return {
             "session_id": session_id,
@@ -437,19 +479,27 @@ def register_eligibility_routes(
         c = await _classify(session_id)
         now_iso = utcnow().isoformat()
         decided_by = getattr(admin, "email", "") or ""
-        approved = 0
-        for entry in c["needs_review"]:
-            await db[COLLECTION_OVERRIDES].update_one(
-                {"session_id": session_id, "student_id": entry["student_id"]},
-                {"$set": {
-                    "session_id": session_id, "student_id": entry["student_id"],
-                    "decision": DECISION_APPROVE, "display_name": entry["display_name"],
-                    "decided_by": decided_by, "decided_at": now_iso,
-                }},
-                upsert=True,
-            )
-            approved += 1
-        return {"ok": True, "session_id": session_id, "approved": approved}
+
+        # Bounded concurrency, same pattern as enroll_all_eligible /
+        # confirm_participants — a large Needs Review list (dozens to
+        # hundreds of students) writes its overrides concurrently
+        # instead of one sequential round trip per student.
+        sem = asyncio.Semaphore(20)
+
+        async def _approve_one(entry: dict) -> None:
+            async with sem:
+                await db[COLLECTION_OVERRIDES].update_one(
+                    {"session_id": session_id, "student_id": entry["student_id"]},
+                    {"$set": {
+                        "session_id": session_id, "student_id": entry["student_id"],
+                        "decision": DECISION_APPROVE, "display_name": entry["display_name"],
+                        "decided_by": decided_by, "decided_at": now_iso,
+                    }},
+                    upsert=True,
+                )
+
+        await asyncio.gather(*(_approve_one(e) for e in c["needs_review"]))
+        return {"ok": True, "session_id": session_id, "approved": len(c["needs_review"])}
 
     @api.post(
         "/speaking-lab/sessions/{session_id}/confirm-participants",

@@ -688,6 +688,61 @@ async def test_26_combined_ab_session_resolves_attendance_per_student_own_group(
 
 
 @pytest.mark.asyncio
+async def test_28_large_combined_roster_resolves_binding_a_bounded_number_of_times_not_per_student():
+    """Regression test for the exact bug reported live: a 60+ student
+    Combined A+B roster must resolve the attendance binding a BOUNDED
+    number of times (once per distinct group — at most 2 here: A and
+    B), never once per student. Before the fix, each of the 60 students
+    triggered its own attendance_classes/attendance_sessions scan,
+    making "Approve All Pending" on a real class appear to hang."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="AB", fee=4, status="waiting")
+    await _seed_wallet(db, "stu092", 0)
+    await _enable_direct_join(db)
+    for i in range(30):
+        sid = f"stua{i}"
+        await _seed_student(db, sid, group="A")
+        await _seed_wallet(db, sid, 10)
+    for i in range(30):
+        sid = f"stub{i}"
+        await _seed_student(db, sid, group="B")
+        await _seed_wallet(db, sid, 10)
+    await _seed_present(db, "stua0", group="A", status="present_full")
+    await _seed_present(db, "stub0", group="B", status="present_full")
+
+    classes_coll = db["attendance_classes"]
+    sessions_coll = db["attendance_sessions"]
+    call_count = {"n": 0}
+    _orig_classes_find = classes_coll.find
+    _orig_sessions_find = sessions_coll.find
+
+    def _counting_classes_find(*a, **k):
+        call_count["n"] += 1
+        return _orig_classes_find(*a, **k)
+
+    def _counting_sessions_find(*a, **k):
+        call_count["n"] += 1
+        return _orig_sessions_find(*a, **k)
+
+    classes_coll.find = _counting_classes_find
+    sessions_coll.find = _counting_sessions_find
+    try:
+        client = _build_v4_client(db)
+        r = client.get("/api/speaking-lab/sessions/s1/eligibility")
+    finally:
+        classes_coll.find = _orig_classes_find
+        sessions_coll.find = _orig_sessions_find
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["roster_size"] == 60
+    # Exactly 2 distinct groups (A, B) -> at most 2 binding resolutions,
+    # each touching both collections once = 4 calls total. NOT 120
+    # (2 collections x 60 students), which is what the bug produced.
+    assert call_count["n"] <= 4, f"expected a bounded call count, got {call_count['n']} (scales with roster size)"
+
+
+@pytest.mark.asyncio
 async def test_27_a_checkin_for_a_different_class_session_id_is_never_matched():
     """Defense in depth on the exact composite-key lookup: a present
     record that exists under a DIFFERENT session_id (even same class,
