@@ -472,6 +472,7 @@ async def test_18_readiness_ready_when_all_tickets_generated():
     assert body["eligible"] == 2
     assert body["tickets"] == 2
     assert body["ready"] is True
+    assert set(body["participant_ids"]) == {"stua1", "stua2"}
 
 
 @pytest.mark.asyncio

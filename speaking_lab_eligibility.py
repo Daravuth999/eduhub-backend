@@ -181,6 +181,11 @@ class ReadinessResponse(BaseModel):
     tickets: int
     notifications_sent: int
     ready: bool
+    # The durable, frozen-at-confirm-time participant set (never
+    # recomputed from live roster state) — the exact student IDs a
+    # teacher-app "Start Lucky Draw" action should hand off to the game.
+    # Empty before freeze.
+    participant_ids: list[str] = []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -515,7 +520,8 @@ def register_eligibility_routes(
         frozen = bool(sess.get("enrollment_frozen_at"))
         if not frozen:
             return {"session_id": session_id, "frozen": False,
-                    "eligible": 0, "tickets": 0, "notifications_sent": 0, "ready": False}
+                    "eligible": 0, "tickets": 0, "notifications_sent": 0, "ready": False,
+                    "participant_ids": []}
         # The durable, frozen-at-confirm-time list — NEVER recomputed from
         # live roster/override state, so a post-freeze roster change can
         # never move this number.
@@ -536,6 +542,7 @@ def register_eligibility_routes(
             "eligible": eligible, "tickets": tickets,
             "notifications_sent": notifications_sent,
             "ready": eligible > 0 and tickets == eligible,
+            "participant_ids": participant_ids,
         }
 
     @api.get(
