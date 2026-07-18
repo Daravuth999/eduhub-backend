@@ -1564,6 +1564,17 @@ async def _fan_out_push(
     return sent, failed
 
 
+# ── ACTIVITY CENTER (isolated adapter — notification_center.py) ─────────────
+# Wraps _fan_out_push so every REAL push event is ALSO persisted as an
+# Activity Center notification (30-day TTL) + delivered over the isolated
+# notification WebSocket. The wrapper calls the original first and NEVER
+# raises into callers — push behaviour is unchanged. Placed here (before any
+# module registration) so every capture of _fan_out_push gets the wrapper.
+from notification_center import wrap_fan_out_push as _nc_wrap_fan_out_push
+_fan_out_push = _nc_wrap_fan_out_push(_fan_out_push, db)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 async def require_studio_user(user: User = Depends(require_user)) -> User:
     """Any authenticated studio user (teacher OR super-admin)."""
     return user
@@ -7213,6 +7224,20 @@ except Exception as _lmb_load_err:
 register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
+
+# ── ACTIVITY CENTER routes (isolated, additive — notification_center.py) ────
+# /api/notifications (list) · /unread-count · /{id}/read · /read-all and the
+# realtime WS at /api/notifications/ws. Student-session auth reused as-is.
+try:
+    from notification_center import register_notification_center
+    register_notification_center(api, app, db, require_student)
+    logging.getLogger("eduhub").info("notification_center: registered")
+except Exception as _nc_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "notification_center failed to load (Activity Center disabled): %s",
+        _nc_err,
+    )
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ── EduTalk Live Coach (admin: "Live Voice Coach Beta") ──────────────────
 # NEW, fully isolated, additive real-time voice-to-voice speaking coach
