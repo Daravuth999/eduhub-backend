@@ -406,6 +406,38 @@ async def ensure_notification_indexes(db) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
+async def _resolve_student_by_session_token(db, session_token: str):
+    """Mirrors current_student()'s session lookup exactly (server.py), for a
+    single candidate token string. Returns the student doc or None — never
+    raises. Used by the WS handler to try BOTH the query-string token and
+    the cookie independently (see notifications_ws for why)."""
+    session_token = (session_token or "").strip()
+    if not session_token:
+        return None
+    sess = await db.student_sessions.find_one(
+        {"session_token": session_token}, {"_id": 0}
+    )
+    if not sess:
+        return None
+    expires = sess.get("expires_at")
+    if expires:
+        try:
+            exp_dt = (
+                datetime.fromisoformat(expires)
+                if isinstance(expires, str) else expires
+            )
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > exp_dt:
+                return None
+        except ValueError:
+            return None
+    return await db.students.find_one(
+        {"student_id": sess.get("student_id"), "is_active": {"$ne": False}},
+        {"_id": 0, "password_hash": 0},
+    )
+
+
 def register_notification_center(api, app, db, require_student) -> None:
     from fastapi import Depends
 
@@ -485,34 +517,19 @@ def register_notification_center(api, app, db, require_student) -> None:
         return {"ok": True}
 
     # ── Realtime — isolated WS. Auth via ?token= (Bearer fallback token) OR
-    #    the existing student_session cookie (sent automatically on wss). ──
+    #    the existing student_session cookie (sent automatically on wss).
+    #    BOTH are attempted independently (query token first, then cookie) —
+    #    never just "whichever string is non-empty". A stale cached Bearer
+    #    token in localStorage must not shadow a still-valid cookie session
+    #    (or vice versa): each candidate is validated on its own merits,
+    #    matching current_student()'s guarantee that a valid session in
+    #    EITHER place authenticates the request. ─────────────────────────
     @app.websocket("/api/notifications/ws")
     async def notifications_ws(ws: WebSocket, token: str = Query(default="")):
-        session_token = (token or "").strip() or (ws.cookies or {}).get("student_session", "")
-        student_doc = None
-        if session_token:
-            sess = await db.student_sessions.find_one(
-                {"session_token": session_token}, {"_id": 0}
-            )
-            if sess:
-                expires = sess.get("expires_at")
-                ok = True
-                if expires:
-                    try:
-                        exp_dt = (
-                            datetime.fromisoformat(expires)
-                            if isinstance(expires, str) else expires
-                        )
-                        if exp_dt.tzinfo is None:
-                            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-                        ok = datetime.now(timezone.utc) <= exp_dt
-                    except ValueError:
-                        ok = False
-                if ok:
-                    student_doc = await db.students.find_one(
-                        {"student_id": sess.get("student_id"), "is_active": {"$ne": False}},
-                        {"_id": 0, "password_hash": 0},
-                    )
+        student_doc = await _resolve_student_by_session_token(db, token)
+        if not student_doc:
+            cookie_token = (ws.cookies or {}).get("student_session", "")
+            student_doc = await _resolve_student_by_session_token(db, cookie_token)
         if not student_doc:
             await ws.close(code=4401)
             return
