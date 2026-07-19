@@ -7239,6 +7239,23 @@ except Exception as _nc_err:  # noqa: BLE001
     )
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── EXPERIENCE CONFIGURATION PLATFORM (isolated, additive — Phase 1) ───────
+# GET /api/experience-configs/active?type=... — read-only. Powers the
+# Welcome Dashboard hero today; generic enough for any future experience
+# type (Digital Books hero, Speaking Lab landing, etc.) without a schema
+# change. See experience_config_tools.py for the full domain model and
+# migration contract.
+try:
+    from experience_config_tools import register_experience_config_routes
+    register_experience_config_routes(api, app, db)
+    logging.getLogger("eduhub").info("experience_config_tools: registered")
+except Exception as _ec_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "experience_config_tools failed to load (Experience Config Platform disabled): %s",
+        _ec_err,
+    )
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── EduTalk Live Coach (admin: "Live Voice Coach Beta") ──────────────────
 # NEW, fully isolated, additive real-time voice-to-voice speaking coach
 # powered by the Gemini Live API. Registers admin config routes
