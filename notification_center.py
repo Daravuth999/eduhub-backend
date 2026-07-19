@@ -1,8 +1,16 @@
 """
-notification_center.py — EduHub Activity Center™ (v1.0, isolated module)
+notification_center.py — EduHub Activity Center™ (v1.1, isolated module)
 ══════════════════════════════════════════════════════════════════════════════
 Enterprise notification system. 100% additive — bolts onto the existing
 FastAPI app without touching any protected business logic.
+
+v1.1 — Unified badge platform support. Adds two OPTIONAL, keyword-only
+params to the wrapped fan-out (`category`, `dedupe_key`) and a `byCategory`
+breakdown on GET /notifications/unread-count. Every v1.0 call site — all of
+which call positionally with exactly 4 args — is byte-identical in
+behaviour; nothing existing was rewritten to adopt the new params. See
+the unified-notification-badge-platform implementation report for the
+frontend half (per-module badges + Home Screen app icon badge sync).
 
 DESIGN
 ──────
@@ -176,21 +184,30 @@ _PRIORITY_RULES: list[tuple[str, str]] = [
 ]
 
 
-def classify_event(title: str, body: str, url: str) -> tuple[str, str]:
-    """Derive (category, priority) from the real push content. Pure fn."""
+def classify_event(
+    title: str, body: str, url: str, category: Optional[str] = None,
+) -> tuple[str, str]:
+    """Derive (category, priority) from the real push content. Pure fn.
+
+    v1.1 — ``category`` lets a caller state its own category explicitly
+    instead of relying on keyword/URL inference. Must be one of CATEGORIES
+    or it's ignored (falls through to inference) — never trust caller input
+    blindly. Existing callers that omit it get byte-identical behaviour.
+    """
     text = f"{title or ''} {body or ''}".lower()
     u = (url or "").lower()
 
-    category = "system"
-    for needle, cat in _TEXT_CATEGORY_RULES:
-        if needle in text:
-            category = cat
-            break
-    else:
-        for needle, cat in _URL_CATEGORY_RULES:
-            if needle in u:
+    if not (category and category in CATEGORIES):
+        category = "system"
+        for needle, cat in _TEXT_CATEGORY_RULES:
+            if needle in text:
                 category = cat
                 break
+        else:
+            for needle, cat in _URL_CATEGORY_RULES:
+                if needle in u:
+                    category = cat
+                    break
 
     priority = "normal"
     for needle, pri in _PRIORITY_RULES:
@@ -315,7 +332,32 @@ def _serialize(doc: dict, viewer_ids: Optional[set[str]] = None) -> dict:
     }
 
 
-async def _record_event(db, subs_query: Any, title: str, body: str, url: str) -> None:
+async def _record_event(
+    db, subs_query: Any, title: str, body: str, url: str,
+    *, category: Optional[str] = None, dedupe_key: Optional[str] = None,
+) -> None:
+    """v1.1 — ``category`` and ``dedupe_key`` are both optional, keyword-only,
+    and additive. Omitting either reproduces v1.0 behaviour exactly (keyword
+    inference, no dedupe check) — existing callers are untouched.
+
+    ``dedupe_key`` guards against the SAME event being recorded twice (e.g. a
+    caller-side retry). It is checked at the EVENT level (one lookup before
+    fan-out), not per-student — if a prior call already recorded any document
+    carrying this key, the whole event is skipped. This does not change
+    Web Push delivery (the original push already happened in the wrapper
+    before this function runs) — it only prevents a duplicate Activity
+    Center entry.
+    """
+    if dedupe_key:
+        try:
+            existing = await db["activity_notifications"].find_one(
+                {"dedupeKey": dedupe_key}, {"_id": 1}
+            )
+            if existing:
+                return
+        except Exception as exc:  # noqa: BLE001 — dedupe check must never block recording
+            log.warning("notification-center: dedupe check failed: %s", str(exc)[:160])
+
     ids, is_broadcast, is_group = extract_target_ids(subs_query)
 
     if is_group:
@@ -326,7 +368,7 @@ async def _record_event(db, subs_query: Any, title: str, body: str, url: str) ->
             log.warning("notification-center: group resolve failed: %s", str(exc)[:160])
             return
 
-    category, priority = classify_event(title, body, url)
+    resolved_category, priority = classify_event(title, body, url, category)
     now = datetime.now(timezone.utc)
     expires = now + timedelta(days=RETENTION_DAYS)
     coll = db["activity_notifications"]
@@ -335,11 +377,13 @@ async def _record_event(db, subs_query: Any, title: str, body: str, url: str) ->
         doc = {
             "studentId": "*",
             "title": title, "body": body, "url": url or "/",
-            "category": category, "priority": priority,
+            "category": resolved_category, "priority": priority,
             "read": False, "readBy": [],
             "source": "push_fanout",
             "createdAt": now, "expiresAt": expires,
         }
+        if dedupe_key:
+            doc["dedupeKey"] = dedupe_key
         res = await coll.insert_one(doc)
         doc["_id"] = res.inserted_id
         await _ws_manager.broadcast({"type": "notification", "item": _serialize(doc, set())})
@@ -360,10 +404,11 @@ async def _record_event(db, subs_query: Any, title: str, body: str, url: str) ->
         {
             "studentId": sid,
             "title": title, "body": body, "url": url or "/",
-            "category": category, "priority": priority,
+            "category": resolved_category, "priority": priority,
             "read": False,
             "source": "push_fanout",
             "createdAt": now, "expiresAt": expires,
+            **({"dedupeKey": dedupe_key} if dedupe_key else {}),
         }
         for sid in norm_ids
     ]
@@ -382,10 +427,19 @@ def wrap_fan_out_push(
 ) -> Callable[..., Awaitable[tuple[int, int]]]:
     async def _fan_out_push_with_activity_center(
         subs_query: dict, title: str, body: str, url: str,
+        *, category: Optional[str] = None, dedupe_key: Optional[str] = None,
     ) -> tuple[int, int]:
+        # v1.1 — category/dedupe_key are Activity Center-only hints; NEVER
+        # forwarded to `original` (the real Web Push sender), whose
+        # signature is unchanged. Every existing call site — all of which
+        # call positionally with exactly 4 args — is byte-identical in
+        # behaviour; these are opt-in for new/updated call sites only.
         result = await original(subs_query, title, body, url)
         try:
-            await _record_event(db, subs_query, title, body, url)
+            await _record_event(
+                db, subs_query, title, body, url,
+                category=category, dedupe_key=dedupe_key,
+            )
         except Exception as exc:  # noqa: BLE001 — NEVER break existing push flow
             log.warning("notification-center: record failed: %s", str(exc)[:200])
         return result
@@ -401,6 +455,11 @@ async def ensure_notification_indexes(db) -> None:
     await coll.create_index("expiresAt", expireAfterSeconds=0)
     await coll.create_index([("studentId", 1), ("createdAt", -1)])
     await coll.create_index([("studentId", 1), ("read", 1)])
+    # v1.1 — supports the per-category unread breakdown (unified badge
+    # platform) and the optional caller-supplied idempotency key. Both
+    # additive; neither changes the meaning of any existing query.
+    await coll.create_index([("studentId", 1), ("category", 1), ("read", 1)])
+    await coll.create_index("dedupeKey", sparse=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,10 +537,33 @@ def register_notification_center(api, app, db, require_student) -> None:
 
     @api.get("/notifications/unread-count")
     async def unread_count(student=Depends(require_student)):
+        # v1.1 — adds `byCategory` alongside the original `count`. Purely
+        # additive: existing callers reading only `.count` see byte-identical
+        # values and behaviour. `byCategory` is what the unified badge
+        # platform (Dashboard/nav/Wallet/Speaking Lab/EduTalk/Attendance
+        # module badges) reads to know WHICH module has unread activity,
+        # without a second endpoint or a second round trip.
         viewer = _viewer_ids(student)
-        own = await coll.count_documents({"studentId": {"$in": viewer}, "read": False})
-        bc = await coll.count_documents({"studentId": "*", "readBy": {"$nin": viewer}})
-        return {"count": min(own + bc, 99)}
+        by_category: dict[str, int] = {}
+
+        own_pipeline = [
+            {"$match": {"studentId": {"$in": viewer}, "read": False}},
+            {"$group": {"_id": "$category", "n": {"$sum": 1}}},
+        ]
+        async for row in coll.aggregate(own_pipeline):
+            cat = row["_id"] or "system"
+            by_category[cat] = by_category.get(cat, 0) + int(row["n"])
+
+        bc_pipeline = [
+            {"$match": {"studentId": "*", "readBy": {"$nin": viewer}}},
+            {"$group": {"_id": "$category", "n": {"$sum": 1}}},
+        ]
+        async for row in coll.aggregate(bc_pipeline):
+            cat = row["_id"] or "system"
+            by_category[cat] = by_category.get(cat, 0) + int(row["n"])
+
+        total = min(sum(by_category.values()), 99)
+        return {"count": total, "byCategory": by_category}
 
     @api.post("/notifications/read-all")
     async def mark_all_read(student=Depends(require_student)):
