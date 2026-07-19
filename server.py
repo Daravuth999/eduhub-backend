@@ -7239,15 +7239,17 @@ except Exception as _nc_err:  # noqa: BLE001
     )
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── EXPERIENCE CONFIGURATION PLATFORM (isolated, additive — Phase 1) ───────
-# GET /api/experience-configs/active?type=... — read-only. Powers the
-# Welcome Dashboard hero today; generic enough for any future experience
-# type (Digital Books hero, Speaking Lab landing, etc.) without a schema
-# change. See experience_config_tools.py for the full domain model and
-# migration contract.
+# ── EXPERIENCE CONFIGURATION PLATFORM (isolated, additive) ────────────────
+# GET /api/experience-configs/active?type=... — public, read-only. Powers
+# the Welcome Dashboard hero today; generic enough for any future
+# experience type (Digital Books hero, Speaking Lab landing, etc.) without
+# a schema change. Phase 3 adds the admin CRUD/publish surface (gated by
+# require_admin) that Author Studio's Welcome Experience Studio uses. See
+# experience_config_tools.py for the full domain model and migration
+# contract.
 try:
     from experience_config_tools import register_experience_config_routes
-    register_experience_config_routes(api, app, db)
+    register_experience_config_routes(api, app, db, require_admin)
     logging.getLogger("eduhub").info("experience_config_tools: registered")
 except Exception as _ec_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
