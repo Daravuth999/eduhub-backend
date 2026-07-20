@@ -55,6 +55,7 @@ import os
 import secrets
 import time
 import unicodedata
+from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -778,27 +779,55 @@ def _build_system_instruction(
 
 
 def _build_report_prompt(transcript_text: str, mode_label: str) -> str:
+    # BUG 5 upgrade — bilingual, coach-quality report. Previously this
+    # prompt had no language awareness at all: `explain_language` is
+    # captured for the LIVE conversation's system instruction elsewhere in
+    # this file (see the module docstring / session setup) but was never
+    # threaded into report generation, so every report was English-only
+    # regardless of the student's chosen explanation language. Every
+    # explanatory field below is now requested in BOTH languages
+    # unconditionally (not just when explain_language == "km") so the
+    # frontend can toggle display language without a second Gemini call,
+    # and English-preferring students still get the richer coaching
+    # content this upgrade adds. Backward compatible: every field the
+    # OLD schema had is still requested with the exact same key/meaning
+    # — only new keys are added, nothing renamed or removed.
     return (
-        "You are EduTalk Live Coach producing a short JSON speaking report for "
-        f"a '{mode_label}' session. Based ONLY on the conversation transcript "
-        "below, return STRICT JSON (no markdown, no prose) with exactly these "
-        "keys:\n"
+        "You are EduTalk Live Coach — an experienced, encouraging English "
+        f"speaking coach — producing a JSON speaking report for a "
+        f"'{mode_label}' session with a Khmer-speaking student. Base every "
+        "field ONLY on the conversation transcript below. Write like a real "
+        "coach who listened closely, not a generic AI summary — be "
+        "specific to what THIS student actually said. Return STRICT JSON "
+        "(no markdown, no prose) with exactly these keys:\n"
         "{\n"
         '  "confidence_score": <int 0-100>,\n'
         '  "clarity_score": <int 0-100>,\n'
-        '  "pronunciation_focus": "<one short phrase>",\n'
-        '  "corrected_sentences": ["<up to 3 short before->after items>"],\n'
-        '  "best_sentence": "<the student\'s best spoken sentence>",\n'
-        '  "improved_sentence": "<one student sentence rewritten better>",\n'
-        '  "next_mission": "<one concrete next practice mission>",\n'
-        '  "summary": "<2 sentence encouraging summary>"\n'
+        '  "pronunciation_focus": "<one short phrase, English>",\n'
+        '  "pronunciation_focus_km": "<same phrase, in Khmer>",\n'
+        '  "corrected_sentences": ["<up to 3 short before->after items, English>"],\n'
+        '  "best_sentence": "<the student\'s best spoken sentence, verbatim>",\n'
+        '  "improved_sentence": "<one student sentence rewritten better, English>",\n'
+        '  "mistake_explanation": "<1-2 sentences: WHY the main mistake happened '
+        '(e.g. a grammar pattern, a sound that does not exist in Khmer, word order), English>",\n'
+        '  "mistake_explanation_km": "<same explanation, in Khmer>",\n'
+        '  "coaching_note": "<1-2 sentences of specific, personalized coaching advice '
+        'for THIS student based on what they actually said, English>",\n'
+        '  "coaching_note_km": "<same coaching note, in Khmer>",\n'
+        '  "next_mission": "<one concrete next practice mission, English>",\n'
+        '  "next_mission_km": "<same mission, in Khmer>",\n'
+        '  "summary": "<2 sentence encouraging summary, English>",\n'
+        '  "summary_km": "<same summary, in Khmer>"\n'
         "}\n\n"
         "TRANSCRIPT:\n" + transcript_text[:6000]
     )
 
 
 def _heuristic_report(transcript: list[dict], mode_label: str) -> dict:
-    """Offline fallback report when Gemini text generation is unavailable."""
+    """Offline fallback report when Gemini text generation is unavailable.
+    Includes the same bilingual fields as the Gemini path (simple, honest
+    template text — never a fabricated pretense of AI-level insight) so
+    the frontend never has to special-case which engine produced a report."""
     student_turns = [t for t in transcript if t.get("role") == "student"]
     spoke = len(student_turns)
     best = ""
@@ -812,14 +841,21 @@ def _heuristic_report(transcript: list[dict], mode_label: str) -> dict:
         "confidence_score": base,
         "clarity_score": max(40, base - 5),
         "pronunciation_focus": "clear final sounds",
+        "pronunciation_focus_km": "ការបញ្ចេញសំឡេងចុងបញ្ចប់ឱ្យច្បាស់",
         "corrected_sentences": [],
         "best_sentence": best,
         "improved_sentence": "",
+        "mistake_explanation": "Not enough speech was captured this session to analyze specific patterns.",
+        "mistake_explanation_km": "សម័យនេះមិនមានការនិយាយគ្រប់គ្រាន់ដើម្បីវិភាគលម្អិតទេ។",
+        "coaching_note": "Keep speaking in full sentences — the more you talk, the more specific your next report can be.",
+        "coaching_note_km": "បន្តនិយាយជាប្រយោគពេញលេញ — កាន់តែនិយាយច្រើន របាយការណ៍លើកក្រោយកាន់តែលម្អិត។",
         "next_mission": "Practice speaking 3 full sentences out loud daily.",
+        "next_mission_km": "អនុវត្តការនិយាយប្រយោគពេញលេញចំនួន៣ជារៀងរាល់ថ្ងៃ។",
         "summary": (
             f"You completed a {mode_label} session and kept speaking — great "
             "effort! Keep practicing to build fluency and confidence."
         ),
+        "summary_km": "អ្នកបានបញ្ចប់សម័យនិយាយ ហើយបានព្យាយាមនិយាយជាប្រចាំ — ខិតខំបន្តទៀត!",
         "engine": "heuristic",
     }
 
@@ -865,6 +901,22 @@ async def _generate_report(transcript: list[dict], mode_label: str) -> dict:
         # Clamp scores defensively.
         for k in ("confidence_score", "clarity_score"):
             report[k] = _clamp_int(report.get(k, 60), 0, 100, 60)
+        # Defensive defaults for the new bilingual/coaching fields — if
+        # Gemini's JSON omits one (it's asked for all of them, but a model
+        # can still drop a key), fall back to the English twin or a safe
+        # empty string rather than letting a KeyError reach the client or
+        # silently rendering "undefined".
+        for en_key, km_key in (
+            ("pronunciation_focus", "pronunciation_focus_km"),
+            ("mistake_explanation", "mistake_explanation_km"),
+            ("coaching_note", "coaching_note_km"),
+            ("next_mission", "next_mission_km"),
+            ("summary", "summary_km"),
+        ):
+            report.setdefault(en_key, "")
+            report.setdefault(km_key, report.get(en_key, ""))
+        report.setdefault("mistake_explanation", "")
+        report.setdefault("coaching_note", "")
         return report
     except Exception as exc:  # noqa: BLE001
         log.warning("live: report generation failed: %s", exc)
@@ -3079,6 +3131,57 @@ async def _ws_send(ws: WebSocket, obj: dict) -> None:
 # --------------------------------------------------------------------------- #
 # The live bridge: EduHub WS  ⇄  Gemini Live WS                               #
 # --------------------------------------------------------------------------- #
+_GEMINI_SETUP_MAX_ATTEMPTS = 2  # initial attempt + 1 retry
+_GEMINI_SETUP_RETRY_DELAY_S = 0.75
+
+
+async def _open_gemini_live_with_retry(uri: str, setup_msg: dict, *, session_id: str,
+                                        timeout: float = 15):
+    """BUG 1 hardening (premature session termination): the student is
+    already charged and shown a "live" screen by the time this runs (the
+    REST reservation completes and the frontend flips to phase="live"
+    BEFORE the WebSocket to Gemini is even attempted) — so a single
+    transient failure connecting to Gemini's Live API (a network blip, a
+    momentary rate/quota hiccup, cold-start latency) must not immediately
+    sacrifice a session that's already been paid for. Retries the WHOLE
+    connect+setup-ack step once, with a short fixed backoff, before giving
+    up. Does NOT retry indefinitely — a genuinely broken key/model must
+    still fail fast so the student isn't left waiting on a spinner for a
+    lost cause, and nothing session-visible (no `ready`, no reward wiring)
+    has happened yet at this point, so a retry here is always safe to
+    start completely fresh.
+
+    Returns (gem, exit_stack) — the caller uses `gem` directly (already
+    past the setupComplete ack) and MUST `await exit_stack.aclose()` when
+    done with it (there is no `async with` at the call site since the
+    connection's lifetime needs to span the whole bridge, not just this
+    function). Uses AsyncExitStack rather than awaiting `_ws_lib.connect()`
+    directly — the connect() call returns an async-context-manager-only
+    object (this is also how it's faked in
+    tests/test_edutalk_live_v2_corrections.py's FakeGeminiWS, which is NOT
+    awaitable), so entry must go through `__aenter__`, not `await`.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _GEMINI_SETUP_MAX_ATTEMPTS + 1):
+        stack = AsyncExitStack()
+        try:
+            gem = await stack.enter_async_context(_ws_lib.connect(uri, max_size=None))
+            await gem.send(json.dumps(setup_msg))
+            raw = await asyncio.wait_for(gem.recv(), timeout=timeout)
+            _ = raw  # setupComplete frame
+            return gem, stack
+        except Exception as exc:
+            await stack.aclose()
+            last_exc = exc
+            log.warning(
+                "live: gemini setup attempt %d/%d failed sid=%s exc=%s",
+                attempt, _GEMINI_SETUP_MAX_ATTEMPTS, session_id, exc,
+            )
+            if attempt < _GEMINI_SETUP_MAX_ATTEMPTS:
+                await asyncio.sleep(_GEMINI_SETUP_RETRY_DELAY_S)
+    raise RuntimeError(f"gemini_setup_failed:{type(last_exc).__name__}") from last_exc
+
+
 async def _run_live_bridge(client_ws: WebSocket, session: dict,
                            duration: int, sess_col, *, finalize) -> None:
     """Bidirectional relay between the student's browser WebSocket and the
@@ -3137,15 +3240,8 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
             reward_services = None
 
     try:
-        async with _ws_lib.connect(uri, max_size=None) as gem:
-            await gem.send(json.dumps(setup_msg))
-            # Wait for setup ack.
-            try:
-                raw = await asyncio.wait_for(gem.recv(), timeout=15)
-                _ = raw  # setupComplete frame
-            except Exception as exc:
-                raise RuntimeError(f"gemini_setup_failed:{type(exc).__name__}")
-
+        gem, _gem_stack = await _open_gemini_live_with_retry(uri, setup_msg, session_id=session_id)
+        try:
             # Mark active + record start timestamp (idempotent).
             await sess_col.update_one(
                 {"session_id": session_id, "active_ts": {"$exists": False}},
@@ -3494,6 +3590,8 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
             )
             for t in pending:
                 t.cancel()
+        finally:
+            await _gem_stack.aclose()
 
         # Persist accumulated transcript before finalizing.
         if transcript:
