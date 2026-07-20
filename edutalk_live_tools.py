@@ -176,8 +176,39 @@ _FAILED_REASONS = {
 }
 _CANCELLED_REASONS = {
     "client_cancel", "early_cancel", "user_cancel", "ws_close",
-    "ws_disconnect", "ws_error", "gemini_closed",
+    "ws_disconnect", "ws_error", "gemini_closed", "gemini_message_error",
 }
+
+# Re-audit hardening — the in-memory `transcript` list accumulated for the
+# whole duration of a live session with NO cap (only ever truncated at
+# SAVE time, transcript[:300]/[:200], well after the fact). A pathological
+# case — a stuck loop, a runaway/misbehaving client, or an unusually long
+# session — could otherwise grow this list without bound for the life of
+# the process. Set far above anything a normal session could ever produce
+# (well beyond the 30-minute hard session cap) so ordinary sessions are
+# completely unaffected and the existing save-time [:200]/[:300] slicing
+# (which keeps the EARLIEST entries) behaves identically either way —
+# this only stops growth once something has already gone far outside
+# normal bounds.
+_MAX_LIVE_TRANSCRIPT_ENTRIES = 2000
+
+
+def _bounded_transcript_append(transcript: list[dict], entry: dict) -> None:
+    if len(transcript) < _MAX_LIVE_TRANSCRIPT_ENTRIES:
+        transcript.append(entry)
+
+
+# Re-audit hardening — the WS handler previously had ZERO single-socket-
+# per-session_id enforcement: a duplicate WebSocket connection for the same
+# session_id (e.g. a stale browser tab retrying, or a student opening the
+# same reader tab twice) could open a SECOND Gemini bridge charging the
+# same already-reserved session concurrently, with both bridges racing to
+# finalize it. In-memory only (this process holds the one live Gemini
+# bridge per session_id — a restart naturally clears it, and there is
+# already no cross-process session-affinity requirement elsewhere in this
+# module). Additive: rejects the SECOND connection attempt; the original,
+# already-bridged connection is completely untouched.
+_active_ws_sessions: set[str] = set()
 
 
 def _map_end_reason(reason: str) -> str:
@@ -2621,6 +2652,16 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             await websocket.close()
             return
 
+        # Re-audit hardening — reject a SECOND concurrent WS connection for a
+        # session_id that already has a live Gemini bridge running. Never
+        # finalize/refund here: this connection attempt is simply rejected,
+        # the original bridge (and its billing outcome) is untouched.
+        if session_id in _active_ws_sessions:
+            await _ws_send(websocket, {"type": "error", "reason": "duplicate_connection"})
+            await websocket.close()
+            return
+        _active_ws_sessions.add(session_id)
+
         duration = int(session.get("duration_seconds")
                        or cfg.get("max_session_seconds", 300))
         try:
@@ -2639,6 +2680,7 @@ def register_edutalk_live_routes(api, db, require_admin, require_student) -> Non
             await _finalize_session(session_id, outcome="failed",
                                     error_reason=f"bridge_error:{type(exc).__name__}")
         finally:
+            _active_ws_sessions.discard(session_id)
             try:
                 await websocket.close()
             except Exception:
@@ -3574,14 +3616,37 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
                         msg = json.loads(raw)
                     except Exception:
                         continue
-                    await _handle_gemini_message(
-                        msg, client_ws, transcript,
-                        reward_ctx=reward_ctx,
-                        reward_services=reward_services,
-                        session=session,
-                        greeting_ctx=greeting_ctx,
-                        sess_col=sess_col,
-                        session_id=session_id)
+                    # Re-audit hardening — _handle_gemini_message's reward-hook
+                    # calls are already individually try/excepted internally,
+                    # but the transcript/audio-forwarding code above that is
+                    # NOT, and previously nothing here caught a failure in it:
+                    # an unhandled exception would propagate out of this task,
+                    # `asyncio.wait` below would report it as "done" without
+                    # ever inspecting why, `end_state` would stay at its
+                    # default {"outcome":"completed","reason":"normal"}, and
+                    # the session would finalize and report to the client
+                    # identically to a normal successful completion — with
+                    # the real crash never logged anywhere. Now: log the
+                    # actual exception (so a future incident is diagnosable)
+                    # and classify it as "cancelled" (fair to the student —
+                    # min_useful_seconds still decides refund vs charge —
+                    # never silently "completed").
+                    try:
+                        await _handle_gemini_message(
+                            msg, client_ws, transcript,
+                            reward_ctx=reward_ctx,
+                            reward_services=reward_services,
+                            session=session,
+                            greeting_ctx=greeting_ctx,
+                            sess_col=sess_col,
+                            session_id=session_id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "live: gemini message handling error sid=%s exc=%s: %s",
+                            session_id, type(exc).__name__, exc,
+                        )
+                        _set_end(f"gemini_message_error:{type(exc).__name__}")
+                        return
 
             done, pending = await asyncio.wait(
                 {asyncio.create_task(pump_client_to_gemini()),
@@ -3590,6 +3655,21 @@ async def _run_live_bridge(client_ws: WebSocket, session: dict,
             )
             for t in pending:
                 t.cancel()
+            # Re-audit hardening — defense-in-depth: log (never re-raise,
+            # this must never crash the finalize path below) ANY exception
+            # a completed pump task carried, even one this file's own
+            # handlers didn't anticipate, so a future incident is always
+            # diagnosable from logs instead of silently vanishing.
+            for t in done:
+                try:
+                    t_exc = t.exception()
+                except asyncio.CancelledError:
+                    t_exc = None
+                if t_exc is not None:
+                    log.warning(
+                        "live: pump task ended with unhandled exception sid=%s exc=%s",
+                        session_id, t_exc,
+                    )
         finally:
             await _gem_stack.aclose()
 
@@ -3679,7 +3759,7 @@ async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
     # reward module can evaluate the open exercise when the turn completes.
     in_tx = server_content.get("inputTranscription")
     if in_tx and in_tx.get("text"):
-        transcript.append({"role": "student", "text": in_tx["text"],
+        _bounded_transcript_append(transcript, {"role": "student", "text": in_tx["text"],
                            "ts": _iso()})
         await _ws_send(client_ws, {"type": "transcript", "role": "student",
                                    "text": in_tx["text"]})
@@ -3690,7 +3770,7 @@ async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
     # the model's response stream.
     out_tx = server_content.get("outputTranscription")
     if out_tx and out_tx.get("text"):
-        transcript.append({"role": "coach", "text": out_tx["text"],
+        _bounded_transcript_append(transcript, {"role": "coach", "text": out_tx["text"],
                            "ts": _iso()})
         await _ws_send(client_ws, {"type": "transcript", "role": "coach",
                                    "text": out_tx["text"]})
@@ -3731,7 +3811,7 @@ async def _handle_gemini_message(msg: dict, client_ws: WebSocket,
                 await _ws_send(client_ws, audio_frame)
             txt = part.get("text")
             if txt:
-                transcript.append({"role": "coach", "text": txt,
+                _bounded_transcript_append(transcript, {"role": "coach", "text": txt,
                                    "ts": _iso()})
                 await _ws_send(client_ws, {"type": "transcript",
                                            "role": "coach", "text": txt})
