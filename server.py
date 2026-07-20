@@ -7064,6 +7064,19 @@ except Exception as _artwork_load_err:  # noqa: BLE001
         "artwork_campaign_tools: disabled (%s)", _artwork_load_err
     )
 
+# ── Hero Artwork (additive, isolated module — Welcome Experience Studio) ───
+# Real file-upload + R2 object storage for transparent Hero compositing
+# artwork (PNG/WebP/SVG/JPEG) + a reusable media library. Distinct from the
+# link-based Artwork Campaigns system above. Dedicated `hero_artwork_assets`
+# collection.
+try:
+    from hero_artwork_tools import register_hero_artwork_routes
+    register_hero_artwork_routes(api, db, require_admin)
+except Exception as _hero_artwork_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "hero_artwork_tools: disabled (%s)", _hero_artwork_load_err
+    )
+
 # ── Book Factory (Phase 1, additive isolated module — Author Studio) ───────
 # Gemini-powered draft generator. Feature-flag gated (BOOK_FACTORY_*), admin-
 # only, fail-closed. Never writes db.books (Editor save remains the only path)
