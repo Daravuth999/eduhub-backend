@@ -113,6 +113,7 @@ KNOWN_EXPERIENCE_TYPES = (
     "speaking_lab_landing",
     "ai_assistant_greeting",
     "achievement_celebration",
+    "achievement_top_earner",
     "seasonal_campaign",
     "promotional_banner",
     "onboarding",
@@ -131,12 +132,28 @@ def _parse_iso(value: Any) -> Optional[datetime]:
         return None
 
 
+def _is_within_annual_window(starts: datetime, ends: datetime, now: datetime) -> bool:
+    """Year-agnostic (month, day) range check for recurring seasonal themes
+    (Khmer New Year, Christmas, ...). Handles a window that wraps across a
+    year boundary (e.g. Dec 20 -> Jan 5) by comparing (month, day) tuples
+    instead of full datetimes, so the SAME config stays active every year
+    with no admin action or redeploy."""
+    s = (starts.month, starts.day)
+    e = (ends.month, ends.day)
+    n = (now.month, now.day)
+    if s <= e:
+        return s <= n <= e
+    return n >= s or n <= e
+
+
 def _is_active_now(doc: dict, now: datetime) -> bool:
     if doc.get("status") != "published":
         return False
     window = doc.get("activeWindow") or {}
     starts = _parse_iso(window.get("startsAt"))
     ends = _parse_iso(window.get("endsAt"))
+    if window.get("recurringAnnual") and starts and ends:
+        return _is_within_annual_window(starts, ends, now)
     if starts and now < starts:
         return False
     if ends and now > ends:
@@ -150,7 +167,7 @@ def _serialize(doc: dict) -> dict:
         "experienceType": doc.get("experienceType", ""),
         "key": doc.get("key", "default"),
         "status": doc.get("status", "draft"),
-        "activeWindow": doc.get("activeWindow") or {"startsAt": None, "endsAt": None},
+        "activeWindow": doc.get("activeWindow") or {"startsAt": None, "endsAt": None, "recurringAnnual": False},
         "content": doc.get("content") or {},
         "appearance": doc.get("appearance") or {},
         "motion": doc.get("motion") or {},
@@ -172,10 +189,11 @@ def _as_domain_dict(value: Any) -> dict:
 
 def _sanitize_active_window(value: Any) -> dict:
     if not isinstance(value, dict):
-        return {"startsAt": None, "endsAt": None}
+        return {"startsAt": None, "endsAt": None, "recurringAnnual": False}
     return {
         "startsAt": value.get("startsAt") or None,
         "endsAt": value.get("endsAt") or None,
+        "recurringAnnual": bool(value.get("recurringAnnual")),
     }
 
 
@@ -347,7 +365,7 @@ def _register_admin_crud_routes(api, coll, require_admin) -> None:
             "experienceType": existing["experienceType"],
             "key": new_key,
             "status": "draft",
-            "activeWindow": existing.get("activeWindow") or {"startsAt": None, "endsAt": None},
+            "activeWindow": existing.get("activeWindow") or {"startsAt": None, "endsAt": None, "recurringAnnual": False},
             "content": existing.get("content") or {},
             "appearance": existing.get("appearance") or {},
             "motion": existing.get("motion") or {},
