@@ -308,6 +308,74 @@ async def get_event(db, event_id: str) -> Optional[dict]:
     return await db[EVENTS_COLL].find_one({"_id": event_id})
 
 
+# Runtime Dashboard bucketing (architecture.md continuation, Author
+# Studio's "Runtime Dashboard": active/upcoming/finished events,
+# participants, prize pools, event health, realtime status).
+_DASHBOARD_BUCKET_FOR_STATE: dict[str, str] = {
+    "draft": "upcoming",
+    "scheduled": "upcoming",
+    "registration_open": "active",
+    "live": "active",
+    "drawing": "active",
+    "settling": "active",
+    "settled": "finished",
+    "archived": "finished",
+    "cancelled": "finished",
+}
+
+
+def _event_health(event: dict, participant_count: int) -> str:
+    """A simple, honest heuristic — no ML, no external signal, just the
+    fields already on the event. "healthy" means the event is in an
+    active operating state; the shortfall variants exist so a teacher
+    scanning the dashboard immediately sees which live events have zero
+    signups rather than having to open each one."""
+    state = event["state"]
+    if state == "cancelled":
+        return "cancelled"
+    if state in ("settled", "archived"):
+        return "completed"
+    if state == "draft":
+        return "not_started"
+    if state in ("scheduled", "registration_open") and participant_count == 0:
+        return "no_registrations"
+    return "healthy"
+
+
+async def get_runtime_dashboard(db, SL_ENTRIES) -> dict:
+    """Author Studio's Runtime Dashboard: every event bucketed into
+    active/upcoming/finished, each enriched with a live participant
+    count (counted from the SAME speaking_lab_entries collection every
+    existing enrollment route already writes to — no new participant
+    tracking), an estimated prize pool (entry_fee * participants — the
+    real Draw/PrizePool machinery is not yet wrapped into the Event
+    Engine, see this module's own docstring), a simple health signal,
+    and the owning template's name for display."""
+    events = await list_events(db)
+    templates = await list_templates(db)
+    template_names = {t["_id"]: t["name"] for t in templates}
+
+    buckets: dict[str, list[dict]] = {"active": [], "upcoming": [], "finished": []}
+    for event in events:
+        session_id = event.get("linked_session_id")
+        participant_count = 0
+        if session_id:
+            participant_count = await SL_ENTRIES.count_documents({"session_id": session_id})
+        entry_fee = int(event.get("entry_fee") or 0)
+        enriched = {
+            **event,
+            "template_name": template_names.get(event.get("template_id"), "(unknown template)"),
+            "participant_count": participant_count,
+            "estimated_prize_pool": entry_fee * participant_count,
+            "health": _event_health(event, participant_count),
+            "realtime_active": event["state"] in ("live", "drawing") and session_id is not None,
+        }
+        bucket = _DASHBOARD_BUCKET_FOR_STATE.get(event["state"], "finished")
+        buckets[bucket].append(enriched)
+
+    return buckets
+
+
 async def transition_event(
     db, SL_SESSIONS, event_id: str, to_state: str, *, actor: str,
 ) -> dict:
@@ -519,6 +587,12 @@ def register_event_engine_routes(
         docs = await list_events(db, state=None)
         open_docs = [d for d in docs if d["state"] in ("registration_open", "live")]
         return {"events": open_docs}
+
+    # Also a static path — same ordering requirement as /v1/events/available
+    # above, registered before the dynamic /v1/events/{event_id} route below.
+    @api.get("/v1/events/dashboard")
+    async def events_dashboard_route(admin=Depends(require_admin)):
+        return await get_runtime_dashboard(db, SL_ENTRIES)
 
     @api.get("/v1/events/{event_id}")
     async def get_event_route(event_id: str, admin=Depends(require_admin)):

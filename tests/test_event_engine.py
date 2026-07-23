@@ -84,6 +84,10 @@ class _Coll:
         return _Cursor([d for d in self.docs.values()
                          if all(d.get(k) == v for k, v in query.items())])
 
+    async def count_documents(self, query=None):
+        query = query or {}
+        return sum(1 for d in self.docs.values() if all(d.get(k) == v for k, v in query.items()))
+
     async def create_index(self, *a, **k):
         return None
 
@@ -480,6 +484,84 @@ def test_event_lifecycle_routes():
 
     resp = client.post(f"/api/v1/events/{event_id}/transition", json={"to": "live"})
     assert resp.status_code == 400  # invalid transition from "scheduled"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Runtime Dashboard — buckets, participant counts, health, prize estimate
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_runtime_dashboard_buckets_events_by_state():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    tmpl = await ee.create_template(db, name="A", event_type="speaking_lab_session", content={}, created_by="a")
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+
+    draft_evt = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    live_evt = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    live_evt = await ee.transition_event(db, sessions, live_evt["_id"], "scheduled", actor="a")
+    live_evt = await ee.transition_event(db, sessions, live_evt["_id"], "registration_open", actor="a")
+    live_evt = await ee.transition_event(db, sessions, live_evt["_id"], "live", actor="a")
+    done_evt = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    done_evt = await ee.transition_event(db, sessions, done_evt["_id"], "scheduled", actor="a")
+    done_evt = await ee.transition_event(db, sessions, done_evt["_id"], "cancelled", actor="a")
+
+    dashboard = await ee.get_runtime_dashboard(db, entries)
+    assert [e["_id"] for e in dashboard["upcoming"]] == [draft_evt["_id"]]
+    assert [e["_id"] for e in dashboard["active"]] == [live_evt["_id"]]
+    assert [e["_id"] for e in dashboard["finished"]] == [done_evt["_id"]]
+
+
+@pytest.mark.asyncio
+async def test_runtime_dashboard_counts_participants_and_estimates_prize_pool():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    tmpl = await ee.create_template(
+        db, name="A", event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": 10}}, created_by="a",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "registration_open", actor="a")
+    session_id = event["linked_session_id"]
+    await entries.insert_one({"_id": "e1", "session_id": session_id, "student_id": "stu1"})
+    await entries.insert_one({"_id": "e2", "session_id": session_id, "student_id": "stu2"})
+
+    dashboard = await ee.get_runtime_dashboard(db, entries)
+    active = dashboard["active"][0]
+    assert active["participant_count"] == 2
+    assert active["estimated_prize_pool"] == 20
+    assert active["health"] == "healthy"
+    assert active["template_name"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_runtime_dashboard_flags_no_registrations_health():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    tmpl = await ee.create_template(db, name="A", event_type="speaking_lab_session", content={}, created_by="a")
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "registration_open", actor="a")
+
+    dashboard = await ee.get_runtime_dashboard(db, entries)
+    assert dashboard["active"][0]["health"] == "no_registrations"
+    assert dashboard["active"][0]["participant_count"] == 0
+
+
+def test_dashboard_route_is_registered_before_dynamic_event_id_route():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    client = _make_client(db, sessions, entries)
+
+    resp = client.get("/api/v1/events/dashboard")
+    assert resp.status_code == 200
+    assert resp.json() == {"active": [], "upcoming": [], "finished": []}
 
 
 def test_available_events_route_only_shows_open_events():
