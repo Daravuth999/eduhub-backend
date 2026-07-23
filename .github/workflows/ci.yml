@@ -1,0 +1,46 @@
+name: CI
+
+# Architecture Reconstruction Phase 1e ("CI boundary + collection-ownership
+# lint"). Wires the three checks this phase's tooling produced into one
+# pipeline: the pytest suite (regression gate), import-linter (eduhub_platform
+# must not import business-domain modules), and the collection-ownership
+# report/strict check. The strict ownership check and import-linter are both
+# real, currently-passing gates (see tools/check_collection_ownership.py and
+# .importlinter for what each one actually enforces and why it's scoped the
+# way it is) — this workflow does not invent new rules, it just runs the
+# checks that already exist in-repo on every push/PR.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  backend-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install production + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run backend test suite
+        run: python -m pytest -q
+
+      - name: Import boundary contract (eduhub_platform)
+        run: lint-imports --config .importlinter
+
+      - name: Collection-ownership — strict gate
+        run: python tools/check_collection_ownership.py --strict
+
+      - name: Collection-ownership — full report (informational)
+        if: always()
+        run: python tools/check_collection_ownership.py
