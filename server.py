@@ -4512,20 +4512,32 @@ app.include_router(_build_status_router(db, _fan_out_push, require_admin))
 # normalized comparisons.
 
 def _norm_student_id(value) -> str:
-    """Canonical student_id for comparisons.
+    """Canonical student_id for comparisons -- thin alias kept for the
+    21 existing call sites in this file. Architecture Reconstruction
+    Phase 1, item 4: the actual normalization rule now lives in
+    eduhub_platform.identity.resolve() (not renamed/removed here to avoid
+    churning 21 call sites in one pass).
 
-    Strips whitespace (including stray \\n / \\r picked up from sheets),
-    drops zero-width spaces, and lowercases. Returns "" for None / non-
-    strings. Safe to call on every ID before any equality check or Mongo
-    query.
+    Package name note: architecture.md's tree names this cross-cutting
+    package `platform/`, but a top-level `platform` package collides with
+    Python's own stdlib `platform` module the moment the repo root is on
+    sys.path (pytest does this by default, and pymongo's own internals
+    call platform.python_implementation() at import time) -- confirmed by
+    13 test files failing to collect. Renamed to `eduhub_platform` to
+    avoid the collision; contents/intent unchanged. Documented here rather
+    than silently deviating from architecture.md's literal naming.
+
+    BUG FIX (found while consolidating, documented not hidden): the
+    previous body here checked for the literal 6-character text
+    of a double-escaped backslash followed by u200b, instead of the
+    real Unicode zero-width space character -- so the "drops
+    zero-width spaces" claim in the old docstring was never actually
+    true. eduhub_platform.identity strips the real characters.
+    Essentially zero regression risk: no real student id has ever
+    contained that literal 6-character escape text.
     """
-    if value is None:
-        return ""
-    s = str(value)
-    # Strip ASCII + common Unicode whitespace and zero-width chars.
-    for ch in ("\\u200b", "\\u200c", "\\u200d", "\\ufeff"):
-        s = s.replace(ch, "")
-    return s.strip().lower()
+    from eduhub_platform.identity import resolve
+    return resolve(value)
 
 
 async def _sl_log_pool_event(
@@ -5958,6 +5970,41 @@ async def startup():
             _ref_idx_exc,
         )
 
+    # ── Login Reward Campaigns: ensure indexes during startup (non-fatal) ──
+    # `_login_reward_hooks` is set by register_login_reward_routes()'s return
+    # value. Resolved at runtime (not decoration time) so this works
+    # regardless of registration order. Any Mongo error inside the helper is
+    # already swallowed and warned by the helper itself; this is a
+    # belt-and-braces second layer so a missing/renamed module can never
+    # break server startup.
+    try:
+        _lrc_hooks = globals().get("_login_reward_hooks")
+        if _lrc_hooks is not None:
+            await _lrc_hooks.ensure_indexes()
+    except Exception as _lrc_idx_exc:  # noqa: BLE001
+        log.warning(
+            "login_reward: ensure_indexes during startup failed (non-fatal): %s",
+            _lrc_idx_exc,
+        )
+
+    # ── Login Mystery Box: ensure indexes during startup (non-fatal) ──
+    # `_login_mystery_box_hooks` is set by
+    # register_login_mystery_box_routes()'s return value. Resolved at
+    # runtime (not decoration time) so this works regardless of
+    # registration order. Any Mongo error inside the helper is already
+    # swallowed and warned by the helper itself; this is a
+    # belt-and-braces second layer so a missing/renamed module can never
+    # break server startup.
+    try:
+        _lmb_hooks = globals().get("_login_mystery_box_hooks")
+        if _lmb_hooks is not None:
+            await _lmb_hooks["_lmb_ensure_indexes"]()
+    except Exception as _lmb_idx_exc:  # noqa: BLE001
+        log.warning(
+            "login_mystery_box: ensure_indexes during startup failed (non-fatal): %s",
+            _lmb_idx_exc,
+        )
+
     # ── Coach Pack v3: ensure indexes during startup (non-fatal) ──
     try:
         _cp_idx_fn = globals().get("_coach_pack_ensure_indexes")
@@ -6993,16 +7040,39 @@ async def studio_conversation_generate(
 # ── Register all api routes with the app ────────────────────────────────────
 # MUST be the last include_router(api) call — v2 so every @api.* route defined
 # above (including /studio/books/{slug}/conversation) is attached to the app.
-exec(open(__import__("pathlib").Path(__file__).parent / "payment_bridge.py").read())
+#
+# Registered via explicit DI (Architecture Reconstruction Phase 1, item 2 —
+# replacing exec()-into-namespace loading). ``_payment_bridge_late_binds`` is
+# a plain dict populated further below, once tuition_tools and referral_tools
+# register their own routes (they load after payment_bridge, so their
+# functions don't exist yet at this point) — see payment_bridge.py's own
+# module docstring for why a dict is needed here instead of a direct
+# parameter. The register call returns _complete_points_payment, which
+# camrapidpay_payment_tools.py's own register call already consumes as an
+# explicit parameter.
+_payment_bridge_late_binds: dict = {}
+from payment_bridge import register_payment_bridge_routes
+_complete_points_payment = register_payment_bridge_routes(
+    api, db, require_admin, User,
+    _fan_out_push, _update_tuition_in_gas,
+    SL_TREASURY_ID, SL_TREASURY_PASSWORD, GAS_POINTS_LOGIN_URL,
+    _payment_bridge_late_binds,
+)
 
 # -- CamRapidPay KHQR Points Top Up provider (flag-gated, dormant by default) --
-# Loaded AFTER payment_bridge so it can reuse _complete_points_payment,
-# _send_topup_push_once, and the shared api/db/log/httpx/require_student
-# globals. Adds POST /api/payments/camrapidpay/create-intent, POST
+# Registered AFTER payment_bridge so _complete_points_payment already exists as
+# a module-level name to pass in explicitly (Architecture Reconstruction
+# Phase 1, item 2 — explicit DI replacing exec()-into-namespace loading).
+# Adds POST /api/payments/camrapidpay/create-intent, POST
 # /api/payments/camrapidpay/webhook, GET /api/payments/camrapidpay/status/{id}.
 # When CAMRAPIDPAY_ENABLED != "true" the routes exist but report unavailable,
-# so the existing ABA/manual fallback continues unchanged.
-exec(open(__import__("pathlib").Path(__file__).parent / "camrapidpay_payment_tools.py").read())
+# so the existing ABA/manual fallback continues unchanged. The register call
+# returns the reconcile-sweep coroutine, assigned below to the same
+# module-level name the existing 60s background loop already looks up.
+from camrapidpay_payment_tools import register_camrapidpay_payment_routes
+_camrapidpay_reconcile_once = register_camrapidpay_payment_routes(
+    api, db, require_student, _complete_points_payment,
+)
 
 # ── Payment Methods Display Config (v1.6, additive, isolated) ────────────
 # Loaded AFTER payment_bridge and camrapidpay_payment_tools so it can reuse
@@ -7015,7 +7085,8 @@ exec(open(__import__("pathlib").Path(__file__).parent / "camrapidpay_payment_too
 # crediting, or wallet movement. Failure to load is non-fatal: the existing
 # /payments/camrapidpay/config probe continues to gate KHQR visibility.
 try:
-    exec(open(__import__("pathlib").Path(__file__).parent / "payment_methods_config_tools.py").read())
+    from payment_methods_config_tools import register_payment_methods_config_routes
+    register_payment_methods_config_routes(api, db, require_admin, User)
 except Exception as _pm_load_err:
     logging.getLogger("eduhub").warning(
         "payment_methods_config_tools.py failed to load (display gate disabled): %s",
@@ -7023,8 +7094,10 @@ except Exception as _pm_load_err:
     )
 
 # ── Tuition Pay (MongoDB billing, KHQR, rewards, receipts) ───────────────
-# Loaded AFTER payment_bridge and camrapidpay_payment_tools so it can reuse
-# _update_tuition_in_gas, _fan_out_push, and all shared globals. Adds:
+# Registered AFTER payment_bridge and camrapidpay_payment_tools so
+# _update_tuition_in_gas and _fan_out_push already exist as module-level
+# names to pass in explicitly (Architecture Reconstruction Phase 1, item 2
+# — explicit DI replacing exec()-into-namespace loading). Adds:
 #   GET  /api/student/tuition
 #   GET  /api/student/tuition/receipt/{receipt_id}
 #   POST /api/student/tuition/receipt/{receipt_id}/acknowledge
@@ -7035,10 +7108,18 @@ except Exception as _pm_load_err:
 #   GET  /api/admin/tuition/receipts
 #   GET  /api/admin/tuition/migration-status
 #   POST /api/admin/tuition/setup-indexes
-# Also exports: tuition_finalize_payment (called by payment_bridge),
-#               tuition_shadow_write     (called by teacher_update_tuition).
+# The register call returns (tuition_finalize_payment, tuition_shadow_write),
+# assigned below to the same module-level names payment_bridge.py and
+# teacher_update_tuition already look up via globals().get(...).
 try:
-    exec(open(__import__("pathlib").Path(__file__).parent / "tuition_tools.py").read())
+    from tuition_tools import register_tuition_routes
+    tuition_finalize_payment, tuition_shadow_write = register_tuition_routes(
+        api, db, require_student, require_admin,
+        _fan_out_push, _update_tuition_in_gas,
+        _WALLET_SERVICE_AVAILABLE, wallet_service,
+    )
+    # Fulfil payment_bridge.py's forward reference (see its module docstring).
+    _payment_bridge_late_binds["tuition_finalize_payment"] = tuition_finalize_payment
 except Exception as _ttn_load_err:
     logging.getLogger("eduhub").warning(
         "tuition_tools.py failed to load (tuition pay disabled): %s",
@@ -7124,9 +7205,13 @@ except Exception as _interaction_progress_load_err:  # noqa: BLE001
     )
 
 # ── Login Reward Campaigns (additive, isolated module) ────────────────────
-# Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
-# require_admin, require_student, _norm_student_id, GAS treasury constants,
-# and Student/User pydantic types. Adds:
+# Registered via explicit DI (Architecture Reconstruction Phase 1, item 2 —
+# replacing exec()-into-namespace loading). This module is the HUB of the
+# reward chain: voucher_reward_tools.py, mystery_box_tools.py, and
+# login_mystery_box_tools.py (all load after it) need some of its db-bound
+# functions/objects, returned here as a small ``LoginRewardHooks`` namespace
+# and passed as an explicit parameter to each sibling's own register call —
+# replacing the old globals().get("_lrc_*") lookups. Adds:
 #   /api/admin/rewards/login-campaigns         (GET / POST)
 #   /api/admin/rewards/login-campaigns/{id}    (GET / PUT / DELETE)
 #   /api/admin/rewards/login-campaigns/{id}/claims (GET)
@@ -7134,14 +7219,12 @@ except Exception as _interaction_progress_load_err:  # noqa: BLE001
 #   /api/rewards/login-campaigns/{id}/claim    (POST, student)
 # All existing endpoints and wallet migration flags are untouched.
 try:
-    # My-Portal-Premium v1: read with utf-8-sig so an accidental BOM at the
-    # top of the file (saved by some Windows editors) is stripped, instead
-    # of making compile() raise SyntaxError on U+FEFF and silently disabling
-    # the feature.
-    _lrc_src_path = __import__("pathlib").Path(__file__).parent / "login_reward_tools.py"
-    with open(_lrc_src_path, "r", encoding="utf-8-sig") as _lrc_fh:
-        _lrc_src_text = _lrc_fh.read()
-    exec(compile(_lrc_src_text, str(_lrc_src_path), "exec"))
+    from login_reward_tools import register_login_reward_routes
+    _login_reward_hooks = register_login_reward_routes(
+        api, db, require_student, require_admin, Student, User,
+        _fan_out_push, GAS_POINTS_LOGIN_URL, SL_TREASURY_ID, SL_TREASURY_PASSWORD,
+        _build_target_query, _generate_coupon_code,
+    )
     logging.getLogger("eduhub").info(
         "login_reward_tools: routes registered (login campaigns + voucher claim)"
     )
@@ -7151,24 +7234,19 @@ except Exception as _lrc_load_err:
         _lrc_load_err,
     )
 # ── Book Voucher listing layer (reward-kind v1.0.2, additive, isolated) ───
-# Loaded immediately AFTER login_reward_tools.py so it can reuse the issuer
-# helpers (_lrc_student_vouchers / _lrc_compose_voucher_payload) already in
-# this namespace. Adds /api/student/vouchers (GET, student). Vouchers are
-# ISSUED inside the login-reward claim itself; this module only lists them.
-# Redemption continues through the EXISTING /api/coupons/* flow. Failure is
-# non-fatal — only the voucher listing endpoint is skipped on load error.
+# Registered via explicit DI immediately AFTER login_reward_tools.py so
+# ``_login_reward_hooks`` already exists to pass in (Architecture
+# Reconstruction Phase 1, item 2 — replacing exec()-into-namespace loading,
+# which also carried a latent BOM/encoding footgun this conversion removes
+# entirely: a real Python import always source-decodes as UTF-8 by default
+# and strips a leading BOM automatically). Adds /api/student/vouchers (GET,
+# student). Vouchers are ISSUED inside the login-reward claim itself; this
+# module only lists them. Redemption continues through the EXISTING
+# /api/coupons/* flow. Failure is non-fatal — only the voucher listing
+# endpoint is skipped on load error.
 try:
-    # My-Portal-Premium v1: same utf-8-sig hardening as login_reward_tools
-    # above. The previous v1.0.2 voucher_reward_tools.py shipped with a
-    # UTF-8 BOM which made compile() raise SyntaxError("invalid
-    # non-printable character U+FEFF") at line 1, the try/except below
-    # caught it silently, and /api/student/vouchers was never registered.
-    # Reading with utf-8-sig strips a leading BOM if present so this can
-    # never silently regress again.
-    _vrt_src_path = __import__("pathlib").Path(__file__).parent / "voucher_reward_tools.py"
-    with open(_vrt_src_path, "r", encoding="utf-8-sig") as _vrt_fh:
-        _vrt_src_text = _vrt_fh.read()
-    exec(compile(_vrt_src_text, str(_vrt_src_path), "exec"))
+    from voucher_reward_tools import register_voucher_reward_routes
+    register_voucher_reward_routes(api, db, require_student, Student, _login_reward_hooks)
     logging.getLogger("eduhub").info(
         "voucher_reward_tools: routes registered (/api/student/vouchers)"
     )
@@ -7178,22 +7256,26 @@ except Exception as _vrt_load_err:
         _vrt_load_err,
     )
 # ── Mystery Box + EduTalk Pass system (Speaking Lab integration v1) ───────
-# Loaded AFTER voucher_reward_tools.py so it can reuse the existing
-# login-reward voucher issuer (_lrc_issue_voucher_for_claim) and the
-# treasury credit pipeline (_lrc_credit_via_treasury). Adds the new
-# /api/admin/mystery-box/*, /api/admin/edutalk-passes/*,
+# Registered via explicit DI (Architecture Reconstruction Phase 1, item 2 —
+# replacing exec()-into-namespace loading) AFTER voucher_reward_tools.py so
+# ``_login_reward_hooks`` already exists to pass in — it holds the existing
+# login-reward voucher issuer and treasury credit pipeline this module
+# reuses. Adds the new /api/admin/mystery-box/*, /api/admin/edutalk-passes/*,
 # /api/speaking-lab/mystery-box/*, /api/student/edutalk-passes and
 # /api/student/mystery-box/history routes. Also wires EduTalk pass
 # consumption hooks into edutalk_tools.py module globals so a winning
 # Mystery Box student spends a pass instead of points when starting an
-# EduTalk session or requesting a voice reply. Failure is non-fatal —
-# only the Mystery Box feature is disabled, the existing EduTalk and
-# voucher flows continue unchanged.
+# EduTalk session or requesting a voice reply. The register call returns a
+# dict of db-bound functions/objects (see mystery_box_tools.py's own
+# docstring for why a dict) consumed by login_mystery_box_tools.py's own
+# register call. Failure is non-fatal — only the Mystery Box feature is
+# disabled, the existing EduTalk and voucher flows continue unchanged.
 try:
-    _mbt_src_path = __import__("pathlib").Path(__file__).parent / "mystery_box_tools.py"
-    with open(_mbt_src_path, "r", encoding="utf-8-sig") as _mbt_fh:
-        _mbt_src_text = _mbt_fh.read()
-    exec(compile(_mbt_src_text, str(_mbt_src_path), "exec"))
+    from mystery_box_tools import register_mystery_box_routes
+    _mystery_box_hooks = register_mystery_box_routes(
+        api, db, require_admin, require_student,
+        _fan_out_push, push_subscriptions, _login_reward_hooks,
+    )
     logging.getLogger("eduhub").info(
         "mystery_box_tools: routes registered (Speaking Lab Mystery Box + EduTalk Pass)"
     )
@@ -7203,13 +7285,10 @@ except Exception as _mbt_load_err:
         _mbt_load_err,
     )
 # ── Login Mystery Box Rewards (additive, isolated, default OFF) ───────────
-# Loaded AFTER login_reward_tools.py AND mystery_box_tools.py so it can
-# reuse:
-#   * _lrc_credit_via_treasury     — existing points credit pipeline
-#   * _lrc_voucher_discount_label  — voucher label helper
-#   * _lrc_safe_artwork_url        — artwork URL allow-list
-#   * _lrc_gen_coupon_code / _lrc_compose_voucher_payload / _lrc_student_vouchers
-#   * _mbt_grant_edutalk_pass      — EduTalk pass entitlement issuer
+# Registered via explicit DI (Architecture Reconstruction Phase 1, item 2 —
+# replacing exec()-into-namespace loading) AFTER login_reward_tools.py AND
+# mystery_box_tools.py so ``_login_reward_hooks`` and
+# ``_mystery_box_hooks["_mbt_grant_edutalk_pass"]`` already exist to pass in.
 # Adds the new student popup endpoints:
 #   /api/student/login-mystery/status         (GET, student)
 #   /api/student/login-mystery/select         (POST, student)
@@ -7222,10 +7301,12 @@ except Exception as _mbt_load_err:
 # Failure is non-fatal — only the Login Mystery Box feature is disabled
 # on load error; every existing route keeps working unchanged.
 try:
-    _lmb_src_path = __import__("pathlib").Path(__file__).parent / "login_mystery_box_tools.py"
-    with open(_lmb_src_path, "r", encoding="utf-8-sig") as _lmb_fh:
-        _lmb_src_text = _lmb_fh.read()
-    exec(compile(_lmb_src_text, str(_lmb_src_path), "exec"))
+    from login_mystery_box_tools import register_login_mystery_box_routes
+    _login_mystery_box_hooks = register_login_mystery_box_routes(
+        api, db, require_admin, require_student,
+        _fan_out_push, _login_reward_hooks,
+        _mystery_box_hooks.get("_mbt_grant_edutalk_pass"),
+    )
     logging.getLogger("eduhub").info(
         "login_mystery_box_tools: routes registered (admin + student)"
     )
@@ -7581,10 +7662,11 @@ except Exception as _vt_reward_err:  # noqa: BLE001
     )
 
 # ── Referral System v1 (additive, isolated module, default OFF) ──────────
-# Loaded via exec() into this namespace so it can reuse api/db/log/httpx,
-# require_admin/require_student, _norm_student_id, GAS treasury constants,
-# Student/User pydantic types, ObjectId, BaseModel/ConfigDict/Field, and
-# the existing _fan_out_push helper. Registers:
+# Registered via explicit DI (Architecture Reconstruction Phase 1, item 2 —
+# replacing exec()-into-namespace loading, which also silently broke on
+# Windows dev machines: exec(open(path).read()) decodes with the OS
+# codepage, not UTF-8, and this file's non-ASCII comment characters raised
+# a UnicodeDecodeError the existing try/except here swallowed). Registers:
 #   /api/referral/my-code                          (GET, student)
 #   /api/referral/stats                            (GET, student)
 #   /api/referral/leads                            (POST, public)
@@ -7593,10 +7675,20 @@ except Exception as _vt_reward_err:  # noqa: BLE001
 #   /api/admin/referral/leads/{lead_id}            (PUT, admin)
 #   /api/admin/referral/leads/{lead_id}/mark-class-paid  (POST, admin)
 #   /api/admin/referral/rewards                    (GET, admin)
+# The register call returns (_ref_ensure_indexes,
+# _referral_on_points_purchase_success), assigned below to the same
+# module-level names the startup handler and payment_bridge.py already
+# look up via globals().get(...).
 # Failure is non-fatal — referral routes simply will not be registered if
 # the module fails to load, leaving all existing flows untouched.
 try:
-    exec(open(__import__("pathlib").Path(__file__).parent / "referral_tools.py").read())
+    from referral_tools import register_referral_routes
+    _ref_ensure_indexes, _referral_on_points_purchase_success = register_referral_routes(
+        api, db, require_student, require_admin, Student, User,
+        _fan_out_push, GAS_POINTS_LOGIN_URL, SL_TREASURY_ID, SL_TREASURY_PASSWORD,
+    )
+    # Fulfil payment_bridge.py's forward reference (see its module docstring).
+    _payment_bridge_late_binds["referral_on_points_purchase_success"] = _referral_on_points_purchase_success
 except Exception as _ref_load_err:
     logging.getLogger("eduhub").warning(
         "referral_tools.py failed to load (feature disabled): %s",

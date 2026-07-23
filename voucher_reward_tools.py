@@ -14,53 +14,33 @@
 #     redeem endpoints, which this module does NOT touch.
 #
 # LOADING
-#   exec()'d into server.py's namespace immediately AFTER login_reward_
-#   tools.py, so it reuses: api, db, require_student, Student, _norm_
-#   student_id, and the login-reward helpers _lrc_student_vouchers /
-#   _lrc_compose_voucher_payload / _lrc_iso / _lrc_now. Failure is non-
-#   fatal (the loader wraps this in try/except).
-#
-# v1.0.3 NOTES (My Portal premium reconstruction)
-#   * File saved as PLAIN UTF-8 (no BOM, no mojibake) so the
-#     `exec(open(...).read())` loader in server.py compiles cleanly under
-#     every Python locale. The previous v1.0.2 file shipped with a UTF-8
-#     BOM (0xEF 0xBB 0xBF) which made `compile()` raise
-#     `SyntaxError: invalid non-printable character U+FEFF` at line 1.
-#     The try/except in server.py silently swallowed that, so the
-#     /api/student/vouchers route was never registered -> the frontend
-#     VoucherHub fell back to its "Could not load vouchers" / 404 state.
-#   * Added a clear success log on module load AND a duplicate one after
-#     the route definition so production logs make the registration
-#     observable.
+#   Registered via register_voucher_reward_routes(api, db, require_student,
+#   Student, login_reward_hooks) from server.py (normal import, explicit DI
+#   — matches the established register_*_routes convention; Architecture
+#   Reconstruction Phase 1, item 2). ``login_reward_hooks`` is the
+#   ``LoginRewardHooks`` namespace returned by login_reward_tools.py's own
+#   register call — it holds the db-bound ``student_vouchers`` collection
+#   and ``compose_voucher_payload`` this module needs. The PURE helpers
+#   (``_lrc_iso`` / ``_lrc_now`` / ``_norm_student_id``-equivalent) are
+#   imported directly since this is a real module now, not resolved via
+#   globals().get(...) into a shared exec() namespace.
 # ============================================================================
 
 import logging as _vrt_logging
 
+from fastapi import Depends
+
+from eduhub_platform.identity import resolve as _vrt_norm
+from login_reward_tools import _lrc_iso, _lrc_now
+
 _VRT_LOG = _vrt_logging.getLogger("eduhub")
 
-# Reuse the issuer module's collection handle + helpers (already present in
-# the shared exec namespace). Defensive fallbacks keep this importable even
-# if the names ever move.
-_vrt_student_vouchers = (
-    globals().get("_lrc_student_vouchers")
-    if globals().get("_lrc_student_vouchers") is not None
-    else db["student_vouchers"]  # noqa: F821 (db is provided by exec namespace)
-)
 
-
-def _vrt_norm(value) -> str:
-    fn = globals().get("_norm_student_id")
-    if callable(fn):
-        return fn(value or "")
-    return (value or "").strip().lower()
-
-
-async def _vrt_compose(row: dict) -> dict:
+async def _vrt_compose(row: dict, compose_voucher_payload) -> dict:
     """Delegate to the login-reward composer when available; otherwise
     return a minimal shape so the endpoint never hard-fails."""
-    composer = globals().get("_lrc_compose_voucher_payload")
-    if callable(composer):
-        return await composer(row)
+    if callable(compose_voucher_payload):
+        return await compose_voucher_payload(row)
     return {
         "voucher_id": row.get("id") or "",
         "campaign_id": row.get("campaign_id"),
@@ -75,67 +55,80 @@ async def _vrt_compose(row: dict) -> dict:
     }
 
 
-@api.get("/student/vouchers")  # noqa: F821 (api provided by exec namespace)
-async def vrt_list_student_vouchers(student: Student = Depends(require_student)):  # type: ignore[name-defined]  # noqa: F821
-    """List the logged-in student's vouchers. Status (active / used /
-    expired / exhausted / unavailable) is computed by the backend from the
-    EXISTING coupon doc (`uses_count`, `max_uses`, `expires_at`, `enabled`).
+def register_voucher_reward_routes(api, db, require_student, Student, login_reward_hooks):
+    """Register the student-facing Book Voucher listing route onto ``api``.
+
+    Explicit-DI replacement for the previous ``exec()``-into-server-namespace
+    loading. Behaviour is identical: same route, same source of truth
+    (``student_vouchers`` + ``db.coupons``), same opportunistic "used"
+    backfill.
     """
-    sid_clean = (getattr(student, "clean_id", "") or "").strip() or getattr(student, "student_id", "")
-    sid_norm = _vrt_norm(sid_clean)
-    if not sid_norm:
-        return {"vouchers": [], "count": 0}
+    _vrt_student_vouchers = (
+        login_reward_hooks.student_vouchers
+        if login_reward_hooks is not None
+        else db["student_vouchers"]
+    )
+    compose_voucher_payload = (
+        login_reward_hooks.compose_voucher_payload if login_reward_hooks is not None else None
+    )
 
-    rows = []
-    try:
-        cur = _vrt_student_vouchers.find(
-            {"student_id_norm": sid_norm}, {"_id": 0}
-        ).sort("claimed_at", -1).limit(200)
-        async for v in cur:
-            rows.append(v)
-    except Exception as _e:
-        _VRT_LOG.warning("voucher_reward: list query failed: %s", _e)
-        return {"vouchers": [], "count": 0}
+    @api.get("/student/vouchers")
+    async def vrt_list_student_vouchers(student: Student = Depends(require_student)):
+        """List the logged-in student's vouchers. Status (active / used /
+        expired / exhausted / unavailable) is computed by the backend from the
+        EXISTING coupon doc (`uses_count`, `max_uses`, `expires_at`, `enabled`).
+        """
+        sid_clean = (getattr(student, "clean_id", "") or "").strip() or getattr(student, "student_id", "")
+        sid_norm = _vrt_norm(sid_clean)
+        if not sid_norm:
+            return {"vouchers": [], "count": 0}
 
-    iso = globals().get("_lrc_iso")
-    now = globals().get("_lrc_now")
+        rows = []
+        try:
+            cur = _vrt_student_vouchers.find(
+                {"student_id_norm": sid_norm}, {"_id": 0}
+            ).sort("claimed_at", -1).limit(200)
+            async for v in cur:
+                rows.append(v)
+        except Exception as _e:
+            _VRT_LOG.warning("voucher_reward: list query failed: %s", _e)
+            return {"vouchers": [], "count": 0}
 
-    out = []
-    for v in rows:
-        code = v.get("coupon_code")
-        coupon = None
-        if code:
-            try:
-                coupon = await db.coupons.find_one({"code": code}, {"_id": 0})  # noqa: F821
-            except Exception:
-                coupon = None
-        # Opportunistic "used" backfill: if the EXISTING coupon already has a
-        # redemption by this student, mark the voucher used. (Single-use
-        # vouchers also flip to "used" purely from uses_count in the composer,
-        # so this is a best-effort enrichment, not a correctness dependency.)
-        if coupon and not v.get("used_at"):
-            for r in (coupon.get("redemptions") or []):
-                rid = r.get("student_id") or ""
-                if rid == v.get("student_id") or _vrt_norm(rid) == sid_norm:
-                    stamp = r.get("redeemed_at") or (iso(now()) if callable(iso) and callable(now) else None)
-                    try:
-                        await _vrt_student_vouchers.update_one(
-                            {"campaign_id": v.get("campaign_id"), "student_id_norm": sid_norm},
-                            {"$set": {
-                                "used_at": stamp,
-                                "redeemed_book_slug": r.get("book_slug"),
-                                "status": "used",
-                            }},
-                        )
-                        v["used_at"] = stamp
-                        v["redeemed_book_slug"] = r.get("book_slug")
-                        v["status"] = "used"
-                    except Exception:
-                        pass
-                    break
-        out.append(await _vrt_compose(v))
+        out = []
+        for v in rows:
+            code = v.get("coupon_code")
+            coupon = None
+            if code:
+                try:
+                    coupon = await db.coupons.find_one({"code": code}, {"_id": 0})
+                except Exception:
+                    coupon = None
+            # Opportunistic "used" backfill: if the EXISTING coupon already has a
+            # redemption by this student, mark the voucher used. (Single-use
+            # vouchers also flip to "used" purely from uses_count in the composer,
+            # so this is a best-effort enrichment, not a correctness dependency.)
+            if coupon and not v.get("used_at"):
+                for r in (coupon.get("redemptions") or []):
+                    rid = r.get("student_id") or ""
+                    if rid == v.get("student_id") or _vrt_norm(rid) == sid_norm:
+                        stamp = r.get("redeemed_at") or _lrc_iso(_lrc_now())
+                        try:
+                            await _vrt_student_vouchers.update_one(
+                                {"campaign_id": v.get("campaign_id"), "student_id_norm": sid_norm},
+                                {"$set": {
+                                    "used_at": stamp,
+                                    "redeemed_book_slug": r.get("book_slug"),
+                                    "status": "used",
+                                }},
+                            )
+                            v["used_at"] = stamp
+                            v["redeemed_book_slug"] = r.get("book_slug")
+                            v["status"] = "used"
+                        except Exception:
+                            pass
+                        break
+            out.append(await _vrt_compose(v, compose_voucher_payload))
 
-    return {"vouchers": out, "count": len(out)}
+        return {"vouchers": out, "count": len(out)}
 
-
-_VRT_LOG.info("voucher_reward_tools: routes registered (/api/student/vouchers)")
+    _VRT_LOG.info("voucher_reward_tools: routes registered (/api/student/vouchers)")
