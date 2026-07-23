@@ -5942,12 +5942,19 @@ async def startup():
     await db.coupons.create_index("code", unique=True)
     await db.coupons.create_index("enabled")
     await db.coupons.create_index("expires_at")
-    await db.payment_intents.create_index([("student_id", 1), ("status", 1), ("created_at", -1)])
-    await db.payment_transactions.create_index([("transaction_id", 1), ("apv", 1)], unique=True)
-    await db.payment_transactions.create_index([("status", 1), ("created_at", -1)])
-    await db.payment_transactions.create_index("matched_student_id")
-    await db.payment_settings.create_index([("amount_khr", 1), ("active", 1)])
-    await db.payment_audit_log.create_index([("txn_id", 1), ("at", -1)])
+    # Payment Bridge indexes: moved into payment_bridge.py's own
+    # _payment_bridge_ensure_indexes (Architecture Reconstruction Phase 1e,
+    # Collection Ownership — server.py used to touch payment_intents /
+    # payment_transactions / payment_settings / payment_audit_log directly,
+    # which the collection-ownership lint flagged as a second module
+    # touching collections that file owns).
+    try:
+        await _payment_bridge_ensure_indexes()
+    except Exception as _pb_idx_exc:  # noqa: BLE001
+        log.warning(
+            "payment_bridge: ensure_indexes during startup failed (non-fatal): %s",
+            _pb_idx_exc,
+        )
     # AI Scene Builder indexes
     await db.ai_scene_jobs.create_index("sceneId", unique=True)
     await db.ai_scene_jobs.create_index([("slug", 1), ("createdAt", -1)])
@@ -6020,12 +6027,18 @@ async def startup():
              "ANY" if not ADMIN_EMAILS else ",".join(ADMIN_EMAILS))
 
     # -- CamRapidPay KHQR Top Up: index + reconciliation sweep --------------
-    # Index for fast reference lookup (webhook + status + reconcile).
+    # Indexes: moved into camrapidpay_payment_tools.py's own
+    # _camrapidpay_ensure_indexes (Architecture Reconstruction Phase 1e,
+    # Collection Ownership — server.py used to touch camrapidpay_intents
+    # directly, which the collection-ownership lint flagged as a second
+    # module touching a collection that file owns).
     try:
-        await db.camrapidpay_intents.create_index("reference", unique=True)
-        await db.camrapidpay_intents.create_index([("status", 1), ("expires_at", 1)])
+        await _camrapidpay_ensure_indexes()
     except Exception as _cam_idx_err:  # noqa: BLE001
-        log.warning("camrapidpay: index setup skipped: %s", _cam_idx_err)
+        log.warning(
+            "camrapidpay: ensure_indexes during startup failed (non-fatal): %s",
+            _cam_idx_err,
+        )
     # Reconciliation sweep: re-verifies still-pending paid invoices so a lost
     # webhook AND a lost client poll can never leave a paid student
     # uncredited. Runs every 60s, non-fatal, only acts when the flag is on.
@@ -7047,12 +7060,15 @@ async def studio_conversation_generate(
 # register their own routes (they load after payment_bridge, so their
 # functions don't exist yet at this point) — see payment_bridge.py's own
 # module docstring for why a dict is needed here instead of a direct
-# parameter. The register call returns _complete_points_payment, which
-# camrapidpay_payment_tools.py's own register call already consumes as an
-# explicit parameter.
+# parameter. The register call returns (_complete_points_payment,
+# _payment_bridge_ensure_indexes) — the former consumed by
+# camrapidpay_payment_tools.py's own register call as an explicit parameter,
+# the latter (Phase 1e, Collection Ownership) called from the startup
+# handler below instead of server.py touching payment_intents /
+# payment_transactions / payment_audit_log directly itself.
 _payment_bridge_late_binds: dict = {}
 from payment_bridge import register_payment_bridge_routes
-_complete_points_payment = register_payment_bridge_routes(
+_complete_points_payment, _payment_bridge_ensure_indexes = register_payment_bridge_routes(
     api, db, require_admin, User,
     _fan_out_push, _update_tuition_in_gas,
     SL_TREASURY_ID, SL_TREASURY_PASSWORD, GAS_POINTS_LOGIN_URL,
@@ -7067,10 +7083,11 @@ _complete_points_payment = register_payment_bridge_routes(
 # /api/payments/camrapidpay/webhook, GET /api/payments/camrapidpay/status/{id}.
 # When CAMRAPIDPAY_ENABLED != "true" the routes exist but report unavailable,
 # so the existing ABA/manual fallback continues unchanged. The register call
-# returns the reconcile-sweep coroutine, assigned below to the same
-# module-level name the existing 60s background loop already looks up.
+# returns (reconcile_once, ensure_indexes); reconcile_once is assigned to the
+# same module-level name the existing 60s background loop already looks up,
+# ensure_indexes (Phase 1e) is called from the startup handler below.
 from camrapidpay_payment_tools import register_camrapidpay_payment_routes
-_camrapidpay_reconcile_once = register_camrapidpay_payment_routes(
+_camrapidpay_reconcile_once, _camrapidpay_ensure_indexes = register_camrapidpay_payment_routes(
     api, db, require_student, _complete_points_payment,
 )
 

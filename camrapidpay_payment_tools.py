@@ -8,8 +8,11 @@
 # existing proven credit path (payment_bridge._complete_points_payment)
 # passed in explicitly rather than resolved via globals() lookup, so this
 # module's conversion is decoupled from payment_bridge.py's own conversion
-# timing. The register call returns the reconcile-sweep coroutine function
-# so server.py's startup background loop can call it directly.
+# timing. The register call returns (reconcile_once, ensure_indexes) --
+# reconcile_once for server.py's existing 60s background loop, and
+# ensure_indexes (Phase 1e, Collection Ownership) so server.py's startup
+# handler creates camrapidpay_intents' indexes via this owning module
+# instead of touching the collection directly itself.
 #
 # SECURITY / TRUTH MODEL (non-negotiable):
 #   - The webhook is a WAKE-UP TRIGGER ONLY. It never credits from its body.
@@ -151,6 +154,24 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
         except Exception:  # noqa: BLE001
             doc = None
         return doc
+
+    async def _camrapidpay_ensure_indexes() -> None:
+        """Create camrapidpay_intents indexes. Architecture Reconstruction
+        Phase 1e (Collection Ownership): this index creation used to live
+        directly in server.py's monolithic startup handler — the collection-
+        ownership lint (tools/check_collection_ownership.py) flagged that as
+        a second module touching a collection this file owns. Moved here so
+        server.py only ever calls the owning module's own function, matching
+        the pattern already used by login_reward_tools.py / referral_tools.py
+        / login_mystery_box_tools.py. Non-fatal — a Mongo error here can
+        never block app boot (server.py's own belt-and-braces try/except
+        around the call is the second layer)."""
+        try:
+            await _cam_intents.create_index("reference", unique=True)
+            await _cam_intents.create_index([("status", 1), ("expires_at", 1)])
+            _CAM_LOG.info("camrapidpay: indexes ensured")
+        except Exception as _idx_exc:  # noqa: BLE001
+            _CAM_LOG.warning("camrapidpay: index setup skipped: %s", _idx_exc)
 
     # -----------------------------------------------------------------------
     # THE one-and-only credit function. Race-proof via atomic status flip.
@@ -900,4 +921,4 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
         # 3) v1.3: migrate any legacy paid_not_credited rows -> manual_review.
         await _camrapidpay_recover_legacy_paid_not_credited()
 
-    return _camrapidpay_reconcile_once
+    return _camrapidpay_reconcile_once, _camrapidpay_ensure_indexes

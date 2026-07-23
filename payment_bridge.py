@@ -246,9 +246,37 @@ def register_payment_bridge_routes(
     loading. Behaviour is identical: same routes, same matching algorithm,
     same money-path safety rules (strict single-match, idempotent push,
     unknown-outcome -> manual review upstream in tuition_tools/wallet_service).
-    Returns ``_complete_points_payment`` for camrapidpay_payment_tools.py's
-    own register call to consume.
+    Returns (``_complete_points_payment``, ``_payment_bridge_ensure_indexes``)
+    -- the former for camrapidpay_payment_tools.py's own register call to
+    consume, the latter (Phase 1e, Collection Ownership) for server.py's
+    startup handler to call instead of touching payment_intents /
+    payment_transactions / payment_audit_log directly itself.
     """
+
+    async def _payment_bridge_ensure_indexes() -> None:
+        """Create indexes for the collections this module owns. Architecture
+        Reconstruction Phase 1e: this index creation used to live directly in
+        server.py's monolithic startup handler -- the collection-ownership
+        lint (tools/check_collection_ownership.py) flagged that as a second
+        module touching collections this file owns. Moved here so server.py
+        only ever calls the owning module's own function. Non-fatal -- a
+        Mongo error here can never block app boot (server.py's own
+        belt-and-braces try/except around the call is the second layer).
+        Note: payment_settings' index stays here too (this module owns its
+        CRUD lifecycle), even though camrapidpay_payment_tools.py also reads
+        that collection -- a legitimate, intentional read-only cross-module
+        consumption, not a second owner.
+        """
+        try:
+            await db.payment_intents.create_index([("student_id", 1), ("status", 1), ("created_at", -1)])
+            await db.payment_transactions.create_index([("transaction_id", 1), ("apv", 1)], unique=True)
+            await db.payment_transactions.create_index([("status", 1), ("created_at", -1)])
+            await db.payment_transactions.create_index("matched_student_id")
+            await db.payment_settings.create_index([("amount_khr", 1), ("active", 1)])
+            await db.payment_audit_log.create_index([("txn_id", 1), ("at", -1)])
+            log.info("payment_bridge: indexes ensured")
+        except Exception as _idx_exc:  # noqa: BLE001
+            log.warning("payment_bridge: index setup skipped: %s", _idx_exc)
 
     # ------ Matching logic ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1575,4 +1603,4 @@ def register_payment_bridge_routes(
             d["_id"] = str(d["_id"])
         return {"ok": True, "history": docs, "student_id": student_id}
 
-    return _complete_points_payment
+    return _complete_points_payment, _payment_bridge_ensure_indexes
