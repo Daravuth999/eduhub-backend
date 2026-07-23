@@ -7058,7 +7058,9 @@ register_tier_config_routes(api, db, require_admin, require_student)
 # realtime WS at /api/notifications/ws. Student-session auth reused as-is.
 try:
     from notification_center import register_notification_center
-    register_notification_center(api, app, db, require_student)
+    # require_admin (Architecture Reconstruction Phase 4) mounts the
+    # additive GET /api/admin/event-bus/status diagnostic route.
+    register_notification_center(api, app, db, require_student, require_admin)
     logging.getLogger("eduhub").info("notification_center: registered")
 except Exception as _nc_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
