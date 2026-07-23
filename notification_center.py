@@ -309,6 +309,66 @@ class _WSManager:
 
 _ws_manager = _WSManager()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Event Platform bridge (Architecture Reconstruction Phase 4) — additive.
+#
+# _ws_manager above is IN-PROCESS ONLY: a WebSocket client connected to one
+# app instance/worker never sees an event recorded on another. That is fine
+# for a single-instance deployment (today's default) and becomes a real gap
+# the moment this app runs with more than one worker. eduhub_platform.events
+# is the fix: _dispatch_realtime() below routes every delivery through an
+# EventBus instead of calling _ws_manager directly.
+#
+#   * Before register_notification_center()'s startup hook runs (e.g. an
+#     isolated unit test that calls _record_event directly, exactly like the
+#     existing test suite already does), `_event_bus` is None and
+#     _dispatch_realtime() falls back to calling _ws_manager directly —
+#     byte-identical to this module's behaviour before this bridge existed.
+#   * Once startup has run, `_event_bus` defaults to InProcessTransport
+#     (still nothing changes: publishing immediately invokes the one
+#     subscriber registered below, which itself just calls _ws_manager —
+#     same effective call, same timing, one extra layer of indirection).
+#   * Only when an operator sets EVENT_BUS_TRANSPORT=redis (via
+#     eduhub_platform.config) AND REDIS_URL does this bridge start actually
+#     relaying events to every other instance's own local _ws_manager —
+#     the missing piece for realtime delivery to work correctly at more
+#     than one instance. See eduhub_platform/events.py's own docstring.
+# ─────────────────────────────────────────────────────────────────────────────
+_event_bus: Any = None
+
+_REALTIME_CHANNEL = "activity_notifications"
+
+
+async def _deliver_ws(payload: dict) -> None:
+    """The actual local WebSocket delivery. Called either directly
+    (bus not yet initialized) or via the event bus subscriber (the normal
+    running-app path, and the only path that also reaches other instances
+    when Redis is configured)."""
+    if payload.get("broadcast"):
+        await _ws_manager.broadcast({"type": "notification", "item": payload["item"]})
+    else:
+        await _ws_manager.send_to(
+            payload.get("student_ids") or [], {"type": "notification", "item": payload["item"]},
+        )
+
+
+async def _dispatch_realtime(payload: dict) -> None:
+    """Deliver a fresh notification in realtime. Routes through the event
+    bus when one has been initialized (register_notification_center's
+    startup hook subscribes _deliver_ws on it, so publishing here already
+    reaches this same process's local WebSocket clients — and every other
+    instance's, once Redis is configured); falls back to a direct call
+    otherwise. NEVER raises — matches every other function in this module's
+    "never break the existing push flow" contract."""
+    if _event_bus is not None:
+        try:
+            await _event_bus.publish(_REALTIME_CHANNEL, payload)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("notification-center: event bus publish failed, "
+                        "delivering locally instead: %s", str(exc)[:200])
+    await _deliver_ws(payload)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
@@ -386,7 +446,7 @@ async def _record_event(
             doc["dedupeKey"] = dedupe_key
         res = await coll.insert_one(doc)
         doc["_id"] = res.inserted_id
-        await _ws_manager.broadcast({"type": "notification", "item": _serialize(doc, set())})
+        await _dispatch_realtime({"broadcast": True, "item": _serialize(doc, set())})
         return
 
     norm_ids: list[str] = []
@@ -415,7 +475,7 @@ async def _record_event(
     res = await coll.insert_many(docs)
     for doc, oid in zip(docs, res.inserted_ids):
         doc["_id"] = oid
-        await _ws_manager.send_to([doc["studentId"]], {"type": "notification", "item": _serialize(doc)})
+        await _dispatch_realtime({"student_ids": [doc["studentId"]], "item": _serialize(doc)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -497,7 +557,13 @@ async def _resolve_student_by_session_token(db, session_token: str):
     )
 
 
-def register_notification_center(api, app, db, require_student) -> None:
+def register_notification_center(api, app, db, require_student, require_admin=None) -> None:
+    """``require_admin`` is optional and additive (Architecture
+    Reconstruction Phase 4, "event platform" verification tooling) — when
+    supplied, mounts GET /api/admin/event-bus/status. Every existing call
+    site (server.py, and both existing test files) passes exactly 4
+    positional args and is unaffected; omitting require_admin simply
+    skips registering that one diagnostic route."""
     from fastapi import Depends
 
     coll = db["activity_notifications"]
@@ -598,6 +664,23 @@ def register_notification_center(api, app, db, require_student) -> None:
             raise HTTPException(status_code=403, detail="not your notification")
         return {"ok": True}
 
+    # ── Event Platform verification tooling (Phase 4) — admin-only,
+    #    read-only diagnostic. Registered only when require_admin is
+    #    supplied (see the function docstring above). ───────────────────
+    if require_admin is not None:
+        @api.get("/admin/event-bus/status")
+        async def event_bus_status(_admin=Depends(require_admin)):
+            import os as _os
+            transport_name = (
+                type(_event_bus._transport).__name__ if _event_bus is not None
+                else "not_initialized"
+            )
+            return {
+                "transport": transport_name,
+                "channel": _REALTIME_CHANNEL,
+                "redis_url_configured": bool(_os.environ.get("REDIS_URL")),
+            }
+
     # ── Realtime — isolated WS. Auth via ?token= (Bearer fallback token) OR
     #    the existing student_session cookie (sent automatically on wss).
     #    BOTH are attempted independently (query token first, then cookie) —
@@ -644,5 +727,23 @@ def register_notification_center(api, app, db, require_student) -> None:
             log.info("notification-center: indexes ready (TTL %sd)", RETENTION_DAYS)
         except Exception as exc:  # noqa: BLE001
             log.warning("notification-center: index bootstrap failed: %s", str(exc)[:200])
+
+        # Architecture Reconstruction Phase 4 ("event platform") — build the
+        # event bus (defaults to InProcessTransport, a no-op behaviour change
+        # from before this bridge existed) and subscribe the SAME local
+        # delivery function this module always used. Non-fatal: a failure
+        # here just leaves _event_bus as None, and _dispatch_realtime's own
+        # fallback keeps every existing push flow working unchanged.
+        global _event_bus
+        try:
+            from eduhub_platform.events import build_event_bus
+            _event_bus = await build_event_bus(db)
+            await _event_bus.subscribe(_REALTIME_CHANNEL, _deliver_ws)
+            log.info("notification-center: event bus ready (transport=%s)",
+                     type(_event_bus._transport).__name__)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("notification-center: event bus init failed (falling back "
+                        "to direct local delivery): %s", str(exc)[:200])
+            _event_bus = None
 
     log.info("notification-center: routes registered (/api/notifications*)")
