@@ -1734,15 +1734,29 @@ def register_student_points_routes(api, db, require_student) -> None:
     require_student is the FastAPI dependency from server.py — never
     imported here to avoid circular imports.
     """
-    import os as _os
     from fastapi import Depends as _Depends, HTTPException as _HTTPException
+
+    from eduhub_platform.config import resolve_bool_flag as _resolve_bool_flag
 
     COLL_WALLETS_P3 = "points_wallets"
     COLL_TXN_P3     = "points_transactions"
 
-    def _read_enabled() -> bool:
-        v = (_os.environ.get("USE_MONGO_POINTS_READ") or "").strip().lower()
-        return v in ("true", "1", "yes")
+    async def _read_enabled() -> bool:
+        """Architecture Reconstruction Phase 3 ("configuration platform"):
+        resolved through eduhub_platform.config instead of a raw
+        os.environ.get() read, so an operator can flip this flag via a
+        published override (no redeploy) without losing the existing
+        env-var behaviour when no override is set. Same truthy-string
+        convention ("true"/"1"/"yes", now also "on") as every existing
+        deployment's USE_MONGO_POINTS_READ env var already uses. A
+        published-override lookup failure degrades to the exact same
+        env-var read this function did before this change — see
+        resolve_bool_flag's own never-raises guarantee.
+        """
+        value, _source = await _resolve_bool_flag(
+            db, "USE_MONGO_POINTS_READ", default=False,
+        )
+        return value
 
     @api.get("/student/points/balance")
     async def _student_points_balance(student=_Depends(require_student)):
@@ -1753,7 +1767,7 @@ def register_student_points_routes(api, db, require_student) -> None:
         When on: returns the live Mongo balance as a float (preserves
         decimals — e.g. 277.5, 240.858).
         """
-        if not _read_enabled():
+        if not await _read_enabled():
             return {
                 "mode":       "disabled",
                 "student_id": student.student_id,
@@ -1786,7 +1800,7 @@ def register_student_points_routes(api, db, require_student) -> None:
         to_id (credits), excluding shadow-only rows.
         When USE_MONGO_POINTS_READ is off: returns mode="disabled".
         """
-        if not _read_enabled():
+        if not await _read_enabled():
             return {
                 "mode":         "disabled",
                 "student_id":   student.student_id,

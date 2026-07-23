@@ -94,6 +94,8 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "payment_transactions": "payment_bridge.py",
     "payment_settings": "payment_bridge.py",
     "payment_audit_log": "payment_bridge.py",
+    # eduhub_platform/config.py (Architecture Reconstruction Phase 3)
+    "platform_config": "config.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed

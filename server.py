@@ -6107,6 +6107,20 @@ async def startup():
                 _wallet_startup_error,
             )
 
+    # Architecture Reconstruction Phase 3 ("configuration platform") —
+    # eduhub_platform.config's platform_config collection index. Non-fatal:
+    # a failure here only means published-override lookups fall back to
+    # the env-var tier (resolve_flag's own degrade-on-error guarantee),
+    # every existing flag keeps working exactly as before.
+    try:
+        from eduhub_platform.config import ensure_config_indexes as _ensure_config_indexes
+        await _ensure_config_indexes(db)
+    except Exception as _config_startup_error:
+        logging.getLogger(__name__).warning(
+            "platform_config: index ensure skipped/failed (non-fatal): %s",
+            _config_startup_error,
+        )
+
 @app.on_event("shutdown")
 async def shutdown():
     # v3 (FIX 10): cancel and await the browser-abandoned recovery task.
