@@ -5777,6 +5777,19 @@ except Exception as _event_engine_err:  # noqa: BLE001
         _event_engine_err,
     )
 
+# ── Platform Configuration admin routes (Architecture Reconstruction     ──
+# Phase 3, Author Studio's "Platform Configuration" screen). Index startup
+# for this module is already wired above (Phase 3 config-platform block).
+# Failure is non-fatal: only the /api/v1/platform-config* routes go away.
+try:
+    from eduhub_platform.config import register_platform_config_routes
+    register_platform_config_routes(api, db, require_admin)
+except Exception as _platform_config_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "platform_config routes failed to load (Platform Configuration "
+        "screen disabled): %s", _platform_config_err,
+    )
+
 # ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
 # Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
 # Join factory above via the hooks dict — no second enrollment system, no

@@ -25,8 +25,12 @@ class _FakeCursor:
     def __init__(self, docs):
         self._docs = list(docs)
 
-    def sort(self, *a, **k):
-        self._docs = sorted(self._docs, key=lambda d: d.get("updated_at") or "", reverse=True)
+    def sort(self, key="updated_at", direction=-1):
+        self._docs = sorted(self._docs, key=lambda d: d.get(key) or "", reverse=(direction == -1))
+        return self
+
+    def limit(self, n):
+        self._docs = self._docs[:n]
         return self
 
     def __aiter__(self):
@@ -71,13 +75,34 @@ class _FakeConfigCollection:
         return None
 
 
+class _FakeAuditCollection:
+    def __init__(self):
+        self.docs: list[dict] = []
+
+    async def insert_one(self, doc):
+        self.docs.append(dict(doc))
+        return _Result(inserted_id=len(self.docs))
+
+    def find(self, query=None, projection=None):
+        query = query or {}
+        rows = [d for d in self.docs if all(d.get(k) == v for k, v in query.items())]
+        return _FakeCursor(rows)
+
+    async def create_index(self, *a, **k):
+        return None
+
+
 class _FakeDB:
     def __init__(self):
         self._config = _FakeConfigCollection()
+        self._audit = _FakeAuditCollection()
 
     def __getitem__(self, name):
-        assert name == cfg.COLL_CONFIG
-        return self._config
+        if name == cfg.COLL_CONFIG:
+            return self._config
+        if name == cfg.COLL_CONFIG_AUDIT:
+            return self._audit
+        raise AssertionError(f"unexpected collection: {name}")
 
 
 pytestmark = []
@@ -225,3 +250,155 @@ async def test_ensure_config_indexes_is_idempotent_and_safe():
     db = _FakeDB()
     await cfg.ensure_config_indexes(db)
     await cfg.ensure_config_indexes(db)  # second call must not raise
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Version tracking + audit history (Author Studio's "Platform Configuration"
+# screen requirements: version display, audit history)
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_set_override_increments_version_each_call():
+    db = _FakeDB()
+    first = await cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test")
+    assert first["version"] == 1
+    second = await cfg.set_override(db, "FLAG_A", "0", updated_by="admin@test")
+    assert second["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_list_overrides_includes_version():
+    db = _FakeDB()
+    await cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test")
+    await cfg.set_override(db, "FLAG_A", "0", updated_by="admin@test")
+    overrides = await cfg.list_overrides(db)
+    assert overrides[0]["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_set_override_records_audit_entry_with_old_and_new_value():
+    db = _FakeDB()
+    await cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test")
+    await cfg.set_override(db, "FLAG_A", "0", updated_by="admin2@test")
+    history = await cfg.get_audit_history(db, "FLAG_A")
+    assert len(history) == 2
+    # newest first
+    assert history[0]["action"] == "set"
+    assert history[0]["old_value"] == "1"
+    assert history[0]["new_value"] == "0"
+    assert history[0]["by"] == "admin2@test"
+    assert history[1]["old_value"] is None
+    assert history[1]["new_value"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_clear_override_records_audit_entry_only_when_something_cleared():
+    db = _FakeDB()
+    # Clearing a flag that was never set records nothing.
+    cleared = await cfg.clear_override(db, "NEVER_SET", updated_by="admin@test")
+    assert cleared is False
+    assert await cfg.get_audit_history(db, "NEVER_SET") == []
+
+    await cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test")
+    await cfg.clear_override(db, "FLAG_A", updated_by="admin@test")
+    history = await cfg.get_audit_history(db, "FLAG_A")
+    assert history[0]["action"] == "clear"
+    assert history[0]["old_value"] == "1"
+    assert history[0]["new_value"] is None
+
+
+@pytest.mark.asyncio
+async def test_audit_history_is_scoped_per_flag_name():
+    db = _FakeDB()
+    await cfg.set_override(db, "FLAG_A", "1", updated_by="a")
+    await cfg.set_override(db, "FLAG_B", "2", updated_by="a")
+    history_a = await cfg.get_audit_history(db, "FLAG_A")
+    assert len(history_a) == 1
+    assert history_a[0]["name"] == "FLAG_A"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# HTTP routes — real APIRouter + FastAPI + TestClient (Author Studio's
+# "Platform Configuration" screen consumes these directly)
+# ═════════════════════════════════════════════════════════════════════════
+def _admin_dep_sync():
+    async def _dep():
+        return {"email": "admin@test"}
+    return _dep
+
+
+def _make_config_client(db):
+    from fastapi import APIRouter, FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    api = APIRouter(prefix="/api")
+    cfg.register_platform_config_routes(api, db, _admin_dep_sync())
+    app.include_router(api)
+    return TestClient(app)
+
+
+def test_list_platform_config_route_returns_overrides():
+    import asyncio
+    db = _FakeDB()
+    asyncio.run(cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test"))
+    client = _make_config_client(db)
+    resp = client.get("/api/v1/platform-config")
+    assert resp.status_code == 200
+    assert resp.json()["overrides"][0]["_id"] == "FLAG_A"
+
+
+def test_get_platform_config_route_reports_all_three_tiers(monkeypatch):
+    monkeypatch.setenv("MY_ENV_FLAG", "from_env")
+    db = _FakeDB()
+    client = _make_config_client(db)
+    resp = client.get("/api/v1/platform-config/MY_ENV_FLAG", params={"default": "fallback"})
+    body = resp.json()
+    assert body["effective_value"] == "from_env"
+    assert body["source"] == "legacy"
+    assert body["environment_fallback"] == "from_env"
+    assert body["default_fallback"] == "fallback"
+    assert body["published_override"] is None
+
+
+def test_set_platform_config_route_creates_override():
+    db = _FakeDB()
+    client = _make_config_client(db)
+    resp = client.post("/api/v1/platform-config/FLAG_A", json={"value": "on"})
+    assert resp.status_code == 200
+    assert resp.json()["override"]["value"] == "on"
+    assert resp.json()["override"]["version"] == 1
+
+
+def test_set_platform_config_route_requires_value_field():
+    db = _FakeDB()
+    client = _make_config_client(db)
+    resp = client.post("/api/v1/platform-config/FLAG_A", json={})
+    assert resp.status_code == 400
+
+
+def test_clear_platform_config_route_removes_override():
+    import asyncio
+    db = _FakeDB()
+    asyncio.run(cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test"))
+    client = _make_config_client(db)
+    resp = client.delete("/api/v1/platform-config/FLAG_A")
+    assert resp.status_code == 200
+    assert resp.json()["cleared"] is True
+    assert await_get(db, "FLAG_A") is None
+
+
+def await_get(db, name):
+    import asyncio
+    return asyncio.run(db[cfg.COLL_CONFIG].find_one({"_id": name}))
+
+
+def test_platform_config_history_route_returns_audit_trail():
+    import asyncio
+    db = _FakeDB()
+    asyncio.run(cfg.set_override(db, "FLAG_A", "1", updated_by="admin@test"))
+    asyncio.run(cfg.set_override(db, "FLAG_A", "0", updated_by="admin@test"))
+    client = _make_config_client(db)
+    resp = client.get("/api/v1/platform-config/FLAG_A/history")
+    assert resp.status_code == 200
+    history = resp.json()["history"]
+    assert len(history) == 2
+    assert history[0]["new_value"] == "0"

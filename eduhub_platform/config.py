@@ -63,6 +63,7 @@ async def ensure_config_indexes(db) -> None:
     by ``_id`` (the flag name) so no secondary index is required for
     point lookups; this index supports listing overrides by recency."""
     await db[COLL_CONFIG].create_index([("updated_at", -1)])
+    await db[COLL_CONFIG_AUDIT].create_index([("name", 1), ("at", -1)])
     log.info("platform_config: indexes ready")
 
 
@@ -132,41 +133,143 @@ async def resolve_bool_flag(
     return _coerce_bool(raw, default=default), source
 
 
+COLL_CONFIG_AUDIT = "platform_config_audit"
+
+
+async def _record_audit(
+    db, name: str, action: str, *, old_value: Any, new_value: Any, by: str,
+) -> None:
+    """Append-only audit trail (Author Studio's "Audit history" /
+    "Version display" requirement). Never raises into the caller — a
+    failure to record history must not block the actual config change
+    it's describing."""
+    try:
+        await db[COLL_CONFIG_AUDIT].insert_one({
+            "name": name,
+            "action": action,  # "set" | "clear"
+            "old_value": old_value,
+            "new_value": new_value,
+            "by": by or "",
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning("platform_config: audit record failed for %r: %s", name, exc)
+
+
 async def set_override(db, name: str, value: Any, *, updated_by: str = "") -> dict[str, Any]:
     """Admin-only: write a ``published`` override for ``name``. Takes
     priority over the environment variable immediately — no redeploy,
-    no process restart."""
+    no process restart. ``version`` increments on every call (Author
+    Studio's "Version display" requirement) and an audit row is
+    recorded describing the change."""
     now = datetime.now(timezone.utc).isoformat()
+    existing = await db[COLL_CONFIG].find_one({"_id": name}, {"_id": 0, "value": 1, "version": 1})
+    next_version = int((existing or {}).get("version") or 0) + 1
     doc = {
         "_id": name,
         "value": value,
+        "version": next_version,
         "updated_at": now,
         "updated_by": updated_by or "",
     }
     await db[COLL_CONFIG].update_one(
         {"_id": name}, {"$set": doc}, upsert=True,
     )
+    await _record_audit(
+        db, name, "set",
+        old_value=(existing or {}).get("value"), new_value=value, by=updated_by,
+    )
     return doc
 
 
-async def clear_override(db, name: str) -> bool:
+async def clear_override(db, name: str, *, updated_by: str = "") -> bool:
     """Admin-only: remove the ``published`` override for ``name``,
     reverting resolution to the legacy/env tier. Returns True if a
-    document was actually removed."""
+    document was actually removed. Records an audit row either way is
+    skipped when nothing existed to clear — there is no change to log."""
+    existing = await db[COLL_CONFIG].find_one({"_id": name}, {"_id": 0, "value": 1})
     result = await db[COLL_CONFIG].delete_one({"_id": name})
-    return bool(getattr(result, "deleted_count", 0))
+    cleared = bool(getattr(result, "deleted_count", 0))
+    if cleared:
+        await _record_audit(
+            db, name, "clear",
+            old_value=(existing or {}).get("value"), new_value=None, by=updated_by,
+        )
+    return cleared
 
 
 async def list_overrides(db) -> list[dict[str, Any]]:
     """Admin-only: list every currently-active ``published`` override,
     newest first. Read-only, no side effects."""
-    cursor = db[COLL_CONFIG].find({}, {"_id": 1, "value": 1, "updated_at": 1, "updated_by": 1}) \
+    cursor = db[COLL_CONFIG].find({}, {"_id": 1, "value": 1, "version": 1, "updated_at": 1, "updated_by": 1}) \
         .sort("updated_at", -1)
     return [doc async for doc in cursor]
 
 
+async def get_audit_history(db, name: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Admin-only: audit trail for one flag, newest first. Read-only."""
+    limit = max(1, min(int(limit or 50), 200))
+    cursor = db[COLL_CONFIG_AUDIT].find({"name": name}, {"_id": 0}).sort("at", -1).limit(limit)
+    return [doc async for doc in cursor]
+
+
+def register_platform_config_routes(api, db, require_admin) -> None:
+    """Mounts /api/v1/platform-config* onto the existing FastAPI router —
+    Author Studio's "Platform Configuration" screen. Admin-only. Never
+    imports a business-domain module (server.py, wallet_service.py,
+    etc.) — this stays a pure infrastructure primitive, matching the
+    package's own one-way dependency contract."""
+    from fastapi import Body, Depends, HTTPException
+
+    @api.get("/v1/platform-config")
+    async def list_platform_config_route(_admin=Depends(require_admin)):
+        overrides = await list_overrides(db)
+        return {"overrides": overrides}
+
+    @api.get("/v1/platform-config/{name}")
+    async def get_platform_config_route(
+        name: str, env_var: str = "", default: str = "", _admin=Depends(require_admin),
+    ):
+        value, source = await resolve_flag(db, name, env_var=env_var or None, default=default or None)
+        override_doc = await db[COLL_CONFIG].find_one({"_id": name})
+        env_value = os.environ.get(env_var or name)
+        return {
+            "name": name,
+            "effective_value": value,
+            "source": source,
+            "published_override": (override_doc or {}).get("value") if override_doc else None,
+            "override_version": (override_doc or {}).get("version") if override_doc else None,
+            "environment_fallback": env_value,
+            "default_fallback": default or None,
+        }
+
+    @api.post("/v1/platform-config/{name}")
+    async def set_platform_config_route(
+        name: str, payload: dict = Body(...), admin=Depends(require_admin),
+    ):
+        if "value" not in payload:
+            raise HTTPException(status_code=400, detail="value is required")
+        doc = await set_override(db, name, payload["value"], updated_by=getattr(admin, "email", ""))
+        return {"ok": True, "override": doc}
+
+    @api.delete("/v1/platform-config/{name}")
+    async def clear_platform_config_route(name: str, admin=Depends(require_admin)):
+        cleared = await clear_override(db, name, updated_by=getattr(admin, "email", ""))
+        return {"ok": True, "cleared": cleared}
+
+    @api.get("/v1/platform-config/{name}/history")
+    async def platform_config_history_route(name: str, _admin=Depends(require_admin)):
+        history = await get_audit_history(db, name)
+        return {"history": history}
+
+    log.info("eduhub_platform.config: routes registered (/api/v1/platform-config*)")
+
+
 __all__ = [
     "COLL_CONFIG",
+    "COLL_CONFIG_AUDIT",
+    "get_audit_history",
+    "register_platform_config_routes",
     "ensure_config_indexes",
     "resolve_flag",
     "resolve_bool_flag",
