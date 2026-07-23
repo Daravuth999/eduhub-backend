@@ -5748,6 +5748,95 @@ _sl_direct_join_hooks.update(register_speaking_lab_direct_join_routes(
     require_admin_dep=require_admin,
 ) or {})
 
+# ── Event Engine (architecture.md §4.3, Migration Phase 3 continuation) ──
+# Speaking Lab becomes the first event *type* instead of its own hard-
+# coded system. Registration below reuses the SAME atomic join
+# transaction (speaking_lab_direct_join._run_direct_join) every existing
+# Direct Join call site already uses — no new join logic, no change to
+# existing /api/speaking-lab/* routes. Failure is non-fatal: if this
+# module fails to load, only the new /api/v1/event-templates* and
+# /api/v1/events* routes are unavailable.
+try:
+    from event_engine import register_event_engine_routes, ensure_event_engine_indexes
+    register_event_engine_routes(
+        api, db, SL_SESSIONS, SL_ENTRIES, _norm_student_id,
+        require_admin, require_student,
+    )
+
+    @app.on_event("startup")
+    async def _event_engine_startup():
+        try:
+            await ensure_event_engine_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "event_engine: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _event_engine_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "event_engine failed to load (Event Templates/Events API disabled): %s",
+        _event_engine_err,
+    )
+
+# ── Platform Configuration admin routes (Architecture Reconstruction     ──
+# Phase 3, Author Studio's "Platform Configuration" screen). Index startup
+# for this module is already wired above (Phase 3 config-platform block).
+# Failure is non-fatal: only the /api/v1/platform-config* routes go away.
+try:
+    from eduhub_platform.config import register_platform_config_routes
+    register_platform_config_routes(api, db, require_admin)
+except Exception as _platform_config_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "platform_config routes failed to load (Platform Configuration "
+        "screen disabled): %s", _platform_config_err,
+    )
+
+# ── Question Bank (Architecture Reconstruction continuation, Author       ──
+# Studio's "Question Bank" screen). Additive and parallel to the existing
+# /api/speaking-lab/questions flat-doc route above, which is left
+# completely untouched. Failure is non-fatal: only /api/v1/question-bank*
+# routes go away.
+try:
+    from question_bank import register_question_bank_routes, ensure_question_bank_indexes
+    register_question_bank_routes(api, db, require_admin)
+
+    @app.on_event("startup")
+    async def _question_bank_startup():
+        try:
+            await ensure_question_bank_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "question_bank: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _question_bank_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "question_bank failed to load (Question Bank API disabled): %s",
+        _question_bank_err,
+    )
+
+# ── Notification Packs (Architecture Reconstruction continuation,        ──
+# Author Studio's "Notification Packs" screen). An authoring layer only —
+# it renders reusable title/body/url templates but never sends anything
+# itself; notification_center.py's existing delivery pipeline is
+# untouched. Failure is non-fatal: only /api/v1/notification-packs*
+# routes go away.
+try:
+    from notification_packs import register_notification_pack_routes, ensure_notification_pack_indexes
+    register_notification_pack_routes(api, db, require_admin)
+
+    @app.on_event("startup")
+    async def _notification_packs_startup():
+        try:
+            await ensure_notification_pack_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "notification_packs: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _notification_packs_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "notification_packs failed to load (Notification Packs API disabled): %s",
+        _notification_packs_err,
+    )
+
 # ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
 # Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
 # Join factory above via the hooks dict — no second enrollment system, no
