@@ -96,6 +96,9 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "payment_audit_log": "payment_bridge.py",
     # eduhub_platform/config.py (Architecture Reconstruction Phase 3)
     "platform_config": "config.py",
+    # event_engine.py (Event Engine v1 — architecture.md Migration Phase 3)
+    "event_templates": "event_engine.py",
+    "events": "event_engine.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed

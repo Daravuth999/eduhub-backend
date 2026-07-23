@@ -5748,6 +5748,35 @@ _sl_direct_join_hooks.update(register_speaking_lab_direct_join_routes(
     require_admin_dep=require_admin,
 ) or {})
 
+# ── Event Engine (architecture.md §4.3, Migration Phase 3 continuation) ──
+# Speaking Lab becomes the first event *type* instead of its own hard-
+# coded system. Registration below reuses the SAME atomic join
+# transaction (speaking_lab_direct_join._run_direct_join) every existing
+# Direct Join call site already uses — no new join logic, no change to
+# existing /api/speaking-lab/* routes. Failure is non-fatal: if this
+# module fails to load, only the new /api/v1/event-templates* and
+# /api/v1/events* routes are unavailable.
+try:
+    from event_engine import register_event_engine_routes, ensure_event_engine_indexes
+    register_event_engine_routes(
+        api, db, SL_SESSIONS, SL_ENTRIES, _norm_student_id,
+        require_admin, require_student,
+    )
+
+    @app.on_event("startup")
+    async def _event_engine_startup():
+        try:
+            await ensure_event_engine_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "event_engine: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _event_engine_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "event_engine failed to load (Event Templates/Events API disabled): %s",
+        _event_engine_err,
+    )
+
 # ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
 # Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
 # Join factory above via the hooks dict — no second enrollment system, no
