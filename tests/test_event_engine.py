@@ -84,6 +84,10 @@ class _Coll:
         return _Cursor([d for d in self.docs.values()
                          if all(d.get(k) == v for k, v in query.items())])
 
+    async def count_documents(self, query=None):
+        query = query or {}
+        return sum(1 for d in self.docs.values() if all(d.get(k) == v for k, v in query.items()))
+
     async def create_index(self, *a, **k):
         return None
 
@@ -363,6 +367,210 @@ async def test_transition_on_unknown_event_raises_404():
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Draw/PrizePool wrapping — transition_event drives lucky_draw.py's
+# EXISTING module-level _run_draw/_finalize_draw when lucky_draw_ctx is
+# supplied. lucky_draw.py's own test suite already proves those two
+# functions correct in depth; these tests only prove event_engine.py
+# calls them at the right moment, with the right args, and handles
+# their failures/idempotency correctly.
+# ═════════════════════════════════════════════════════════════════════════
+async def _live_event_with_ctx(db, sessions, *, prize_policy=None):
+    tmpl = await ee.create_template(
+        db, name="A", event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": 10}, "prize_policy": prize_policy or {}},
+        created_by="a",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "registration_open", actor="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "live", actor="a")
+    return event
+
+
+def _lucky_draw_ctx(**overrides):
+    ctx = {
+        "sl_publish": None, "gas_url": "https://gas.example/exec",
+        "treasury_id": "stu092", "treasury_password": "pw",
+        "mock_gas": True, "log": None, "push_notify": None,
+    }
+    ctx.update(overrides)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_transition_to_drawing_without_ctx_is_pure_bookkeeping(monkeypatch):
+    import lucky_draw
+    calls = []
+
+    async def _fake_run_draw(*a, **k):
+        calls.append((a, k))
+        return {}
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    event = await ee.transition_event(db, sessions, event["_id"], "drawing", actor="a")
+    assert event["state"] == "drawing"
+    assert calls == []  # no lucky_draw_ctx supplied -> unchanged bookkeeping-only behavior
+
+
+@pytest.mark.asyncio
+async def test_transition_to_drawing_with_ctx_calls_run_draw(monkeypatch):
+    import lucky_draw
+    calls = []
+
+    async def _fake_run_draw(db_, sl_publish, session_id, config, gas_url, treasury_id,
+                              treasury_password, mock_gas, log, *, granted_by, push_notify=None):
+        calls.append({
+            "session_id": session_id, "granted_by": granted_by,
+            "num_winners": config.num_winners, "split": config.split,
+        })
+        return {"draw_id": "draw-1"}
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions, prize_policy={"num_winners": 2, "split": [60, 40]})
+    ctx = _lucky_draw_ctx()
+    updated = await ee.transition_event(
+        db, sessions, event["_id"], "drawing", actor="teacher@test", lucky_draw_ctx=ctx,
+    )
+    assert updated["state"] == "drawing"
+    assert len(calls) == 1
+    assert calls[0]["session_id"] == updated["linked_session_id"]
+    assert calls[0]["granted_by"] == "teacher@test"
+    assert calls[0]["num_winners"] == 2
+    assert calls[0]["split"] == [60, 40]
+
+
+@pytest.mark.asyncio
+async def test_transition_to_drawing_tolerates_already_run_409(monkeypatch):
+    import lucky_draw
+    from fastapi import HTTPException
+
+    async def _fake_run_draw(*a, **k):
+        raise HTTPException(status_code=409, detail="Lucky draw already run for this session")
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    updated = await ee.transition_event(
+        db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=_lucky_draw_ctx(),
+    )
+    assert updated["state"] == "drawing"  # idempotent — treated as already succeeded
+
+
+@pytest.mark.asyncio
+async def test_transition_to_drawing_propagates_other_failures_and_blocks_state(monkeypatch):
+    import lucky_draw
+    from fastapi import HTTPException
+
+    async def _fake_run_draw(*a, **k):
+        raise HTTPException(status_code=503, detail="payout provider not configured")
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    with pytest.raises(ee.EventEngineError) as exc:
+        await ee.transition_event(
+            db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=_lucky_draw_ctx(),
+        )
+    assert exc.value.code == "lucky_draw_prepare_failed"
+    assert exc.value.http_status == 503
+    reloaded = await ee.get_event(db, event["_id"])
+    assert reloaded["state"] == "live"  # state must NOT advance on a real failure
+
+
+@pytest.mark.asyncio
+async def test_transition_to_settling_calls_finalize_draw(monkeypatch):
+    import lucky_draw
+    calls = []
+
+    async def _fake_run_draw(*a, **k):
+        return {"draw_id": "draw-1"}
+
+    async def _fake_finalize_draw(db_, sl_publish, session_id, gas_url, treasury_id,
+                                   treasury_password, mock_gas, log, *, push_notify=None):
+        calls.append(session_id)
+        return {"draw_id": "draw-1", "finalized": True}
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+    monkeypatch.setattr(lucky_draw, "_finalize_draw", _fake_finalize_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    ctx = _lucky_draw_ctx()
+    event = await ee.transition_event(db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=ctx)
+    event = await ee.transition_event(db, sessions, event["_id"], "settling", actor="a", lucky_draw_ctx=ctx)
+    assert event["state"] == "settling"
+    assert calls == [event["linked_session_id"]]
+
+
+@pytest.mark.asyncio
+async def test_transition_to_settling_propagates_failures_and_blocks_state(monkeypatch):
+    import lucky_draw
+    from fastapi import HTTPException
+
+    async def _fake_run_draw(*a, **k):
+        return {"draw_id": "draw-1"}
+
+    async def _fake_finalize_draw(*a, **k):
+        raise HTTPException(status_code=404, detail="No prepared draw found for this session")
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+    monkeypatch.setattr(lucky_draw, "_finalize_draw", _fake_finalize_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    ctx = _lucky_draw_ctx()
+    event = await ee.transition_event(db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=ctx)
+    with pytest.raises(ee.EventEngineError) as exc:
+        await ee.transition_event(db, sessions, event["_id"], "settling", actor="a", lucky_draw_ctx=ctx)
+    assert exc.value.code == "lucky_draw_finalize_failed"
+    reloaded = await ee.get_event(db, event["_id"])
+    assert reloaded["state"] == "drawing"  # state must NOT advance on a real failure
+
+
+def test_transition_route_threads_lucky_draw_ctx(monkeypatch):
+    import lucky_draw
+    calls = []
+
+    async def _fake_run_draw(db_, sl_publish, session_id, config, gas_url, treasury_id,
+                              treasury_password, mock_gas, log, *, granted_by, push_notify=None):
+        calls.append(session_id)
+        return {"draw_id": "draw-1"}
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    app = FastAPI()
+    api = APIRouter(prefix="/api")
+    ee.register_event_engine_routes(
+        api, db, sessions, entries, _norm_student_id, _admin_dep, _student_dep,
+        lucky_draw_ctx=_lucky_draw_ctx(),
+    )
+    app.include_router(api)
+    client = TestClient(app)
+
+    tmpl_id = client.post("/api/v1/event-templates", json={
+        "name": "A", "event_type": "speaking_lab_session",
+    }).json()["template"]["_id"]
+    client.post(f"/api/v1/event-templates/{tmpl_id}/publish")
+    event_id = client.post("/api/v1/events", json={"template_id": tmpl_id}).json()["event"]["_id"]
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "scheduled"})
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "registration_open"})
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "live"})
+    resp = client.post(f"/api/v1/events/{event_id}/transition", json={"to": "drawing"})
+    assert resp.status_code == 200
+    assert len(calls) == 1
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Registration — delegates to the EXISTING _run_direct_join
 # ═════════════════════════════════════════════════════════════════════════
 @pytest.mark.asyncio
@@ -482,6 +690,84 @@ def test_event_lifecycle_routes():
     assert resp.status_code == 400  # invalid transition from "scheduled"
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# Runtime Dashboard — buckets, participant counts, health, prize estimate
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_runtime_dashboard_buckets_events_by_state():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    tmpl = await ee.create_template(db, name="A", event_type="speaking_lab_session", content={}, created_by="a")
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+
+    draft_evt = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    live_evt = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    live_evt = await ee.transition_event(db, sessions, live_evt["_id"], "scheduled", actor="a")
+    live_evt = await ee.transition_event(db, sessions, live_evt["_id"], "registration_open", actor="a")
+    live_evt = await ee.transition_event(db, sessions, live_evt["_id"], "live", actor="a")
+    done_evt = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    done_evt = await ee.transition_event(db, sessions, done_evt["_id"], "scheduled", actor="a")
+    done_evt = await ee.transition_event(db, sessions, done_evt["_id"], "cancelled", actor="a")
+
+    dashboard = await ee.get_runtime_dashboard(db, entries)
+    assert [e["_id"] for e in dashboard["upcoming"]] == [draft_evt["_id"]]
+    assert [e["_id"] for e in dashboard["active"]] == [live_evt["_id"]]
+    assert [e["_id"] for e in dashboard["finished"]] == [done_evt["_id"]]
+
+
+@pytest.mark.asyncio
+async def test_runtime_dashboard_counts_participants_and_estimates_prize_pool():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    tmpl = await ee.create_template(
+        db, name="A", event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": 10}}, created_by="a",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "registration_open", actor="a")
+    session_id = event["linked_session_id"]
+    await entries.insert_one({"_id": "e1", "session_id": session_id, "student_id": "stu1"})
+    await entries.insert_one({"_id": "e2", "session_id": session_id, "student_id": "stu2"})
+
+    dashboard = await ee.get_runtime_dashboard(db, entries)
+    active = dashboard["active"][0]
+    assert active["participant_count"] == 2
+    assert active["estimated_prize_pool"] == 20
+    assert active["health"] == "healthy"
+    assert active["template_name"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_runtime_dashboard_flags_no_registrations_health():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    tmpl = await ee.create_template(db, name="A", event_type="speaking_lab_session", content={}, created_by="a")
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, sessions, event["_id"], "registration_open", actor="a")
+
+    dashboard = await ee.get_runtime_dashboard(db, entries)
+    assert dashboard["active"][0]["health"] == "no_registrations"
+    assert dashboard["active"][0]["participant_count"] == 0
+
+
+def test_dashboard_route_is_registered_before_dynamic_event_id_route():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    client = _make_client(db, sessions, entries)
+
+    resp = client.get("/api/v1/events/dashboard")
+    assert resp.status_code == 200
+    assert resp.json() == {"active": [], "upcoming": [], "finished": []}
+
+
 def test_available_events_route_only_shows_open_events():
     db = _FakeDB()
     sessions = _SessionsColl()
@@ -501,3 +787,21 @@ def test_available_events_route_only_shows_open_events():
     available = client.get("/api/v1/events/available").json()["events"]
     assert len(available) == 1
     assert available[0]["_id"] == event_id
+
+
+def test_available_events_route_includes_template_name():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    client = _make_client(db, sessions, entries)
+
+    tmpl_id = client.post("/api/v1/event-templates", json={
+        "name": "Weekly Speaking Lab", "event_type": "speaking_lab_session",
+    }).json()["template"]["_id"]
+    client.post(f"/api/v1/event-templates/{tmpl_id}/publish")
+    event_id = client.post("/api/v1/events", json={"template_id": tmpl_id}).json()["event"]["_id"]
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "scheduled"})
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "registration_open"})
+
+    available = client.get("/api/v1/events/available").json()["events"]
+    assert available[0]["template_name"] == "Weekly Speaking Lab"

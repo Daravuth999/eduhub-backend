@@ -1789,6 +1789,53 @@ def register_student_points_routes(api, db, require_student) -> None:
             "updated_at": wallet.get("updated_at"),
         }
 
+    @api.get("/student/points/leaderboard")
+    async def _student_points_leaderboard(
+        limit: int = 10,
+        student=_Depends(require_student),
+    ):
+        """Top-N students by MongoDB wallet balance — Migration Phase 8
+        ("phase_8_leaderboard" in register_migration_routes' own staged
+        checklist below). Same graceful-degradation contract as balance/
+        history above: while USE_MONGO_POINTS_READ is off, GAS Sheets is
+        still the authoritative points source for most students in
+        production, so ranking off points_wallets here would silently
+        show an incomplete/wrong leaderboard. Returns mode="disabled" so
+        the frontend keeps its existing (legacy) leaderboard source
+        until this flag is actually flipped — a separate, deliberate
+        production migration decision, not something this endpoint's
+        existence should force.
+        """
+        if not await _read_enabled():
+            return {"mode": "disabled", "entries": []}
+        limit_safe = max(1, min(int(limit), 50))
+        cursor = db[COLL_WALLETS_P3].find(
+            {"status": "active"},
+            {"_id": 0, "student_id": 1, "clean_id": 1, "balance": 1},
+        ).sort("balance", -1).limit(limit_safe)
+        wallets = await cursor.to_list(length=limit_safe)
+        if not wallets:
+            return {"mode": "mongo", "entries": []}
+        student_ids = [w["student_id"] for w in wallets]
+        info_by_id: dict[str, dict] = {}
+        async for s in db.students.find(
+            {"student_id": {"$in": student_ids}},
+            {"_id": 0, "student_id": 1, "display_name": 1, "group": 1},
+        ):
+            info_by_id[s["student_id"]] = s
+        entries = []
+        for rank, w in enumerate(wallets, start=1):
+            info = info_by_id.get(w["student_id"], {})
+            entries.append({
+                "rank": rank,
+                "student_id": w["student_id"],
+                "clean_id": w.get("clean_id") or w["student_id"],
+                "display_name": info.get("display_name") or w.get("clean_id") or w["student_id"],
+                "group": info.get("group"),
+                "points": float(w.get("balance") or 0),
+            })
+        return {"mode": "mongo", "entries": entries}
+
     @api.get("/student/points/history")
     async def _student_points_history(
         limit: int = 50,
