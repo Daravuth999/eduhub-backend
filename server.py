@@ -5790,6 +5790,29 @@ except Exception as _platform_config_err:  # noqa: BLE001
         "screen disabled): %s", _platform_config_err,
     )
 
+# ── Question Bank (Architecture Reconstruction continuation, Author       ──
+# Studio's "Question Bank" screen). Additive and parallel to the existing
+# /api/speaking-lab/questions flat-doc route above, which is left
+# completely untouched. Failure is non-fatal: only /api/v1/question-bank*
+# routes go away.
+try:
+    from question_bank import register_question_bank_routes, ensure_question_bank_indexes
+    register_question_bank_routes(api, db, require_admin)
+
+    @app.on_event("startup")
+    async def _question_bank_startup():
+        try:
+            await ensure_question_bank_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "question_bank: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _question_bank_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "question_bank failed to load (Question Bank API disabled): %s",
+        _question_bank_err,
+    )
+
 # ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
 # Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
 # Join factory above via the hooks dict — no second enrollment system, no

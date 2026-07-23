@@ -100,6 +100,8 @@ OWNED_COLLECTIONS: dict[str, str] = {
     # event_engine.py (Event Engine v1 — architecture.md Migration Phase 3)
     "event_templates": "event_engine.py",
     "events": "event_engine.py",
+    # question_bank.py (Architecture Reconstruction continuation)
+    "question_bank_items": "question_bank.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed
