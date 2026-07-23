@@ -583,3 +583,21 @@ def test_available_events_route_only_shows_open_events():
     available = client.get("/api/v1/events/available").json()["events"]
     assert len(available) == 1
     assert available[0]["_id"] == event_id
+
+
+def test_available_events_route_includes_template_name():
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    entries = _Coll()
+    client = _make_client(db, sessions, entries)
+
+    tmpl_id = client.post("/api/v1/event-templates", json={
+        "name": "Weekly Speaking Lab", "event_type": "speaking_lab_session",
+    }).json()["template"]["_id"]
+    client.post(f"/api/v1/event-templates/{tmpl_id}/publish")
+    event_id = client.post("/api/v1/events", json={"template_id": tmpl_id}).json()["event"]["_id"]
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "scheduled"})
+    client.post(f"/api/v1/events/{event_id}/transition", json={"to": "registration_open"})
+
+    available = client.get("/api/v1/events/available").json()["events"]
+    assert available[0]["template_name"] == "Weekly Speaking Lab"

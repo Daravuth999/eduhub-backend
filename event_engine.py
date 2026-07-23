@@ -586,6 +586,10 @@ def register_event_engine_routes(
     async def list_available_events_route(student=Depends(require_student)):
         docs = await list_events(db, state=None)
         open_docs = [d for d in docs if d["state"] in ("registration_open", "live")]
+        templates = await list_templates(db)
+        template_names = {t["_id"]: t["name"] for t in templates}
+        for d in open_docs:
+            d["template_name"] = template_names.get(d.get("template_id"), "Event")
         return {"events": open_docs}
 
     # Also a static path — same ordering requirement as /v1/events/available
