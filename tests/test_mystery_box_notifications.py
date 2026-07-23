@@ -2,14 +2,15 @@
 Mystery Box — reward-success push notifications (v1.0)
 =========================================================
 
-``mystery_box_tools.py`` is loaded via ``exec()`` directly into
-``server.py``'s namespace (not a normal import) so it can reuse shared
-globals (``api``, ``db``, ``require_admin``, ``_norm_student_id``,
-``_lrc_credit_via_treasury``, ``_lrc_issue_voucher_for_claim``,
-``_fan_out_push``, ``push_subscriptions``, ...) without a dependency
-list. To unit-test it in isolation we build the same kind of namespace
-server.py builds and ``exec()`` the real module source into it — this
-exercises the ACTUAL production code, not a reimplementation.
+``mystery_box_tools.py`` is a normal importable module (Architecture
+Reconstruction Phase 1, item 2 — converted from the old exec()-into-
+server-namespace loading). Its ``register_mystery_box_routes(api, db,
+require_admin, require_student, fan_out_push, push_subscriptions,
+login_reward_hooks)`` factory takes every collaborator as an explicit
+parameter. To unit-test it in isolation we import the real module and call
+that factory with fakes standing in for its collaborators, capturing the
+dict it returns — this exercises the ACTUAL production code, not a
+reimplementation.
 
 Covers the exactly-once notification design added on top of the
 existing, unmodified grant paths:
@@ -29,21 +30,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import itertools
 import pathlib
 import sys
-import types
 
 import pytest
 from fastapi import APIRouter, Depends, HTTPException
 
-_MODULE_NAME_COUNTER = itertools.count()
-
 BACKEND_DIR = pathlib.Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
-
-MODULE_PATH = BACKEND_DIR / "mystery_box_tools.py"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,10 +190,6 @@ class _FakeDB:
 # ─────────────────────────────────────────────────────────────────────────────
 # Fake shared-namespace collaborators
 # ─────────────────────────────────────────────────────────────────────────────
-def _norm_student_id(value) -> str:
-    return str(value or "").strip().lower()
-
-
 class _Admin:
     email = "teacher@school.example"
 
@@ -254,42 +245,40 @@ class PushRecorder:
         return (1, 0)
 
 
+class _FakeLoginRewardHooks:
+    """Stand-in for login_reward_tools.LoginRewardHooks (Architecture
+    Reconstruction Phase 1, item 2). mystery_box_tools.py now receives this
+    as an explicit parameter instead of resolving `_lrc_credit_via_treasury`
+    / `_lrc_issue_voucher_for_claim` via globals().get(...)."""
+    def __init__(self, credit, issuer):
+        self.credit_via_treasury = credit
+        self.issue_voucher_for_claim = issuer
+
+
 def _build_namespace(db, *, credit=None, issuer=None, push=None,
                      subscriber_count=1):
-    """Exec the REAL mystery_box_tools.py source into a fresh namespace,
-    exactly as server.py does, with fakes standing in for its shared
-    collaborators."""
+    """Import the REAL mystery_box_tools.py module and call its
+    register_mystery_box_routes(...) factory with fakes standing in for its
+    explicit-DI collaborators — this exercises the ACTUAL production code,
+    not a reimplementation. Returns the dict the factory returns (mirrors
+    the old exec()-namespace shape closely enough that every existing
+    ns["name"] lookup in this file's test bodies still works unchanged)."""
     push = push if push is not None else PushRecorder(mode="sent")
 
     class _PushSubs:
         async def count_documents(self, query):
             return subscriber_count
 
-    # Register a REAL module object in sys.modules so pydantic v2's forward
-    # -ref resolution (which looks up `sys.modules[cls.__module__].__dict__`)
-    # can find `Optional`/`List`/etc. after the module-level `from typing
-    # import ...` line executes below — a plain dict passed to exec() alone
-    # is not discoverable that way.
-    mod_name = f"mystery_box_tools_under_test_{next(_MODULE_NAME_COUNTER)}"
-    mod = types.ModuleType(mod_name)
-    ns = mod.__dict__
-    ns.update({
-        "__name__": mod_name,
-        "api": APIRouter(),
-        "db": db,
-        "Depends": Depends,
-        "HTTPException": HTTPException,
-        "require_admin": _require_admin,
-        "require_student": _require_student,
-        "_norm_student_id": _norm_student_id,
-        "_lrc_credit_via_treasury": credit or TreasuryCredit(ok=True),
-        "_lrc_issue_voucher_for_claim": issuer or VoucherIssuer(ok=True),
-        "_fan_out_push": push,
-        "push_subscriptions": _PushSubs(),
-    })
-    sys.modules[mod_name] = mod
-    src = MODULE_PATH.read_text(encoding="utf-8")
-    exec(compile(src, str(MODULE_PATH), "exec"), ns)  # noqa: S102
+    import mystery_box_tools as mbt_module
+
+    hooks = _FakeLoginRewardHooks(
+        credit or TreasuryCredit(ok=True),
+        issuer or VoucherIssuer(ok=True),
+    )
+    ns = mbt_module.register_mystery_box_routes(
+        APIRouter(), db, _require_admin, _require_student,
+        push, _PushSubs(), hooks,
+    )
     # Recreate the unique index the real code relies on (round_id, student_id_norm).
     db["speaking_lab_mystery_claims"].set_unique("round_id", "student_id_norm")
     return ns, push

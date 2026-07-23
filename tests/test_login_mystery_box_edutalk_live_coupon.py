@@ -3,13 +3,16 @@
 Login Mystery Box — new `edutalk_live_coupon` reward type (Live Voice
 Coach Coupon Checkpoint 3, "FULL BUILD AUTHORIZATION").
 
-``login_mystery_box_tools.py`` is loaded via ``exec()`` directly into
-``server.py``'s namespace (not a normal import), exactly like
-``login_reward_tools.py`` / ``mystery_box_tools.py`` / ``voucher_reward_tools.py``,
-so it can reuse shared globals without an explicit dependency list. To
-unit-test it in isolation we build the same kind of namespace server.py
-builds and ``exec()`` the REAL module source into it — this exercises the
-ACTUAL production code, not a re-implementation of it. Pattern follows
+``login_mystery_box_tools.py`` is a normal importable module (Architecture
+Reconstruction Phase 1, item 2 — converted from the old exec()-into-
+server-namespace loading). Its ``register_login_mystery_box_routes(api, db,
+require_admin, require_student, fan_out_push, login_reward_hooks,
+grant_edutalk_pass)`` factory takes every collaborator as an explicit
+parameter. To unit-test it in isolation we import the real module, call
+that factory with fakes standing in for its collaborators, and merge the
+returned dict with the module's own pure module-level names (pydantic
+classes, validation/display helpers) — this exercises the ACTUAL
+production code, not a re-implementation of it. Pattern follows
 ``tests/test_mystery_box_notifications.py``.
 
 Covers (per the "FULL BUILD AUTHORIZATION" requirement list):
@@ -32,19 +35,13 @@ import copy
 import itertools
 import pathlib
 import sys
-import types
-from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import APIRouter, Depends, HTTPException
 
-_MODULE_NAME_COUNTER = itertools.count()
-
 BACKEND_DIR = pathlib.Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
-
-MODULE_PATH = BACKEND_DIR / "login_mystery_box_tools.py"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,17 +181,6 @@ class _FakeDB:
         return self[name]
 
 
-class _FakeApp:
-    def on_event(self, name):
-        def deco(fn):
-            return fn
-        return deco
-
-
-def _norm_student_id(value) -> str:
-    return str(value or "").strip().lower()
-
-
 class _Admin:
     email = "teacher@school.example"
 
@@ -270,49 +256,54 @@ async def _compose_voucher_payload(row: dict) -> dict:
     }
 
 
-def _voucher_discount_label(dtype, value):
-    if dtype == "percent":
-        return f"{value:g}% off"
-    return f"${value:g} off"
+class _FakeLoginRewardHooks:
+    """Stand-in for login_reward_tools.LoginRewardHooks (Architecture
+    Reconstruction Phase 1, item 2). login_mystery_box_tools.py now
+    receives this as an explicit parameter instead of resolving
+    `_lrc_credit_via_treasury` / `_lrc_gen_coupon_code` /
+    `_lrc_compose_voucher_payload` / `_lrc_student_vouchers` via
+    globals().get(...). ``_lrc_voucher_discount_label`` /
+    ``_lrc_safe_artwork_url`` are PURE in the real module and are now
+    imported directly from login_reward_tools by login_mystery_box_tools.py
+    itself, so they don't need a fake here."""
+    def __init__(self, credit, gen_code, compose, student_vouchers):
+        self.credit_via_treasury = credit
+        self.gen_coupon_code = gen_code
+        self.compose_voucher_payload = compose
+        self.student_vouchers = student_vouchers
+        self.issue_voucher_for_claim = None  # not used by this module
 
 
 def _build_namespace(db, *, credit=None, push=None, gen_code=None,
-                     compose=None, student_vouchers=None, edutalk_pass_fn=None):
+                     compose=None, student_vouchers=None, edutalk_pass_fn=None,
+                     login_reward_hooks_unavailable=False):
+    """Import the REAL login_mystery_box_tools.py module and call its
+    register_login_mystery_box_routes(...) factory with fakes standing in
+    for its explicit-DI collaborators — this exercises the ACTUAL
+    production code, not a reimplementation. Returns a dict merging the
+    module's own pure module-level names (pydantic classes, validation/
+    display helpers) with the factory's returned db-bound route functions,
+    so every existing ns["name"] lookup in this file's test bodies still
+    works unchanged."""
     push = push if push is not None else PushRecorder(mode="sent")
     gen_code = gen_code or _gen_coupon_code_unique
     compose = compose or _compose_voucher_payload
     student_vouchers = student_vouchers if student_vouchers is not None else db["student_vouchers"]
 
-    mod_name = f"login_mystery_box_tools_under_test_{next(_MODULE_NAME_COUNTER)}"
-    mod = types.ModuleType(mod_name)
-    ns = mod.__dict__
-    ns.update({
-        "__name__": mod_name,
-        "api": APIRouter(),
-        "app": _FakeApp(),
-        "db": db,
-        "log": type("L", (), {"info": lambda *a, **k: None, "warning": lambda *a, **k: None,
-                              "error": lambda *a, **k: None})(),
-        "Depends": Depends,
-        "HTTPException": HTTPException,
-        "datetime": datetime,
-        "timezone": timezone,
-        "timedelta": timedelta,
-        "require_admin": _require_admin,
-        "require_student": _require_student,
-        "_norm_student_id": _norm_student_id,
-        "_fan_out_push": push,
-        "_lrc_credit_via_treasury": credit or TreasuryCredit(ok=True),
-        "_lrc_voucher_discount_label": _voucher_discount_label,
-        "_lrc_safe_artwork_url": lambda v: "",
-        "_lrc_gen_coupon_code": gen_code,
-        "_lrc_compose_voucher_payload": compose,
-        "_lrc_student_vouchers": student_vouchers,
-        "_mbt_grant_edutalk_pass": edutalk_pass_fn or (lambda **kw: None),
-    })
-    sys.modules[mod_name] = mod
-    src = MODULE_PATH.read_text(encoding="utf-8")
-    exec(compile(src, str(MODULE_PATH), "exec"), ns)  # noqa: S102
+    import login_mystery_box_tools as lmb_module
+
+    hooks = None
+    if not login_reward_hooks_unavailable:
+        hooks = _FakeLoginRewardHooks(
+            credit or TreasuryCredit(ok=True), gen_code, compose, student_vouchers,
+        )
+
+    factory_ns = lmb_module.register_login_mystery_box_routes(
+        APIRouter(), db, _require_admin, _require_student,
+        push, hooks, edutalk_pass_fn or (lambda **kw: None),
+    )
+    ns = dict(vars(lmb_module))
+    ns.update(factory_ns)
     return ns, push
 
 
@@ -558,11 +549,11 @@ async def test_select_lost_race_path_returns_same_receipt():
 @pytest.mark.asyncio
 async def test_grant_failure_when_issuer_helpers_missing_fails_claim_and_raises_502():
     db = _FakeDB()
-    ns, push = _build_namespace(db, gen_code=None, compose=None)
-    # Remove the issuer helpers post-load to simulate login_reward_tools not
-    # having loaded (the documented graceful-degradation path).
-    ns["_lrc_gen_coupon_code"] = None
-    ns["_lrc_compose_voucher_payload"] = None
+    # login_reward_hooks_unavailable=True simulates login_reward_tools not
+    # having loaded (the documented graceful-degradation path) — the
+    # factory receives login_reward_hooks=None, exactly as server.py's own
+    # try/except would pass through on a real load failure.
+    ns, push = _build_namespace(db, login_reward_hooks_unavailable=True)
     cid = await _seed_campaign(db, reward_pool=[_edutalk_live_coupon_reward(amount=20, weight=100)])
     await _prime_claim(ns, db, cid)
 

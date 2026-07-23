@@ -150,12 +150,21 @@ def _coerce_amount(amount: Any, *, label: str = "amount") -> int:
 
 
 def _norm_id(value: Any, label: str = "student_id") -> str:
-    if not isinstance(value, str):
-        raise WalletError("INVALID_ID", f"{label} must be a string")
-    v = value.strip().lower()
-    if not v or len(v) > 64:
-        raise WalletError("INVALID_ID", f"{label} invalid")
-    return v
+    # Architecture Reconstruction Phase 1, item 4 — the actual normalization
+    # RULE (zero-width-char stripping + whitespace strip + lowercase) now
+    # lives in exactly one place: eduhub_platform.identity (renamed from
+    # architecture.md's literal `platform` — that name collides with
+    # Python's own stdlib `platform` module once the repo root is on
+    # sys.path; see server.py:_norm_student_id for the full note). This
+    # function keeps its own distinct, deliberate CONTRACT (raise
+    # WalletError on empty/too-long input) — that fail-fast behavior is
+    # money-path code and is preserved unchanged, just re-homed onto the
+    # shared rule instead of a private copy.
+    from eduhub_platform.identity import resolve_strict
+    try:
+        return resolve_strict(value, label=label)
+    except ValueError as exc:
+        raise WalletError("INVALID_ID", str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #

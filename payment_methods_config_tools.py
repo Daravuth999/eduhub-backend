@@ -5,10 +5,10 @@
 # individual payment-method buttons in the student Top-Up modal WITHOUT
 # touching any money-movement code.
 #
-# Loaded via exec() into server.py's namespace, so it shares api / db / log /
-# require_admin and the FastAPI HTTPException helper. The CamRapidPay
-# (KHQR) provider helper is imported lazily so failure to import never
-# breaks the rest of the server.
+# Registered via register_payment_methods_config_routes(api, db, require_admin,
+# User) from server.py (normal import, explicit DI — matches the established
+# register_*_routes convention). The CamRapidPay (KHQR) provider helper is
+# imported lazily so failure to import never breaks the rest of the server.
 #
 # It exposes:
 #   GET   /api/payments/methods/public   – student-safe display config
@@ -30,12 +30,14 @@
 # ===========================================================================
 
 import logging as _pm_logging
+from datetime import datetime, timezone
+
+from fastapi import Depends
 
 _PM_LOG = _pm_logging.getLogger("eduhub.payment_methods")
 
 # Single canonical doc key — never changes.
 _PM_DOC_ID = "v1"
-_pm_collection = db["payment_method_settings"]
 
 
 def _pm_provider_ready_khqr() -> tuple[bool, str]:
@@ -76,128 +78,137 @@ def _pm_provider_ready_aba() -> tuple[bool, str]:
     return True, "ok"
 
 
-async def _pm_load_doc() -> dict:
-    """Load the config doc with safe defaults.
+def register_payment_methods_config_routes(api, db, require_admin, User):
+    """Register the payment-methods display-config routes onto ``api``.
 
-    Defaults are computed from environment readiness so first-deploy admins
-    see exactly what is live without having to flip anything.
+    Explicit-DI replacement for the previous ``exec()``-into-server-namespace
+    loading. Behaviour is identical: same routes, same storage collection,
+    same defaults.
     """
-    doc = await _pm_collection.find_one({"_doc_id": _PM_DOC_ID})
-    if not doc:
-        doc = {}
-    aba_default = True
-    khqr_ready, _ = _pm_provider_ready_khqr()
-    khqr_default = bool(khqr_ready)
-    aba = doc.get("aba") or {}
-    khqr = doc.get("khqr") or {}
-    return {
-        "aba": {
-            "enabled": bool(aba.get("enabled", aba_default)),
-        },
-        "khqr": {
-            "enabled": bool(khqr.get("enabled", khqr_default)),
-        },
-    }
+    _pm_collection = db["payment_method_settings"]
+
+    async def _pm_load_doc() -> dict:
+        """Load the config doc with safe defaults.
+
+        Defaults are computed from environment readiness so first-deploy admins
+        see exactly what is live without having to flip anything.
+        """
+        doc = await _pm_collection.find_one({"_doc_id": _PM_DOC_ID})
+        if not doc:
+            doc = {}
+        aba_default = True
+        khqr_ready, _ = _pm_provider_ready_khqr()
+        khqr_default = bool(khqr_ready)
+        aba = doc.get("aba") or {}
+        khqr = doc.get("khqr") or {}
+        return {
+            "aba": {
+                "enabled": bool(aba.get("enabled", aba_default)),
+            },
+            "khqr": {
+                "enabled": bool(khqr.get("enabled", khqr_default)),
+            },
+        }
 
 
-async def _pm_save_doc(cfg: dict) -> dict:
-    """Persist the config doc (idempotent upsert)."""
-    sanitized = {
-        "_doc_id": _PM_DOC_ID,
-        "aba": {
-            "enabled": bool(cfg.get("aba", {}).get("enabled", True)),
-        },
-        "khqr": {
-            "enabled": bool(cfg.get("khqr", {}).get("enabled", False)),
-        },
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await _pm_collection.update_one(
-        {"_doc_id": _PM_DOC_ID},
-        {"$set": sanitized},
-        upsert=True,
-    )
-    return sanitized
+    async def _pm_save_doc(cfg: dict) -> dict:
+        """Persist the config doc (idempotent upsert)."""
+        sanitized = {
+            "_doc_id": _PM_DOC_ID,
+            "aba": {
+                "enabled": bool(cfg.get("aba", {}).get("enabled", True)),
+            },
+            "khqr": {
+                "enabled": bool(cfg.get("khqr", {}).get("enabled", False)),
+            },
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await _pm_collection.update_one(
+            {"_doc_id": _PM_DOC_ID},
+            {"$set": sanitized},
+            upsert=True,
+        )
+        return sanitized
 
 
-# ---------------------------------------------------------------------------
-# Public: student-safe display config (no secrets, no provider diagnostics)
-# ---------------------------------------------------------------------------
-@api.get("/payments/methods/public")
-async def payments_methods_public():
-    """Return the safe display config used by the student Top-Up modal.
+    # ---------------------------------------------------------------------------
+    # Public: student-safe display config (no secrets, no provider diagnostics)
+    # ---------------------------------------------------------------------------
+    @api.get("/payments/methods/public")
+    async def payments_methods_public():
+        """Return the safe display config used by the student Top-Up modal.
 
-    Auth: PUBLIC (matches /payments/camrapidpay/config) — no PII, no
-    secrets, only display booleans. This avoids iOS Safari ITP / cross-site
-    cookie failures that would otherwise hide both payment methods.
-    """
-    saved = await _pm_load_doc()
-    khqr_ready, khqr_reason = _pm_provider_ready_khqr()
-    khqr_visible = bool(saved["khqr"]["enabled"]) and khqr_ready
-    aba_visible = bool(saved["aba"]["enabled"])
-    return {
-        "aba": {
-            "enabled": aba_visible,
-            "label": "ABA Pay",
-        },
-        "khqr": {
-            "enabled": khqr_visible,
-            "label": "KHQR",
-            "provider_ready": khqr_ready,
-            "reason": khqr_reason,
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# Admin: diagnostic view + toggle
-# ---------------------------------------------------------------------------
-@api.get("/admin/payments/methods")
-async def admin_payments_methods_get(admin: User = Depends(require_admin)):
-    """Admin diagnostic view of the payment methods display config."""
-    saved = await _pm_load_doc()
-    khqr_ready, khqr_reason = _pm_provider_ready_khqr()
-    aba_ready, aba_reason = _pm_provider_ready_aba()
-    return {
-        "aba": {
-            "enabled": bool(saved["aba"]["enabled"]),
-            "configured": aba_ready,
-            "reason": aba_reason,
-        },
-        "khqr": {
-            "enabled": bool(saved["khqr"]["enabled"]),
-            "configured": khqr_ready,
-            "provider_ready": khqr_ready,
-            "reason": khqr_reason,
-        },
-    }
+        Auth: PUBLIC (matches /payments/camrapidpay/config) — no PII, no
+        secrets, only display booleans. This avoids iOS Safari ITP / cross-site
+        cookie failures that would otherwise hide both payment methods.
+        """
+        saved = await _pm_load_doc()
+        khqr_ready, khqr_reason = _pm_provider_ready_khqr()
+        khqr_visible = bool(saved["khqr"]["enabled"]) and khqr_ready
+        aba_visible = bool(saved["aba"]["enabled"])
+        return {
+            "aba": {
+                "enabled": aba_visible,
+                "label": "ABA Pay",
+            },
+            "khqr": {
+                "enabled": khqr_visible,
+                "label": "KHQR",
+                "provider_ready": khqr_ready,
+                "reason": khqr_reason,
+            },
+        }
 
 
-@api.patch("/admin/payments/methods")
-async def admin_payments_methods_patch(
-    payload: dict,
-    admin: User = Depends(require_admin),
-):
-    """Update the payment-methods display toggles.
-
-    Only the ``enabled`` boolean of each method is writeable. All other keys
-    in the payload are ignored. Missing methods are left untouched.
-    """
-    current = await _pm_load_doc()
-    aba_patch = payload.get("aba") if isinstance(payload, dict) else None
-    khqr_patch = payload.get("khqr") if isinstance(payload, dict) else None
-    if isinstance(aba_patch, dict) and "enabled" in aba_patch:
-        current["aba"]["enabled"] = bool(aba_patch["enabled"])
-    if isinstance(khqr_patch, dict) and "enabled" in khqr_patch:
-        current["khqr"]["enabled"] = bool(khqr_patch["enabled"])
-    saved = await _pm_save_doc(current)
-    _PM_LOG.info(
-        "payment_methods updated by admin=%s aba=%s khqr=%s",
-        getattr(admin, "username", "?"),
-        saved["aba"]["enabled"],
-        saved["khqr"]["enabled"],
-    )
-    return await admin_payments_methods_get(admin=admin)  # type: ignore[call-arg]
+    # ---------------------------------------------------------------------------
+    # Admin: diagnostic view + toggle
+    # ---------------------------------------------------------------------------
+    @api.get("/admin/payments/methods")
+    async def admin_payments_methods_get(admin: User = Depends(require_admin)):
+        """Admin diagnostic view of the payment methods display config."""
+        saved = await _pm_load_doc()
+        khqr_ready, khqr_reason = _pm_provider_ready_khqr()
+        aba_ready, aba_reason = _pm_provider_ready_aba()
+        return {
+            "aba": {
+                "enabled": bool(saved["aba"]["enabled"]),
+                "configured": aba_ready,
+                "reason": aba_reason,
+            },
+            "khqr": {
+                "enabled": bool(saved["khqr"]["enabled"]),
+                "configured": khqr_ready,
+                "provider_ready": khqr_ready,
+                "reason": khqr_reason,
+            },
+        }
 
 
-_PM_LOG.info("payment_methods_config_tools: routes registered")
+    @api.patch("/admin/payments/methods")
+    async def admin_payments_methods_patch(
+        payload: dict,
+        admin: User = Depends(require_admin),
+    ):
+        """Update the payment-methods display toggles.
+
+        Only the ``enabled`` boolean of each method is writeable. All other keys
+        in the payload are ignored. Missing methods are left untouched.
+        """
+        current = await _pm_load_doc()
+        aba_patch = payload.get("aba") if isinstance(payload, dict) else None
+        khqr_patch = payload.get("khqr") if isinstance(payload, dict) else None
+        if isinstance(aba_patch, dict) and "enabled" in aba_patch:
+            current["aba"]["enabled"] = bool(aba_patch["enabled"])
+        if isinstance(khqr_patch, dict) and "enabled" in khqr_patch:
+            current["khqr"]["enabled"] = bool(khqr_patch["enabled"])
+        saved = await _pm_save_doc(current)
+        _PM_LOG.info(
+            "payment_methods updated by admin=%s aba=%s khqr=%s",
+            getattr(admin, "username", "?"),
+            saved["aba"]["enabled"],
+            saved["khqr"]["enabled"],
+        )
+        return await admin_payments_methods_get(admin=admin)  # type: ignore[call-arg]
+
+
+    _PM_LOG.info("payment_methods_config_tools: routes registered")
