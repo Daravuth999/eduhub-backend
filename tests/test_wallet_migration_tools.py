@@ -34,7 +34,8 @@ class _FakeCursor:
         self._docs = self._docs[:n]
         return self
 
-    def sort(self, *a, **k):
+    def sort(self, key, direction=None):
+        self._docs = sorted(self._docs, key=lambda d: d.get(key) or 0, reverse=(direction == -1))
         return self
 
     def __aiter__(self):
@@ -46,6 +47,10 @@ class _FakeCursor:
             return next(self._it)
         except StopIteration:
             raise StopAsyncIteration
+
+    async def to_list(self, length=None):
+        docs = self._docs if length is None else self._docs[:length]
+        return [dict(d) for d in docs]
 
 
 class _Result:
@@ -107,7 +112,9 @@ class _FakeWallets:
         return dict(existing)
 
     def find(self, query=None, projection=None):
-        return _FakeCursor(list(self.docs.values()))
+        query = query or {}
+        docs = [d for d in self.docs.values() if all(d.get(k) == v for k, v in query.items())]
+        return _FakeCursor(docs)
 
     async def count_documents(self, query=None):
         return len(self.docs)
@@ -211,6 +218,10 @@ class _FakeStudents:
 
     def find(self, query=None, projection=None):
         query = query or {}
+        in_ids = query.get("student_id")
+        if isinstance(in_ids, dict) and "$in" in in_ids:
+            wanted = set(in_ids["$in"])
+            return _FakeCursor([d for d in self.docs if d.get("student_id") in wanted])
         return _FakeCursor([d for d in self.docs if _student_matches_active_or(d, query)])
 
     def aggregate(self, pipeline):
@@ -763,3 +774,82 @@ def test_student_points_routes_enabled_reads_mongo_balance(monkeypatch):
     body = resp.json()
     assert body["mode"] != "disabled"
     assert body["balance"] == 77
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# /student/points/leaderboard — Migration Phase 8, same flag-gated
+# graceful-degradation contract as balance/history above.
+# ═════════════════════════════════════════════════════════════════════════
+def _leaderboard_client(db):
+    app = FastAPI()
+    api = APIRouter(prefix="/api")
+    ws.register_student_points_routes(api, db, _student_dep)
+    app.include_router(api)
+    return TestClient(app)
+
+
+def test_leaderboard_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("USE_MONGO_POINTS_READ", raising=False)
+    db = _FakeDB()
+    _seed_wallet(db, "stu1", 500)
+    client = _leaderboard_client(db)
+    resp = client.get("/api/student/points/leaderboard")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mode"] == "disabled"
+    assert body["entries"] == []
+
+
+def test_leaderboard_enabled_ranks_by_balance_desc(monkeypatch):
+    monkeypatch.setenv("USE_MONGO_POINTS_READ", "true")
+    db = _FakeDB()
+    _seed_wallet(db, "stu1", 100)
+    _seed_wallet(db, "stu2", 500)
+    _seed_wallet(db, "stu3", 250)
+    _seed_student(db, "stu1", display_name="Alice", group="A")
+    _seed_student(db, "stu2", display_name="Bob", group="B")
+    _seed_student(db, "stu3", display_name="Cara", group="A")
+    client = _leaderboard_client(db)
+    resp = client.get("/api/student/points/leaderboard")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mode"] == "mongo"
+    ranked_ids = [e["student_id"] for e in body["entries"]]
+    assert ranked_ids == ["stu2", "stu3", "stu1"]
+    assert body["entries"][0]["display_name"] == "Bob"
+    assert body["entries"][0]["rank"] == 1
+    assert body["entries"][0]["points"] == 500
+
+
+def test_leaderboard_respects_limit_param(monkeypatch):
+    monkeypatch.setenv("USE_MONGO_POINTS_READ", "true")
+    db = _FakeDB()
+    for i in range(5):
+        _seed_wallet(db, f"stu{i}", i * 10)
+    client = _leaderboard_client(db)
+    resp = client.get("/api/student/points/leaderboard?limit=2")
+    assert resp.status_code == 200
+    assert len(resp.json()["entries"]) == 2
+
+
+def test_leaderboard_uses_clean_id_as_display_name_fallback(monkeypatch):
+    monkeypatch.setenv("USE_MONGO_POINTS_READ", "true")
+    db = _FakeDB()
+    _seed_wallet(db, "stu1", 42)
+    # No matching db.students row — display_name should fall back to clean_id.
+    client = _leaderboard_client(db)
+    resp = client.get("/api/student/points/leaderboard")
+    body = resp.json()
+    assert body["entries"][0]["display_name"] == "stu1"
+
+
+def test_leaderboard_excludes_inactive_wallets(monkeypatch):
+    monkeypatch.setenv("USE_MONGO_POINTS_READ", "true")
+    db = _FakeDB()
+    _seed_wallet(db, "stu1", 999)
+    db.wallets.docs["stu1"]["status"] = "suspended"
+    _seed_wallet(db, "stu2", 10)
+    client = _leaderboard_client(db)
+    resp = client.get("/api/student/points/leaderboard")
+    ranked_ids = [e["student_id"] for e in resp.json()["entries"]]
+    assert ranked_ids == ["stu2"]
