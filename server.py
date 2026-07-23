@@ -5813,6 +5813,30 @@ except Exception as _question_bank_err:  # noqa: BLE001
         _question_bank_err,
     )
 
+# ── Notification Packs (Architecture Reconstruction continuation,        ──
+# Author Studio's "Notification Packs" screen). An authoring layer only —
+# it renders reusable title/body/url templates but never sends anything
+# itself; notification_center.py's existing delivery pipeline is
+# untouched. Failure is non-fatal: only /api/v1/notification-packs*
+# routes go away.
+try:
+    from notification_packs import register_notification_pack_routes, ensure_notification_pack_indexes
+    register_notification_pack_routes(api, db, require_admin)
+
+    @app.on_event("startup")
+    async def _notification_packs_startup():
+        try:
+            await ensure_notification_pack_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "notification_packs: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _notification_packs_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "notification_packs failed to load (Notification Packs API disabled): %s",
+        _notification_packs_err,
+    )
+
 # ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
 # Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
 # Join factory above via the hooks dict — no second enrollment system, no

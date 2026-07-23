@@ -102,6 +102,8 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "events": "event_engine.py",
     # question_bank.py (Architecture Reconstruction continuation)
     "question_bank_items": "question_bank.py",
+    # notification_packs.py (Architecture Reconstruction continuation)
+    "notification_packs": "notification_packs.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed
