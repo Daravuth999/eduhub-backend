@@ -22,16 +22,20 @@ _perform_join and the draw state machine as the engine's internals"):
     stream, lucky draw) keeps working unchanged against events created
     this way.
 
-NOT YET WRAPPED (explicitly deferred, not silently skipped) — the Draw /
-PrizePool machinery. lucky_draw.py's payout state machine lives entirely
-inside its single ``register_lucky_draw_routes`` closure today (no
-module-level function analogous to ``_run_direct_join`` to call), so
-wrapping it here would mean either duplicating that logic or first
-refactoring lucky_draw.py to expose one — real work, not attempted in
-this increment. Events can reach "live" and be operated through the
-EXISTING lucky-draw admin routes exactly as today; the Event's own
-lifecycle just tracks "drawing/settling/settled" as bookkeeping states
-an operator advances explicitly once the legacy draw flow completes.
+DRAW / PRIZEPOOL WRAPPING (originally deferred, now wired) —
+lucky_draw.py's ``_run_draw``/``_finalize_draw`` turned out to already
+be module-level functions (not trapped in ``register_lucky_draw_routes``'s
+closure, contrary to this file's original assessment), so no
+lucky_draw.py refactor was needed. ``transition_event``'s optional
+``lucky_draw_ctx`` parameter wires them in: advancing to "drawing"
+calls ``_run_draw`` (prepare — lock entries, pick winners), advancing
+to "settling" calls ``_finalize_draw`` (pay out + notify) — both
+UNCHANGED, same atomic claims, same GAS transfer code. When
+``lucky_draw_ctx`` is omitted, "drawing"/"settling" remain pure
+bookkeeping as before, and the legacy per-session admin routes
+(retry-failed, reconcile-historical) remain the only way to reach those
+recovery paths — this wrapping only covers the normal prepare/finalize
+happy path.
 
 DATA MODEL
 ──────────
@@ -376,14 +380,89 @@ async def get_runtime_dashboard(db, SL_ENTRIES) -> dict:
     return buckets
 
 
+async def _prepare_lucky_draw(db, session_id: str, event: dict, actor: str, ctx: dict) -> None:
+    """Advancing to "drawing" now actually PREPARES the draw (locks
+    entries, picks winners) by calling lucky_draw.py's module-level
+    ``_run_draw`` — the SAME atomic-claim function every existing
+    /lucky-draw admin route already calls, completely unchanged. This
+    is the Draw/PrizePool wrapping event_engine.py's own module
+    docstring originally deferred: lucky_draw.py's _run_draw and
+    _finalize_draw turned out to already be module-level (not trapped
+    in the register_lucky_draw_routes closure), so no lucky_draw.py
+    refactor was needed after all — only this caller."""
+    from fastapi import HTTPException
+    from lucky_draw import LuckyDrawConfig, _run_draw
+
+    prize_policy = (event.get("config_snapshot") or {}).get("prize_policy") or {}
+    config = LuckyDrawConfig(
+        num_winners=prize_policy.get("num_winners"),
+        split=prize_policy.get("split"),
+    )
+    try:
+        await _run_draw(
+            db, ctx.get("sl_publish"), session_id, config,
+            ctx.get("gas_url", ""), ctx.get("treasury_id", ""),
+            ctx.get("treasury_password", ""), bool(ctx.get("mock_gas", False)),
+            ctx.get("log") or logger, granted_by=actor,
+            push_notify=ctx.get("push_notify"),
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            # Draw already prepared for this session (e.g. retrying the
+            # SAME transition after a partial failure elsewhere) — the
+            # legacy /lucky-draw admin route treats this as idempotent
+            # success, so the Event's transition does too.
+            return
+        raise EventEngineError(
+            "lucky_draw_prepare_failed", str(exc.detail), http_status=exc.status_code,
+        ) from exc
+
+
+async def _finalize_lucky_draw(db, session_id: str, ctx: dict) -> None:
+    """Advancing to "settling" now actually FINALIZES the prepared draw
+    (GAS transfer + winner pushes) by calling lucky_draw.py's module-
+    level ``_finalize_draw`` — unchanged, and already safe to call more
+    than once (its own atomic finalize claim + per-winner claims)."""
+    from fastapi import HTTPException
+    from lucky_draw import _finalize_draw
+
+    try:
+        await _finalize_draw(
+            db, ctx.get("sl_publish"), session_id,
+            ctx.get("gas_url", ""), ctx.get("treasury_id", ""),
+            ctx.get("treasury_password", ""), bool(ctx.get("mock_gas", False)),
+            ctx.get("log") or logger, push_notify=ctx.get("push_notify"),
+        )
+    except HTTPException as exc:
+        raise EventEngineError(
+            "lucky_draw_finalize_failed", str(exc.detail), http_status=exc.status_code,
+        ) from exc
+
+
 async def transition_event(
     db, SL_SESSIONS, event_id: str, to_state: str, *, actor: str,
+    lucky_draw_ctx: Optional[dict] = None,
 ) -> dict:
     """Advance an event's lifecycle. Validates the transition against
     _ALLOWED_TRANSITIONS, then (for event_type=speaking_lab_session)
     creates or updates the underlying speaking_lab_sessions document so
     every EXISTING route that reads that collection keeps working
-    unchanged — this is the actual "wrap, don't rewrite" seam."""
+    unchanged — this is the actual "wrap, don't rewrite" seam.
+
+    ``lucky_draw_ctx`` (optional): when provided, wraps the EXISTING
+    lucky_draw.py machinery so "drawing" actually prepares the draw and
+    "settling" actually finalizes it (pays out + notifies) — see
+    _prepare_lucky_draw/_finalize_lucky_draw above. Expected keys:
+    sl_publish, gas_url, treasury_id, treasury_password, mock_gas, log,
+    push_notify (all optional; missing keys degrade the same way
+    lucky_draw.py's own register_lucky_draw_routes degrades). When
+    omitted (the default), "drawing"/"settling" remain pure bookkeeping
+    exactly as before this wrapping was added — an operator must still
+    use the legacy /api/speaking-lab/sessions/{id}/lucky-draw* admin
+    routes directly. A failure here raises and the event's state does
+    NOT advance, so the operator sees the failure and can retry the
+    same transition rather than the UI silently claiming success while
+    no draw actually ran."""
     event = await get_event(db, event_id)
     if not event:
         raise EventEngineError("event_not_found", http_status=404)
@@ -425,6 +504,12 @@ async def transition_event(
                     {"session_id": linked_session_id},
                     {"$set": {"status": new_status}},
                 )
+
+            if lucky_draw_ctx:
+                if to_state == "drawing":
+                    await _prepare_lucky_draw(db, linked_session_id, event, actor, lucky_draw_ctx)
+                elif to_state == "settling":
+                    await _finalize_lucky_draw(db, linked_session_id, lucky_draw_ctx)
 
     history_entry = {"state": to_state, "at": now, "by": actor}
     await db[EVENTS_COLL].update_one(
@@ -480,12 +565,18 @@ async def register_participant(
 
 def register_event_engine_routes(
     api, db, SL_SESSIONS, SL_ENTRIES, norm_student_id,
-    require_admin, require_student,
+    require_admin, require_student, *, lucky_draw_ctx: Optional[dict] = None,
 ) -> None:
     """Mounts /api/v1/event-templates/* (admin) and /api/v1/events/*
     (admin + student) onto the existing FastAPI router. Registered via
     explicit DI, matching the register_*_routes convention established
-    across this codebase's Phase 1 conversion."""
+    across this codebase's Phase 1 conversion.
+
+    ``lucky_draw_ctx`` (optional): forwarded to transition_event so
+    advancing an event to "drawing"/"settling" actually drives
+    lucky_draw.py's existing prepare/finalize machinery — see
+    transition_event's own docstring. Omit to keep those two states
+    pure bookkeeping (this module's original behavior)."""
     from fastapi import Body, Depends, HTTPException
 
     def _raise(exc: EventEngineError):
@@ -613,6 +704,7 @@ def register_event_engine_routes(
             doc = await transition_event(
                 db, SL_SESSIONS, event_id, payload.get("to", ""),
                 actor=getattr(admin, "email", ""),
+                lucky_draw_ctx=lucky_draw_ctx,
             )
         except EventEngineError as exc:
             _raise(exc)

@@ -5758,9 +5758,24 @@ _sl_direct_join_hooks.update(register_speaking_lab_direct_join_routes(
 # /api/v1/events* routes are unavailable.
 try:
     from event_engine import register_event_engine_routes, ensure_event_engine_indexes
+    # Wraps the SAME lucky_draw.py machinery register_lucky_draw_routes
+    # above already uses (identical gas_url/treasury/push_notify values)
+    # so advancing an Event to "drawing"/"settling" actually drives the
+    # existing prepare/finalize draw flow instead of staying bookkeeping-
+    # only. See event_engine.py's module docstring.
+    _event_engine_lucky_draw_ctx = {
+        "sl_publish": _sl_publish,
+        "gas_url": GAS_POINTS_LOGIN_URL,
+        "treasury_id": SL_TREASURY_ID,
+        "treasury_password": SL_TREASURY_PASSWORD,
+        "mock_gas": os.environ.get("LUCKY_DRAW_MOCK_GAS", "").lower() in ("1", "true", "yes"),
+        "log": log,
+        "push_notify": _lucky_draw_push_notify,
+    }
     register_event_engine_routes(
         api, db, SL_SESSIONS, SL_ENTRIES, _norm_student_id,
         require_admin, require_student,
+        lucky_draw_ctx=_event_engine_lucky_draw_ctx,
     )
 
     @app.on_event("startup")
