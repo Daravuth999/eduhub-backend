@@ -5852,6 +5852,35 @@ except Exception as _notification_packs_err:  # noqa: BLE001
         _notification_packs_err,
     )
 
+# ── Prize Pool Platform (architecture continuation: "reusable Prize     ──
+# Pools... one pool, multiple consumers, every deduction updates one
+# ledger"). Every pool is a plain points_wallets/points_transactions
+# entry under a virtual "pool_<id>" wallet id — contribute()/distribute()
+# are just wallet_service.WalletService.transfer() calls, so this NEVER
+# introduces a second ledger. New consumers only (Weekly Rewards,
+# Tournament, Promotion, Top-up/Referral Campaigns, Seasonal Events) —
+# Lucky Draw/Mystery Box keep their own existing, production-hardened
+# payout machinery untouched. Failure is non-fatal: only
+# /api/v1/prize-pools* routes go away.
+try:
+    from prize_pool import register_prize_pool_routes, ensure_prize_pool_indexes
+    _prize_pool_wallet_service = wallet_service.WalletService(db)
+    register_prize_pool_routes(api, db, _prize_pool_wallet_service, require_admin)
+
+    @app.on_event("startup")
+    async def _prize_pool_startup():
+        try:
+            await ensure_prize_pool_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "prize_pool: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _prize_pool_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "prize_pool failed to load (Prize Pool API disabled): %s",
+        _prize_pool_err,
+    )
+
 # ── Speaking Lab V4 — Attendance-Assisted Auto Enrollment (Phase 1).
 # Additive: reuses eligible_roster/perform_join UNCHANGED from the Direct
 # Join factory above via the hooks dict — no second enrollment system, no

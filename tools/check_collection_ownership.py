@@ -104,6 +104,8 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "question_bank_items": "question_bank.py",
     # notification_packs.py (Architecture Reconstruction continuation)
     "notification_packs": "notification_packs.py",
+    # prize_pool.py (Architecture Reconstruction continuation — Prize Pool Platform)
+    "prize_pools": "prize_pool.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed
