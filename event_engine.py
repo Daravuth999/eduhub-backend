@@ -705,7 +705,12 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
             or all(w.get("transfer_ok") for w in winners)
         )
         now = datetime.now(timezone.utc)
-        expires_at = (now + timedelta(hours=48)).isoformat()
+        # A full week, not 48h — "this week's Hall of Fame" must outlive the
+        # gap between weekly Speaking Lab sessions. Belt-and-suspenders: the
+        # active-list route ALSO falls back to the latest showcase past its
+        # own expiry when nothing is currently active, so a slower-than-
+        # weekly cadence still never leaves the PWA with no showcase at all.
+        expires_at = (now + timedelta(days=7)).isoformat()
         content = {
             "eventId": event["_id"],
             "eventName": event_name,

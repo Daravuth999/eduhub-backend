@@ -638,6 +638,15 @@ async def test_settling_auto_publishes_winner_showcase(monkeypatch):
     assert showcase["content"]["eventId"] == event["_id"]
     assert showcase["content"]["champion"]["student_id"] == "stu0"
     assert showcase["content"]["topWinners"] == winners
+
+    # Blocker-bug fix: must stay visible for a full week, not the old 48h
+    # window (which routinely expired between weekly Speaking Lab sessions
+    # and made the showcase vanish with no newer one to replace it).
+    from datetime import datetime, timezone
+    ends_at = datetime.fromisoformat(showcase["activeWindow"]["endsAt"])
+    now = datetime.now(timezone.utc)
+    days_remaining = (ends_at - now).total_seconds() / 86400
+    assert 6.9 < days_remaining <= 7.0
     assert showcase["content"]["distributionCompleted"] is True
     assert showcase["content"]["payoutStatus"] == "paid"
     assert showcase["content"]["celebrationBanner"] is True

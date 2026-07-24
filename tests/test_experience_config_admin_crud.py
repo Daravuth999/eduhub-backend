@@ -218,6 +218,54 @@ def test_active_list_route_returns_empty_list_when_nothing_published():
     assert resp.json()["configs"] == []
 
 
+def test_active_list_falls_back_to_latest_when_all_have_expired():
+    """No gap: if every published winner_showcase's activeWindow has
+    lapsed (e.g. a slower-than-usual week between Speaking Lab sessions),
+    the PWA must still see the most recent one rather than a blank list —
+    replacement only happens when something NEWER is published, never
+    purely from a timer."""
+    client, db = _make_client()
+    older_past = "2020-01-01T00:00:00+00:00"
+    newer_past = "2021-06-15T00:00:00+00:00"
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_older", content={"champion": "Older"},
+        active_window={"startsAt": None, "endsAt": older_past, "recurringAnnual": False},
+    ))
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_newer", content={"champion": "Newer"},
+        active_window={"startsAt": None, "endsAt": newer_past, "recurringAnnual": False},
+    ))
+
+    resp = client.get("/api/experience-configs/active-list?type=winner_showcase")
+
+    assert resp.status_code == 200
+    configs = resp.json()["configs"]
+    assert len(configs) == 1
+    assert configs[0]["content"]["champion"] == "Newer"
+
+
+def test_active_list_prefers_currently_active_over_the_expired_fallback():
+    """The fallback only kicks in when NOTHING is currently active — a
+    genuinely active showcase must never be shadowed by an older expired
+    one, and the newest active one wins."""
+    client, db = _make_client()
+    past = "2020-01-01T00:00:00+00:00"
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_expired", content={"champion": "Old"},
+        active_window={"startsAt": None, "endsAt": past, "recurringAnnual": False},
+    ))
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_live", content={"champion": "Current"},
+    ))
+
+    resp = client.get("/api/experience-configs/active-list?type=winner_showcase")
+
+    assert resp.status_code == 200
+    configs = resp.json()["configs"]
+    assert len(configs) == 1
+    assert configs[0]["content"]["champion"] == "Current"
+
+
 # ── create ───────────────────────────────────────────────────────────────
 
 def test_create_draft_config():

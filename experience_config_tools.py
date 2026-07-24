@@ -300,7 +300,17 @@ def register_experience_config_routes(api, app, db, require_admin=None) -> None:
         normal, expected state."""
         now = datetime.now(timezone.utc)
         candidates = coll.find({"experienceType": type, "status": "published"})
-        active = [doc async for doc in candidates if _is_active_now(doc, now)]
+        docs = [doc async for doc in candidates]
+        active = [d for d in docs if _is_active_now(d, now)]
+        # Never show a hard blank just because every candidate's activeWindow
+        # happened to lapse before anything newer was published (e.g. a
+        # slower-than-usual gap between Speaking Lab sessions) — fall back
+        # to the single most recently updated published doc of this type,
+        # expired or not, so replacement only ever happens when something
+        # NEWER is actually published, never from a timer alone.
+        if not active and docs:
+            docs.sort(key=lambda d: d.get("updatedAt") or now, reverse=True)
+            active = [docs[0]]
         active.sort(key=lambda d: d.get("updatedAt") or now, reverse=True)
         return {"configs": [_serialize(d) for d in active]}
 
