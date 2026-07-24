@@ -572,13 +572,19 @@ def test_40_protected_lucky_draw_unchanged():
     import ast as _ast
 
     PROTECTED = ("_weighted_pick", "_normalize_split", "_run_draw")
+    # _run_draw baseline updated (funding-source migration): the ONLY change
+    # is `pool_total = sum(...)` -> `await _resolve_pool_total(...)` so a
+    # session an admin linked to a Prize Pool can split that pool's live
+    # balance instead of the entry-fee sum. Winner selection, weighting,
+    # split normalization, and the treasury-safety claim above it are
+    # byte-for-byte unchanged — see lucky_draw.py's own module docstring.
     BASELINE = {
         "_weighted_pick":
             "871c5ad4d2cc3d721ed309e8dc2930e55053fdd9ac53d5a2a3fb815d6ccd461a",
         "_normalize_split":
             "077c2583249d28118a489a47ad00fa669f14375e8db6b7a153837bff6fa9a359",
         "_run_draw":
-            "65ecec65bcd07a0fad9023e8b3b91f73a801c6ec551e93d63b989ef164825aac",
+            "e3d47271833cc42038d40fee312000afc6ecf43b04c6c53d6de23f0a185068ca",
     }
     p = pathlib.Path(__file__).resolve().parent.parent / "lucky_draw.py"
     source = p.read_text(encoding="utf-8")

@@ -21,11 +21,24 @@ lucky_draw.py and mystery_box_tools.py are each production-hardened,
 self-contained reward systems with their own payout state machines —
 per the approved architecture's own safeguard ("preserve existing
 business logic... wrap them, generalize them, reuse them, do NOT
-rewrite stable logic"), migrating them onto this primitive is real,
-separate work, not attempted here. This module is for NEW consumers
-(Weekly Rewards, Tournament, Promotion, Top-up Campaign, Referral
-Campaign, Seasonal Events) that don't have an existing reward mechanism
-to preserve.
+rewrite stable logic"), migrating their SETTLEMENT/PAYOUT logic onto
+this primitive is real, separate work, not attempted here. This module
+is for NEW consumers (Weekly Rewards, Tournament, Promotion, Top-up
+Campaign, Referral Campaign, Seasonal Events) that don't have an
+existing reward mechanism to preserve.
+
+FUNDING-SOURCE WIRING (architecture continuation — "students never
+deposit points into the pool; administrators fund it"): lucky_draw.py's
+own pool-total computation (`_resolve_pool_total`) now OPTIONALLY reads
+a session's live pool balance through `get_pool_balance` when an admin
+has linked one via `link_pool_to_session`/`fund_pool` below — but
+lucky_draw.py's winner selection, draw state machine, GAS transfer, and
+per-winner atomic payout claims are completely untouched. This module
+never calls into lucky_draw.py; the dependency runs one way only
+(lucky_draw.py reads a balance from here, and best-effort records a
+`distribute()` per paid winner after ITS OWN unmodified finalize
+succeeds) — see lucky_draw.py's `_resolve_pool_total`/
+`_record_pool_distribution` for the actual seam.
 
 DATA MODEL
 ──────────
@@ -39,7 +52,26 @@ always derived live from the wallet ledger):
 matching experience_config_tools.py's own "never require a schema
 migration for a new type" convention). Known values today: "event",
 "weekly_reward", "tournament", "promotion", "topup_campaign",
-"referral_campaign", "seasonal_event".
+"referral_campaign", "seasonal_event", "speaking_lab_session".
+
+FUNDING: two ways points enter a pool.
+  * ``fund_pool`` — a pure one-sided WalletService.credit() into the
+    pool's virtual wallet, no counterparty debited. This is THE
+    administrator-funding path ("administrators decide how many points
+    are available for rewards" — nobody's wallet is drawn down to make
+    it happen, same convention login-reward/treasury grants already use
+    for minting points onto a wallet).
+  * ``contribute`` — the original two-sided WalletService.transfer()
+    from a student's own wallet (kept, unchanged, for any consumer that
+    genuinely wants a student-funded pool — Lucky Draw's NEW funding
+    model does not use this path).
+
+SESSION LINKING: ``link_pool_to_session`` stamps ``prize_pool_id`` onto
+a ``speaking_lab_sessions`` document — the field lucky_draw.py's
+``_resolve_pool_total`` reads. This module never reads or writes
+``speaking_lab_lucky_codes``/draw state; it only ever touches the one
+``prize_pool_id`` field on the session doc, and only via this explicit
+admin action.
 """
 from __future__ import annotations
 
@@ -55,7 +87,7 @@ COLL_POOLS = "prize_pools"
 POOL_STATUSES = ("open", "locked", "settled", "cancelled")
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "open": {"locked", "cancelled"},
-    "locked": {"settled", "cancelled"},
+    "locked": {"open", "settled", "cancelled"},
 }
 
 
@@ -155,6 +187,75 @@ async def settle_pool(db, pool_id: str, *, actor: str) -> dict:
 
 async def cancel_pool(db, pool_id: str, *, actor: str) -> dict:
     return await _transition(db, pool_id, "cancelled", actor=actor)
+
+
+async def unlock_pool(db, pool_id: str, *, actor: str) -> dict:
+    """Reopen a locked pool for further admin funding — e.g. a teacher
+    needs another session's worth of rewards from the same season pool.
+    Distributions already recorded are untouched; this only flips status."""
+    return await _transition(db, pool_id, "open", actor=actor)
+
+
+async def fund_pool(
+    db, wallet_service, pool_id: str, *, amount: int,
+    idempotency_key: str, actor: str = "", note: str = "",
+) -> dict:
+    """Administrator funding — the ONLY way points enter a pool under the
+    Lucky Draw funding-source migration ("students never deposit points
+    into the pool; administrators decide how many points are available
+    for rewards"). A pure ONE-SIDED WalletService.credit() — no student
+    or other wallet is debited to make this happen; the admin's decision
+    to fund a pool IS the source, same convention treasury/login-reward
+    grants already use for minting points onto a wallet. Only allowed
+    while "open" (matches lock semantics for contribute())."""
+    pool = await get_pool(db, pool_id)
+    if not pool:
+        raise PrizePoolError("pool_not_found", http_status=404)
+    if pool["status"] != "open":
+        raise PrizePoolError(
+            "pool_not_open",
+            f"Pool is {pool['status']!r}; funding is only accepted while open.",
+        )
+    return await wallet_service.credit(
+        pool["pool_wallet_id"], amount,
+        source="prize_pool_admin_fund", source_ref=pool_id,
+        idempotency_key=idempotency_key,
+        payload={"pool_name": pool["name"], "actor": actor, "note": note},
+    )
+
+
+async def link_pool_to_session(db, pool_id: str, session_id: str, *, actor: str = "") -> dict:
+    """Associate a pool with a Speaking Lab session — stamps
+    ``prize_pool_id`` onto the session's own ``speaking_lab_sessions``
+    document, the field lucky_draw.py's ``_resolve_pool_total`` reads.
+    Re-linking a session to a different pool simply overwrites the
+    field; nothing about the previous pool's own state changes."""
+    pool = await get_pool(db, pool_id)
+    if not pool:
+        raise PrizePoolError("pool_not_found", http_status=404)
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise PrizePoolError("invalid_session_id", "session_id is required")
+    result = await db.speaking_lab_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {"prize_pool_id": pool_id, "prize_pool_linked_by": actor,
+                   "prize_pool_linked_at": _now_iso()}},
+    )
+    if getattr(result, "matched_count", 0) == 0:
+        raise PrizePoolError("session_not_found", "Speaking Lab session not found", http_status=404)
+    return {"pool_id": pool_id, "session_id": session_id}
+
+
+async def get_pool_for_session(db, session_id: str) -> Optional[dict]:
+    """The pool currently funding a Speaking Lab session, or None if the
+    session still relies on the legacy entry-fee-summed pool."""
+    sess = await db.speaking_lab_sessions.find_one(
+        {"session_id": session_id}, {"_id": 0, "prize_pool_id": 1},
+    )
+    pool_id = (sess or {}).get("prize_pool_id")
+    if not pool_id:
+        return None
+    return await get_pool(db, pool_id)
 
 
 async def contribute(
@@ -317,10 +418,51 @@ def register_prize_pool_routes(api, db, wallet_service, require_admin) -> None:
             raise HTTPException(status_code=409, detail=exc.message)
         return {"ok": True, "result": result}
 
+    @api.post("/v1/prize-pools/{pool_id}/fund")
+    async def fund_pool_route(pool_id: str, payload: dict = Body(...), admin=Depends(require_admin)):
+        from wallet_service import WalletError
+        try:
+            result = await fund_pool(
+                db, wallet_service, pool_id,
+                amount=payload.get("amount", 0),
+                idempotency_key=payload.get("idempotency_key", ""),
+                actor=getattr(admin, "email", ""),
+                note=payload.get("note", ""),
+            )
+        except PrizePoolError as exc:
+            _raise(exc)
+        except WalletError as exc:
+            raise HTTPException(status_code=409, detail=exc.message)
+        return {"ok": True, "result": result}
+
+    @api.post("/v1/prize-pools/{pool_id}/link-session")
+    async def link_pool_to_session_route(pool_id: str, payload: dict = Body(...), admin=Depends(require_admin)):
+        try:
+            result = await link_pool_to_session(
+                db, pool_id, payload.get("session_id", ""),
+                actor=getattr(admin, "email", ""),
+            )
+        except PrizePoolError as exc:
+            _raise(exc)
+        return {"ok": True, "result": result}
+
+    @api.get("/v1/prize-pools/by-session/{session_id}")
+    async def get_pool_for_session_route(session_id: str, admin=Depends(require_admin)):
+        doc = await get_pool_for_session(db, session_id)
+        return {"pool": doc}
+
     @api.post("/v1/prize-pools/{pool_id}/lock")
     async def lock_pool_route(pool_id: str, admin=Depends(require_admin)):
         try:
             doc = await lock_pool(db, pool_id, actor=getattr(admin, "email", ""))
+        except PrizePoolError as exc:
+            _raise(exc)
+        return {"ok": True, "pool": doc}
+
+    @api.post("/v1/prize-pools/{pool_id}/unlock")
+    async def unlock_pool_route(pool_id: str, admin=Depends(require_admin)):
+        try:
+            doc = await unlock_pool(db, pool_id, actor=getattr(admin, "email", ""))
         except PrizePoolError as exc:
             _raise(exc)
         return {"ok": True, "pool": doc}
@@ -360,8 +502,12 @@ __all__ = [
     "get_pool",
     "list_pools",
     "lock_pool",
+    "unlock_pool",
     "settle_pool",
     "cancel_pool",
+    "fund_pool",
+    "link_pool_to_session",
+    "get_pool_for_session",
     "contribute",
     "distribute",
     "get_pool_balance",

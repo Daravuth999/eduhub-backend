@@ -53,6 +53,36 @@ Players who were NEVER picked by the slot machine during the session get a
 2× weight (the "smart diversity" rule). The slot-picked set comes from the
 session document's "slot_picks" field if present, otherwise no penalty
 applies.  Pool is split per the session's settings doc.
+
+Funding-source migration (architecture continuation — "students no longer
+contribute points to the pool through entry fees; administrators fund the
+pool through the Prize Pool Platform")
+-------------------------------------------------------------------------
+NOTHING about lucky-code issuance, attendance, eligibility, the draw
+state machine, GAS payout, or the atomic claims above changed. The ONLY
+thing that changed is where `pool_total` (the number split among
+winners) comes from:
+
+  * Legacy sessions (no `prize_pool_id` on the session doc) — UNCHANGED,
+    `pool_total` is still the sum of `entry_fee` across
+    `speaking_lab_lucky_codes` rows, exactly as before this migration.
+  * A session an admin has linked to a Prize Pool via
+    `prize_pool.link_pool_to_session` — `pool_total` is that pool's LIVE
+    balance instead (see `_resolve_pool_total`). Students still receive
+    lucky codes exactly as before; `entry_fee` on those codes is simply
+    0 under this model (nobody pays), so the legacy entry-fee sum would
+    have been 0 anyway — this is what makes the swap backward compatible
+    rather than a parallel/duplicate mechanism.
+
+After a paid finalize, `_record_pool_distribution` best-effort records
+each winner's payout in the LINKED pool's own ledger (via
+`prize_pool.distribute`) so Author Studio's "remaining balance" and
+"distribution history" reflect reality — this NEVER touches
+`_finalize_draw`'s own GAS transfer / per-winner atomic claims; it only
+reads their already-committed result and records a parallel ledger
+entry, wired at the two callers (this module's own finalize routes, and
+event_engine.py's `_finalize_lucky_draw` wrapper), never inside
+`_finalize_draw` itself.
 """
 
 from __future__ import annotations
@@ -319,8 +349,81 @@ def _payout_counts(results: list[dict]) -> dict:
 # Helpers used by both the SSE hook and the HTTP endpoints
 # ---------------------------------------------------------------------------
 
+async def _resolve_pool_total(db, session_id: str, entry_fee_total: int) -> int:
+    """The single seam for the funding-source migration (see module
+    docstring). Returns the LEGACY entry-fee sum unchanged UNLESS an
+    admin has linked this session to a Prize Pool
+    (`prize_pool.link_pool_to_session`), in which case that pool's live
+    balance is returned instead. Fails safe: any lookup error (pool
+    deleted, wallet_service unavailable, etc.) falls back to the
+    entry-fee sum rather than raising — a misconfigured link must never
+    crash pool display or a draw, it should just behave like a legacy
+    session."""
+    try:
+        sess = await db.speaking_lab_sessions.find_one(
+            {"session_id": session_id}, {"_id": 0, "prize_pool_id": 1},
+        )
+        pool_id = (sess or {}).get("prize_pool_id")
+        if not pool_id:
+            return entry_fee_total
+        import prize_pool as pp
+        from wallet_service import WalletService
+        balance = await pp.get_pool_balance(db, WalletService(db), pool_id)
+        return int(balance)
+    except Exception:  # noqa: BLE001
+        return entry_fee_total
+
+
+async def _record_pool_distribution(
+    db, session_id: str, winners: list, *, actor: str = "",
+) -> None:
+    """Best-effort, additive — after `_finalize_draw` (unchanged, called
+    by the caller BEFORE this) has already committed its GAS payouts,
+    record each successfully-paid winner as a `prize_pool.distribute()`
+    entry in the session's LINKED pool (if any), so Author Studio's
+    balance/ledger reflect the real payout. Deterministic per-student
+    idempotency key — safe to call more than once for the same finalize
+    (e.g. a retried request) without double-recording. NEVER raises —
+    a display-ledger hiccup must never be mistaken for a payout failure,
+    the money has already moved via GAS by the time this runs."""
+    if not winners:
+        return
+    try:
+        sess = await db.speaking_lab_sessions.find_one(
+            {"session_id": session_id}, {"_id": 0, "prize_pool_id": 1},
+        )
+        pool_id = (sess or {}).get("prize_pool_id")
+        if not pool_id:
+            return
+        import prize_pool as pp
+        from wallet_service import WalletService, WalletError
+        ws = WalletService(db)
+        for w in winners:
+            if not w.get("transfer_ok"):
+                continue
+            amount = int(w.get("amount") or 0)
+            student_id = w.get("student_id")
+            if amount <= 0 or not student_id:
+                continue
+            try:
+                await pp.distribute(
+                    db, ws, pool_id,
+                    student_id=student_id, amount=amount,
+                    idempotency_key=f"lucky_draw_distribute:{session_id}:{student_id}",
+                    actor=actor, reason="lucky_draw_payout",
+                )
+            except WalletError:
+                continue  # e.g. pool balance already fully accounted for by a prior call
+            except pp.PrizePoolError:
+                continue  # e.g. pool cancelled/settled between prepare and finalize
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _pool_state(db, session_id: str) -> dict:
-    """Return {pool_total, player_count, entry_fee_sum} for a session."""
+    """Return {pool_total, player_count} for a session. `pool_total`
+    goes through `_resolve_pool_total` — see the funding-source
+    migration note in this module's docstring."""
     cursor = db.speaking_lab_lucky_codes.find(
         {"session_id": session_id}, {"_id": 0, "entry_fee": 1},
     )
@@ -329,7 +432,7 @@ async def _pool_state(db, session_id: str) -> dict:
     async for row in cursor:
         total += int(row.get("entry_fee") or 0)
         count += 1
-    return {"pool_total": total, "player_count": count}
+    return {"pool_total": await _resolve_pool_total(db, session_id, total), "player_count": count}
 
 
 async def persist_lucky_code(
@@ -854,11 +957,20 @@ def register_lucky_draw_routes(
             session_id: str,
             admin=Depends(require_admin),
         ):
-            return await _finalize_draw(
+            resp = await _finalize_draw(
                 db, sl_publish, session_id, gas_url, treasury_id,
                 treasury_password, mock_gas, log,
                 push_notify=push_notify,
             )
+            # Funding-source migration (additive, best-effort — see module
+            # docstring): record the payout in the linked Prize Pool's own
+            # ledger. Never affects the response above; the GAS payout
+            # already committed by the unchanged _finalize_draw() call.
+            await _record_pool_distribution(
+                db, session_id, resp.get("winners") or [],
+                actor=getattr(admin, "email", "admin"),
+            )
+            return resp
 
         # ── FIX 9: safe retry of failed payouts (admin-only) ─────────────
         @api.post("/speaking-lab/sessions/{session_id}/lucky-draw/retry-failed")
@@ -923,11 +1035,13 @@ def register_lucky_draw_routes(
         # Same finalize route in dev mode (no admin gate).
         @api.post("/speaking-lab/sessions/{session_id}/lucky-draw/finalize")
         async def lucky_draw_finalize_post_dev(session_id: str):
-            return await _finalize_draw(
+            resp = await _finalize_draw(
                 db, sl_publish, session_id, gas_url, treasury_id,
                 treasury_password, mock_gas, log,
                 push_notify=push_notify,
             )
+            await _record_pool_distribution(db, session_id, resp.get("winners") or [], actor="dev")
+            return resp
 
 
 async def _pool_payload(
@@ -1013,7 +1127,7 @@ async def _pool_payload(
         total += int(row.get("entry_fee") or 0)
     return {
         "session_id":     session_id,
-        "pool_total":     total,
+        "pool_total":     await _resolve_pool_total(db, session_id, total) if db is not None else total,
         "player_count":   len(codes),
         "entry_fee":      int(sess.get("entry_fee") or 0),
         "lucky_codes":    [{"code": c["code"], "display_name": c["display_name"]}
@@ -1121,7 +1235,13 @@ async def _run_draw(
             raise HTTPException(status_code=400,
                                 detail="No lucky codes — pool is empty")
 
-        pool_total = sum(c["entry_fee"] for c in candidates)
+        # Funding-source migration (see module docstring): legacy sessions
+        # keep the entry-fee sum unchanged; a session an admin linked to a
+        # Prize Pool instead splits that pool's live balance. Winner
+        # selection/weighting above this line is completely unaffected —
+        # only the NUMBER being split changes.
+        entry_fee_total = sum(c["entry_fee"] for c in candidates)
+        pool_total = await _resolve_pool_total(db, session_id, entry_fee_total)
         if pool_total <= 0:
             await _release_claim("zero_pool_total")
             raise HTTPException(status_code=400, detail="Pool total is zero")

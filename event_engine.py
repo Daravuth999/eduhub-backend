@@ -461,19 +461,24 @@ async def _prepare_lucky_draw(db, session_id: str, event: dict, actor: str, ctx:
         ) from exc
 
 
-async def _finalize_lucky_draw(db, session_id: str, ctx: dict) -> dict:
+async def _finalize_lucky_draw(db, session_id: str, ctx: dict, *, actor: str = "") -> dict:
     """Advancing to "settling" now actually FINALIZES the prepared draw
     (GAS transfer + winner pushes) by calling lucky_draw.py's module-
     level ``_finalize_draw`` — unchanged, and already safe to call more
     than once (its own atomic finalize claim + per-winner claims). The
     returned dict (winners/amounts/payout_status) is what
     ``_publish_winner_showcase`` reads — real settlement data, not
-    re-derived or guessed."""
+    re-derived or guessed.
+
+    Also records the payout in the session's linked Prize Pool (funding-
+    source migration, additive/best-effort — see lucky_draw.py's own
+    ``_record_pool_distribution``, which this reuses rather than
+    duplicating)."""
     from fastapi import HTTPException
-    from lucky_draw import _finalize_draw
+    from lucky_draw import _finalize_draw, _record_pool_distribution
 
     try:
-        return await _finalize_draw(
+        result = await _finalize_draw(
             db, ctx.get("sl_publish"), session_id,
             ctx.get("gas_url", ""), ctx.get("treasury_id", ""),
             ctx.get("treasury_password", ""), bool(ctx.get("mock_gas", False)),
@@ -483,6 +488,8 @@ async def _finalize_lucky_draw(db, session_id: str, ctx: dict) -> dict:
         raise EventEngineError(
             "lucky_draw_finalize_failed", str(exc.detail), http_status=exc.status_code,
         ) from exc
+    await _record_pool_distribution(db, session_id, result.get("winners") or [], actor=actor)
+    return result
 
 
 async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, actor: str) -> None:
@@ -619,6 +626,13 @@ async def transition_event(
                 "created_at": now,
                 "auto_enroll": False,
                 "event_id": event_id,  # back-reference, additive column
+                # Funding-source migration: auto-link this session to the
+                # event's own companion Prize Pool (created in create_event)
+                # so lucky_draw.py's _resolve_pool_total uses it instead of
+                # summing entry fees — zero extra admin action required for
+                # events created through the Event Engine. None for events
+                # whose companion pool creation failed (best-effort there).
+                "prize_pool_id": event.get("prize_pool_id"),
             })
         elif linked_session_id is not None:
             new_status = _SESSION_STATUS_FOR_EVENT_STATE.get(to_state)
@@ -632,7 +646,7 @@ async def transition_event(
                 if to_state == "drawing":
                     await _prepare_lucky_draw(db, linked_session_id, event, actor, lucky_draw_ctx)
                 elif to_state == "settling":
-                    finalize_result = await _finalize_lucky_draw(db, linked_session_id, lucky_draw_ctx)
+                    finalize_result = await _finalize_lucky_draw(db, linked_session_id, lucky_draw_ctx, actor=actor)
                     await _publish_winner_showcase(db, event, finalize_result, actor=actor)
 
     history_entry = {"state": to_state, "at": now, "by": actor}
