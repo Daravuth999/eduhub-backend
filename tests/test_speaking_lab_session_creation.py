@@ -52,14 +52,38 @@ class _FakeSettingsCollection:
         return self.doc
 
 
+class _FakeTemplatesCollection:
+    """Minimal stand-in for event_engine.py's TEMPLATES_COLL, just enough
+    to drive the REAL get_active_reward_pool_id() against a fixed set of
+    template docs (sorted client-side by updated_at, matching Mongo's
+    sort=[("updated_at", -1)] semantics)."""
+    def __init__(self, docs=None):
+        self._docs = list(docs or [])
+
+    async def find_one(self, query, projection=None, sort=None):
+        candidates = [
+            d for d in self._docs
+            if d.get("event_type") == query.get("event_type")
+            and d.get("status") != "archived"
+            and d.get("reward_pool_id") is not None
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda d: d.get("updated_at", ""), reverse=True)
+        return candidates[0]
+
+
 class _FakeDB:
-    def __init__(self):
+    def __init__(self, templates=None):
         self.sessions = _FakeCollection()
         self.settings = _FakeSettingsCollection()
+        self.event_templates = _FakeTemplatesCollection(templates)
 
     def __getitem__(self, name):
         if name == "speaking_lab_settings":
             return self.settings
+        if name == "event_templates":
+            return self.event_templates
         return self.sessions
 
 
@@ -78,7 +102,7 @@ def _build_app(db):
         if schedule_norm and schedule_norm not in ("A", "B", "AB"):
             raise HTTPException(status_code=400, detail="schedule must be 'A', 'B', 'AB', or empty")
         session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
-        await db["speaking_lab_sessions"].insert_one({
+        session_doc = {
             "session_id": session_id,
             "schedule":   schedule_norm,
             "entry_fee":  payload.entry_fee,
@@ -86,7 +110,15 @@ def _build_app(db):
             "status":     "waiting",
             "created_by": admin.email,
             "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        try:
+            from event_engine import get_active_reward_pool_id
+            reward_pool_id = await get_active_reward_pool_id(db)
+            if reward_pool_id:
+                session_doc["prize_pool_id"] = reward_pool_id
+        except Exception:  # noqa: BLE001
+            pass
+        await db["speaking_lab_sessions"].insert_one(session_doc)
         return {"session_id": session_id, "schedule": schedule_norm, "entry_fee": payload.entry_fee}
         # ── end verbatim copy ──
 
@@ -112,6 +144,8 @@ def test_0_route_body_matches_server_py():
     assert 'if schedule_norm and schedule_norm not in ("A", "B", "AB"):' in src
     assert "ab_schedule_disabled" not in src
     assert "ab_schedule_enabled(db)" not in src
+    assert "from event_engine import get_active_reward_pool_id" in src
+    assert 'session_doc["prize_pool_id"] = reward_pool_id' in src
 
 
 def test_1_ab_accepted_with_no_env_var_and_no_db_doc_at_all():
@@ -183,3 +217,74 @@ def test_6_invalid_schedule_value_rejected():
 
     assert resp.status_code == 400
     assert db.sessions._docs == []
+
+
+# ── Reward Pool auto-link (blocker-bug fix: the legacy/default session
+#    creation flow every teacher actually uses had zero connection to
+#    Event Templates' Reward Pool — this proves the fix using the REAL
+#    (unmocked) event_engine.get_active_reward_pool_id) ─────────────────
+
+def test_7_new_session_auto_links_the_configured_reward_pool():
+    db = _FakeDB(templates=[{
+        "event_type": "speaking_lab_session", "status": "draft",
+        "reward_pool_id": "pool_abc123", "updated_at": "2026-07-24T06:04:59Z",
+    }])
+    client = TestClient(_build_app(db))
+
+    resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 0})
+
+    assert resp.status_code == 200
+    assert db.sessions._docs[0]["prize_pool_id"] == "pool_abc123"
+
+
+def test_8_no_reward_pool_configured_keeps_legacy_entry_fee_session_unchanged():
+    db = _FakeDB(templates=[])
+    client = TestClient(_build_app(db))
+
+    resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 4})
+
+    assert resp.status_code == 200
+    assert "prize_pool_id" not in db.sessions._docs[0]
+
+
+def test_9_archived_template_reward_pool_is_never_auto_linked():
+    db = _FakeDB(templates=[{
+        "event_type": "speaking_lab_session", "status": "archived",
+        "reward_pool_id": "pool_stale", "updated_at": "2026-07-24T06:04:59Z",
+    }])
+    client = TestClient(_build_app(db))
+
+    resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 0})
+
+    assert resp.status_code == 200
+    assert "prize_pool_id" not in db.sessions._docs[0]
+
+
+def test_10_most_recently_updated_template_wins_when_multiple_configured():
+    db = _FakeDB(templates=[
+        {"event_type": "speaking_lab_session", "status": "draft",
+         "reward_pool_id": "pool_old", "updated_at": "2026-07-01T00:00:00Z"},
+        {"event_type": "speaking_lab_session", "status": "published",
+         "reward_pool_id": "pool_newest", "updated_at": "2026-07-24T06:04:59Z"},
+    ])
+    client = TestClient(_build_app(db))
+
+    resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 0})
+
+    assert resp.status_code == 200
+    assert db.sessions._docs[0]["prize_pool_id"] == "pool_newest"
+
+
+def test_11_reward_pool_lookup_failure_never_blocks_session_creation():
+    class _BoomTemplates:
+        async def find_one(self, *a, **k):
+            raise RuntimeError("db unavailable")
+
+    db = _FakeDB()
+    db.event_templates = _BoomTemplates()
+    client = TestClient(_build_app(db))
+
+    resp = client.post("/api/speaking-lab/sessions", json={"schedule": "AB", "entry_fee": 4})
+
+    assert resp.status_code == 200
+    assert "prize_pool_id" not in db.sessions._docs[0]

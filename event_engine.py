@@ -191,6 +191,28 @@ async def get_template(db, template_id: str) -> Optional[dict]:
     return await db[TEMPLATES_COLL].find_one({"_id": template_id})
 
 
+async def get_active_reward_pool_id(db) -> Optional[str]:
+    """The single source of truth an admin's Reward Pool save feeds into
+    for sessions created OUTSIDE the Event Engine lifecycle (the
+    legacy/default `POST /speaking-lab/sessions` flow every teacher
+    actually uses today to start a round — see server.py's
+    sl_create_session). Since Speaking Lab has exactly one event type,
+    "the" configured Reward Pool is the most recently saved
+    (non-archived) template that has one. Returns None when no admin
+    has configured a Reward Pool, so untouched legacy entry-fee
+    sessions keep behaving exactly as before."""
+    doc = await db[TEMPLATES_COLL].find_one(
+        {
+            "event_type": "speaking_lab_session",
+            "status": {"$ne": "archived"},
+            "reward_pool_id": {"$ne": None},
+        },
+        {"_id": 0, "reward_pool_id": 1},
+        sort=[("updated_at", -1)],
+    )
+    return (doc or {}).get("reward_pool_id")
+
+
 async def update_template(db, template_id: str, updates: dict, *, updated_by: str) -> dict:
     """Only mutable while ``draft`` — a published template is immutable
     (architecture.md §4.3's "why snapshots matter": editing a template

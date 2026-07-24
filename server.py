@@ -5195,7 +5195,7 @@ async def sl_create_session(
     # students into one shared session/pool/draw (see
     # session_schedule_eligibility() in teacher_admission.py).
     session_id = f"sl_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
-    await SL_SESSIONS.insert_one({
+    session_doc = {
         "session_id": session_id,
         "schedule":   schedule_norm,
         "entry_fee":  payload.entry_fee,
@@ -5204,7 +5204,21 @@ async def sl_create_session(
         "created_by": admin.email,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "auto_enroll": bool(payload.auto_enroll),
-    })
+    }
+    # Auto-link the admin's Reward Pool (configured once in Author Studio ->
+    # Event Templates) to every NEW session, including ones started through
+    # this legacy/default flow — never just the Event Engine's own
+    # transition_event path. Best-effort: a lookup failure must never block
+    # session creation, it just leaves the session on the legacy entry-fee
+    # model exactly as before.
+    try:
+        from event_engine import get_active_reward_pool_id
+        reward_pool_id = await get_active_reward_pool_id(db)
+        if reward_pool_id:
+            session_doc["prize_pool_id"] = reward_pool_id
+    except Exception:  # noqa: BLE001
+        pass
+    await SL_SESSIONS.insert_one(session_doc)
     log.info("sl.session.create: %s schedule=%s fee=%s auto_enroll=%s",
               session_id, schedule_norm, payload.entry_fee, payload.auto_enroll)
     response = {"session_id": session_id, "schedule": schedule_norm, "entry_fee": payload.entry_fee}
