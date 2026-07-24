@@ -138,6 +138,49 @@ def test_delete_requires_admin():
     assert resp.status_code == 401
 
 
+# ── auto_publish_experience_config (system-authored, e.g. event_engine.py's
+#    automatic Winner Showcase) ───────────────────────────────────────────
+import asyncio
+
+
+def test_auto_publish_creates_and_publishes_a_new_config():
+    db = _FakeDB()
+    doc = asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_1",
+        content={"champion": {"student_id": "stu1"}}, created_by="event_engine:teacher@test",
+    ))
+    assert doc["status"] == "published"
+    assert doc["experienceType"] == "winner_showcase"
+    assert doc["key"] == "evt_1"
+    assert doc["content"]["champion"]["student_id"] == "stu1"
+    assert doc["version"] == 1
+    assert doc["createdBy"] == "event_engine:teacher@test"
+
+
+def test_auto_publish_is_idempotent_per_key_and_bumps_version():
+    db = _FakeDB()
+    first = asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_1", content={"champion": "A"},
+    ))
+    second = asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_1", content={"champion": "B"},
+    ))
+    assert second["id"] == first["id"]
+    assert second["version"] == 2
+    assert second["content"]["champion"] == "B"
+    assert second["status"] == "published"
+
+
+def test_auto_publish_is_visible_through_the_public_active_route():
+    client, db = _make_client()
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_1", content={"champion": "A"},
+    ))
+    resp = client.get("/api/experience-configs/active?type=winner_showcase")
+    assert resp.status_code == 200
+    assert resp.json()["config"]["content"]["champion"] == "A"
+
+
 # ── create ───────────────────────────────────────────────────────────────
 
 def test_create_draft_config():

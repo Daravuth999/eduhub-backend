@@ -16,6 +16,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 import event_engine as ee
+import prize_pool as pp
 
 
 # ── fake Mongo ──────────────────────────────────────────────────────────
@@ -110,15 +111,53 @@ class _SessionsColl(_Coll):
         return await super().find_one(query, projection)
 
 
+class _IdKeyedColl(_Coll):
+    """prize_pools / experience_configs are keyed by their own ``_id``/``id``
+    string field the SAME way ``events``/``templates`` already are here —
+    but experience_configs uses the field name ``id`` (matching
+    experience_config_tools.py's own convention), not ``_id``."""
+
+    def __init__(self, id_field="_id"):
+        super().__init__()
+        self._id_field = id_field
+
+    async def insert_one(self, doc):
+        self.docs[doc[self._id_field]] = dict(doc)
+        return _Result(inserted_id=doc[self._id_field])
+
+    async def find_one(self, query, projection=None):
+        _id = query.get(self._id_field)
+        if _id is not None:
+            doc = self.docs.get(_id)
+            return dict(doc) if doc else None
+        for d in self.docs.values():
+            if all(d.get(k) == v for k, v in query.items()):
+                return dict(d)
+        return None
+
+    async def update_one(self, query, update):
+        _id = query.get(self._id_field)
+        target = self.docs.get(_id) if _id is not None else None
+        if target is None:
+            return _Result(matched_count=0)
+        if "$set" in update:
+            target.update(update["$set"])
+        return _Result(matched_count=1)
+
+
 class _FakeDB:
     def __init__(self):
         self.templates = _Coll()
         self.events = _Coll()
+        self.prize_pools = _IdKeyedColl(id_field="_id")
+        self.experience_configs = _IdKeyedColl(id_field="id")
 
     def __getitem__(self, name):
         return {
             ee.TEMPLATES_COLL: self.templates,
             ee.EVENTS_COLL: self.events,
+            "prize_pools": self.prize_pools,
+            "experience_configs": self.experience_configs,
         }[name]
 
 
@@ -280,6 +319,22 @@ async def test_create_event_rejects_invalid_schedule():
 
 
 @pytest.mark.asyncio
+async def test_create_event_creates_companion_prize_pool():
+    db = _FakeDB()
+    tmpl = await ee.create_template(db, name="Weekly SL", event_type="speaking_lab_session", content={}, created_by="a")
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    assert event["prize_pool_id"] is not None
+
+    pool = await pp.get_pool(db, event["prize_pool_id"])
+    assert pool is not None
+    assert pool["owner_type"] == "event"
+    assert pool["owner_ref"] == event["_id"]
+    assert pool["status"] == "open"
+    assert pool["name"] == "Weekly SL — Prize Pool"
+
+
+@pytest.mark.asyncio
 async def test_create_event_rejects_out_of_range_entry_fee():
     db = _FakeDB()
     tmpl = await ee.create_template(db, name="A", event_type="speaking_lab_session", content={}, created_by="a")
@@ -333,6 +388,11 @@ async def test_full_happy_path_transitions_and_creates_underlying_session():
     event = await ee.transition_event(db, sessions, event["_id"], "archived", actor="a")
     assert event["state"] == "archived"
     assert len(event["state_history"]) == 8  # draft + 7 transitions
+
+    # Reaching "settled" also closes the event's companion prize pool
+    # (bookkeeping only — see _close_event_prize_pool).
+    pool = await pp.get_pool(db, event["prize_pool_id"])
+    assert pool["status"] == "settled"
 
 
 @pytest.mark.asyncio
@@ -533,6 +593,107 @@ async def test_transition_to_settling_propagates_failures_and_blocks_state(monke
     assert exc.value.code == "lucky_draw_finalize_failed"
     reloaded = await ee.get_event(db, event["_id"])
     assert reloaded["state"] == "drawing"  # state must NOT advance on a real failure
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Automatic Winner Showcase — auto-published right after a lucky draw
+# finalizes (architecture continuation's "no manual dashboard editing").
+# Champion/top winners/payout status all come from the SAME finalize
+# response lucky_draw.py's own test suite already proves correct; these
+# tests only prove event_engine.py reads it and auto-publishes correctly.
+# ═════════════════════════════════════════════════════════════════════════
+def _fake_winners(n=3):
+    return [
+        {"student_id": f"stu{i}", "display_name": f"Student {i}", "amount": 100 - i * 10,
+         "transfer_ok": True, "transfer_err": ""}
+        for i in range(n)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_settling_auto_publishes_winner_showcase(monkeypatch):
+    import lucky_draw
+
+    async def _fake_run_draw(*a, **k):
+        return {"draw_id": "draw-1"}
+
+    winners = _fake_winners(3)
+
+    async def _fake_finalize_draw(*a, **k):
+        return {"draw_id": "draw-1", "payout_status": "paid", "finalized_at": "2026-01-01T00:00:00+00:00",
+                "winners": winners}
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+    monkeypatch.setattr(lucky_draw, "_finalize_draw", _fake_finalize_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    ctx = _lucky_draw_ctx()
+    event = await ee.transition_event(db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=ctx)
+    event = await ee.transition_event(db, sessions, event["_id"], "settling", actor="teacher@test", lucky_draw_ctx=ctx)
+
+    showcase = await db["experience_configs"].find_one({"experienceType": "winner_showcase", "key": event["_id"]})
+    assert showcase is not None
+    assert showcase["status"] == "published"
+    assert showcase["content"]["eventId"] == event["_id"]
+    assert showcase["content"]["champion"]["student_id"] == "stu0"
+    assert showcase["content"]["topWinners"] == winners
+    assert showcase["content"]["distributionCompleted"] is True
+    assert showcase["content"]["payoutStatus"] == "paid"
+    assert showcase["content"]["celebrationBanner"] is True
+    assert showcase["createdBy"] == "event_engine:teacher@test"
+
+
+@pytest.mark.asyncio
+async def test_settling_does_not_publish_showcase_when_no_winners(monkeypatch):
+    import lucky_draw
+
+    async def _fake_run_draw(*a, **k):
+        return {"draw_id": "draw-1"}
+
+    async def _fake_finalize_draw(*a, **k):
+        return {"draw_id": "draw-1", "payout_status": "paid", "winners": []}
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+    monkeypatch.setattr(lucky_draw, "_finalize_draw", _fake_finalize_draw)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    ctx = _lucky_draw_ctx()
+    event = await ee.transition_event(db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=ctx)
+    event = await ee.transition_event(db, sessions, event["_id"], "settling", actor="a", lucky_draw_ctx=ctx)
+
+    assert db.experience_configs.docs == {}
+
+
+@pytest.mark.asyncio
+async def test_showcase_publish_failure_does_not_block_settlement(monkeypatch):
+    import lucky_draw
+    import experience_config_tools as ect
+
+    async def _fake_run_draw(*a, **k):
+        return {"draw_id": "draw-1"}
+
+    async def _fake_finalize_draw(*a, **k):
+        return {"draw_id": "draw-1", "payout_status": "paid", "winners": _fake_winners(1)}
+
+    async def _boom_publish(*a, **k):
+        raise RuntimeError("display layer is down")
+
+    monkeypatch.setattr(lucky_draw, "_run_draw", _fake_run_draw)
+    monkeypatch.setattr(lucky_draw, "_finalize_draw", _fake_finalize_draw)
+    # _publish_winner_showcase does `from experience_config_tools import
+    # auto_publish_experience_config` at call time, so patching the module
+    # attribute here is what the real function will pick up.
+    monkeypatch.setattr(ect, "auto_publish_experience_config", _boom_publish)
+
+    db = _FakeDB()
+    sessions = _SessionsColl()
+    event = await _live_event_with_ctx(db, sessions)
+    ctx = _lucky_draw_ctx()
+    event = await ee.transition_event(db, sessions, event["_id"], "drawing", actor="a", lucky_draw_ctx=ctx)
+    event = await ee.transition_event(db, sessions, event["_id"], "settling", actor="a", lucky_draw_ctx=ctx)
+    assert event["state"] == "settling"  # settlement itself succeeded despite the showcase failure
 
 
 def test_transition_route_threads_lucky_draw_ctx(monkeypatch):

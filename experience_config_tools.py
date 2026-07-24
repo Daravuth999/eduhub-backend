@@ -197,6 +197,57 @@ def _sanitize_active_window(value: Any) -> dict:
     }
 
 
+async def auto_publish_experience_config(
+    db, *, experience_type: str, key: str, content: dict, created_by: str = "system",
+) -> dict:
+    """System-authored publish — for automated flows (e.g. the Event Engine
+    auto-publishing a Winner Showcase right after an event settles) that
+    need a config LIVE without a human going through the admin CRUD routes
+    below. Reuses the exact same ``experience_configs`` collection/document
+    shape as those routes (so the existing published+active resolver above
+    keeps working unchanged) — additive, not a parallel storage path.
+
+    Idempotent per (experienceType, key): a second call for the SAME key
+    (e.g. re-running the same event's settlement) updates content in place
+    and bumps version, rather than raising the admin route's 409-on-
+    duplicate-create. This is what lets a caller safely retry without
+    tracking whether it already published.
+    """
+    coll = db["experience_configs"]
+    now = datetime.now(timezone.utc)
+    existing = await coll.find_one({"experienceType": experience_type, "key": key})
+    if existing:
+        await coll.update_one(
+            {"id": existing["id"]},
+            {"$set": {
+                "content": _as_domain_dict(content),
+                "status": "published",
+                "updatedAt": now,
+                "version": existing.get("version", 1) + 1,
+            }},
+        )
+        doc = await coll.find_one({"id": existing["id"]})
+    else:
+        doc = {
+            "id": uuid.uuid4().hex,
+            "experienceType": experience_type,
+            "key": key,
+            "status": "published",
+            "activeWindow": {"startsAt": None, "endsAt": None, "recurringAnnual": False},
+            "content": _as_domain_dict(content),
+            "appearance": {},
+            "motion": {},
+            "playback": {},
+            "version": 1,
+            "createdBy": created_by,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        await coll.insert_one(dict(doc))
+    log.info("experience-config: auto-published %s/%s by %s", experience_type, key, created_by)
+    return _serialize(doc)
+
+
 async def ensure_experience_config_indexes(db) -> None:
     coll = db["experience_configs"]
     await coll.create_index([("experienceType", 1), ("status", 1)])
