@@ -255,6 +255,120 @@ async def archive_template(db, template_id: str, *, updated_by: str) -> dict:
     return await get_template(db, template_id)
 
 
+async def set_template_reward_pool(
+    db, template_id: str, *, points: int,
+    num_winners: Optional[int] = None, split: Optional[list] = None,
+    actor: str = "",
+) -> dict:
+    """The ONE admin action behind Author Studio's "Reward Pool" section
+    (architecture continuation — the administrator configures Reward Pool
+    PTS / Number of Winners / Prize Distribution in a single Save; the
+    platform does everything else automatically):
+
+      1. Ensures the template has its own reward pool (created on first
+         use, owner_type="event_template"; recreated if a previous one
+         was settled/cancelled; unlocked if locked).
+      2. Tops the pool's LIVE balance up to ``points`` via prize_pool.
+         fund_pool — an admin credit, no student wallet is ever debited.
+         Idempotent against re-saving the same number (balance already at
+         target → no funding happens); saving a higher number funds only
+         the difference; saving a lower number never claws points back.
+      3. Stores num_winners/split (and the configured points, for
+         display) in the template's ``prize_policy`` — the SAME field
+         ``_prepare_lucky_draw`` already reads from each event's frozen
+         config snapshot.
+      4. Stamps ``reward_pool_id`` on the template so ``transition_event``
+         auto-links every FUTURE session created from this template — no
+         manual linking, no copy/paste ids, ever.
+
+    Deliberately allowed on PUBLISHED templates: funding is an
+    operational/money action, not versioned template content. Events
+    already created keep their frozen prize_policy snapshots untouched
+    (that is exactly what snapshots are for); only new events pick up a
+    changed policy."""
+    tmpl = await get_template(db, template_id)
+    if not tmpl:
+        raise EventEngineError("template_not_found", http_status=404)
+    if tmpl["status"] == "archived":
+        raise EventEngineError(
+            "template_archived", "An archived template's reward pool cannot be changed.",
+        )
+    try:
+        points = int(points)
+    except (TypeError, ValueError):
+        raise EventEngineError("invalid_points", "Reward Pool points must be an integer") from None
+    if not (0 <= points <= 100000):
+        raise EventEngineError("invalid_points", "Reward Pool points out of range (0-100000)")
+    if num_winners is not None:
+        if not isinstance(num_winners, int) or not (1 <= num_winners <= 3):
+            raise EventEngineError("invalid_num_winners", "Number of winners must be 1-3")
+    if split is not None:
+        if (not isinstance(split, list) or not split
+                or not all(isinstance(s, (int, float)) and s > 0 for s in split)):
+            raise EventEngineError("invalid_split", "Prize distribution must be a list of positive numbers")
+
+    from wallet_service import WalletService
+    wallet_service = WalletService(db)
+
+    pool_id = tmpl.get("reward_pool_id")
+    pool = await pp.get_pool(db, pool_id) if pool_id else None
+    if pool and pool["status"] in ("settled", "cancelled"):
+        pool = None  # terminal — start a fresh pool rather than reviving it
+    if pool is None:
+        pool = await pp.create_pool(
+            db, name=f"{tmpl['name']} — Reward Pool",
+            owner_type="event_template", owner_ref=template_id,
+            created_by=actor or "author_studio",
+        )
+    if pool["status"] == "locked":
+        pool = await pp.unlock_pool(db, pool["_id"], actor=actor)
+
+    balance = await pp.get_pool_balance(db, wallet_service, pool["_id"])
+    if points > balance:
+        await pp.fund_pool(
+            db, wallet_service, pool["_id"], amount=int(points - balance),
+            idempotency_key=f"tmpl-reward-{template_id}-{uuid.uuid4().hex[:12]}",
+            actor=actor, note="Reward Pool top-up from Event Templates",
+        )
+        balance = await pp.get_pool_balance(db, wallet_service, pool["_id"])
+
+    prize_policy = dict(tmpl.get("prize_policy") or {})
+    prize_policy["reward_pool_points"] = points
+    if num_winners is not None:
+        prize_policy["num_winners"] = num_winners
+    if split is not None:
+        prize_policy["split"] = split
+    await db[TEMPLATES_COLL].update_one(
+        {"_id": template_id},
+        {"$set": {"prize_policy": prize_policy, "reward_pool_id": pool["_id"],
+                   "updated_at": _now_iso(), "updated_by": actor}},
+    )
+    return {
+        "template_id": template_id,
+        "reward_pool_id": pool["_id"],
+        "balance": balance,
+        "prize_policy": prize_policy,
+    }
+
+
+async def get_template_reward_pool(db, template_id: str) -> dict:
+    """Read-side of the Reward Pool section: the configured policy plus
+    the pool's LIVE balance (None when no pool has been set up yet, or
+    when the balance lookup fails — display-only, never blocks)."""
+    tmpl = await get_template(db, template_id)
+    if not tmpl:
+        raise EventEngineError("template_not_found", http_status=404)
+    balance = None
+    pool_id = tmpl.get("reward_pool_id")
+    if pool_id:
+        try:
+            from wallet_service import WalletService
+            balance = await pp.get_pool_balance(db, WalletService(db), pool_id)
+        except Exception:  # noqa: BLE001
+            balance = None
+    return {"prize_policy": tmpl.get("prize_policy") or {}, "balance": balance}
+
+
 async def duplicate_template(db, template_id: str, *, created_by: str) -> dict:
     tmpl = await get_template(db, template_id)
     if not tmpl:
@@ -433,12 +547,31 @@ async def get_runtime_dashboard(db, SL_SESSIONS, SL_ENTRIES) -> dict:
             pool_id = (sess or {}).get("prize_pool_id")
         if pool_id:
             try:
-                import prize_pool as pp
                 from wallet_service import WalletService
                 prize_pool_balance = await pp.get_pool_balance(db, WalletService(db), pool_id)
                 funding_source = "prize_pool"
             except Exception:  # noqa: BLE001
                 pass  # fail safe to the entry-fee estimate below
+        # Admin-facing progress counts (Author Studio shows these as
+        # "Lucky Codes" / "Winners" — implementation-neutral labels).
+        # Best-effort: a count failure degrades to 0 rather than breaking
+        # the whole dashboard.
+        lucky_code_count = 0
+        winner_count = 0
+        if session_id:
+            try:
+                lucky_code_count = await db.speaking_lab_lucky_codes.count_documents(
+                    {"session_id": session_id})
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                draw = await db.speaking_lab_lucky_draws.find_one(
+                    {"session_id": session_id, "finalized": True},
+                    {"_id": 0, "results": 1})
+                if draw:
+                    winner_count = len(draw.get("results") or [])
+            except Exception:  # noqa: BLE001
+                pass
         enriched = {
             **event,
             "template_name": template_names.get(event.get("template_id"), "(unknown template)"),
@@ -446,6 +579,8 @@ async def get_runtime_dashboard(db, SL_SESSIONS, SL_ENTRIES) -> dict:
             "estimated_prize_pool": entry_fee * participant_count,
             "funding_source": funding_source,
             "prize_pool_balance": prize_pool_balance,
+            "lucky_code_count": lucky_code_count,
+            "winner_count": winner_count,
             "health": _event_health(event, participant_count),
             "realtime_active": event["state"] in ("live", "drawing") and session_id is not None,
         }
@@ -647,6 +782,21 @@ async def transition_event(
             # First time this event opens for entry — create the
             # underlying session NOW, using the exact document shape
             # server.py's own sl_create_session route already writes.
+            #
+            # Reward Pool auto-link: if the admin configured a Reward Pool
+            # on this event's TEMPLATE (set_template_reward_pool — an
+            # explicit, already-FUNDED decision), every session created
+            # from that template links to it automatically, so the
+            # Speaking Lab runtime shows the configured pool with zero
+            # extra admin steps. The event's own auto-created companion
+            # pool is deliberately NOT linked here — it starts empty, and
+            # linking it would break the default entry-fee model
+            # (_resolve_pool_total would return 0 instead of the
+            # entry-fee sum). Live template lookup, not the snapshot:
+            # funding is operational money state, and the admin may have
+            # topped up between event creation and opening registration.
+            tmpl_doc = await get_template(db, event.get("template_id"))
+            template_reward_pool_id = (tmpl_doc or {}).get("reward_pool_id")
             linked_session_id = _new_id("sl")
             await SL_SESSIONS.insert_one({
                 "session_id": linked_session_id,
@@ -658,20 +808,7 @@ async def transition_event(
                 "created_at": now,
                 "auto_enroll": False,
                 "event_id": event_id,  # back-reference, additive column
-                # Funding-source migration: deliberately NOT auto-stamping
-                # prize_pool_id here. This event's own companion pool
-                # (event["prize_pool_id"], created in create_event) exists
-                # and is ready to be linked, but linking must stay an
-                # EXPLICIT admin action (prize_pool.link_pool_to_session —
-                # exactly what the architecture asks for: "Associate a
-                # Prize Pool with an Event or Speaking Lab session").
-                # Auto-linking here would silently break the DEFAULT
-                # entry-fee funding model for every Event Engine session:
-                # _resolve_pool_total would find a real (but empty)
-                # companion pool and return 0 instead of falling through
-                # to the entry-fee sum, failing "Pool total is zero" on
-                # any entry-fee event nobody ever intended to be pool-
-                # funded.
+                "prize_pool_id": template_reward_pool_id,
             })
         elif linked_session_id is not None:
             new_status = _SESSION_STATUS_FOR_EVENT_STATE.get(to_state)
@@ -826,6 +963,36 @@ def register_event_engine_routes(
         except EventEngineError as exc:
             _raise(exc)
         return {"ok": True, "template": doc}
+
+    # ── Reward Pool — the single admin configuration action ────────────
+    @api.get("/v1/event-templates/{template_id}/reward-pool")
+    async def get_template_reward_pool_route(template_id: str, admin=Depends(require_admin)):
+        try:
+            result = await get_template_reward_pool(db, template_id)
+        except EventEngineError as exc:
+            _raise(exc)
+        return result
+
+    @api.post("/v1/event-templates/{template_id}/reward-pool")
+    async def set_template_reward_pool_route(
+        template_id: str, payload: dict = Body(...), admin=Depends(require_admin),
+    ):
+        from wallet_service import WalletError
+        try:
+            result = await set_template_reward_pool(
+                db, template_id,
+                points=payload.get("points", 0),
+                num_winners=payload.get("num_winners"),
+                split=payload.get("split"),
+                actor=getattr(admin, "email", ""),
+            )
+        except EventEngineError as exc:
+            _raise(exc)
+        except pp.PrizePoolError as exc:
+            raise HTTPException(status_code=exc.http_status, detail=exc.message)
+        except WalletError as exc:
+            raise HTTPException(status_code=409, detail=exc.message)
+        return {"ok": True, **result}
 
     # ── Events (Event Operator Console) ────────────────────────────────
     @api.post("/v1/events")
