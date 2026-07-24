@@ -131,6 +131,11 @@ async def create_pool(
         "created_at": now,
         "updated_at": now,
         "settled_at": None,
+        # Bidirectional with speaking_lab_sessions.prize_pool_id (see
+        # link_pool_to_session) — lets Author Studio show "this pool funds
+        # session X" directly on the pool row, not only "this session is
+        # funded by pool Y" on the session/event row.
+        "linked_session_id": None,
     }
     await db[COLL_POOLS].insert_one(doc)
     return doc
@@ -227,9 +232,14 @@ async def fund_pool(
 async def link_pool_to_session(db, pool_id: str, session_id: str, *, actor: str = "") -> dict:
     """Associate a pool with a Speaking Lab session — stamps
     ``prize_pool_id`` onto the session's own ``speaking_lab_sessions``
-    document, the field lucky_draw.py's ``_resolve_pool_total`` reads.
-    Re-linking a session to a different pool simply overwrites the
-    field; nothing about the previous pool's own state changes."""
+    document (the field lucky_draw.py's ``_resolve_pool_total`` reads)
+    AND ``linked_session_id`` back onto the pool doc itself, so Author
+    Studio can show "this pool funds session X" directly on the Prize
+    Pools screen without a second lookup. Re-linking a session to a
+    different pool simply overwrites both sides; nothing about the
+    previous pool's own state changes (its own ``linked_session_id`` is
+    left stale/informational — a pool can only usefully fund one session
+    at a time in practice, but this module does not enforce that)."""
     pool = await get_pool(db, pool_id)
     if not pool:
         raise PrizePoolError("pool_not_found", http_status=404)
@@ -243,6 +253,10 @@ async def link_pool_to_session(db, pool_id: str, session_id: str, *, actor: str 
     )
     if getattr(result, "matched_count", 0) == 0:
         raise PrizePoolError("session_not_found", "Speaking Lab session not found", http_status=404)
+    await db[COLL_POOLS].update_one(
+        {"_id": pool_id},
+        {"$set": {"linked_session_id": session_id, "updated_at": _now_iso()}},
+    )
     return {"pool_id": pool_id, "session_id": session_id}
 
 

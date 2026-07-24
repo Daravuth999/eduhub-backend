@@ -871,7 +871,7 @@ async def test_runtime_dashboard_buckets_events_by_state():
     done_evt = await ee.transition_event(db, sessions, done_evt["_id"], "scheduled", actor="a")
     done_evt = await ee.transition_event(db, sessions, done_evt["_id"], "cancelled", actor="a")
 
-    dashboard = await ee.get_runtime_dashboard(db, entries)
+    dashboard = await ee.get_runtime_dashboard(db, sessions, entries)
     assert [e["_id"] for e in dashboard["upcoming"]] == [draft_evt["_id"]]
     assert [e["_id"] for e in dashboard["active"]] == [live_evt["_id"]]
     assert [e["_id"] for e in dashboard["finished"]] == [done_evt["_id"]]
@@ -894,10 +894,12 @@ async def test_runtime_dashboard_counts_participants_and_estimates_prize_pool():
     await entries.insert_one({"_id": "e1", "session_id": session_id, "student_id": "stu1"})
     await entries.insert_one({"_id": "e2", "session_id": session_id, "student_id": "stu2"})
 
-    dashboard = await ee.get_runtime_dashboard(db, entries)
+    dashboard = await ee.get_runtime_dashboard(db, sessions, entries)
     active = dashboard["active"][0]
     assert active["participant_count"] == 2
     assert active["estimated_prize_pool"] == 20
+    assert active["funding_source"] == "entry_fee"  # never auto-linked — see event_engine.py's own comment
+    assert active["prize_pool_balance"] is None
     assert active["health"] == "healthy"
     assert active["template_name"] == "A"
 
@@ -913,7 +915,7 @@ async def test_runtime_dashboard_flags_no_registrations_health():
     event = await ee.transition_event(db, sessions, event["_id"], "scheduled", actor="a")
     event = await ee.transition_event(db, sessions, event["_id"], "registration_open", actor="a")
 
-    dashboard = await ee.get_runtime_dashboard(db, entries)
+    dashboard = await ee.get_runtime_dashboard(db, sessions, entries)
     assert dashboard["active"][0]["health"] == "no_registrations"
     assert dashboard["active"][0]["participant_count"] == 0
 

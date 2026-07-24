@@ -389,15 +389,22 @@ def _event_health(event: dict, participant_count: int) -> str:
     return "healthy"
 
 
-async def get_runtime_dashboard(db, SL_ENTRIES) -> dict:
+async def get_runtime_dashboard(db, SL_SESSIONS, SL_ENTRIES) -> dict:
     """Author Studio's Runtime Dashboard: every event bucketed into
     active/upcoming/finished, each enriched with a live participant
     count (counted from the SAME speaking_lab_entries collection every
     existing enrollment route already writes to — no new participant
-    tracking), an estimated prize pool (entry_fee * participants — the
-    real Draw/PrizePool machinery is not yet wrapped into the Event
-    Engine, see this module's own docstring), a simple health signal,
-    and the owning template's name for display."""
+    tracking), a prize-pool readout, a simple health signal, and the
+    owning template's name for display.
+
+    Funding-source migration: ``estimated_prize_pool`` (entry_fee *
+    participants) is preserved unchanged for any event still on the
+    legacy entry-fee model. An event with an admin-funded Prize Pool
+    linked instead gets ``funding_source: "prize_pool"`` and
+    ``prize_pool_balance`` — that event's REAL available reward total,
+    a live read through prize_pool.get_pool_balance, never a stale
+    estimate. A balance lookup failure (pool deleted, etc.) degrades to
+    the entry-fee estimate rather than breaking the dashboard."""
     events = await list_events(db)
     templates = await list_templates(db)
     template_names = {t["_id"]: t["name"] for t in templates}
@@ -409,11 +416,36 @@ async def get_runtime_dashboard(db, SL_ENTRIES) -> dict:
         if session_id:
             participant_count = await SL_ENTRIES.count_documents({"session_id": session_id})
         entry_fee = int(event.get("entry_fee") or 0)
+        funding_source = "entry_fee"
+        prize_pool_balance = None
+        # IMPORTANT: check the SESSION's own prize_pool_id (the field that
+        # actually drives funding — set only via the explicit
+        # prize_pool.link_pool_to_session action), NOT event["prize_pool_id"]
+        # (the event's companion pool reference, which exists for EVERY
+        # event regardless of whether it's ever linked/used — checking
+        # that instead would wrongly report every event as pool-funded).
+        # Mirrors lucky_draw.py's own _resolve_pool_total exactly.
+        pool_id = None
+        if session_id:
+            sess = await SL_SESSIONS.find_one(
+                {"session_id": session_id}, {"_id": 0, "prize_pool_id": 1},
+            )
+            pool_id = (sess or {}).get("prize_pool_id")
+        if pool_id:
+            try:
+                import prize_pool as pp
+                from wallet_service import WalletService
+                prize_pool_balance = await pp.get_pool_balance(db, WalletService(db), pool_id)
+                funding_source = "prize_pool"
+            except Exception:  # noqa: BLE001
+                pass  # fail safe to the entry-fee estimate below
         enriched = {
             **event,
             "template_name": template_names.get(event.get("template_id"), "(unknown template)"),
             "participant_count": participant_count,
             "estimated_prize_pool": entry_fee * participant_count,
+            "funding_source": funding_source,
+            "prize_pool_balance": prize_pool_balance,
             "health": _event_health(event, participant_count),
             "realtime_active": event["state"] in ("live", "drawing") and session_id is not None,
         }
@@ -626,13 +658,20 @@ async def transition_event(
                 "created_at": now,
                 "auto_enroll": False,
                 "event_id": event_id,  # back-reference, additive column
-                # Funding-source migration: auto-link this session to the
-                # event's own companion Prize Pool (created in create_event)
-                # so lucky_draw.py's _resolve_pool_total uses it instead of
-                # summing entry fees — zero extra admin action required for
-                # events created through the Event Engine. None for events
-                # whose companion pool creation failed (best-effort there).
-                "prize_pool_id": event.get("prize_pool_id"),
+                # Funding-source migration: deliberately NOT auto-stamping
+                # prize_pool_id here. This event's own companion pool
+                # (event["prize_pool_id"], created in create_event) exists
+                # and is ready to be linked, but linking must stay an
+                # EXPLICIT admin action (prize_pool.link_pool_to_session —
+                # exactly what the architecture asks for: "Associate a
+                # Prize Pool with an Event or Speaking Lab session").
+                # Auto-linking here would silently break the DEFAULT
+                # entry-fee funding model for every Event Engine session:
+                # _resolve_pool_total would find a real (but empty)
+                # companion pool and return 0 instead of falling through
+                # to the entry-fee sum, failing "Pool total is zero" on
+                # any entry-fee event nobody ever intended to be pool-
+                # funded.
             })
         elif linked_session_id is not None:
             new_status = _SESSION_STATUS_FOR_EVENT_STATE.get(to_state)
@@ -827,7 +866,7 @@ def register_event_engine_routes(
     # above, registered before the dynamic /v1/events/{event_id} route below.
     @api.get("/v1/events/dashboard")
     async def events_dashboard_route(admin=Depends(require_admin)):
-        return await get_runtime_dashboard(db, SL_ENTRIES)
+        return await get_runtime_dashboard(db, SL_SESSIONS, SL_ENTRIES)
 
     @api.get("/v1/events/{event_id}")
     async def get_event_route(event_id: str, admin=Depends(require_admin)):
