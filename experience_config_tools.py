@@ -199,6 +199,7 @@ def _sanitize_active_window(value: Any) -> dict:
 
 async def auto_publish_experience_config(
     db, *, experience_type: str, key: str, content: dict, created_by: str = "system",
+    active_window: Optional[dict] = None,
 ) -> dict:
     """System-authored publish — for automated flows (e.g. the Event Engine
     auto-publishing a Winner Showcase right after an event settles) that
@@ -215,12 +216,16 @@ async def auto_publish_experience_config(
     """
     coll = db["experience_configs"]
     now = datetime.now(timezone.utc)
+    window = _sanitize_active_window(active_window) if active_window else {
+        "startsAt": None, "endsAt": None, "recurringAnnual": False,
+    }
     existing = await coll.find_one({"experienceType": experience_type, "key": key})
     if existing:
         await coll.update_one(
             {"id": existing["id"]},
             {"$set": {
                 "content": _as_domain_dict(content),
+                "activeWindow": window,
                 "status": "published",
                 "updatedAt": now,
                 "version": existing.get("version", 1) + 1,
@@ -233,7 +238,7 @@ async def auto_publish_experience_config(
             "experienceType": experience_type,
             "key": key,
             "status": "published",
-            "activeWindow": {"startsAt": None, "endsAt": None, "recurringAnnual": False},
+            "activeWindow": window,
             "content": _as_domain_dict(content),
             "appearance": {},
             "motion": {},
@@ -281,6 +286,23 @@ def register_experience_config_routes(api, app, db, require_admin=None) -> None:
             if best is None or (doc.get("updatedAt") or now) > (best.get("updatedAt") or now):
                 best = doc
         return {"config": _serialize(best) if best else None}
+
+    @api.get("/experience-configs/active-list")
+    async def get_active_experience_config_list(
+        type: str = Query(..., min_length=1, max_length=64, alias="type"),
+    ):
+        """Public, read-only. Unlike /active (which picks ONE "best"
+        candidate), this returns EVERY currently-active published config
+        for the type, newest first — for experience types with more than
+        one legitimately-simultaneous instance (e.g. "winner_showcase",
+        one per settled event, auto-rotated client-side until each one's
+        own activeWindow.endsAt passes). Never 404s; an empty list is a
+        normal, expected state."""
+        now = datetime.now(timezone.utc)
+        candidates = coll.find({"experienceType": type, "status": "published"})
+        active = [doc async for doc in candidates if _is_active_now(doc, now)]
+        active.sort(key=lambda d: d.get("updatedAt") or now, reverse=True)
+        return {"configs": [_serialize(d) for d in active]}
 
     if require_admin is not None:
         _register_admin_crud_routes(api, coll, require_admin)

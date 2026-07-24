@@ -509,6 +509,7 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
             or all(w.get("transfer_ok") for w in winners)
         )
         now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(hours=48)).isoformat()
         content = {
             "eventId": event["_id"],
             "eventName": event_name,
@@ -519,11 +520,15 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
             "payoutStatus": payout_status,
             "celebrationBanner": True,
             "settledAt": finalize_result.get("finalized_at") or now.isoformat(),
-            "expiresAt": (now + timedelta(hours=48)).isoformat(),
+            "expiresAt": expires_at,
         }
         await auto_publish_experience_config(
             db, experience_type="winner_showcase", key=event["_id"],
             content=content, created_by=f"event_engine:{actor}",
+            # Reuse the platform's OWN active-window expiry mechanism
+            # (_is_active_now) rather than making every reader re-derive
+            # "is this showcase still current" from content.expiresAt.
+            active_window={"startsAt": None, "endsAt": expires_at, "recurringAnnual": False},
         )
     except Exception:  # noqa: BLE001
         logger.exception(

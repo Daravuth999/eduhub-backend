@@ -181,6 +181,43 @@ def test_auto_publish_is_visible_through_the_public_active_route():
     assert resp.json()["config"]["content"]["champion"] == "A"
 
 
+def test_auto_publish_respects_custom_active_window():
+    client, db = _make_client()
+    past = "2020-01-01T00:00:00+00:00"
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_expired", content={"champion": "Old"},
+        active_window={"startsAt": None, "endsAt": past, "recurringAnnual": False},
+    ))
+    resp = client.get("/api/experience-configs/active?type=winner_showcase")
+    assert resp.json()["config"] is None  # past its own endsAt -> not active
+
+
+def test_active_list_route_returns_every_currently_active_instance():
+    client, db = _make_client()
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_1", content={"champion": "A"},
+    ))
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_2", content={"champion": "B"},
+    ))
+    past = "2020-01-01T00:00:00+00:00"
+    asyncio.run(ect.auto_publish_experience_config(
+        db, experience_type="winner_showcase", key="evt_expired", content={"champion": "Old"},
+        active_window={"startsAt": None, "endsAt": past, "recurringAnnual": False},
+    ))
+    resp = client.get("/api/experience-configs/active-list?type=winner_showcase")
+    assert resp.status_code == 200
+    champions = {c["content"]["champion"] for c in resp.json()["configs"]}
+    assert champions == {"A", "B"}  # the expired one is excluded
+
+
+def test_active_list_route_returns_empty_list_when_nothing_published():
+    client, _ = _make_client()
+    resp = client.get("/api/experience-configs/active-list?type=winner_showcase")
+    assert resp.status_code == 200
+    assert resp.json()["configs"] == []
+
+
 # ── create ───────────────────────────────────────────────────────────────
 
 def test_create_draft_config():
