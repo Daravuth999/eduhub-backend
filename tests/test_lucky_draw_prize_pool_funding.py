@@ -480,3 +480,265 @@ async def test_get_pool_for_session_returns_linked_pool():
     await _make_session(db, session_id="sl_linked2", prize_pool_id=pool["_id"])
     result = await pp.get_pool_for_session(db, "sl_linked2")
     assert result["_id"] == pool["_id"]
+
+
+@pytest.mark.asyncio
+async def test_link_pool_to_session_also_stamps_the_pool_side():
+    db = _FakeDB()
+    pool = await pp.create_pool(db, name="A", owner_type="speaking_lab_session", created_by="a")
+    await _make_session(db, session_id="sl_bidir")
+    await pp.link_pool_to_session(db, pool["_id"], "sl_bidir", actor="a")
+    reloaded = await pp.get_pool(db, pool["_id"])
+    assert reloaded["linked_session_id"] == "sl_bidir"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Regression guard: Event Engine's auto-created companion pool must NEVER
+# be auto-linked to a session — that would silently break the DEFAULT
+# entry-fee funding model for every Event Engine event (the companion
+# pool starts at balance 0, so _resolve_pool_total would return 0 instead
+# of falling through to the entry-fee sum, and the draw would incorrectly
+# fail "Pool total is zero" even though students genuinely paid).
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_event_engine_entry_fee_event_is_not_broken_by_companion_pool():
+    import event_engine as ee
+
+    db = _FakeDB()
+    tmpl = await ee.create_template(
+        db, name="Weekly Speaking Lab", event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": 10}}, created_by="admin@test",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="admin@test")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="admin@test")
+    assert event["prize_pool_id"] is not None  # companion pool exists...
+
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "registration_open", actor="a")
+    session_id = event["linked_session_id"]
+
+    sess = await db.speaking_lab_sessions.find_one({"session_id": session_id})
+    assert sess.get("prize_pool_id") is None  # ...but is NOT auto-linked to the session
+
+    # Two students genuinely pay the entry fee (simulating the unchanged
+    # speaking_lab_direct_join.py flow).
+    for i in range(2):
+        await db["speaking_lab_lucky_codes"].insert_one({
+            "session_id": session_id, "student_id": f"stu{i}", "display_name": f"Student {i}",
+            "code": f"ABC{i}", "entry_fee": 10, "awarded_at": "2026-01-01T00:00:00+00:00",
+        })
+
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "live", actor="a")
+    ctx = {"sl_publish": _noop_publish, "gas_url": "", "treasury_id": "", "treasury_password": "",
+           "mock_gas": True, "log": None, "push_notify": None}
+    event = await ee.transition_event(
+        db, db.speaking_lab_sessions, event["_id"], "drawing", actor="admin@test", lucky_draw_ctx=ctx,
+    )
+    assert event["state"] == "drawing"  # did NOT fail "Pool total is zero"
+
+
+@pytest.mark.asyncio
+async def test_runtime_dashboard_reports_entry_fee_for_every_event_by_default():
+    """Every event gets a companion pool at creation (event["prize_pool_id"]
+    always set) — the dashboard must NOT mistake that for the session
+    actually being funded by it. Only an explicit link changes the
+    reported funding_source."""
+    import event_engine as ee
+
+    db = _FakeDB()
+    tmpl = await ee.create_template(
+        db, name="A", event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": 10}}, created_by="a",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    assert event["prize_pool_id"] is not None  # companion pool exists...
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "registration_open", actor="a")
+
+    dashboard = await ee.get_runtime_dashboard(db, db.speaking_lab_sessions, db.speaking_lab_entries)
+    active = dashboard["active"][0]
+    assert active["funding_source"] == "entry_fee"  # ...but is NOT reported as pool-funded
+    assert active["prize_pool_balance"] is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_dashboard_shows_live_prize_pool_balance_when_linked():
+    import event_engine as ee
+
+    db = _FakeDB()
+    tmpl = await ee.create_template(
+        db, name="A", event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": 0}}, created_by="a",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="a")
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="a")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "scheduled", actor="a")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "registration_open", actor="a")
+
+    wallet_service = ws.WalletService(db)
+    await pp.fund_pool(
+        db, wallet_service, event["prize_pool_id"], amount=300,
+        idempotency_key="fund-dash-1", actor="admin@test",
+    )
+    await pp.link_pool_to_session(db, event["prize_pool_id"], event["linked_session_id"], actor="admin@test")
+
+    dashboard = await ee.get_runtime_dashboard(db, db.speaking_lab_sessions, db.speaking_lab_entries)
+    active = dashboard["active"][0]
+    assert active["funding_source"] == "prize_pool"
+    assert active["prize_pool_balance"] == 300
+    assert active["estimated_prize_pool"] == 0  # entry_fee estimate still computed, just not the winning number
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Template Reward Pool — the single admin configuration action
+# (set_template_reward_pool: create + fund + link, all automatic)
+# ═════════════════════════════════════════════════════════════════════════
+async def _published_template(db, *, name="Weekly Speaking Lab", entry_fee=0):
+    import event_engine as ee
+    tmpl = await ee.create_template(
+        db, name=name, event_type="speaking_lab_session",
+        content={"runtime_defaults": {"entry_fee": entry_fee}}, created_by="admin@test",
+    )
+    await ee.publish_template(db, tmpl["_id"], updated_by="admin@test")
+    return tmpl
+
+
+@pytest.mark.asyncio
+async def test_set_template_reward_pool_creates_funds_and_stamps():
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db)
+    result = await ee.set_template_reward_pool(
+        db, tmpl["_id"], points=500, num_winners=3, split=[50, 30, 20], actor="admin@test",
+    )
+    assert result["balance"] == 500
+    assert result["prize_policy"] == {"reward_pool_points": 500, "num_winners": 3, "split": [50, 30, 20]}
+
+    reloaded = await ee.get_template(db, tmpl["_id"])
+    assert reloaded["reward_pool_id"] == result["reward_pool_id"]
+    pool = await pp.get_pool(db, result["reward_pool_id"])
+    assert pool["owner_type"] == "event_template"
+    assert pool["owner_ref"] == tmpl["_id"]
+    assert pool["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_set_template_reward_pool_top_up_semantics():
+    """Re-saving the same number never double-funds; a higher number funds
+    only the difference; a lower number never claws points back."""
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db)
+    wallet_service = ws.WalletService(db)
+
+    r1 = await ee.set_template_reward_pool(db, tmpl["_id"], points=500, actor="a")
+    r2 = await ee.set_template_reward_pool(db, tmpl["_id"], points=500, actor="a")
+    assert r2["balance"] == 500
+    assert r2["reward_pool_id"] == r1["reward_pool_id"]  # same pool, not a second one
+
+    r3 = await ee.set_template_reward_pool(db, tmpl["_id"], points=800, actor="a")
+    assert r3["balance"] == 800
+
+    r4 = await ee.set_template_reward_pool(db, tmpl["_id"], points=300, actor="a")
+    assert r4["balance"] == 800  # never debits
+    assert r4["prize_policy"]["reward_pool_points"] == 300  # but the configured target updates
+
+    # Only two funding ledger entries exist (500, then +300 top-up)
+    ledger = await pp.get_pool_ledger(db, wallet_service, r1["reward_pool_id"])
+    fund_entries = [e for e in ledger if e.get("source") == "prize_pool_admin_fund"]
+    assert len(fund_entries) == 2
+
+
+@pytest.mark.asyncio
+async def test_set_template_reward_pool_rejects_bad_input_and_archived():
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db)
+    with pytest.raises(ee.EventEngineError) as exc:
+        await ee.set_template_reward_pool(db, tmpl["_id"], points=-5, actor="a")
+    assert exc.value.code == "invalid_points"
+    with pytest.raises(ee.EventEngineError) as exc:
+        await ee.set_template_reward_pool(db, tmpl["_id"], points=100, num_winners=9, actor="a")
+    assert exc.value.code == "invalid_num_winners"
+
+    await ee.archive_template(db, tmpl["_id"], updated_by="a")
+    with pytest.raises(ee.EventEngineError) as exc:
+        await ee.set_template_reward_pool(db, tmpl["_id"], points=100, actor="a")
+    assert exc.value.code == "template_archived"
+
+
+@pytest.mark.asyncio
+async def test_new_session_from_reward_pool_template_auto_links_and_runtime_shows_pool():
+    """The complete promised flow: admin saves Reward Pool 500 on the
+    template -> teacher opens a session from it -> the Speaking Lab
+    runtime pool endpoint immediately reports 500 with zero extra steps."""
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db)
+    await ee.set_template_reward_pool(db, tmpl["_id"], points=500, num_winners=3, split=[50, 30, 20], actor="a")
+
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="teacher@test")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "scheduled", actor="t")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "registration_open", actor="t")
+
+    reloaded_tmpl = await ee.get_template(db, tmpl["_id"])
+    sess = await db.speaking_lab_sessions.find_one({"session_id": event["linked_session_id"]})
+    assert sess["prize_pool_id"] == reloaded_tmpl["reward_pool_id"]  # auto-linked, no admin action
+
+    # Speaking Lab runtime pool total = the configured Reward Pool
+    total = await ld._resolve_pool_total(db, event["linked_session_id"], 0)
+    assert total == 500
+
+    dashboard = await ee.get_runtime_dashboard(db, db.speaking_lab_sessions, db.speaking_lab_entries)
+    assert dashboard["active"][0]["prize_pool_balance"] == 500
+
+
+@pytest.mark.asyncio
+async def test_template_without_reward_pool_keeps_entry_fee_model():
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db, entry_fee=10)
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="t")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "scheduled", actor="t")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "registration_open", actor="t")
+    sess = await db.speaking_lab_sessions.find_one({"session_id": event["linked_session_id"]})
+    assert sess.get("prize_pool_id") is None
+    assert await ld._resolve_pool_total(db, event["linked_session_id"], 30) == 30
+
+
+@pytest.mark.asyncio
+async def test_get_template_reward_pool_returns_policy_and_live_balance():
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db)
+    before = await ee.get_template_reward_pool(db, tmpl["_id"])
+    assert before == {"prize_policy": {}, "balance": None}
+
+    await ee.set_template_reward_pool(db, tmpl["_id"], points=500, num_winners=2, split=[60, 40], actor="a")
+    after = await ee.get_template_reward_pool(db, tmpl["_id"])
+    assert after["balance"] == 500
+    assert after["prize_policy"]["num_winners"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dashboard_lucky_code_and_winner_counts():
+    import event_engine as ee
+    db = _FakeDB()
+    tmpl = await _published_template(db)
+    event = await ee.create_event(db, template_id=tmpl["_id"], created_by="t")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "scheduled", actor="t")
+    event = await ee.transition_event(db, db.speaking_lab_sessions, event["_id"], "registration_open", actor="t")
+    sid = event["linked_session_id"]
+    for i in range(4):
+        await db.speaking_lab_lucky_codes.insert_one({
+            "session_id": sid, "student_id": f"stu{i}", "code": f"C{i}", "entry_fee": 0,
+        })
+    await db.speaking_lab_lucky_draws.insert_one({
+        "draw_id": "draw-1", "session_id": sid, "finalized": True,
+        "results": [{"student_id": "stu0"}, {"student_id": "stu1"}],
+    })
+    dashboard = await ee.get_runtime_dashboard(db, db.speaking_lab_sessions, db.speaking_lab_entries)
+    active = dashboard["active"][0]
+    assert active["lucky_code_count"] == 4
+    assert active["winner_count"] == 2
