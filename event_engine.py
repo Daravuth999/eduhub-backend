@@ -22,7 +22,7 @@ _perform_join and the draw state machine as the engine's internals"):
     stream, lucky draw) keeps working unchanged against events created
     this way.
 
-DRAW / PRIZEPOOL WRAPPING (originally deferred, now wired) —
+DRAW WRAPPING (originally deferred, now wired) —
 lucky_draw.py's ``_run_draw``/``_finalize_draw`` turned out to already
 be module-level functions (not trapped in ``register_lucky_draw_routes``'s
 closure, contrary to this file's original assessment), so no
@@ -36,6 +36,29 @@ bookkeeping as before, and the legacy per-session admin routes
 (retry-failed, reconcile-historical) remain the only way to reach those
 recovery paths — this wrapping only covers the normal prepare/finalize
 happy path.
+
+PRIZE POOL WIRING — every event created here (any event_type) gets a
+companion Prize Pool via prize_pool.py's ``create_pool`` (owner_type=
+"event", owner_ref=event id, ``event["prize_pool_id"]``). This does NOT
+change how Speaking Lab actually pays winners today — that remains
+lucky_draw.py's own GAS treasury transfer, wired above. The companion
+pool exists so a FUTURE event_type with no legacy payout mechanism of
+its own can contribute/distribute through it (the same "one pool,
+multiple consumers" primitive Weekly Rewards/Tournament/etc. will use)
+without another Event Engine schema change. When an event reaches
+"settled" its pool is locked then settled too (bookkeeping only, best-
+effort — see ``_close_event_prize_pool``); a pool nobody ever
+contributed to simply settles at a zero balance.
+
+AUTOMATIC WINNER SHOWCASE — when ``_finalize_lucky_draw`` succeeds (the
+moment winners/amounts/payout status become authoritatively known,
+inside the "settling" transition), ``_publish_winner_showcase`` auto-
+publishes an experienceType="winner_showcase" experience_configs doc
+(key=event id) via experience_config_tools.auto_publish_experience_config
+— champion, top winners, payout status, all read straight from
+lucky_draw's own finalize response, never guessed or duplicated. A
+showcase-publish failure is logged and swallowed; it must never block
+or roll back a settlement that has already moved real money.
 
 DATA MODEL
 ──────────
@@ -57,8 +80,10 @@ from __future__ import annotations
 import copy
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+import prize_pool as pp
 
 logger = logging.getLogger("eduhub.event_engine")
 
@@ -281,8 +306,25 @@ async def create_event(
 
     now = _now_iso()
     config_snapshot = {k: copy.deepcopy(tmpl.get(k)) for k in _TEMPLATE_CONTENT_FIELDS}
+    event_id = _new_id("evt")
+
+    # Every event gets a companion Prize Pool — see this module's own
+    # docstring ("PRIZE POOL WIRING"). Best-effort: a pool-creation hiccup
+    # must never block event creation itself (event creation has no money
+    # movement of its own; the pool is a forward-looking capability, not a
+    # dependency of THIS event_type's actual payout path).
+    prize_pool_id = None
+    try:
+        pool = await pp.create_pool(
+            db, name=f"{tmpl['name']} — Prize Pool",
+            owner_type="event", owner_ref=event_id, created_by=created_by,
+        )
+        prize_pool_id = pool["_id"]
+    except pp.PrizePoolError:
+        logger.warning("event_engine: companion prize pool creation failed for event=%s", event_id)
+
     doc = {
-        "_id": _new_id("evt"),
+        "_id": event_id,
         "event_type": tmpl["event_type"],
         "template_id": template_id,
         "template_version": tmpl.get("version"),
@@ -292,6 +334,7 @@ async def create_event(
         "linked_session_id": None,
         "schedule": schedule_norm,
         "entry_fee": resolved_entry_fee,
+        "prize_pool_id": prize_pool_id,
         "created_by": created_by,
         "created_at": now,
         "updated_at": now,
@@ -418,16 +461,24 @@ async def _prepare_lucky_draw(db, session_id: str, event: dict, actor: str, ctx:
         ) from exc
 
 
-async def _finalize_lucky_draw(db, session_id: str, ctx: dict) -> None:
+async def _finalize_lucky_draw(db, session_id: str, ctx: dict, *, actor: str = "") -> dict:
     """Advancing to "settling" now actually FINALIZES the prepared draw
     (GAS transfer + winner pushes) by calling lucky_draw.py's module-
     level ``_finalize_draw`` — unchanged, and already safe to call more
-    than once (its own atomic finalize claim + per-winner claims)."""
+    than once (its own atomic finalize claim + per-winner claims). The
+    returned dict (winners/amounts/payout_status) is what
+    ``_publish_winner_showcase`` reads — real settlement data, not
+    re-derived or guessed.
+
+    Also records the payout in the session's linked Prize Pool (funding-
+    source migration, additive/best-effort — see lucky_draw.py's own
+    ``_record_pool_distribution``, which this reuses rather than
+    duplicating)."""
     from fastapi import HTTPException
-    from lucky_draw import _finalize_draw
+    from lucky_draw import _finalize_draw, _record_pool_distribution
 
     try:
-        await _finalize_draw(
+        result = await _finalize_draw(
             db, ctx.get("sl_publish"), session_id,
             ctx.get("gas_url", ""), ctx.get("treasury_id", ""),
             ctx.get("treasury_password", ""), bool(ctx.get("mock_gas", False)),
@@ -437,6 +488,85 @@ async def _finalize_lucky_draw(db, session_id: str, ctx: dict) -> None:
         raise EventEngineError(
             "lucky_draw_finalize_failed", str(exc.detail), http_status=exc.status_code,
         ) from exc
+    await _record_pool_distribution(db, session_id, result.get("winners") or [], actor=actor)
+    return result
+
+
+async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, actor: str) -> None:
+    """Auto-publish a Winner Showcase right after a lucky draw finalizes —
+    architecture continuation's "no manual dashboard editing" requirement.
+    Champion/top winners/payout status all come straight from
+    lucky_draw.py's own finalize response (the SAME data the teacher
+    console already shows); nothing here is guessed or duplicated.
+
+    Best-effort: a showcase-publish failure is logged and swallowed. The
+    money has already moved by the time this runs — a display-layer
+    hiccup must never roll back or block a real settlement."""
+    winners = list(finalize_result.get("winners") or [])
+    if not winners:
+        return  # nothing to showcase (e.g. zero entries in the draw)
+    try:
+        from experience_config_tools import auto_publish_experience_config
+
+        tmpl = await get_template(db, event.get("template_id"))
+        event_name = (tmpl or {}).get("name") or "Event"
+        payout_status = finalize_result.get("payout_status") or ""
+        distribution_completed = (
+            payout_status in ("paid", "completed")
+            or all(w.get("transfer_ok") for w in winners)
+        )
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(hours=48)).isoformat()
+        content = {
+            "eventId": event["_id"],
+            "eventName": event_name,
+            "champion": winners[0],
+            "topWinners": winners[:5],
+            "rewardGranted": True,
+            "distributionCompleted": distribution_completed,
+            "payoutStatus": payout_status,
+            "celebrationBanner": True,
+            "settledAt": finalize_result.get("finalized_at") or now.isoformat(),
+            "expiresAt": expires_at,
+        }
+        await auto_publish_experience_config(
+            db, experience_type="winner_showcase", key=event["_id"],
+            content=content, created_by=f"event_engine:{actor}",
+            # Reuse the platform's OWN active-window expiry mechanism
+            # (_is_active_now) rather than making every reader re-derive
+            # "is this showcase still current" from content.expiresAt.
+            active_window={"startsAt": None, "endsAt": expires_at, "recurringAnnual": False},
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "event_engine: winner showcase auto-publish failed for event=%s", event["_id"],
+        )
+
+
+async def _close_event_prize_pool(db, event: dict, *, actor: str) -> None:
+    """When an event settles, its companion Prize Pool (if any) is locked
+    then settled too — bookkeeping only, no money movement (see
+    prize_pool.py's own settle_pool docstring). A pool nobody ever
+    contributed to (true for every Speaking Lab event today — that
+    event_type's real payout stays on the GAS/Lucky Draw path) simply
+    settles at a zero balance. Best-effort: never blocks the event's own
+    "settled" transition, which is what actually matters to the operator."""
+    pool_id = event.get("prize_pool_id")
+    if not pool_id:
+        return
+    try:
+        pool = await pp.get_pool(db, pool_id)
+        if not pool:
+            return
+        if pool["status"] == "open":
+            await pp.lock_pool(db, pool_id, actor=actor)
+            pool = await pp.get_pool(db, pool_id)
+        if pool["status"] == "locked":
+            await pp.settle_pool(db, pool_id, actor=actor)
+    except pp.PrizePoolError:
+        logger.warning(
+            "event_engine: could not close prize pool %s for event %s", pool_id, event["_id"],
+        )
 
 
 async def transition_event(
@@ -496,6 +626,13 @@ async def transition_event(
                 "created_at": now,
                 "auto_enroll": False,
                 "event_id": event_id,  # back-reference, additive column
+                # Funding-source migration: auto-link this session to the
+                # event's own companion Prize Pool (created in create_event)
+                # so lucky_draw.py's _resolve_pool_total uses it instead of
+                # summing entry fees — zero extra admin action required for
+                # events created through the Event Engine. None for events
+                # whose companion pool creation failed (best-effort there).
+                "prize_pool_id": event.get("prize_pool_id"),
             })
         elif linked_session_id is not None:
             new_status = _SESSION_STATUS_FOR_EVENT_STATE.get(to_state)
@@ -509,7 +646,8 @@ async def transition_event(
                 if to_state == "drawing":
                     await _prepare_lucky_draw(db, linked_session_id, event, actor, lucky_draw_ctx)
                 elif to_state == "settling":
-                    await _finalize_lucky_draw(db, linked_session_id, lucky_draw_ctx)
+                    finalize_result = await _finalize_lucky_draw(db, linked_session_id, lucky_draw_ctx, actor=actor)
+                    await _publish_winner_showcase(db, event, finalize_result, actor=actor)
 
     history_entry = {"state": to_state, "at": now, "by": actor}
     await db[EVENTS_COLL].update_one(
@@ -520,6 +658,8 @@ async def transition_event(
             "$push": {"state_history": history_entry},
         },
     )
+    if to_state == "settled":
+        await _close_event_prize_pool(db, event, actor=actor)
     return await get_event(db, event_id)
 
 

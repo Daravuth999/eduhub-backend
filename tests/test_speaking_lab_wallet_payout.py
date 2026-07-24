@@ -749,10 +749,13 @@ def _hash_function_source(path, func_name):
     raise AssertionError(f"function {func_name} not found in {path}")
 
 
+# _run_draw baseline updated (funding-source migration): only the pool_total
+# computation changed (may now read a linked Prize Pool's live balance) —
+# see lucky_draw.py's module docstring.
 _PROTECTED_BASELINES = {
     "_weighted_pick": "871c5ad4d2cc3d721ed309e8dc2930e55053fdd9ac53d5a2a3fb815d6ccd461a",
     "_normalize_split": "077c2583249d28118a489a47ad00fa669f14375e8db6b7a153837bff6fa9a359",
-    "_run_draw": "65ecec65bcd07a0fad9023e8b3b91f73a801c6ec551e93d63b989ef164825aac",
+    "_run_draw": "e3d47271833cc42038d40fee312000afc6ecf43b04c6c53d6de23f0a185068ca",
 }
 
 
