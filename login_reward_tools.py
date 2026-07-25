@@ -281,6 +281,14 @@ class _LRCCampaignIn(BaseModel):
     push_body: str | None = ""
     push_target: Literal["eligible_unclaimed", "all_subscribers"] = "eligible_unclaimed"
 
+    # ── Reward Experience Engine v1 (additive, optional, presentational) ──
+    # Free-form dict describing the immersive popup experience (environment,
+    # glass, lighting, particles, decorations…). Sanitised by
+    # _lrc_sanitize_experience() before persisting. It NEVER influences
+    # eligibility, crediting, voucher issuance, push or any server-side rule.
+    # Campaigns without it (or with None) render the legacy popup unchanged.
+    experience: dict | None = None
+
 
 class _LRCPushSendNowIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -440,6 +448,150 @@ def _lrc_validate_voucher_fields(p: "_LRCCampaignIn") -> dict:
         "voucher_cta_label": cta,
         "voucher_source": source,
         "voucher_existing_code": existing_code,
+    }
+
+
+# ── Reward Experience Engine v1 — sanitiser (presentational config only) ───
+_RXP_ENVIRONMENTS = (
+    "classic", "morning_angkor", "lotus_garden", "royal_heritage",
+    "vip_luxury", "academic_hall", "festival_celebration", "modern_studio",
+)
+_RXP_GLASS = ("auto", "warm", "frost", "midnight", "solid")
+_RXP_LIGHTING = ("auto", "soft", "golden", "aurora", "spotlight", "morning", "sunset", "studio", "cool", "none")
+_RXP_REVEAL = ("cinematic", "float", "bloom", "fade", "scale", "slide", "classic")
+_RXP_PARTICLES = ("auto", "dust", "fireflies", "petals", "sparkles", "confetti", "mist", "rays", "none")
+_RXP_INTENSITIES = ("subtle", "premium", "celebration")
+_RXP_SIZES = ("compact", "standard", "grand")
+_RXP_DECOR_ANIMS = ("none", "float", "pulse", "spin", "drift", "sway")
+_RXP_LIGHT_DIRECTIONS = ("top", "left", "right", "bottom", "center")
+_RXP_CTA_STYLES = ("solid", "gradient", "glass", "outline")
+_RXP_CTA_ANIMS = ("none", "pulse", "shimmer")
+_RXP_GLASS_BORDERS = ("auto", "none", "soft", "gold", "glow")
+_RXP_FONTS = ("default", "serif", "display", "rounded", "mono")
+
+_RXP_HEX_RE = _lrc_re.compile(r"^#[0-9a-fA-F]{3,8}$")
+_RXP_ASSET_RE = _lrc_re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def _rxp_enum(v, allowed, default):
+    return v if isinstance(v, str) and v in allowed else default
+
+
+def _rxp_num(v, lo, hi, default):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if f != f:  # NaN
+        return default
+    return max(lo, min(hi, f))
+
+
+def _rxp_sanitize_decoration(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = "custom" if raw.get("kind") == "custom" else "builtin"
+    dec = {
+        "id": str(raw.get("id") or "")[:64] or None,
+        "kind": kind,
+        "asset": "",
+        "url": "",
+        "x": _rxp_num(raw.get("x"), 0, 100, 50),
+        "y": _rxp_num(raw.get("y"), 0, 100, 50),
+        "size": int(_rxp_num(raw.get("size"), 16, 400, 72)),
+        "rotation": _rxp_num(raw.get("rotation"), -180, 180, 0),
+        "opacity": _rxp_num(raw.get("opacity"), 0, 1, 1),
+        "glow": _rxp_num(raw.get("glow"), 0, 1, 0),
+        "blur": _rxp_num(raw.get("blur"), 0, 12, 0),
+        "flip": bool(raw.get("flip")),
+        "locked": bool(raw.get("locked")),
+        "visible": raw.get("visible") is not False,
+        "name": str(raw.get("name") or "")[:60],
+        "group": str(raw.get("group") or "")[:40],
+        "shadow": _rxp_num(raw.get("shadow"), 0, 1, 0),
+        "anim": _rxp_enum(raw.get("anim"), _RXP_DECOR_ANIMS, "none"),
+        "anim_speed": _rxp_num(raw.get("anim_speed"), 0.25, 4, 1),
+        "layer": "front" if raw.get("layer") == "front" else "back",
+    }
+    if not dec["id"]:
+        dec["id"] = f"dec_{_lrc_secrets.token_hex(5)}"
+    if kind == "builtin":
+        asset = str(raw.get("asset") or "")
+        if not _RXP_ASSET_RE.match(asset):
+            return None
+        dec["asset"] = asset
+    else:
+        url = _lrc_safe_artwork_url(raw.get("url"))
+        if not url:
+            return None
+        dec["url"] = url
+    return dec
+
+
+def _lrc_sanitize_experience(raw) -> dict | None:
+    """Bounded, whitelisted copy of the admin-supplied experience config.
+    Purely presentational — the claim pipeline never reads it."""
+    if not isinstance(raw, dict):
+        return None
+    decorations = []
+    for item in (raw.get("decorations") or [])[:40]:
+        dec = _rxp_sanitize_decoration(item)
+        if dec:
+            decorations.append(dec)
+    ambient = raw.get("ambient_color")
+    gc = raw.get("glass_config") if isinstance(raw.get("glass_config"), dict) else {}
+    lc = raw.get("lighting_config") if isinstance(raw.get("lighting_config"), dict) else {}
+    ty = raw.get("typography") if isinstance(raw.get("typography"), dict) else {}
+    cta = raw.get("cta") if isinstance(raw.get("cta"), dict) else {}
+    lc_color = lc.get("color")
+    ty_color = ty.get("title_color")
+    return {
+        "version": 2,
+        "environment": _rxp_enum(raw.get("environment"), _RXP_ENVIRONMENTS, "classic"),
+        "glass": _rxp_enum(raw.get("glass"), _RXP_GLASS, "auto"),
+        "lighting": _rxp_enum(raw.get("lighting"), _RXP_LIGHTING, "auto"),
+        "reveal": _rxp_enum(raw.get("reveal"), _RXP_REVEAL, "cinematic"),
+        "particles": _rxp_enum(raw.get("particles"), _RXP_PARTICLES, "auto"),
+        "particle_intensity": _rxp_enum(raw.get("particle_intensity"), _RXP_INTENSITIES, "premium"),
+        "backdrop_blur": int(_rxp_num(raw.get("backdrop_blur"), 0, 24, 10)),
+        "env_intensity": _rxp_num(raw.get("env_intensity"), 0, 1, 1),
+        "ambient_color": ambient if isinstance(ambient, str) and _RXP_HEX_RE.match(ambient) else "",
+        "popup_size": _rxp_enum(raw.get("popup_size"), _RXP_SIZES, "standard"),
+        # V2 — glass system (all bounded; -1 means "use preset default")
+        "glass_config": {
+            "frost": _rxp_num(gc.get("frost"), -1, 40, -1),
+            "opacity": _rxp_num(gc.get("opacity"), -1, 1, -1),
+            "radius": _rxp_num(gc.get("radius"), -1, 48, -1),
+            "border": _rxp_enum(gc.get("border"), _RXP_GLASS_BORDERS, "auto"),
+            "reflection": gc.get("reflection") is not False,
+            "depth": _rxp_num(gc.get("depth"), 0, 1, 0.6),
+        },
+        # V2 — lighting engine
+        "lighting_config": {
+            "intensity": _rxp_num(lc.get("intensity"), 0, 1, 0.6),
+            "direction": _rxp_enum(lc.get("direction"), _RXP_LIGHT_DIRECTIONS, "top"),
+            "color": lc_color if isinstance(lc_color, str) and _RXP_HEX_RE.match(lc_color) else "",
+            "blur": _rxp_num(lc.get("blur"), 0, 40, 20),
+            "opacity": _rxp_num(lc.get("opacity"), 0, 1, 0.7),
+        },
+        # V2 — typography (presentational styling of the existing texts)
+        "typography": {
+            "title_font": _rxp_enum(ty.get("title_font"), _RXP_FONTS, "default"),
+            "title_weight": int(_rxp_num(ty.get("title_weight"), 400, 900, 900)),
+            "title_spacing": _rxp_num(ty.get("title_spacing"), -2, 8, 0),
+            "title_color": ty_color if isinstance(ty_color, str) and _RXP_HEX_RE.match(ty_color) else "",
+            "title_shadow": _rxp_num(ty.get("title_shadow"), 0, 1, 0),
+            "align": _rxp_enum(ty.get("align"), ("center", "left"), "center"),
+        },
+        # V2 — CTA design system (text itself stays the campaign's cta_text)
+        "cta": {
+            "style": _rxp_enum(cta.get("style"), _RXP_CTA_STYLES, "solid"),
+            "radius": int(_rxp_num(cta.get("radius"), 0, 40, 40)),
+            "glow": _rxp_num(cta.get("glow"), 0, 1, 0.4),
+            "shadow": _rxp_num(cta.get("shadow"), 0, 1, 0.5),
+            "animation": _rxp_enum(cta.get("animation"), _RXP_CTA_ANIMS, "shimmer"),
+        },
+        "decorations": decorations,
     }
 
 
@@ -610,6 +762,8 @@ def _lrc_validate_payload(p: _LRCCampaignIn) -> dict:
         "push_title": push_title,
         "push_body": push_body,
         "push_target": push_target,
+        # Reward Experience Engine v1 (additive, presentational only).
+        "experience": _lrc_sanitize_experience(p.experience),
     }
 
 
