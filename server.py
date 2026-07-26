@@ -46,6 +46,7 @@ from auth_session_ttl import (
 )
 from auth_lifecycle import derive_student_status
 from auth_roles import derive_user_role
+from password_reset_requests import register_password_reset_routes
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -6017,6 +6018,16 @@ register_eligibility_routes(
     _sl_direct_join_hooks.get("perform_free_ticket_issuance"),
     _norm_student_id,
     require_admin_dep=require_admin,
+    log=log,
+)
+
+# Milestone 4 (Authentication Completion, Phase 1) — teacher-assisted
+# password reset queue. See password_reset_requests.py.
+register_password_reset_routes(
+    api,
+    db,
+    require_admin=require_admin,
+    verify_turnstile=_verify_turnstile,
     log=log,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
