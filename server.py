@@ -45,6 +45,7 @@ from auth_session_ttl import (
     cleanup_expired_sessions as cleanup_expired_auth_sessions,
 )
 from auth_lifecycle import derive_student_status
+from auth_roles import derive_user_role
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -384,6 +385,12 @@ class User(BaseModel):
     name: str
     picture: str | None = ""
     is_admin: bool = False
+    # Milestone 2 (role model foundation) — additive. is_admin remains the
+    # actual enforcement mechanism (require_admin() still checks it
+    # directly); role is a read-side projection derived via
+    # derive_user_role() at every construction site. "admin" is reserved
+    # for a future milestone — never produced by this one. See auth_roles.py.
+    role: Literal["teacher", "admin", "super_admin"] = "teacher"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -472,6 +479,7 @@ async def current_user(
             user["created_at"] = datetime.fromisoformat(ca)
         except Exception:  # noqa: BLE001
             user["created_at"] = datetime.now(timezone.utc)
+    user["role"] = derive_user_role(user)
     return User(**user)
 
 
@@ -604,6 +612,11 @@ async def auth_google(payload: dict, response: Response):
                 "name": data.get("name") or user_doc.get("name", ""),
                 "picture": data.get("picture") or user_doc.get("picture", ""),
                 "is_admin": is_admin,
+                # Milestone 2 (role model foundation) — preserves an
+                # explicit pre-existing role (e.g. a future "admin"
+                # assignment) across logins instead of resetting it every
+                # time; only falls back to is_admin when none is set yet.
+                "role": derive_user_role({"role": user_doc.get("role"), "is_admin": is_admin}),
                 "last_login": now.isoformat(),
             }},
         )
@@ -615,6 +628,8 @@ async def auth_google(payload: dict, response: Response):
             "name": data.get("name") or "",
             "picture": data.get("picture") or "",
             "is_admin": is_admin,
+            # Milestone 2 (role model foundation) — see auth_roles.py.
+            "role": derive_user_role({"is_admin": is_admin}),
             "created_at": now.isoformat(),
             "last_login": now.isoformat(),
         })
@@ -3387,6 +3402,11 @@ class Student(BaseModel):
     # derive_student_status() at every construction site, never relied on
     # by pydantic's own default here. See auth_lifecycle.py.
     status: Literal["active", "suspended", "archived"] = "active"
+    # Milestone 2 (role model foundation) — additive, constant. Students
+    # have exactly one role, so this needs no fallback helper: the default
+    # covers every legacy document with no read-site computation required.
+    # See auth_roles.py for the User-side equivalent (which does branch).
+    role: Literal["student"] = "student"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login: datetime | None = None
 
@@ -3727,6 +3747,8 @@ async def teacher_create_student(
                 # Milestone 1 (account lifecycle states) — new/updated
                 # documents carry an explicit status going forward.
                 "status": "active",
+                # Milestone 2 (role model foundation) — see auth_roles.py.
+                "role": "student",
                 "enrolled_at": now.isoformat(),
                 "last_login": None,
             }},
@@ -3747,6 +3769,8 @@ async def teacher_create_student(
             "is_active": True,
             # Milestone 1 (account lifecycle states) — see auth_lifecycle.py.
             "status": "active",
+            # Milestone 2 (role model foundation) — see auth_roles.py.
+            "role": "student",
             "created_at": now.isoformat(),
             "enrolled_at": now.isoformat(),
             "last_login": None,
@@ -3788,6 +3812,8 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
         # existing documents have no `status` field, this computes it from
         # `is_active` on every read. See auth_lifecycle.py.
         s["status"] = derive_student_status(s)
+        # Milestone 2 (role model foundation) — constant, no fallback needed.
+        s["role"] = "student"
 
     # If db.students is empty, fall back to GAS_PORTAL_URL?action=getStudents
     # This covers schools whose student roster lives entirely in Google Sheets.
@@ -3837,6 +3863,7 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                                 "source": "gas",
                             }
                             gas_row["status"] = derive_student_status(gas_row)
+                            gas_row["role"] = "student"
                             students.append(gas_row)
                         if students:
                             log.info("teacher_list_students: loaded %d students from GAS fallback", len(students))
