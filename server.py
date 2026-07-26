@@ -47,6 +47,7 @@ from auth_session_ttl import (
 from auth_lifecycle import derive_student_status
 from auth_roles import derive_user_role
 from password_reset_requests import register_password_reset_routes
+from student_avatar import register_student_avatar_routes
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -3410,6 +3411,10 @@ class Student(BaseModel):
     role: Literal["student"] = "student"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login: datetime | None = None
+    # Premium Student Profile & Settings milestone — additive. Set only via
+    # the new /auth/student/avatar upload route; empty string means no
+    # avatar has been uploaded (frontend falls back to initials).
+    avatar_url: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -3543,6 +3548,14 @@ async def student_me(student: Student = Depends(require_student)):
         "clean_id": student.clean_id,
         "display_name": student.display_name,
         "group": student.group,
+        # Premium Student Profile & Settings milestone — additive fields.
+        # All four already existed on the Student model (Milestones 1-2);
+        # this is the first time they're surfaced via an API response.
+        "status": student.status,
+        "role": student.role,
+        "created_at": student.created_at.isoformat(),
+        "last_login": student.last_login.isoformat() if student.last_login else None,
+        "avatar_url": student.avatar_url,
     }
 
 
@@ -6028,6 +6041,15 @@ register_password_reset_routes(
     db,
     require_admin=require_admin,
     verify_turnstile=_verify_turnstile,
+    log=log,
+)
+
+# Premium Student Profile & Settings milestone — avatar upload/delete.
+# See student_avatar.py.
+register_student_avatar_routes(
+    api,
+    db,
+    require_student=require_student,
     log=log,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
