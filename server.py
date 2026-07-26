@@ -40,6 +40,12 @@ from lucky_draw import (
     ensure_lucky_draw_indexes,
     recover_abandoned_draws,
 )
+from auth_session_ttl import (
+    ensure_ttl_index as ensure_auth_session_ttl_index,
+    cleanup_expired_sessions as cleanup_expired_auth_sessions,
+)
+from auth_lifecycle import derive_student_status
+from auth_roles import derive_user_role
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -379,6 +385,12 @@ class User(BaseModel):
     name: str
     picture: str | None = ""
     is_admin: bool = False
+    # Milestone 2 (role model foundation) — additive. is_admin remains the
+    # actual enforcement mechanism (require_admin() still checks it
+    # directly); role is a read-side projection derived via
+    # derive_user_role() at every construction site. "admin" is reserved
+    # for a future milestone — never produced by this one. See auth_roles.py.
+    role: Literal["teacher", "admin", "super_admin"] = "teacher"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -467,6 +479,7 @@ async def current_user(
             user["created_at"] = datetime.fromisoformat(ca)
         except Exception:  # noqa: BLE001
             user["created_at"] = datetime.now(timezone.utc)
+    user["role"] = derive_user_role(user)
     return User(**user)
 
 
@@ -599,6 +612,11 @@ async def auth_google(payload: dict, response: Response):
                 "name": data.get("name") or user_doc.get("name", ""),
                 "picture": data.get("picture") or user_doc.get("picture", ""),
                 "is_admin": is_admin,
+                # Milestone 2 (role model foundation) — preserves an
+                # explicit pre-existing role (e.g. a future "admin"
+                # assignment) across logins instead of resetting it every
+                # time; only falls back to is_admin when none is set yet.
+                "role": derive_user_role({"role": user_doc.get("role"), "is_admin": is_admin}),
                 "last_login": now.isoformat(),
             }},
         )
@@ -610,6 +628,8 @@ async def auth_google(payload: dict, response: Response):
             "name": data.get("name") or "",
             "picture": data.get("picture") or "",
             "is_admin": is_admin,
+            # Milestone 2 (role model foundation) — see auth_roles.py.
+            "role": derive_user_role({"is_admin": is_admin}),
             "created_at": now.isoformat(),
             "last_login": now.isoformat(),
         })
@@ -618,7 +638,9 @@ async def auth_google(payload: dict, response: Response):
     await db.user_sessions.insert_one({
         "user_id": user_id,
         "session_token": session_token,
-        "expires_at": (now + timedelta(days=7)).isoformat(),
+        # Milestone 0 (auth TTL migration) — native BSON Date, not an ISO
+        # string; current_user() already tolerates either type on read.
+        "expires_at": now + timedelta(days=7),
         "created_at": now.isoformat(),
     })
 
@@ -3374,6 +3396,17 @@ class Student(BaseModel):
     display_name: str
     group: str = ""
     is_active: bool = True
+    # Milestone 1 (account lifecycle states) — additive. is_active remains
+    # the actual enforcement mechanism (current_student() still checks it
+    # directly); status is a read-side projection derived via
+    # derive_student_status() at every construction site, never relied on
+    # by pydantic's own default here. See auth_lifecycle.py.
+    status: Literal["active", "suspended", "archived"] = "active"
+    # Milestone 2 (role model foundation) — additive, constant. Students
+    # have exactly one role, so this needs no fallback helper: the default
+    # covers every legacy document with no read-site computation required.
+    # See auth_roles.py for the User-side equivalent (which does branch).
+    role: Literal["student"] = "student"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login: datetime | None = None
 
@@ -3406,6 +3439,7 @@ async def current_student(
     )
     if not doc or doc.get("is_active") is False:
         return None
+    doc["status"] = derive_student_status(doc)
     return Student(**doc)
 
 
@@ -3472,7 +3506,11 @@ async def student_login(payload: dict, response: Response):
     await db.student_sessions.insert_one({
         "student_id": doc["student_id"],
         "session_token": session_token,
-        "expires_at": (now + timedelta(days=30)).isoformat(),
+        # Milestone 0 (auth TTL migration) — stored as a native BSON Date,
+        # not an ISO string. MongoDB's TTL monitor only evaluates Date-typed
+        # values; current_student() already tolerates either type on read,
+        # so this is a write-only change with no read-side impact.
+        "expires_at": now + timedelta(days=30),
         "created_at": now.isoformat(),
     })
     await db.students.update_one(
@@ -3706,6 +3744,11 @@ async def teacher_create_student(
                 "group": group,
                 "password_hash": password_hash,
                 "is_active": True,
+                # Milestone 1 (account lifecycle states) — new/updated
+                # documents carry an explicit status going forward.
+                "status": "active",
+                # Milestone 2 (role model foundation) — see auth_roles.py.
+                "role": "student",
                 "enrolled_at": now.isoformat(),
                 "last_login": None,
             }},
@@ -3724,6 +3767,10 @@ async def teacher_create_student(
             "group": group,
             "password_hash": password_hash,
             "is_active": True,
+            # Milestone 1 (account lifecycle states) — see auth_lifecycle.py.
+            "status": "active",
+            # Milestone 2 (role model foundation) — see auth_roles.py.
+            "role": "student",
             "created_at": now.isoformat(),
             "enrolled_at": now.isoformat(),
             "last_login": None,
@@ -3761,6 +3808,12 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
     for s in students:
         if "enrolled_at" not in s:
             s["enrolled_at"] = s.get("created_at", "")
+        # Milestone 1 (account lifecycle states) — additive projection;
+        # existing documents have no `status` field, this computes it from
+        # `is_active` on every read. See auth_lifecycle.py.
+        s["status"] = derive_student_status(s)
+        # Milestone 2 (role model foundation) — constant, no fallback needed.
+        s["role"] = "student"
 
     # If db.students is empty, fall back to GAS_PORTAL_URL?action=getStudents
     # This covers schools whose student roster lives entirely in Google Sheets.
@@ -3800,7 +3853,7 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                             ).strip()
                             if not sid:
                                 continue
-                            students.append({
+                            gas_row = {
                                 "student_id": sid,
                                 "clean_id": sid,
                                 "display_name": name,
@@ -3808,7 +3861,10 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                                 "level": level,
                                 "is_active": True,
                                 "source": "gas",
-                            })
+                            }
+                            gas_row["status"] = derive_student_status(gas_row)
+                            gas_row["role"] = "student"
+                            students.append(gas_row)
                         if students:
                             log.info("teacher_list_students: loaded %d students from GAS fallback", len(students))
                     except Exception as parse_exc:
@@ -4125,7 +4181,10 @@ async def teacher_deactivate_student(
 
     result = await db.students.update_one(
         {"student_id": student_id},
-        {"$set": {"is_active": False}},
+        # Milestone 1 (account lifecycle states) — deactivate maps to
+        # "archived" (the only lifecycle transition this route performs;
+        # see auth_lifecycle.py and the approved lifecycle table).
+        {"$set": {"is_active": False, "status": "archived"}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Student not found")
@@ -4141,17 +4200,6 @@ async def teacher_deactivate_student(
 
 
 # --------------------------------------------------------------------------- #
-# Startup indexes   ADD these four lines inside the existing startup()        #
-# function body, immediately before the final log.info line.                  #
-# --------------------------------------------------------------------------- #
-#
-#     # Student Auth v10.0 indexes
-#     await db.students.create_index("clean_id", unique=True)
-#     await db.students.create_index("student_id", unique=True)
-#     await db.student_sessions.create_index("session_token", unique=True)
-#     await db.student_sessions.create_index("expires_at")
-#
-# -- End Student Auth + Management v10.0 ------------------------------------ #
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
 from restriction_realtime import build_router as _build_status_router
@@ -5988,7 +6036,7 @@ async def startup():
     await db.users.create_index("email", unique=True)
     await db.users.create_index("user_id", unique=True)
     await db.user_sessions.create_index("session_token", unique=True)
-    await db.user_sessions.create_index("expires_at")
+    await ensure_auth_session_ttl_index(db, "user_sessions")
     await push_subscriptions.create_index("endpoint", unique=True)
     await push_subscriptions.create_index("studentId")
     await push_subscriptions.create_index("group")
@@ -5999,7 +6047,12 @@ async def startup():
     await db.students.create_index("clean_id", unique=True)
     await db.students.create_index("student_id", unique=True)
     await db.student_sessions.create_index("session_token", unique=True)
-    await db.student_sessions.create_index("expires_at")
+    # Milestone 0 (auth TTL migration) — converts the plain expires_at index
+    # into a real TTL index and clears the pre-migration string-typed
+    # expired-session backlog. See auth_session_ttl.py for the full
+    # rationale; storage-hygiene only, no login/session-validation impact.
+    await ensure_auth_session_ttl_index(db, "student_sessions")
+    await cleanup_expired_auth_sessions(db)
         # Speaking Lab indexes
     await db.points_history.create_index([("student_id", 1), ("created_at", -1)])
     await db.speaking_lab_sessions.create_index("session_id", unique=True)
