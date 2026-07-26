@@ -40,6 +40,10 @@ from lucky_draw import (
     ensure_lucky_draw_indexes,
     recover_abandoned_draws,
 )
+from auth_session_ttl import (
+    ensure_ttl_index as ensure_auth_session_ttl_index,
+    cleanup_expired_sessions as cleanup_expired_auth_sessions,
+)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -618,7 +622,9 @@ async def auth_google(payload: dict, response: Response):
     await db.user_sessions.insert_one({
         "user_id": user_id,
         "session_token": session_token,
-        "expires_at": (now + timedelta(days=7)).isoformat(),
+        # Milestone 0 (auth TTL migration) — native BSON Date, not an ISO
+        # string; current_user() already tolerates either type on read.
+        "expires_at": now + timedelta(days=7),
         "created_at": now.isoformat(),
     })
 
@@ -3472,7 +3478,11 @@ async def student_login(payload: dict, response: Response):
     await db.student_sessions.insert_one({
         "student_id": doc["student_id"],
         "session_token": session_token,
-        "expires_at": (now + timedelta(days=30)).isoformat(),
+        # Milestone 0 (auth TTL migration) — stored as a native BSON Date,
+        # not an ISO string. MongoDB's TTL monitor only evaluates Date-typed
+        # values; current_student() already tolerates either type on read,
+        # so this is a write-only change with no read-side impact.
+        "expires_at": now + timedelta(days=30),
         "created_at": now.isoformat(),
     })
     await db.students.update_one(
@@ -4141,17 +4151,6 @@ async def teacher_deactivate_student(
 
 
 # --------------------------------------------------------------------------- #
-# Startup indexes   ADD these four lines inside the existing startup()        #
-# function body, immediately before the final log.info line.                  #
-# --------------------------------------------------------------------------- #
-#
-#     # Student Auth v10.0 indexes
-#     await db.students.create_index("clean_id", unique=True)
-#     await db.students.create_index("student_id", unique=True)
-#     await db.student_sessions.create_index("session_token", unique=True)
-#     await db.student_sessions.create_index("expires_at")
-#
-# -- End Student Auth + Management v10.0 ------------------------------------ #
 # Wire up                                                                     #
 # --------------------------------------------------------------------------- #
 from restriction_realtime import build_router as _build_status_router
@@ -5988,7 +5987,7 @@ async def startup():
     await db.users.create_index("email", unique=True)
     await db.users.create_index("user_id", unique=True)
     await db.user_sessions.create_index("session_token", unique=True)
-    await db.user_sessions.create_index("expires_at")
+    await ensure_auth_session_ttl_index(db, "user_sessions")
     await push_subscriptions.create_index("endpoint", unique=True)
     await push_subscriptions.create_index("studentId")
     await push_subscriptions.create_index("group")
@@ -5999,7 +5998,12 @@ async def startup():
     await db.students.create_index("clean_id", unique=True)
     await db.students.create_index("student_id", unique=True)
     await db.student_sessions.create_index("session_token", unique=True)
-    await db.student_sessions.create_index("expires_at")
+    # Milestone 0 (auth TTL migration) — converts the plain expires_at index
+    # into a real TTL index and clears the pre-migration string-typed
+    # expired-session backlog. See auth_session_ttl.py for the full
+    # rationale; storage-hygiene only, no login/session-validation impact.
+    await ensure_auth_session_ttl_index(db, "student_sessions")
+    await cleanup_expired_auth_sessions(db)
         # Speaking Lab indexes
     await db.points_history.create_index([("student_id", 1), ("created_at", -1)])
     await db.speaking_lab_sessions.create_index("session_id", unique=True)
