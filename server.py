@@ -46,6 +46,7 @@ from auth_session_ttl import (
 )
 from auth_lifecycle import derive_student_status
 from auth_roles import derive_user_role
+from password_reset_requests import register_password_reset_routes
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -3545,6 +3546,68 @@ async def student_me(student: Student = Depends(require_student)):
     }
 
 
+@api.post("/auth/student/change-password")
+async def student_change_password(
+    payload: dict,
+    student: Student = Depends(require_student),
+):
+    """Authenticated self-service password change (Milestone 3).
+
+    Requires proof of the CURRENT password before accepting a new one —
+    a valid session alone is not sufficient. Reuses the exact bcrypt
+    hashing path and GAS compatibility sync that teacher_reset_password
+    already uses, and mirrors that endpoint's session-invalidation
+    convention: all sessions are revoked on success, forcing a fresh
+    login with the new password everywhere (including this one).
+    """
+    current_password = payload.get("current_password") or ""
+    new_password = payload.get("new_password") or ""
+
+    if not current_password or not new_password:
+        raise HTTPException(
+            status_code=400, detail="current_password and new_password are required",
+        )
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=400, detail="New password must be at least 6 characters",
+        )
+
+    doc = await db.students.find_one(
+        {"student_id": student.student_id},
+        {"_id": 0, "password_hash": 1, "clean_id": 1},
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    stored_hash = (doc.get("password_hash") or "").strip()
+    _pw_ok = False
+    if stored_hash:
+        try:
+            _pw_ok = _bcrypt_lib.checkpw(
+                current_password.encode("utf-8"), stored_hash.encode("utf-8"),
+            )
+        except Exception:
+            _pw_ok = False
+    if not _pw_ok:
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    new_hash = _bcrypt_lib.hashpw(
+        new_password.encode("utf-8"), _bcrypt_lib.gensalt(rounds=12),
+    ).decode("utf-8")
+    await db.students.update_one(
+        {"student_id": student.student_id},
+        {"$set": {"password_hash": new_hash}},
+    )
+    await db.student_sessions.delete_many({"student_id": student.student_id})
+
+    log.info("student: self-service password change for %s", student.student_id)
+    # Fire-and-forget â€” never delay the response on a GAS outage.
+    import asyncio as _asyncio_change
+    _asyncio_change.create_task(_sync_password_to_gas(doc["clean_id"], new_password))
+
+    return {"ok": True}
+
+
 @api.post("/auth/student/logout")
 async def student_logout(
     response: Response,
@@ -5955,6 +6018,16 @@ register_eligibility_routes(
     _sl_direct_join_hooks.get("perform_free_ticket_issuance"),
     _norm_student_id,
     require_admin_dep=require_admin,
+    log=log,
+)
+
+# Milestone 4 (Authentication Completion, Phase 1) — teacher-assisted
+# password reset queue. See password_reset_requests.py.
+register_password_reset_routes(
+    api,
+    db,
+    require_admin=require_admin,
+    verify_turnstile=_verify_turnstile,
     log=log,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
