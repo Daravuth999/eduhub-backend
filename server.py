@@ -44,6 +44,7 @@ from auth_session_ttl import (
     ensure_ttl_index as ensure_auth_session_ttl_index,
     cleanup_expired_sessions as cleanup_expired_auth_sessions,
 )
+from auth_lifecycle import derive_student_status
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -3380,6 +3381,12 @@ class Student(BaseModel):
     display_name: str
     group: str = ""
     is_active: bool = True
+    # Milestone 1 (account lifecycle states) — additive. is_active remains
+    # the actual enforcement mechanism (current_student() still checks it
+    # directly); status is a read-side projection derived via
+    # derive_student_status() at every construction site, never relied on
+    # by pydantic's own default here. See auth_lifecycle.py.
+    status: Literal["active", "suspended", "archived"] = "active"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login: datetime | None = None
 
@@ -3412,6 +3419,7 @@ async def current_student(
     )
     if not doc or doc.get("is_active") is False:
         return None
+    doc["status"] = derive_student_status(doc)
     return Student(**doc)
 
 
@@ -3716,6 +3724,9 @@ async def teacher_create_student(
                 "group": group,
                 "password_hash": password_hash,
                 "is_active": True,
+                # Milestone 1 (account lifecycle states) — new/updated
+                # documents carry an explicit status going forward.
+                "status": "active",
                 "enrolled_at": now.isoformat(),
                 "last_login": None,
             }},
@@ -3734,6 +3745,8 @@ async def teacher_create_student(
             "group": group,
             "password_hash": password_hash,
             "is_active": True,
+            # Milestone 1 (account lifecycle states) — see auth_lifecycle.py.
+            "status": "active",
             "created_at": now.isoformat(),
             "enrolled_at": now.isoformat(),
             "last_login": None,
@@ -3771,6 +3784,10 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
     for s in students:
         if "enrolled_at" not in s:
             s["enrolled_at"] = s.get("created_at", "")
+        # Milestone 1 (account lifecycle states) — additive projection;
+        # existing documents have no `status` field, this computes it from
+        # `is_active` on every read. See auth_lifecycle.py.
+        s["status"] = derive_student_status(s)
 
     # If db.students is empty, fall back to GAS_PORTAL_URL?action=getStudents
     # This covers schools whose student roster lives entirely in Google Sheets.
@@ -3810,7 +3827,7 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                             ).strip()
                             if not sid:
                                 continue
-                            students.append({
+                            gas_row = {
                                 "student_id": sid,
                                 "clean_id": sid,
                                 "display_name": name,
@@ -3818,7 +3835,9 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
                                 "level": level,
                                 "is_active": True,
                                 "source": "gas",
-                            })
+                            }
+                            gas_row["status"] = derive_student_status(gas_row)
+                            students.append(gas_row)
                         if students:
                             log.info("teacher_list_students: loaded %d students from GAS fallback", len(students))
                     except Exception as parse_exc:
@@ -4135,7 +4154,10 @@ async def teacher_deactivate_student(
 
     result = await db.students.update_one(
         {"student_id": student_id},
-        {"$set": {"is_active": False}},
+        # Milestone 1 (account lifecycle states) — deactivate maps to
+        # "archived" (the only lifecycle transition this route performs;
+        # see auth_lifecycle.py and the approved lifecycle table).
+        {"$set": {"is_active": False, "status": "archived"}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Student not found")
