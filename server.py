@@ -7831,4 +7831,40 @@ except Exception as _attendance_err:  # noqa: BLE001
     )
 
 
+# ── Achievement Center (Trophy Tiers, Phase 1) — additive, non-fatal ─────────
+# Failure is non-fatal: if the module fails to load, only achievements are
+# disabled; every existing route keeps working unchanged.
+try:
+    from achievement_tools import (
+        register_achievement_routes as _register_achievement_routes,
+        ensure_achievement_indexes as _ensure_achievement_indexes,
+    )
+    _achievement_wallet = None
+    if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
+        try:
+            _achievement_wallet = wallet_service.WalletService(db)
+        except Exception as _achv_wallet_err:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "achievements: WalletService init failed (claims disabled): %s",
+                _achv_wallet_err,
+            )
+    _register_achievement_routes(
+        api, db, require_student, require_admin, wallet=_achievement_wallet,
+    )
+
+    @app.on_event("startup")
+    async def _achievement_startup_indexes() -> None:
+        try:
+            await _ensure_achievement_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "achievements: index/seed ensure failed at startup (non-fatal): %s", exc,
+            )
+except Exception as _achievement_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "achievement_tools route registration failed (feature disabled): %s",
+        _achievement_err,
+    )
+
+
 app.include_router(api)
