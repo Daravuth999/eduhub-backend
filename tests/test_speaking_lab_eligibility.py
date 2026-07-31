@@ -1189,3 +1189,267 @@ async def test_39_confirm_participants_re_run_after_partial_failure_completes_th
     good_ticket_2 = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
         {"session_id": "s1", "student_id": "stugood"})
     assert good_ticket_2["lucky_code"] == good_ticket_1["lucky_code"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# V4.3 — Recovery Mode: `playable`/`failed_count` on readiness, and the new
+# Retry Failed endpoint. This is the fix for the production issue where a
+# single failed ticket blocked the ENTIRE session: the game must become
+# playable for every successful student immediately, and the teacher must
+# be able to retry only the ones that failed — without restarting the whole
+# Confirm Participants flow, without re-touching anyone already ticketed.
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _flaky_persist_for(dj_mod, bad_ids: set[str]):
+    """Shared helper: returns (patched, restore) — patched persist_lucky_code
+    raises for every student_id in bad_ids, delegates to the real one
+    otherwise. Mirrors the exact simulated-failure pattern test_15/test_39
+    already use, reused rather than reinvented."""
+    orig_persist = dj_mod.persist_lucky_code
+
+    async def _flaky(db_, session_id, student_id, display_name, *, amount=0, session=None):
+        if student_id in bad_ids:
+            raise RuntimeError(f"simulated ticket-persistence failure for {student_id}")
+        return await orig_persist(db_, session_id, student_id, display_name,
+                                  amount=amount, session=session)
+    return _flaky, orig_persist
+
+
+@pytest.mark.asyncio
+async def test_40_readiness_playable_true_with_partial_success_ready_false():
+    """Root-cause regression guard: `ready` keeps its original strict
+    all-or-nothing meaning (nothing that already depends on it changes
+    behaviour), but `playable` — the new Start Session gate — must be True
+    the moment at least one participant has a ticket, even while `ready`
+    is still False."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
+    await _seed_student(db, "stugood", group="A")
+    await _seed_present(db, "stugood", status="present_full")
+    await _seed_student(db, "stubad", group="A")
+    await _seed_present(db, "stubad", status="present_full")
+    client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    flaky, orig = await _flaky_persist_for(dj_mod, {"stubad"})
+    dj_mod.persist_lucky_code = flaky
+    try:
+        client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        dj_mod.persist_lucky_code = orig
+
+    r = client.get("/api/speaking-lab/sessions/s1/readiness")
+    body = r.json()
+    assert body["eligible"] == 2
+    assert body["tickets"] == 1
+    assert body["ready"] is False
+    assert body["playable"] is True
+    assert body["failed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_41_readiness_not_playable_with_zero_tickets():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
+    await _seed_student(db, "stubad", group="A")
+    await _seed_present(db, "stubad", status="present_full")
+    client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    flaky, orig = await _flaky_persist_for(dj_mod, {"stubad"})
+    dj_mod.persist_lucky_code = flaky
+    try:
+        client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        dj_mod.persist_lucky_code = orig
+
+    r = client.get("/api/speaking-lab/sessions/s1/readiness")
+    body = r.json()
+    assert body["tickets"] == 0
+    assert body["ready"] is False
+    assert body["playable"] is False
+    assert body["failed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_42_retry_failed_recovers_only_the_missing_students():
+    """Desired behaviour from the spec: 40-student class, 2 fail -> retry
+    only recovers those 2, never re-touches the other 38, and readiness
+    becomes fully `ready` afterward."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
+    good_ids = [f"stugood{i}" for i in range(3)]
+    for sid in good_ids:
+        await _seed_student(db, sid, group="A")
+        await _seed_present(db, sid, status="present_full")
+    await _seed_student(db, "stubad1", group="A")
+    await _seed_present(db, "stubad1", status="present_full")
+    await _seed_student(db, "stubad2", group="A")
+    await _seed_present(db, "stubad2", status="present_full")
+    client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    flaky, orig = await _flaky_persist_for(dj_mod, {"stubad1", "stubad2"})
+    dj_mod.persist_lucky_code = flaky
+    try:
+        r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        dj_mod.persist_lucky_code = orig
+
+    assert r1.json()["joined"] == 3
+    assert len(r1.json()["failed"]) == 2
+
+    good_tickets_before = {}
+    for sid in good_ids:
+        row = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": "s1", "student_id": sid, "status": "committed"})
+        good_tickets_before[sid] = row["lucky_code"]
+
+    r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants/retry-failed")
+    body2 = r2.json()
+    assert body2["attempted"] == 2
+    assert body2["recovered"] == 2
+    assert body2["still_failed"] == []
+
+    # Nobody already-ticketed was re-touched (same code, still exactly one row).
+    for sid in good_ids:
+        rows = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+            {"session_id": "s1", "student_id": sid, "status": "committed"})
+        assert rows == 1
+        row = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": "s1", "student_id": sid, "status": "committed"})
+        assert row["lucky_code"] == good_tickets_before[sid]
+
+    for sid in ("stubad1", "stubad2"):
+        row = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+            {"session_id": "s1", "student_id": sid, "status": "committed"})
+        assert row is not None and row["lucky_code"]
+
+    r3 = client.get("/api/speaking-lab/sessions/s1/readiness")
+    body3 = r3.json()
+    assert body3["tickets"] == 5
+    assert body3["ready"] is True
+    assert body3["playable"] is True
+    assert body3["failed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_43_retry_failed_is_idempotent_when_called_repeatedly():
+    """Safe to execute multiple times, safe if the teacher retries
+    repeatedly: once nothing is missing, retry-failed is a pure no-op —
+    never re-issues, never errors."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
+    await _seed_student(db, "stubad", group="A")
+    await _seed_present(db, "stubad", status="present_full")
+    client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    flaky, orig = await _flaky_persist_for(dj_mod, {"stubad"})
+    dj_mod.persist_lucky_code = flaky
+    try:
+        client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        dj_mod.persist_lucky_code = orig
+
+    r1 = client.post("/api/speaking-lab/sessions/s1/confirm-participants/retry-failed")
+    assert r1.json()["recovered"] == 1
+    code_after_first_retry = (await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stubad", "status": "committed"}))["lucky_code"]
+
+    # Nothing left to retry now — must be a clean no-op, not an error and
+    # not a second ticket.
+    r2 = client.post("/api/speaking-lab/sessions/s1/confirm-participants/retry-failed")
+    body2 = r2.json()
+    assert body2["attempted"] == 0
+    assert body2["recovered"] == 0
+    assert body2["still_failed"] == []
+
+    rows = await db[dj.COLLECTION_DIRECT_JOINS].count_documents(
+        {"session_id": "s1", "student_id": "stubad", "status": "committed"})
+    assert rows == 1
+    final_code = (await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stubad", "status": "committed"}))["lucky_code"]
+    assert final_code == code_after_first_retry
+
+
+@pytest.mark.asyncio
+async def test_44_retry_failed_rejects_before_confirm_participants_has_run():
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
+    await _seed_student(db, "stu1", group="A")
+    await _seed_present(db, "stu1", status="present_full")
+    client = _build_v4_client(db)
+
+    r = client.post("/api/speaking-lab/sessions/s1/confirm-participants/retry-failed")
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "not_frozen"
+
+
+@pytest.mark.asyncio
+async def test_45_retry_failed_supports_retrying_a_single_named_student():
+    """'Retry Individual Student' — a body with `student_ids` retries only
+    that subset, leaving any OTHER still-failed student untouched."""
+    db = _build_db()
+    await _seed_session(db, sid="s1", schedule="A", status="waiting")
+    await _seed_student(db, "stubad1", group="A")
+    await _seed_present(db, "stubad1", status="present_full")
+    await _seed_student(db, "stubad2", group="A")
+    await _seed_present(db, "stubad2", status="present_full")
+    client = _build_v4_client(db)
+
+    import speaking_lab_direct_join as dj_mod
+    flaky, orig = await _flaky_persist_for(dj_mod, {"stubad1", "stubad2"})
+    dj_mod.persist_lucky_code = flaky
+    try:
+        client.post("/api/speaking-lab/sessions/s1/confirm-participants")
+    finally:
+        dj_mod.persist_lucky_code = orig
+
+    r = client.post(
+        "/api/speaking-lab/sessions/s1/confirm-participants/retry-failed",
+        json={"student_ids": ["stubad1"]},
+    )
+    body = r.json()
+    assert body["attempted"] == 1
+    assert body["recovered"] == 1
+
+    row1 = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stubad1", "status": "committed"})
+    assert row1 is not None
+    row2 = await db[dj.COLLECTION_DIRECT_JOINS].find_one(
+        {"session_id": "s1", "student_id": "stubad2", "status": "committed"})
+    assert row2 is None  # untouched — was not in the requested subset
+
+
+@pytest.mark.asyncio
+async def test_46_retry_failed_rejects_a_non_admin_caller():
+    db = _build_db()
+    await _setup_basic_session(db)
+    from fastapi import APIRouter, FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+
+    api = APIRouter(prefix="/api")
+
+    async def _require_student_dyn():
+        return _Student("unused")
+
+    async def _reject_non_admin():
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    hooks = dj.register_speaking_lab_direct_join_routes(
+        api, db, db.speaking_lab_sessions, db.speaking_lab_entries,
+        _noop_publish, _require_student_dyn, _norm,
+        require_admin_dep=_reject_non_admin,
+    )
+    elig.register_eligibility_routes(
+        api, db, db.speaking_lab_sessions,
+        hooks["eligible_roster"], hooks["perform_free_ticket_issuance"], _norm,
+        require_admin_dep=_reject_non_admin,
+    )
+    app = FastAPI()
+    app.include_router(api)
+    client = TestClient(app)
+
+    r = client.post("/api/speaking-lab/sessions/s1/confirm-participants/retry-failed")
+    assert r.status_code == 403

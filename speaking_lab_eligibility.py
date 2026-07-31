@@ -175,6 +175,19 @@ class ConfirmParticipantsResponse(BaseModel):
     failed: list[dict] = []
 
 
+class RetryFailedResponse(BaseModel):
+    """Recovery Mode (V4.3): result of retrying only the currently-missing
+    participants. Reuses the exact same idempotent
+    ``perform_free_ticket_issuance_fn`` Confirm Participants itself calls —
+    no parallel ticket-issuance path, no new duplicate-protection logic."""
+    ok: bool = True
+    session_id: str
+    attempted: int
+    recovered: int
+    already_had_ticket: int
+    still_failed: list[dict] = []
+
+
 class ReadinessResponse(BaseModel):
     ok: bool = True
     session_id: str
@@ -183,6 +196,19 @@ class ReadinessResponse(BaseModel):
     tickets: int
     notifications_sent: int
     ready: bool
+    # Recovery Mode (V4.3) — additive, never replaces `ready`. `ready`
+    # keeps its original strict "every confirmed participant has a
+    # ticket" meaning so nothing that already depends on it changes
+    # behaviour. `playable` is the new, deliberately more permissive
+    # signal a teacher-app "Start Session" action should actually gate
+    # on: the session is playable the moment AT LEAST ONE participant has
+    # a ticket, so 2 failures out of 40 no longer block the other 38.
+    # Safe because the Lucky Draw's own entrant pool is built from
+    # `speaking_lab_lucky_codes` rows (i.e. who actually has a ticket),
+    # never from `enrollment_frozen_participants` — a student without a
+    # ticket was never going to be a draw entrant either way.
+    playable: bool = False
+    failed_count: int = 0
     # The durable, frozen-at-confirm-time participant set (never
     # recomputed from live roster state) — the exact student IDs a
     # teacher-app "Start Session" action should hand off to the game.
@@ -416,6 +442,49 @@ def register_eligibility_routes(
             combined.setdefault(e["student_id"], e)
         return list(combined.values())
 
+    async def _attempt_ticket_issuance(
+        session_id: str, entry: dict, idem_prefix: str,
+    ) -> tuple[str, Optional[dict]]:
+        """Single source of truth for "try to issue one student's ticket and
+        classify the outcome" — used by BOTH Confirm Participants (first
+        pass, every frozen participant) and Retry Failed (recovery pass,
+        only the currently-missing ones). Always calls the SAME
+        ``perform_free_ticket_issuance_fn`` Direct Join already exposes;
+        never a parallel issuance path. Returns
+        ``("joined" | "already_had_ticket" | "failed", failure_detail)``.
+        """
+        idem_key = f"{idem_prefix}:{session_id}:{entry['student_id']}"
+        try:
+            result = await perform_free_ticket_issuance_fn(
+                session_id, entry["student_id"], entry["display_name"], idem_key,
+            )
+            if getattr(result, "idempotent_replay", False):
+                return "already_had_ticket", None
+            return "joined", None
+        except HTTPException as exc:
+            detail = exc.detail
+            reason = (detail.get("error") if isinstance(detail, dict) else None) or "error"
+            return "failed", {"student_id": entry["student_id"], "reason": reason}
+        except Exception as exc:  # noqa: BLE001
+            # Defense in depth: perform_join_fn now converts every exception
+            # type it knows about into HTTPException (see
+            # speaking_lab_direct_join.py's _perform_join), but this
+            # one-student failure must NEVER be allowed to blow up
+            # asyncio.gather and take down the whole batch response for
+            # every OTHER student in it — the teacher must always get a
+            # readiness result, not an opaque "Failed to fetch".
+            L.error(
+                "speaking_lab_eligibility: ticket issuance unexpected failure "
+                "session_id=%s student_id=%s idem_prefix=%s err=%s",
+                session_id, entry["student_id"], idem_prefix, exc, exc_info=True,
+            )
+            await enroll_audit.record_enrollment_attempt(
+                db, session_id=session_id, student_id=entry["student_id"],
+                idempotency_key=idem_key, outcome="unexpected_error",
+                reason_code="unexpected_error", http_status=500,
+                lucky_code_assigned=False, log=L)
+            return "failed", {"student_id": entry["student_id"], "reason": "unexpected_error"}
+
     @api.get(
         "/speaking-lab/sessions/{session_id}/eligibility",
         response_model=EligibilityResponse,
@@ -582,39 +651,12 @@ def register_eligibility_routes(
 
         async def _one(entry: dict) -> None:
             async with sem:
-                idem_key = f"confirm_participants:{session_id}:{entry['student_id']}"
-                try:
-                    result = await perform_free_ticket_issuance_fn(
-                        session_id, entry["student_id"], entry["display_name"], idem_key,
-                    )
-                    if getattr(result, "idempotent_replay", False):
-                        counters["already_had_ticket"] += 1
-                    else:
-                        counters["joined"] += 1
-                except HTTPException as exc:
-                    detail = exc.detail
-                    reason = (detail.get("error") if isinstance(detail, dict) else None) or "error"
-                    failed.append({"student_id": entry["student_id"], "reason": reason})
-                except Exception as exc:  # noqa: BLE001
-                    # Defense in depth: perform_join_fn now converts every
-                    # exception type it knows about into HTTPException (see
-                    # speaking_lab_direct_join.py's _perform_join), but this
-                    # one-student failure must NEVER be allowed to blow up
-                    # asyncio.gather and take down the whole Confirm
-                    # Participants response for every OTHER student in the
-                    # same batch — the teacher must always get a readiness
-                    # result, not an opaque "Failed to fetch".
-                    L.error(
-                        "speaking_lab_eligibility: confirm_participants "
-                        "unexpected failure session_id=%s student_id=%s err=%s",
-                        session_id, entry["student_id"], exc, exc_info=True,
-                    )
-                    await enroll_audit.record_enrollment_attempt(
-                        db, session_id=session_id, student_id=entry["student_id"],
-                        idempotency_key=idem_key, outcome="unexpected_error",
-                        reason_code="unexpected_error", http_status=500,
-                        lucky_code_assigned=False, log=L)
-                    failed.append({"student_id": entry["student_id"], "reason": "unexpected_error"})
+                outcome, detail = await _attempt_ticket_issuance(
+                    session_id, entry, "confirm_participants")
+                if outcome == "failed":
+                    failed.append(detail)
+                else:
+                    counters[outcome] += 1
 
         await asyncio.gather(*(_one(e) for e in participants))
 
@@ -624,6 +666,98 @@ def register_eligibility_routes(
             joined=counters["joined"],
             already_had_ticket=counters["already_had_ticket"],
             failed=failed,
+        )
+
+    async def _ticketed_ids_for(session_id: str, participant_ids: list[str]) -> set[str]:
+        """Same "who already has a committed ticket" query `_readiness` uses
+        — the single source of truth both readiness display and Retry
+        Failed's "only retry the actually-missing ones" logic read from."""
+        ids: set[str] = set()
+        cur = db[COLLECTION_DIRECT_JOINS].find(
+            {"session_id": session_id, "status": "committed",
+             "student_id": {"$in": participant_ids or [""]}},
+            {"_id": 0, "student_id": 1},
+        )
+        async for row in cur:
+            ids.add(row["student_id"])
+        return ids
+
+    @api.post(
+        "/speaking-lab/sessions/{session_id}/confirm-participants/retry-failed",
+        response_model=RetryFailedResponse,
+        summary="V4.3 Recovery Mode: retry ticket issuance for currently-missing participants only (admin)",
+    )
+    async def post_retry_failed_participants(
+        session_id: str, body: dict | None = None,
+        admin=Depends(require_admin_dep), max_concurrency: int = 20,
+    ) -> RetryFailedResponse:
+        """Recovery Mode. Never re-issues an already-ticketed student (every
+        call re-reads the CURRENT committed-ticket set first), never
+        regenerates a Lucky Code for one that exists (``persist_lucky_code``
+        / ``_perform_free_ticket_issuance`` are themselves idempotent —
+        this endpoint adds no new duplicate-protection layer, it just calls
+        the same reusable issuance path again for a narrower set of
+        students). Safe to call repeatedly, safe after a page refresh or a
+        server restart: all state this reads and writes is durable Mongo
+        state, nothing in memory.
+
+        ``body.student_ids`` (optional) — retry only these specific
+        students ("Retry Individual Student"); omitted or empty ->
+        retry every currently-missing participant ("Retry All Failed").
+        Ids outside the frozen participant set, or that already have a
+        ticket, are silently ignored rather than erroring — the caller may
+        be retrying a stale UI snapshot.
+        """
+        try:
+            sess = await _session_or_404(session_id)
+        except EligibilityError as exc:
+            raise HTTPException(
+                status_code=exc.http_status,
+                detail={"error": exc.code, "message": exc.message},
+            ) from exc
+        if not sess.get("enrollment_frozen_at"):
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "not_frozen", "message": "Confirm Participants has not run yet."},
+            )
+
+        participants: list[dict] = sess.get("enrollment_frozen_participants") or []
+        participant_ids = [e["student_id"] for e in participants]
+        ticketed = await _ticketed_ids_for(session_id, participant_ids)
+        missing = [e for e in participants if e["student_id"] not in ticketed]
+
+        requested = (body or {}).get("student_ids") if body else None
+        if requested:
+            requested_set = {norm_student_id(sid) for sid in requested}
+            missing = [e for e in missing if e["student_id"] in requested_set]
+
+        if not missing:
+            return RetryFailedResponse(
+                session_id=session_id, attempted=0, recovered=0,
+                already_had_ticket=0, still_failed=[],
+            )
+
+        sem = asyncio.Semaphore(max_concurrency)
+        counters = {"joined": 0, "already_had_ticket": 0}
+        still_failed: list[dict] = []
+
+        async def _one(entry: dict) -> None:
+            async with sem:
+                outcome, detail = await _attempt_ticket_issuance(
+                    session_id, entry, "retry_failed_participants")
+                if outcome == "failed":
+                    still_failed.append(detail)
+                else:
+                    counters[outcome] += 1
+
+        await asyncio.gather(*(_one(e) for e in missing))
+
+        return RetryFailedResponse(
+            session_id=session_id,
+            attempted=len(missing),
+            recovered=counters["joined"],
+            already_had_ticket=counters["already_had_ticket"],
+            still_failed=still_failed,
         )
 
     async def _readiness(session_id: str) -> dict:
@@ -640,14 +774,7 @@ def register_eligibility_routes(
         participant_ids = [e["student_id"] for e in participants]
         eligible = len(participant_ids)
 
-        ticketed_ids: set[str] = set()
-        cur = db[COLLECTION_DIRECT_JOINS].find(
-            {"session_id": session_id, "status": "committed",
-             "student_id": {"$in": participant_ids or [""]}},
-            {"_id": 0, "student_id": 1},
-        )
-        async for row in cur:
-            ticketed_ids.add(row["student_id"])
+        ticketed_ids = await _ticketed_ids_for(session_id, participant_ids)
         tickets = len(ticketed_ids)
 
         notifications_sent = await db[COLLECTION_DIRECT_JOINS].count_documents(
@@ -683,6 +810,9 @@ def register_eligibility_routes(
             "eligible": eligible, "tickets": tickets,
             "notifications_sent": notifications_sent,
             "ready": eligible > 0 and tickets == eligible,
+            # Recovery Mode (V4.3) — see ReadinessResponse.playable docstring.
+            "playable": eligible > 0 and tickets > 0,
+            "failed_count": len(missing_ids),
             "participant_ids": participant_ids,
             "failed_detail": failed_detail,
         }
