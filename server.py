@@ -19,6 +19,8 @@ from typing import Any, Literal
 import json
 import httpx
 
+from guest_content_boundary import apply_guest_content_boundary as _apply_guest_content_boundary
+
 # â”€â”€ LUCKY DRAW SURGERY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from teacher_admission import (
     register_teacher_admission_routes,
@@ -699,65 +701,15 @@ async def auth_logout(
     return {"ok": True}
 
 
-# --------------------------------------------------------------------------- #
-# Books   public read                                                         #
-# --------------------------------------------------------------------------- #
-CANONICAL_BOOK_FIELDS = {
-    "slug", "title", "subtitle", "author", "section", "coverEmoji",
-    "coverImage", "coverGradient", "accent", "badge", "level",
-    "readingMinutes", "price", "tier", "published", "newUntil", "contentType",
-    "format", "chapters", "content", "revision", "_authoredAt", "_authoredBy",
-    "ai_voice",
-}
-
-
-def _clean_book(doc: dict) -> dict:
-    out = {k: v for k, v in doc.items() if k in CANONICAL_BOOK_FIELDS}
-    # Ensure all chapters/blocks are clean dicts (no ObjectIds)
-    chapters = out.get("chapters") or []
-    out["chapters"] = [
-        {
-            "title": str(c.get("title") or "Main"),
-            "blocks": [
-                {k: v for k, v in b.items() if not k.startswith("_")}
-                for b in (c.get("blocks") or [])
-                if isinstance(b, dict)
-            ],
-        }
-        for c in chapters
-        if isinstance(c, dict)
-    ]
-    return out
-
-
-@api.get("/books")
-async def list_books():
-    """Return every published book, latest revision per slug."""
-    cursor = db.books.find(
-        {"published": True},
-        {"_id": 0},
-    ).sort([("slug", 1), ("revision", -1)])
-    seen: set[str] = set()
-    out: list[dict] = []
-    async for doc in cursor:
-        slug = doc.get("slug") or ""
-        if not slug or slug in seen:
-            continue
-        seen.add(slug)
-        out.append(_clean_book(doc))
-    return {"success": True, "books": out}
-
-
-@api.get("/books/{slug}")
-async def get_book(slug: str):
-    doc = await db.books.find_one(
-        {"slug": slug, "published": True},
-        {"_id": 0},
-        sort=[("revision", -1)],
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Book not found")
-    return {"success": True, "book": _clean_book(doc)}
+# NOTE: the "Books — public read" section (CANONICAL_BOOK_FIELDS, _clean_book,
+# _apply_guest_content_boundary, list_books, get_book) moved further down in
+# this file, immediately after current_student()'s definition — those routes
+# need current_student as a Depends() default value, which must already be a
+# bound name at the point the route functions are defined (default argument
+# values are evaluated at `def` time, unlike annotations under
+# `from __future__ import annotations`). _clean_book's other call sites
+# elsewhere in this file resolve it at call time and are unaffected by where
+# it's defined.
 
 
 # --------------------------------------------------------------------------- #
@@ -3447,6 +3399,72 @@ async def current_student(
         return None
     doc["status"] = derive_student_status(doc)
     return Student(**doc)
+
+
+# --------------------------------------------------------------------------- #
+# Books   public read                                                         #
+# --------------------------------------------------------------------------- #
+CANONICAL_BOOK_FIELDS = {
+    "slug", "title", "subtitle", "author", "section", "coverEmoji",
+    "coverImage", "coverGradient", "accent", "badge", "level",
+    "readingMinutes", "price", "tier", "published", "newUntil", "contentType",
+    "format", "chapters", "content", "revision", "_authoredAt", "_authoredBy",
+    "ai_voice",
+}
+
+
+def _clean_book(doc: dict) -> dict:
+    out = {k: v for k, v in doc.items() if k in CANONICAL_BOOK_FIELDS}
+    # Ensure all chapters/blocks are clean dicts (no ObjectIds)
+    chapters = out.get("chapters") or []
+    out["chapters"] = [
+        {
+            "title": str(c.get("title") or "Main"),
+            "blocks": [
+                {k: v for k, v in b.items() if not k.startswith("_")}
+                for b in (c.get("blocks") or [])
+                if isinstance(b, dict)
+            ],
+        }
+        for c in chapters
+        if isinstance(c, dict)
+    ]
+    return out
+
+
+# Guest content boundary (imported at module top) — see
+# guest_content_boundary.py for the full rationale.
+@api.get("/books")
+async def list_books(student: Student | None = Depends(current_student)):
+    """Return every published book, latest revision per slug. Full chapter
+    content is only included for zero-price books when the caller is an
+    unauthenticated guest — see guest_content_boundary.py."""
+    cursor = db.books.find(
+        {"published": True},
+        {"_id": 0},
+    ).sort([("slug", 1), ("revision", -1)])
+    seen: set[str] = set()
+    out: list[dict] = []
+    async for doc in cursor:
+        slug = doc.get("slug") or ""
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        out.append(_apply_guest_content_boundary(_clean_book(doc), student is None))
+    return {"success": True, "books": out}
+
+
+@api.get("/books/{slug}")
+async def get_book(slug: str, student: Student | None = Depends(current_student)):
+    doc = await db.books.find_one(
+        {"slug": slug, "published": True},
+        {"_id": 0},
+        sort=[("revision", -1)],
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Book not found")
+    book = _apply_guest_content_boundary(_clean_book(doc), student is None)
+    return {"success": True, "book": book}
 
 
 async def require_student(
