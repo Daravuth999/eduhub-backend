@@ -219,6 +219,42 @@ def _ttn_httpx_factory():
     )
 
 
+def _ttn_is_expired(exp, now: datetime) -> bool:
+    """True iff `exp` (a datetime, possibly naive, possibly None) is in the
+    past relative to `now`. Never raises. Single shared implementation used
+    everywhere an intent's expires_at needs checking — both the poll-time
+    expiry transition and the duplicate-intent reap check in
+    create_tuition_intent (see that function's docstring for why a shared,
+    correctly-parenthesized implementation matters here)."""
+    if exp is None:
+        return False
+    if exp.tzinfo is None:
+        return now > exp.replace(tzinfo=timezone.utc)
+    return now > exp
+
+
+def _ttn_render_qr_image(qr_payload: str) -> str:
+    """Render a KHQR EMV payload string to a base64 PNG data URI. Never
+    raises — returns "" on any rendering failure. Shared by intent creation
+    and intent resume/poll (qr_image is never persisted on the intent
+    document — only the raw qr_payload is — so anywhere the client needs to
+    display the code, it's regenerated fresh from the same deterministic
+    payload string)."""
+    if not qr_payload:
+        return ""
+    try:
+        import io as _qr_io
+        import base64 as _qr_b64
+        import segno as _qr_segno
+        qr = _qr_segno.make(qr_payload, error="m")
+        buf = _qr_io.BytesIO()
+        qr.save(buf, kind="png", scale=8, border=2)
+        return "data:image/png;base64," + _qr_b64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as _qr_exc:
+        _TTN_LOG.warning("_ttn_render_qr_image: render failed: %s", _qr_exc)
+        return ""
+
+
 def register_tuition_routes(
     api, db, require_student, require_admin,
     fan_out_push, update_tuition_in_gas,
@@ -708,13 +744,39 @@ def register_tuition_routes(
                 detail={"code": "TUITION_ACCOUNT_DISABLED", "message": "Tuition payment is disabled for this account."},
             )
 
-        # Block duplicate intent creation
+        # Block duplicate intent creation.
+        #
+        # BUG FIX (Aug 2026): status alone used to be enough to block. But
+        # "pending" -> "expired" is ONLY ever set as a side effect of a live
+        # poll_tuition_intent/webhook call reaching the provider-expired
+        # branch. If a student generates a QR, then closes the tab/app
+        # before ever polling again, nothing sweeps the row — it sits at
+        # "pending" in Mongo forever (no TTL index, no background job), and
+        # every future create_tuition_intent call (this month AND every
+        # month after) hit this block permanently with a 409, even though
+        # the intent's own `expires_at` had long since passed. Reap it here:
+        # a "pending" intent whose expires_at is already in the past is
+        # treated as expired (and persisted as such) instead of blocking.
         blocking_intent = await db[_TTN_COLL_INTENTS].find_one(
             {
                 "student_id": student.student_id,
                 "status": {"$in": ["pending", "verifying", "finalizing", "manual_review"]},
             },
         )
+        if blocking_intent and blocking_intent.get("status") == "pending":
+            exp = blocking_intent.get("expires_at")
+            if isinstance(exp, str):
+                try:
+                    exp = datetime.fromisoformat(exp)
+                except ValueError:
+                    exp = None
+            if _ttn_is_expired(exp, _ttn_utcnow()):
+                await db[_TTN_COLL_INTENTS].update_one(
+                    {"intent_id": blocking_intent["intent_id"], "status": "pending"},
+                    {"$set": {"status": "expired"}},
+                )
+                blocking_intent = None  # reaped — falls through to create a fresh intent
+
         if blocking_intent:
             bi_status = blocking_intent.get("status")
             if bi_status == "manual_review":
@@ -783,19 +845,9 @@ def register_tuition_routes(
         qr_payload = created.get("qr_code") or ""
         payment_url = created.get("payment_url") or ""
 
-        # Build base64 QR image
-        qr_image = ""
-        if qr_payload:
-            try:
-                import io as _qr_io
-                import base64 as _qr_b64
-                import segno as _qr_segno
-                qr = _qr_segno.make(qr_payload, error="m")
-                buf = _qr_io.BytesIO()
-                qr.save(buf, kind="png", scale=8, border=2)
-                qr_image = "data:image/png;base64," + _qr_b64.b64encode(buf.getvalue()).decode("ascii")
-            except Exception as _qr_exc:
-                _TTN_LOG.warning("create_tuition_intent: QR render failed: %s", _qr_exc)
+        # Build base64 QR image (_ttn_render_qr_image never raises — logs and
+        # returns "" on failure, matching this route's prior behavior).
+        qr_image = _ttn_render_qr_image(qr_payload)
 
         # ── Persist intent ──────────────────────────────────────────────────────
         intent_id = "tui_" + _ttn_secrets.token_hex(12)
@@ -846,20 +898,48 @@ def register_tuition_routes(
     ):
         """
         Poll tuition payment intent. Triggers server-to-server CamRapidPay check
-        when status is still pending.
+        when status is still pending. Also doubles as the RESUME endpoint: the
+        client (createIntent's 409 handler) calls this with the intent_id from
+        an INTENT_ACTIVE error to reopen an existing payment, so a still-valid
+        "pending" intent's response includes a freshly-regenerated qr_image
+        (never persisted on the document — only the raw qr_payload is).
 
-        Returns the current intent document (minus large qr_payload field).
+        Returns the current intent document (qr_payload itself is never sent
+        to the client — only the derived qr_image, when resumable).
         """
         intent = await db[_TTN_COLL_INTENTS].find_one(
             {"intent_id": intent_id, "student_id": student.student_id},
-            {"_id": 0, "qr_payload": 0},
+            {"_id": 0},
         )
         if not intent:
             raise HTTPException(status_code=404, detail="Intent not found")
 
         status = intent.get("status", "pending")
 
-        # Only attempt verification when still pending
+        # Local expiry check FIRST, independent of the provider round-trip —
+        # an intent whose own expires_at has already passed is expired
+        # regardless of whether the provider agrees or is even reachable
+        # (see create_tuition_intent's duplicate-block reap for why this
+        # matters: a "pending" row can otherwise sit forever with nothing to
+        # ever transition it, since this whole poll route only runs while a
+        # client is actively calling it).
+        if status == "pending":
+            now_utc = _ttn_utcnow()
+            exp = intent.get("expires_at")
+            if isinstance(exp, str):
+                try:
+                    exp = datetime.fromisoformat(exp)
+                except ValueError:
+                    exp = None
+            if _ttn_is_expired(exp, now_utc):
+                await db[_TTN_COLL_INTENTS].update_one(
+                    {"intent_id": intent_id, "status": "pending"},
+                    {"$set": {"status": "expired"}},
+                )
+                status = "expired"
+
+        # Only attempt provider verification when still pending after the
+        # local expiry check above.
         if status == "pending":
             reference = intent.get("khqr_reference") or intent.get("reference", "")
             if reference:
@@ -903,10 +983,7 @@ def register_tuition_routes(
                                     exp = datetime.fromisoformat(exp)
                                 except ValueError:
                                     exp = None
-                            if exp is not None and (
-                                (now_utc > exp.replace(tzinfo=timezone.utc)) if exp.tzinfo is None
-                                else (now_utc > exp)
-                            ):
+                            if _ttn_is_expired(exp, now_utc):
                                 await db[_TTN_COLL_INTENTS].update_one(
                                     {"intent_id": intent_id, "status": "pending"},
                                     {"$set": {"status": "expired"}},
@@ -921,13 +998,20 @@ def register_tuition_routes(
         # Re-fetch to pick up any finalization updates
         fresh = await db[_TTN_COLL_INTENTS].find_one(
             {"intent_id": intent_id},
-            {"_id": 0, "qr_payload": 0},
+            {"_id": 0},
         )
         if fresh:
             for k in ("created_at", "expires_at", "finalized_at"):
                 v = fresh.get(k)
                 if isinstance(v, datetime):
                     fresh[k] = v.isoformat()
+            # qr_image is never persisted — regenerate it here whenever the
+            # intent is still resumable, so a resume (or any poll) always
+            # has a real, displayable QR. The raw payload itself never
+            # leaves the server.
+            qr_payload = fresh.pop("qr_payload", None)
+            if fresh.get("status") == "pending":
+                fresh["qr_image"] = _ttn_render_qr_image(qr_payload or "")
             return fresh
 
         return {"intent_id": intent_id, "status": status}
