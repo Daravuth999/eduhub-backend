@@ -49,6 +49,9 @@ _TTN_COLL_INTENTS  = "tuition_payment_intents"
 _TTN_COLL_RECEIPTS = "tuition_receipts"
 _TTN_COLL_CONFIG      = "tuition_config"
 _TTN_COLL_DISMISSALS  = "tuition_reminder_dismissals"
+# Persistent Tuition Receipt Engine (Aug 2026) — sequential invoice numbers,
+# one atomic-counter doc per calendar year (_id: "invoice_{year}").
+_TTN_COLL_INVOICE_COUNTERS = "tuition_invoice_counters"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Cambodia UTC+7
@@ -278,9 +281,11 @@ def register_tuition_routes(
 
             # 3. Create immutable receipt
             receipt_id = "rcpt_" + _ttn_secrets.token_hex(12)
+            invoice_number = await _ttn_next_invoice_number()
             now = _ttn_utcnow()
             receipt_doc = {
                 "receipt_id":       receipt_id,
+                "invoice_number":   invoice_number,
                 "student_id":       student_id,
                 "clean_id":         clean_id,
                 "amount_usd":       round(float(amount_usd), 2),
@@ -296,6 +301,7 @@ def register_tuition_routes(
                 "confirmed_at":     now,
                 "acknowledged_at":  None,
                 "intent_id":        intent_id,
+                "recorded_by_name": None,
             }
             await db[_TTN_COLL_RECEIPTS].insert_one(receipt_doc)
 
@@ -485,6 +491,43 @@ def register_tuition_routes(
             "dismiss_strategy": "session",  # session | server
             "frequency": "once_per_day",    # always | once_per_day | once_per_week
             "style": "fullscreen",          # fullscreen | banner
+        }
+
+    async def _ttn_next_invoice_number() -> str:
+        """Atomically mint the next sequential invoice number for the current
+        Cambodia-local year: INV-{year}-{seq:06d}. Race-safe by construction —
+        a single MongoDB find_one_and_update($inc) is one atomic document
+        operation, so concurrent callers can never observe or write the same
+        seq value. One counter doc per year gives automatic yearly reset with
+        no cron/rollover logic needed."""
+        year = _ttn_today_kh().year
+        counter_id = f"invoice_{year}"
+        doc = await db[_TTN_COLL_INVOICE_COUNTERS].find_one_and_update(
+            {"_id": counter_id},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=True,
+        )
+        return f"INV-{year}-{doc['seq']:06d}"
+
+    async def _ttn_get_receipt_template_config() -> dict:
+        """Return receipt PDF/PNG template config (company header, notes,
+        terms), with safe defaults if not yet set by an admin."""
+        doc = await db[_TTN_COLL_CONFIG].find_one({"type": "receipt_template_config"})
+        return doc or {
+            "type": "receipt_template_config",
+            "company_name":    "Eduhub Studio",
+            "company_address": "Phnom Penh, Cambodia",
+            "company_phone":   "",
+            "company_email":   "",
+            "notes": (
+                "Thank you for choosing EduHub Studio. We appreciate your "
+                "trust in our program."
+            ),
+            "terms_and_conditions": (
+                "Payment received is non-refundable and non-transferable "
+                "after enrollment confirmation."
+            ),
         }
 
     # ── Student API routes ────────────────────────────────────────────────
@@ -860,7 +903,10 @@ def register_tuition_routes(
                                     exp = datetime.fromisoformat(exp)
                                 except ValueError:
                                     exp = None
-                            if exp and now_utc > exp.replace(tzinfo=timezone.utc) if exp.tzinfo is None else now_utc > exp:
+                            if exp is not None and (
+                                (now_utc > exp.replace(tzinfo=timezone.utc)) if exp.tzinfo is None
+                                else (now_utc > exp)
+                            ):
                                 await db[_TTN_COLL_INTENTS].update_one(
                                     {"intent_id": intent_id, "status": "pending"},
                                     {"$set": {"status": "expired"}},
@@ -1007,12 +1053,40 @@ def register_tuition_routes(
             await db[_TTN_COLL_RECEIPTS].create_index(
                 [("student_id", 1), ("confirmed_at", -1)], background=True
             )
+            # sparse=True: pre-migration receipts don't have invoice_number yet
+            # (see /admin/tuition/receipts/backfill-invoice-numbers) — a
+            # non-sparse unique index would reject the second null.
+            await db[_TTN_COLL_RECEIPTS].create_index(
+                [("invoice_number", 1)], unique=True, sparse=True, background=True
+            )
             results[_TTN_COLL_RECEIPTS] = "ok"
         except Exception as exc:
             results[_TTN_COLL_RECEIPTS] = str(exc)
 
         _TTN_LOG.info("admin_tuition_setup_indexes: %s", results)
         return {"ok": True, "indexes": results}
+
+    @api.post("/admin/tuition/receipts/backfill-invoice-numbers")
+    async def admin_backfill_invoice_numbers(admin=Depends(require_admin)):
+        """One-time, idempotent/resumable: assign invoice_number to every
+        pre-existing receipt that predates the Persistent Tuition Receipt
+        Engine. Chronological (oldest confirmed_at first), so numbering
+        reads naturally. Safe to re-run — already-numbered receipts are
+        skipped, and interrupting/resuming never reassigns or duplicates."""
+        cursor = db[_TTN_COLL_RECEIPTS].find(
+            {"invoice_number": {"$exists": False}}, {"_id": 0, "receipt_id": 1}
+        ).sort("confirmed_at", 1)
+        assigned = 0
+        async for doc in cursor:
+            invoice_number = await _ttn_next_invoice_number()
+            result = await db[_TTN_COLL_RECEIPTS].update_one(
+                {"receipt_id": doc["receipt_id"], "invoice_number": {"$exists": False}},
+                {"$set": {"invoice_number": invoice_number}},
+            )
+            if result.modified_count:
+                assigned += 1
+        _TTN_LOG.info("admin_backfill_invoice_numbers: assigned=%d", assigned)
+        return {"ok": True, "assigned": assigned}
 
     # ── Student-facing reminder endpoint (server controls all eligibility) ──
 
@@ -1190,6 +1264,31 @@ def register_tuition_routes(
         )
         return {"ok": True}
 
+    # ── Admin: receipt template config (company header / notes / terms) ────
+
+    @api.get("/admin/tuition/receipt-template-config")
+    async def admin_receipt_template_get_config(admin=Depends(require_admin)):
+        cfg = await _ttn_get_receipt_template_config()
+        cfg.pop("_id", None)
+        return {"ok": True, "config": cfg}
+
+    @api.put("/admin/tuition/receipt-template-config")
+    async def admin_receipt_template_set_config(payload: dict, admin=Depends(require_admin)):
+        allowed = {
+            "company_name", "company_address", "company_phone", "company_email",
+            "notes", "terms_and_conditions",
+        }
+        updates = {k: v for k, v in payload.items() if k in allowed}
+        if not updates:
+            raise HTTPException(status_code=400, detail="No valid config fields provided")
+        updates["updated_at"] = _ttn_utcnow()
+        await db[_TTN_COLL_CONFIG].update_one(
+            {"type": "receipt_template_config"},
+            {"$set": {"type": "receipt_template_config", **updates}},
+            upsert=True,
+        )
+        return {"ok": True}
+
     # ── Admin: tuition accounts (account list + per-student edit) ───────────
 
     @api.get("/admin/tuition/accounts")
@@ -1310,9 +1409,14 @@ def register_tuition_routes(
         reward_pts = 0
 
         receipt_id = "rcpt_" + _ttn_secrets.token_hex(12)
+        # Invoice number is minted here, AFTER the duplicate-reference
+        # idempotency check above, so a replayed request never burns a
+        # second sequential number for the same payment.
+        invoice_number = await _ttn_next_invoice_number()
         now = _ttn_utcnow()
         receipt_doc = {
             "receipt_id":       receipt_id,
+            "invoice_number":   invoice_number,
             "student_id":       student_id,
             "clean_id":         clean_id,
             "amount_usd":       round(amount_usd, 2),
@@ -1330,6 +1434,7 @@ def register_tuition_routes(
             "confirmed_at":     now,
             "acknowledged_at":  None,
             "recorded_by":      "admin",
+            "recorded_by_name": admin.name,
             "intent_id":        None,
         }
         await db[_TTN_COLL_RECEIPTS].insert_one(receipt_doc)

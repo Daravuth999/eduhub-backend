@@ -6143,6 +6143,14 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 async def startup():
     global audio_bucket
     audio_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="studio_audio")
+    try:
+        from tuition_receipt_files import set_receipt_bucket as _ttn_set_receipt_bucket
+        _ttn_set_receipt_bucket(AsyncIOMotorGridFSBucket(db, bucket_name="tuition_receipt_files"))
+    except Exception as _ttn_bucket_err:
+        logging.getLogger("eduhub").warning(
+            "tuition_receipt_files: GridFS bucket init failed (receipt PDF/PNG disabled): %s",
+            _ttn_bucket_err,
+        )
     # Ensure useful indexes
     await db.books.create_index([("slug", 1), ("revision", -1)])
     await db.books.create_index("published")
@@ -7171,6 +7179,20 @@ except Exception as _ttn_load_err:
     logging.getLogger("eduhub").warning(
         "tuition_tools.py failed to load (tuition pay disabled): %s",
         _ttn_load_err,
+    )
+
+# Persistent Tuition Receipt Engine (Aug 2026) — PDF/PNG download +
+# regenerate routes. Routes are registered now (defining a route needs no
+# event loop); the GridFS bucket itself is constructed inside startup()
+# below, next to `audio_bucket` — AsyncIOMotorGridFSBucket needs a running
+# event loop, which plain module import time does not have.
+try:
+    from tuition_receipt_files import register_tuition_receipt_files_routes
+    register_tuition_receipt_files_routes(api, db, require_student, require_admin)
+except Exception as _ttn_files_load_err:
+    logging.getLogger("eduhub").warning(
+        "tuition_receipt_files.py failed to load (receipt PDF/PNG disabled): %s",
+        _ttn_files_load_err,
     )
 
 # ── Premium AI Tools (Phase 1) — register isolated routes onto /api ──────
