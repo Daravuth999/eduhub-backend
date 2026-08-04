@@ -21,3 +21,5 @@ redis>=5.0         # eduhub_platform.events RedisTransport (Architecture Reconst
                    # Phase 4, "event platform") — lazily imported, only touched when an
                    # operator sets EVENT_BUS_TRANSPORT=redis + REDIS_URL; every other
                    # deployment never imports it at runtime.
+reportlab>=4.2,<5  # tuition_receipt_pdf.py — pure-Python PDF invoice generation, no system libs
+pymupdf>=1.24,<2   # tuition_receipt_pdf.py — PDF->PNG rasterization (self-contained wheel, no poppler/Cairo)
