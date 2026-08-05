@@ -189,10 +189,10 @@ class _CompletePaymentStub:
 def _make_api(db, student_clean_id="stu001", credit_outcome="ok"):
     api = APIRouter(prefix="/api")
     completer = _CompletePaymentStub(outcome=credit_outcome)
-    cam_tools.register_camrapidpay_payment_routes(
+    _reconcile, _ensure_idx, bridge_verify = cam_tools.register_camrapidpay_payment_routes(
         api, db, _student_dep(student_clean_id), completer,
     )
-    return api, completer
+    return api, completer, bridge_verify
 
 
 def _seed_intent(db: FakeDB, *, reference, amount_usd=0.5, amount_khr=2000,
@@ -253,7 +253,7 @@ def test_check_status_not_ok_is_now_logged(monkeypatch, caplog):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-TEST-001"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     endpoint = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -276,7 +276,7 @@ def test_still_pending_outcome_is_now_logged(monkeypatch, caplog):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-TEST-002"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     endpoint = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -359,7 +359,7 @@ def test_successful_payment_credits_exactly_once_at_various_amounts(monkeypatch,
     _enable_camrapidpay(monkeypatch)
     ref = f"EDUHUB-AMT-{int(amount_usd * 100)}"
     _seed_intent(db, reference=ref, amount_usd=amount_usd, base_points=base_points, bonus_points=0)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     endpoint = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -383,7 +383,7 @@ def test_polling_only_detects_success(monkeypatch):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-POLL-ONLY"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -404,7 +404,7 @@ def test_webhook_only_detects_and_credits(monkeypatch):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-WEBHOOK-ONLY"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     webhook_ep = _find_endpoint(api, "/api/payments/camrapidpay/webhook")
 
     _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
@@ -435,7 +435,7 @@ def test_webhook_amount_mismatch_is_audit_only_and_never_blocks_credit(monkeypat
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-MISMATCH"
     _seed_intent(db, reference=ref, amount_usd=0.5)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     webhook_ep = _find_endpoint(api, "/api/payments/camrapidpay/webhook")
 
     _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
@@ -463,7 +463,7 @@ def test_duplicate_webhook_credits_only_once(monkeypatch):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-DUP-WEBHOOK"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     webhook_ep = _find_endpoint(api, "/api/payments/camrapidpay/webhook")
 
     _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
@@ -486,7 +486,7 @@ def test_delayed_webhook_after_local_expiry_still_credits(monkeypatch):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-DELAYED"
     _seed_intent(db, reference=ref, expires_in_min=-1)  # already expired locally
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     webhook_ep = _find_endpoint(api, "/api/payments/camrapidpay/webhook")
 
     _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
@@ -509,7 +509,7 @@ def test_expired_payment_marks_expired_and_never_credits(monkeypatch):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-EXPIRED"
     _seed_intent(db, reference=ref, expires_in_min=-1)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -530,7 +530,7 @@ def test_cancelled_payment_normalizes_to_expired_and_never_credits(monkeypatch):
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-CANCELLED"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -551,7 +551,7 @@ def test_multiple_simultaneous_payments_credit_independently(monkeypatch):
     ref_a, ref_b = "EDUHUB-MULTI-A", "EDUHUB-MULTI-B"
     _seed_intent(db, reference=ref_a, student_id="stu_a", base_points=50, bonus_points=0)
     _seed_intent(db, reference=ref_b, student_id="stu_b", base_points=100, bonus_points=10)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent_a = run(db.camrapidpay_intents.find_one({"reference": ref_a}))
     intent_b = run(db.camrapidpay_intents.find_one({"reference": ref_b}))
@@ -582,7 +582,7 @@ def test_concurrent_double_check_on_same_reference_credits_only_once(monkeypatch
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-RACE"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db)
+    api, completer, _bridge = _make_api(db)
     status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -607,7 +607,7 @@ def test_unknown_credit_outcome_routes_to_manual_review_not_silent_loss(monkeypa
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-UNKNOWN-OUTCOME"
     _seed_intent(db, reference=ref)
-    api, completer = _make_api(db, credit_outcome="raise")
+    api, completer, _bridge = _make_api(db, credit_outcome="raise")
     status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
     intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
 
@@ -620,3 +620,198 @@ def test_unknown_credit_outcome_routes_to_manual_review_not_silent_loss(monkeypa
     stored = run(db.camrapidpay_intents.find_one({"reference": ref}))
     assert stored["status"] == "manual_review"
     assert stored["credited_at"] is None
+
+
+# ── Hybrid verification restore (Aug 2026) — bank-notification bridge ────────
+# Confirmed root cause: CamRapidPay's check-transaction-api never reports
+# Success even when a payment genuinely settles into the linked Bakong/ABA
+# account (verified against a real bank receipt + CamRapidPay's own
+# merchant dashboard). These tests exercise the second confirmation source
+# added to close that gap: _camrapidpay_verify_via_bank_notification(), the
+# function payment_bridge.py's existing, already-production-proven ABA/
+# Bakong Telegram-notification bridge calls when its own payment_intents
+# matching finds nothing.
+
+def _bank_txn(*, amount, currency="USD", transaction_id="58778590821", apv="782ba862"):
+    return {
+        "amount": amount, "currency": currency,
+        "transaction_id": transaction_id, "apv": apv,
+        "payer_name": "Some Student", "payment_method": "Bakong",
+    }
+
+
+def test_bridge_no_candidate_returns_no_match(monkeypatch):
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    api, completer, bridge = _make_api(db)
+
+    result = run(bridge(_bank_txn(amount=0.5)))
+
+    assert result["status"] == "no_match"
+    assert result["credited"] is False
+    assert completer.calls == []
+
+
+def test_bridge_single_exact_match_credits_via_shared_completion_function(monkeypatch):
+    """The bridge must converge on the EXACT SAME complete_points_payment
+    call CamRapidPay's own Success path uses -- same wallet update, same
+    downstream receipt/notification flow."""
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    ref = "EDUHUB-BRIDGE-MATCH"
+    _seed_intent(db, reference=ref, amount_usd=0.5, base_points=50, bonus_points=5)
+    api, completer, bridge = _make_api(db)
+
+    result = run(bridge(_bank_txn(amount=0.5, transaction_id="58778590821")))
+
+    assert result["status"] == "credited"
+    assert result["credited"] is True
+    assert result["reference"] == ref
+    assert result["points_added"] == 55
+    assert len(completer.calls) == 1
+    assert completer.calls[0]["txn"]["transaction_id"] == "58778590821"
+    assert completer.calls[0]["txn"]["order_id"] == ref
+    stored = run(db.camrapidpay_intents.find_one({"reference": ref}))
+    assert stored["status"] == "credited"
+    assert stored["credited_via"] == "bank_notification"
+
+
+def test_bridge_matches_khr_notifications_against_amount_khr(monkeypatch):
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    ref = "EDUHUB-BRIDGE-KHR"
+    _seed_intent(db, reference=ref, amount_usd=0.5, amount_khr=2000, base_points=50, bonus_points=0)
+    api, completer, bridge = _make_api(db)
+
+    result = run(bridge(_bank_txn(amount=2000, currency="KHR")))
+
+    assert result["status"] == "credited"
+    assert len(completer.calls) == 1
+
+
+def test_bridge_ambiguous_candidates_never_guesses(monkeypatch):
+    """Two students' intents pending for the same amount at the same time --
+    the bridge must NEVER auto-credit either one, mirroring payment_bridge.py's
+    own strict single-match discipline exactly."""
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    _seed_intent(db, reference="EDUHUB-AMBIG-A", amount_usd=0.5, student_id="stu_a")
+    _seed_intent(db, reference="EDUHUB-AMBIG-B", amount_usd=0.5, student_id="stu_b")
+    api, completer, bridge = _make_api(db)
+
+    result = run(bridge(_bank_txn(amount=0.5)))
+
+    assert result["status"] == "ambiguous"
+    assert result["credited"] is False
+    assert completer.calls == []
+
+
+def test_bridge_ignores_locally_expired_intents(monkeypatch):
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    _seed_intent(db, reference="EDUHUB-BRIDGE-EXPIRED", amount_usd=0.5, expires_in_min=-1)
+    api, completer, bridge = _make_api(db)
+
+    result = run(bridge(_bank_txn(amount=0.5)))
+
+    assert result["status"] == "no_match"
+    assert completer.calls == []
+
+
+def test_bridge_credit_exception_routes_to_manual_review(monkeypatch):
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    ref = "EDUHUB-BRIDGE-EXC"
+    _seed_intent(db, reference=ref, amount_usd=0.5)
+    api, completer, bridge = _make_api(db, credit_outcome="raise")
+
+    result = run(bridge(_bank_txn(amount=0.5)))
+
+    assert result["status"] == "manual_review"
+    assert result["credited"] is False
+    stored = run(db.camrapidpay_intents.find_one({"reference": ref}))
+    assert stored["status"] == "manual_review"
+    assert stored["credited_at"] is None
+
+
+# ── The core requirement: credited exactly once regardless of which source
+# arrives first ───────────────────────────────────────────────────────────
+
+def test_camrapidpay_success_first_then_bank_notification_does_not_double_credit(monkeypatch):
+    """CamRapidPay's own check-transaction-api reports Success and credits
+    the intent BEFORE the bank-notification bridge ever sees it (e.g. the
+    reconciliation outage resolves itself, or the reconcile sweep wins the
+    race). The bridge must recognize the reference is already claimed."""
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    ref = "EDUHUB-RACE-CAM-FIRST"
+    _seed_intent(db, reference=ref, amount_usd=0.5, base_points=50, bonus_points=0)
+    api, completer, bridge = _make_api(db)
+    status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
+    intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
+
+    _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
+    first = run(status_ep(str(intent["_id"]), student=SimpleNamespace(clean_id="stu001")))
+    assert first["credited"] is True
+
+    # The bank notification for the SAME payment now arrives.
+    bridge_result = run(bridge(_bank_txn(amount=0.5)))
+
+    assert bridge_result["status"] == "already_claimed"
+    assert bridge_result["credited"] is True  # honestly reports it WAS credited -- just not by this call
+    assert len(completer.calls) == 1, "the GAS credit call must still have fired exactly once"
+
+
+def test_bank_notification_first_then_camrapidpay_success_does_not_double_credit(monkeypatch):
+    """The reverse order -- the bank notification arrives and credits FIRST
+    (the exact real-world scenario: CamRapidPay's reconciliation never
+    catches up at all). A later CamRapidPay Success response for the same
+    reference (e.g. a delayed reconcile-sweep check) must safely no-op."""
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    ref = "EDUHUB-RACE-BRIDGE-FIRST"
+    _seed_intent(db, reference=ref, amount_usd=0.5, base_points=50, bonus_points=0)
+    api, completer, bridge = _make_api(db)
+    status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
+    intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
+
+    bridge_result = run(bridge(_bank_txn(amount=0.5)))
+    assert bridge_result["status"] == "credited"
+    assert bridge_result["credited"] is True
+
+    # CamRapidPay's own check-transaction-api finally reports Success too.
+    _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
+    second = run(status_ep(str(intent["_id"]), student=SimpleNamespace(clean_id="stu001")))
+
+    assert second["credited"] is True  # idempotent: reports already-credited truthfully
+    assert len(completer.calls) == 1, "the GAS credit call must still have fired exactly once"
+    stored = run(db.camrapidpay_intents.find_one({"reference": ref}))
+    assert stored["credited_via"] == "bank_notification"  # first-writer wins, never overwritten
+
+
+def test_concurrent_camrapidpay_check_and_bank_notification_credit_exactly_once(monkeypatch):
+    """True concurrency: CamRapidPay's status check and the bank-notification
+    bridge both reach the atomic claim for the SAME reference at effectively
+    the same instant. Exactly one must win; both must report the outcome
+    truthfully; the GAS credit call must fire exactly once."""
+    db = FakeDB()
+    _enable_camrapidpay(monkeypatch)
+    ref = "EDUHUB-RACE-CONCURRENT"
+    _seed_intent(db, reference=ref, amount_usd=0.5, base_points=50, bonus_points=0)
+    api, completer, bridge = _make_api(db)
+    status_ep = _find_endpoint(api, "/api/payments/camrapidpay/status/{payment_intent_id}")
+    intent = run(db.camrapidpay_intents.find_one({"reference": ref}))
+
+    _patch_check_status(monkeypatch, default={"ok": True, "status": cam_provider.STATUS_SUCCESS, "raw": {}})
+
+    async def both():
+        return await asyncio.gather(
+            status_ep(str(intent["_id"]), student=SimpleNamespace(clean_id="stu001")),
+            bridge(_bank_txn(amount=0.5)),
+        )
+
+    status_result, bridge_result = run(both())
+
+    assert status_result["credited"] is True
+    assert bridge_result["credited"] is True
+    assert len(completer.calls) == 1, "only one of the two racing sources may ever call the GAS credit path"
