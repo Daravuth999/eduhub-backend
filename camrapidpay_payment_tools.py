@@ -255,7 +255,15 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
         # ---- Server-to-server verification: the ONLY proof of payment ----
         status_res = await _cam.check_status(_cam_httpx_factory, reference)
         if not status_res.get("ok"):
-            # Transport failure - do NOT change state, let caller / sweep retry.
+            # Diagnostics fix (production incident, Aug 2026): this branch was
+            # previously silent — a transport failure or provider outage left
+            # zero trace, indistinguishable in logs from an invoice that was
+            # simply never checked. Transport failure - do NOT change state,
+            # let caller / sweep retry (behavior unchanged).
+            _CAM_LOG.warning(
+                "camrapidpay: verify ref=%s check_status not ok error=%s -> staying %s",
+                reference, status_res.get("error"), intent.get("status", "pending"),
+            )
             return {"ok": False, "status": intent.get("status", "pending"),
                     "credited": False, "error": "status_unavailable"}
 
@@ -284,7 +292,16 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
             return {"ok": True, "status": "expired", "credited": False}
 
         if prov_status != _cam.STATUS_SUCCESS:
-            # Still pending and not yet expired - keep waiting.
+            # Diagnostics fix: this was the single most consequential silent
+            # branch in the whole module. Every verify call that doesn't
+            # result in a credit ends up here or above; without a log line,
+            # "stuck pending forever" and "genuinely still unpaid" are
+            # indistinguishable from Render logs. Still pending and not yet
+            # expired - keep waiting (behavior unchanged).
+            _CAM_LOG.info(
+                "camrapidpay: verify ref=%s provider_status=%s expired_locally=%s -> still pending",
+                reference, prov_status, expired_locally,
+            )
             return {"ok": True, "status": "pending", "credited": False}
 
         # ---- Payment verified Success. ATOMIC flip to claim the credit. ----

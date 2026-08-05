@@ -435,12 +435,44 @@ async def check_status(httpx_client_factory, reference):
             return {"ok": False, "error": f"http_{r.status_code}"}
         j = r.json()
         if not isinstance(j, dict):
+            # Diagnostics fix (production incident, Aug 2026): this branch was
+            # previously silent. A payment stuck in "Waiting for payment"
+            # forever with zero log trace is indistinguishable from a
+            # perfectly healthy still-pending invoice unless we can SEE what
+            # the provider actually sent. Logging the raw (truncated, never
+            # containing api_key/secret — see _redact_text_secrets) body here
+            # is what makes a future contract-drift incident diagnosable from
+            # Render logs alone, instead of requiring a live code patch to
+            # find out. No behavior change: still returns bad_response.
+            _log.warning(
+                "camrapidpay: status non-dict response ref=%s body=%s",
+                reference, _redact_url_secrets(str(j))[:300],
+            )
             return {"ok": False, "error": "bad_response"}
         # success:true + status:Success => paid. success:false => not completed.
         if j.get("success") is True:
-            return {"ok": True, "status": _normalize_status(j.get("status")), "raw": _sanitize_raw(j)}
+            norm = _normalize_status(j.get("status"))
+            # Diagnostics fix: log every successful status check, not only
+            # failures. Previously NOTHING was logged here, so a genuinely
+            # paid invoice whose raw `status` string _normalize_status()
+            # doesn't recognize (falls through to STATUS_UNKNOWN, which the
+            # caller treats the same as "still pending") produced zero trace
+            # of ever having been checked at all.
+            _log.info(
+                "camrapidpay: status check ref=%s provider_status=%r normalized=%s",
+                reference, j.get("status"), norm,
+            )
+            return {"ok": True, "status": norm, "raw": _sanitize_raw(j)}
         # success:false means not found / not completed -> treat as pending,
-        # NOT an error (the invoice may simply be unpaid yet).
+        # NOT an error (the invoice may simply be unpaid yet). Diagnostics
+        # fix: log the sanitized raw body here too — a real success:false
+        # for an actually-paid reference (e.g. a provider contract change)
+        # was previously the single most important response this module
+        # ever discarded without a trace.
+        _log.info(
+            "camrapidpay: status check ref=%s success=false raw=%s",
+            reference, _redact_text_secrets(str(_sanitize_raw(j)))[:300],
+        )
         return {"ok": True, "status": STATUS_PENDING, "raw": _sanitize_raw(j)}
     except Exception as exc:  # noqa: BLE001
         _log.warning("camrapidpay: status exception ref=%s type=%s", reference, type(exc).__name__)
