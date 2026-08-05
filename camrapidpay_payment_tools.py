@@ -768,7 +768,16 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
                     f"amount got={wh_amount} expected={intent.get('amount')} "
                     f"currency got={wh_currency} expected={intent.get('currency')}"
                 )[:200]
-                _CAM_LOG.warning("camrapidpay: webhook mismatch (audit only) ref=%s", reference)
+                # Diagnostics fix: the got=/expected= detail previously only
+                # reached Mongo's webhook_mismatch_reason field, never
+                # stdout -- every occurrence observed so far had to be
+                # inferred from the WARNING alone. Logging the same string
+                # that's already being written to the DB costs nothing and
+                # makes it visible from Render logs directly.
+                _CAM_LOG.warning(
+                    "camrapidpay: webhook mismatch (audit only) ref=%s reason=%s",
+                    reference, audit_set["webhook_mismatch_reason"],
+                )
             else:
                 audit_set["webhook_mismatch"] = False
             await _cam_intents.update_one(
