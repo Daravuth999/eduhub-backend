@@ -256,9 +256,9 @@ class _FakeDB:
         raise AssertionError(f"unexpected collection: {name}")
 
 
-async def _seed_published_lesson(db, *, price=50, lesson_id="vid_1", sync_id="sync_abc"):
+async def _seed_published_lesson(db, *, price=50, lesson_id="vid_1", sync_id="sync_abc", media_ref="https://pub-x.r2.dev/vid.mp4"):
     lesson = schema.build_video_lesson(
-        title="Ordering Coffee", price=price, lesson_id=lesson_id, sync_id=sync_id,
+        title="Ordering Coffee", price=price, lesson_id=lesson_id, sync_id=sync_id, media_ref=media_ref,
         status="published", created_at="t0",
     )
     await db[vlt.LESSONS_COLL].insert_one(lesson)
@@ -338,6 +338,10 @@ async def test_attach_lesson_media_binds_sync_id_via_shared_engine():
     sync_doc = db.chapter_sync.docs[updated["syncId"]]
     assert sync_doc["ownerRef"] == f"video_lesson:{lesson['lessonId']}"
     assert sync_doc["alignmentStatus"] == "awaiting_provider"
+    # mediaRef is denormalized onto the lesson so playback never depends on
+    # sync_schema.is_servable_to_students()'s alignment-readiness gate.
+    assert updated["mediaRef"] == sync_doc["mediaRef"]
+    assert updated["mediaRef"].startswith("gridfs://sync_media/")
     assert len(bucket.files) == 1  # stored via GridFS fallback (no R2 env vars in tests)
 
 
@@ -379,6 +383,7 @@ async def test_paid_lesson_hides_sync_id_when_not_owned():
     out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
     assert out["owned"] is False
     assert "syncId" not in out
+    assert "mediaRef" not in out  # the playable video itself is also protected
 
 
 @pytest.mark.asyncio
@@ -391,6 +396,7 @@ async def test_paid_lesson_shows_sync_id_when_owned():
     out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
     assert out["owned"] is True
     assert out["syncId"] == "sync_abc"
+    assert out["mediaRef"] == "https://pub-x.r2.dev/vid.mp4"
 
 
 # ── purchase state machine ───────────────────────────────────────────────

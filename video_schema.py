@@ -75,6 +75,7 @@ def build_video_lesson(
     thumbnail_url: str = "",
     tier: str = "standard",
     sync_id: str | None = None,
+    media_ref: str | None = None,
     duration_sec: float = 0.0,
     status: str = "draft",
     created_by: str = "",
@@ -87,7 +88,16 @@ def build_video_lesson(
 ) -> dict:
     """Assemble a video lesson metadata document. `syncId` is a reference
     into the existing chapter_sync collection (sync_schema.py's canonical
-    document) — this module never embeds transcript/word data itself."""
+    document) — this module never embeds transcript/word data itself.
+
+    `mediaRef` is deliberately ALSO stored here, denormalized from the sync
+    document, rather than requiring every video-playback caller to fetch
+    the sync document first: playing a video must not depend on whether
+    its transcript/alignment is ready. `is_servable_to_students()` (the
+    sync document's own publish gate) is about caption/highlight
+    readiness — it has nothing to do with whether the underlying video
+    file itself may be watched, and gating playback on it would silently
+    make every lesson unwatchable until an ASR vendor exists."""
     if status not in VIDEO_LESSON_STATUSES:
         raise ValueError(f"invalid status: {status!r}")
     if price < 0:
@@ -107,6 +117,7 @@ def build_video_lesson(
         "price": int(price),
         "tier": tier,
         "syncId": sync_id,  # None until a transcript/teleprompter track exists
+        "mediaRef": media_ref,  # None until media is uploaded — the playable video/audio URL
         "durationSec": round(float(duration_sec), 3),
         "status": status,
         "revision": 1,

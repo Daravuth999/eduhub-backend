@@ -123,7 +123,7 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
     if not existing:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
     safe_updates = {k: v for k, v in updates.items() if k in (
-        "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "durationSec", "status",
+        "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "mediaRef", "durationSec", "status",
         "instructor", "category", "difficulty", "cefrLevel", "estimatedStudyMinutes",
     )}
     merged = {**existing, **safe_updates}
@@ -139,15 +139,21 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
 async def attach_lesson_media(
     db, lesson_id: str, *, raw: bytes, declared_content_type: str, media_bucket, uploaded_by: str = "",
 ) -> dict:
-    """Upload a lesson's video/audio and bind the resulting syncId onto it.
-    Reuses sync_studio_tools.create_sync_from_upload — the SAME storage
-    validation, R2-first/GridFS-fallback, and canonical schema Books uses —
-    via its public function, never by touching the chapter_sync collection
-    directly (that stays exclusively owned by sync_studio_tools.py, per
-    tools/check_collection_ownership.py). `owner_ref` (not `slug`/
-    `chapter_index`) is how this product binds to the shared, provider-
-    neutral Universal Synchronization Engine without either module knowing
-    about the other's domain."""
+    """Upload a lesson's video/audio and bind the resulting syncId AND
+    mediaRef onto it. Reuses sync_studio_tools.create_sync_from_upload —
+    the SAME storage validation, R2-first/GridFS-fallback, and canonical
+    schema Books uses — via its public function, never by touching the
+    chapter_sync collection directly (that stays exclusively owned by
+    sync_studio_tools.py, per tools/check_collection_ownership.py).
+    `owner_ref` (not `slug`/`chapter_index`) is how this product binds to
+    the shared, provider-neutral Universal Synchronization Engine without
+    either module knowing about the other's domain.
+
+    `mediaRef` is denormalized onto the lesson itself (not fetched from
+    the sync document at playback time) so video playback never depends
+    on sync_schema.is_servable_to_students()'s alignment-readiness gate —
+    see build_video_lesson()'s docstring for why that gate must stay
+    scoped to captions/highlighting only."""
     lesson = await get_video_lesson(db, lesson_id)
     if not lesson:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
@@ -160,7 +166,9 @@ async def attach_lesson_media(
     except sync_studio_tools.SyncStudioError as exc:
         raise VideoLibraryError(exc.code, exc.message, exc.http_status) from exc
 
-    return await update_video_lesson(db, lesson_id, {"syncId": sync_doc["syncId"]})
+    return await update_video_lesson(
+        db, lesson_id, {"syncId": sync_doc["syncId"], "mediaRef": sync_doc["mediaRef"]},
+    )
 
 
 # ── Ownership (the ONLY function anything should call to decide access) ────
@@ -201,14 +209,16 @@ async def list_continue_watching(db, student_id: str) -> list[dict]:
 async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None) -> dict:
     """Backend-computed ownership flag — the frontend never decides this.
     Free lessons (price<=0) are always "owned"; a paid lesson only exposes
-    its syncId (the actual transcript/teleprompter reference) once owned —
-    everything else (title, thumbnail, price) is always visible so a
-    student can browse and decide whether to purchase."""
+    its syncId AND mediaRef (the actual protected content — transcript
+    reference and the playable video file itself) once owned — everything
+    else (title, thumbnail, price, instructor, category) is always visible
+    so a student can browse and decide whether to purchase."""
     price = int(lesson.get("price") or 0)
     owned = price <= 0 or (bool(student_id) and await student_owns_lesson(db, student_id, lesson["lessonId"]))
     out = {**lesson, "owned": owned}
     if not owned:
         out.pop("syncId", None)
+        out.pop("mediaRef", None)
     return out
 
 
