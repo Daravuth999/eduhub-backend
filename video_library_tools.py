@@ -44,6 +44,7 @@ import video_library_points_adapter as points
 import sync_studio_tools
 from video_schema import (
     RETRYABLE_STATES,
+    build_progress_record,
     build_purchase_record,
     build_video_lesson,
     is_owned,
@@ -54,6 +55,7 @@ logger = logging.getLogger("eduhub.video_library")
 
 LESSONS_COLL = "video_lessons"
 PURCHASES_COLL = "video_purchases"
+PROGRESS_COLL = "video_progress"
 
 
 def _utcnow_iso() -> str:
@@ -75,8 +77,12 @@ class VideoLibraryError(Exception):
 async def ensure_video_library_indexes(db) -> None:
     await db[LESSONS_COLL].create_index("lessonId", unique=True)
     await db[LESSONS_COLL].create_index("status")
+    await db[LESSONS_COLL].create_index([("status", 1), ("category", 1)])
+    await db[LESSONS_COLL].create_index([("status", 1), ("difficulty", 1)])
     await db[PURCHASES_COLL].create_index("purchaseId", unique=True)
     await db[PURCHASES_COLL].create_index([("studentId", 1), ("lessonId", 1)])
+    await db[PROGRESS_COLL].create_index([("studentId", 1), ("lessonId", 1)])
+    await db[PROGRESS_COLL].create_index([("studentId", 1), ("updatedAt", -1)])
     logger.info("video_library_tools: indexes ready")
 
 
@@ -95,8 +101,19 @@ async def get_video_lesson(db, lesson_id: str) -> dict | None:
     return await db[LESSONS_COLL].find_one({"lessonId": lesson_id}, {"_id": 0})
 
 
-async def list_video_lessons(db, *, status: str | None = None) -> list[dict]:
-    query = {"status": status} if status else {}
+async def list_video_lessons(
+    db, *, status: str | None = None, category: str | None = None, difficulty: str | None = None,
+) -> list[dict]:
+    """Discovery filters (category/difficulty) power the standalone
+    dashboard's category rows and level tabs — additive query params, never
+    a second listing function."""
+    query: dict = {}
+    if status:
+        query["status"] = status
+    if category:
+        query["category"] = category
+    if difficulty:
+        query["difficulty"] = difficulty
     cursor = db[LESSONS_COLL].find(query, {"_id": 0}).sort([("createdAt", -1)])
     return await cursor.to_list(length=500)
 
@@ -106,7 +123,8 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
     if not existing:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
     safe_updates = {k: v for k, v in updates.items() if k in (
-        "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "durationSec", "status",
+        "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "mediaRef", "durationSec", "status",
+        "instructor", "category", "difficulty", "cefrLevel", "estimatedStudyMinutes",
     )}
     merged = {**existing, **safe_updates}
     ok, errors = validate_video_lesson(merged)
@@ -121,15 +139,21 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
 async def attach_lesson_media(
     db, lesson_id: str, *, raw: bytes, declared_content_type: str, media_bucket, uploaded_by: str = "",
 ) -> dict:
-    """Upload a lesson's video/audio and bind the resulting syncId onto it.
-    Reuses sync_studio_tools.create_sync_from_upload — the SAME storage
-    validation, R2-first/GridFS-fallback, and canonical schema Books uses —
-    via its public function, never by touching the chapter_sync collection
-    directly (that stays exclusively owned by sync_studio_tools.py, per
-    tools/check_collection_ownership.py). `owner_ref` (not `slug`/
-    `chapter_index`) is how this product binds to the shared, provider-
-    neutral Universal Synchronization Engine without either module knowing
-    about the other's domain."""
+    """Upload a lesson's video/audio and bind the resulting syncId AND
+    mediaRef onto it. Reuses sync_studio_tools.create_sync_from_upload —
+    the SAME storage validation, R2-first/GridFS-fallback, and canonical
+    schema Books uses — via its public function, never by touching the
+    chapter_sync collection directly (that stays exclusively owned by
+    sync_studio_tools.py, per tools/check_collection_ownership.py).
+    `owner_ref` (not `slug`/`chapter_index`) is how this product binds to
+    the shared, provider-neutral Universal Synchronization Engine without
+    either module knowing about the other's domain.
+
+    `mediaRef` is denormalized onto the lesson itself (not fetched from
+    the sync document at playback time) so video playback never depends
+    on sync_schema.is_servable_to_students()'s alignment-readiness gate —
+    see build_video_lesson()'s docstring for why that gate must stay
+    scoped to captions/highlighting only."""
     lesson = await get_video_lesson(db, lesson_id)
     if not lesson:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
@@ -142,7 +166,9 @@ async def attach_lesson_media(
     except sync_studio_tools.SyncStudioError as exc:
         raise VideoLibraryError(exc.code, exc.message, exc.http_status) from exc
 
-    return await update_video_lesson(db, lesson_id, {"syncId": sync_doc["syncId"]})
+    return await update_video_lesson(
+        db, lesson_id, {"syncId": sync_doc["syncId"], "mediaRef": sync_doc["mediaRef"]},
+    )
 
 
 # ── Ownership (the ONLY function anything should call to decide access) ────
@@ -154,17 +180,45 @@ async def student_owns_lesson(db, student_id: str, lesson_id: str) -> bool:
     return is_owned(await get_purchase(db, student_id, lesson_id))
 
 
+# ── Progress ("where did I leave off") ──────────────────────────────────────
+async def record_progress(db, *, student_id: str, lesson_id: str, position_sec: float, duration_sec: float) -> dict:
+    doc = build_progress_record(
+        student_id=student_id, lesson_id=lesson_id, position_sec=position_sec,
+        duration_sec=duration_sec, updated_at=_utcnow_iso(),
+    )
+    key = _purchase_key(student_id, lesson_id)  # same {studentId}::{lessonId} shape, different collection
+    await db[PROGRESS_COLL].update_one({"_id": key}, {"$set": doc}, upsert=True)
+    return doc
+
+
+async def get_progress(db, student_id: str, lesson_id: str) -> dict | None:
+    return await db[PROGRESS_COLL].find_one({"_id": _purchase_key(student_id, lesson_id)}, {"_id": 0})
+
+
+async def list_continue_watching(db, student_id: str) -> list[dict]:
+    """Lessons with real, saved progress that are not yet complete —
+    powers the dashboard's "Continue Learning" row. Never returns a lesson
+    the student hasn't actually started (no synthetic "recommended as
+    continue watching" — that's a different, unbuilt "Recommended" concern)."""
+    cursor = db[PROGRESS_COLL].find(
+        {"studentId": student_id, "completed": False}, {"_id": 0},
+    ).sort([("updatedAt", -1)])
+    return await cursor.to_list(length=50)
+
+
 async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None) -> dict:
     """Backend-computed ownership flag — the frontend never decides this.
     Free lessons (price<=0) are always "owned"; a paid lesson only exposes
-    its syncId (the actual transcript/teleprompter reference) once owned —
-    everything else (title, thumbnail, price) is always visible so a
-    student can browse and decide whether to purchase."""
+    its syncId AND mediaRef (the actual protected content — transcript
+    reference and the playable video file itself) once owned — everything
+    else (title, thumbnail, price, instructor, category) is always visible
+    so a student can browse and decide whether to purchase."""
     price = int(lesson.get("price") or 0)
     owned = price <= 0 or (bool(student_id) and await student_owns_lesson(db, student_id, lesson["lessonId"]))
     out = {**lesson, "owned": owned}
     if not owned:
         out.pop("syncId", None)
+        out.pop("mediaRef", None)
     return out
 
 
@@ -298,6 +352,11 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
                 tier=payload.get("tier", "standard"),
                 sync_id=payload.get("syncId"),
                 duration_sec=float(payload.get("durationSec", 0.0)),
+                instructor=payload.get("instructor", ""),
+                category=payload.get("category") or None,
+                difficulty=payload.get("difficulty") or None,
+                cefr_level=payload.get("cefrLevel") or None,
+                estimated_study_minutes=int(payload.get("estimatedStudyMinutes", 0) or 0),
             )
         except VideoLibraryError as exc:
             _raise(exc)
@@ -307,6 +366,22 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
     async def list_lessons_admin_route(status: str = "", _admin=Depends(require_admin)):
         docs = await list_video_lessons(db, status=status or None)
         return {"lessons": docs}
+
+    @api.post("/video/lessons/{lesson_id}/progress")
+    async def progress_route(lesson_id: str, payload: dict = Body(...), student=Depends(require_student)):
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        doc = await record_progress(
+            db, student_id=student_id, lesson_id=lesson_id,
+            position_sec=float(payload.get("positionSec", 0.0)),
+            duration_sec=float(payload.get("durationSec", 0.0)),
+        )
+        return {"ok": True, "progress": doc}
+
+    @api.get("/video/progress/mine")
+    async def my_continue_watching_route(student=Depends(require_student)):
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        docs = await list_continue_watching(db, student_id)
+        return {"progress": docs}
 
     @api.patch("/studio/video/lessons/{lesson_id}")
     async def update_lesson_route(lesson_id: str, payload: dict = Body(...), _admin=Depends(require_admin)):
@@ -342,8 +417,10 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
 
     # ── Student-facing Video Library ────────────────────────────────────
     @api.get("/video/lessons")
-    async def list_lessons_route(student=Depends(require_student)):
-        lessons = await list_video_lessons(db, status="published")
+    async def list_lessons_route(category: str = "", difficulty: str = "", student=Depends(require_student)):
+        lessons = await list_video_lessons(
+            db, status="published", category=category or None, difficulty=difficulty or None,
+        )
         student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
         out = [await serialize_lesson_for_student(db, lesson, student_id) for lesson in lessons]
         return {"lessons": out}

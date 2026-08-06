@@ -207,6 +207,12 @@ class _Coll:
                 new_doc = dict(update["$setOnInsert"])
                 self.docs[new_doc["_id"]] = new_doc
                 return _Result(matched_count=0, upserted_id=new_doc["_id"])
+            if upsert and "$set" in update:
+                new_doc = {**query, **update["$set"]}
+                key = new_doc.get("_id") or query.get("_id")
+                new_doc["_id"] = key
+                self.docs[key] = new_doc
+                return _Result(matched_count=0, upserted_id=key)
             return _Result(matched_count=0)
         if "$set" in update:
             doc.update(update["$set"])
@@ -235,6 +241,7 @@ class _FakeDB:
     def __init__(self):
         self.video_lessons = _Coll()
         self.video_purchases = _Coll()
+        self.video_progress = _Coll()
         self.chapter_sync = _Coll()  # sync_studio_tools.py's collection — cross-module reuse test
 
     def __getitem__(self, name):
@@ -242,14 +249,16 @@ class _FakeDB:
             return self.video_lessons
         if name == vlt.PURCHASES_COLL:
             return self.video_purchases
+        if name == vlt.PROGRESS_COLL:
+            return self.video_progress
         if name == "chapter_sync":
             return self.chapter_sync
         raise AssertionError(f"unexpected collection: {name}")
 
 
-async def _seed_published_lesson(db, *, price=50, lesson_id="vid_1", sync_id="sync_abc"):
+async def _seed_published_lesson(db, *, price=50, lesson_id="vid_1", sync_id="sync_abc", media_ref="https://pub-x.r2.dev/vid.mp4"):
     lesson = schema.build_video_lesson(
-        title="Ordering Coffee", price=price, lesson_id=lesson_id, sync_id=sync_id,
+        title="Ordering Coffee", price=price, lesson_id=lesson_id, sync_id=sync_id, media_ref=media_ref,
         status="published", created_at="t0",
     )
     await db[vlt.LESSONS_COLL].insert_one(lesson)
@@ -329,6 +338,10 @@ async def test_attach_lesson_media_binds_sync_id_via_shared_engine():
     sync_doc = db.chapter_sync.docs[updated["syncId"]]
     assert sync_doc["ownerRef"] == f"video_lesson:{lesson['lessonId']}"
     assert sync_doc["alignmentStatus"] == "awaiting_provider"
+    # mediaRef is denormalized onto the lesson so playback never depends on
+    # sync_schema.is_servable_to_students()'s alignment-readiness gate.
+    assert updated["mediaRef"] == sync_doc["mediaRef"]
+    assert updated["mediaRef"].startswith("gridfs://sync_media/")
     assert len(bucket.files) == 1  # stored via GridFS fallback (no R2 env vars in tests)
 
 
@@ -370,6 +383,7 @@ async def test_paid_lesson_hides_sync_id_when_not_owned():
     out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
     assert out["owned"] is False
     assert "syncId" not in out
+    assert "mediaRef" not in out  # the playable video itself is also protected
 
 
 @pytest.mark.asyncio
@@ -382,6 +396,7 @@ async def test_paid_lesson_shows_sync_id_when_owned():
     out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
     assert out["owned"] is True
     assert out["syncId"] == "sync_abc"
+    assert out["mediaRef"] == "https://pub-x.r2.dev/vid.mp4"
 
 
 # ── purchase state machine ───────────────────────────────────────────────
@@ -555,3 +570,131 @@ async def test_admin_reconcile_rejects_invalid_resolution():
     with pytest.raises(vlt.VideoLibraryError) as exc:
         await vlt.admin_reconcile_purchase(db, "stu1", "vid_1", resolution="maybe", actor="admin@x.com")
     assert exc.value.code == "invalid_resolution"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# video_schema.py — discovery metadata (product direction: standalone
+# premium dashboard needs real category/level data)
+# ═════════════════════════════════════════════════════════════════════════
+def test_build_video_lesson_accepts_discovery_metadata():
+    doc = schema.build_video_lesson(
+        title="Ordering Coffee", price=50, instructor="Ms. Sopheak",
+        category="conversation", difficulty="beginner", cefr_level="A2",
+        estimated_study_minutes=15,
+    )
+    assert doc["instructor"] == "Ms. Sopheak"
+    assert doc["category"] == "conversation"
+    assert doc["difficulty"] == "beginner"
+    assert doc["cefrLevel"] == "A2"
+    assert doc["estimatedStudyMinutes"] == 15
+
+
+def test_build_video_lesson_rejects_invalid_category():
+    with pytest.raises(ValueError):
+        schema.build_video_lesson(title="x", price=0, category="not_a_real_category")
+
+
+def test_build_video_lesson_rejects_invalid_difficulty():
+    with pytest.raises(ValueError):
+        schema.build_video_lesson(title="x", price=0, difficulty="expert")
+
+
+def test_build_video_lesson_rejects_invalid_cefr_level():
+    with pytest.raises(ValueError):
+        schema.build_video_lesson(title="x", price=0, cefr_level="Z9")
+
+
+def test_validate_video_lesson_catches_invalid_discovery_metadata():
+    doc = schema.build_video_lesson(title="x", price=0)
+    doc["category"] = "not_real"
+    ok, errors = schema.validate_video_lesson(doc)
+    assert not ok
+    assert any("category" in e for e in errors)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# video_schema.py — progress record
+# ═════════════════════════════════════════════════════════════════════════
+def test_build_progress_record_computes_completion_from_fraction():
+    incomplete = schema.build_progress_record(student_id="s", lesson_id="l", position_sec=30, duration_sec=100)
+    assert incomplete["completed"] is False
+    complete = schema.build_progress_record(student_id="s", lesson_id="l", position_sec=95, duration_sec=100)
+    assert complete["completed"] is True
+
+
+def test_build_progress_record_zero_duration_never_marks_complete():
+    doc = schema.build_progress_record(student_id="s", lesson_id="l", position_sec=0, duration_sec=0)
+    assert doc["completed"] is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# video_library_tools.py — discovery filters + progress ("Continue Learning")
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_list_video_lessons_filters_by_category_and_difficulty():
+    db = _FakeDB()
+    await vlt.create_video_lesson(db, title="Coffee Chat", price=0, created_by="a", category="conversation", difficulty="beginner")
+    await vlt.create_video_lesson(db, title="Boardroom English", price=0, created_by="a", category="business", difficulty="advanced")
+
+    conv = await vlt.list_video_lessons(db, category="conversation")
+    assert [l["title"] for l in conv] == ["Coffee Chat"]
+
+    beginner = await vlt.list_video_lessons(db, difficulty="beginner")
+    assert [l["title"] for l in beginner] == ["Coffee Chat"]
+
+
+@pytest.mark.asyncio
+async def test_create_lesson_route_payload_passthrough_via_service():
+    db = _FakeDB()
+    doc = await vlt.create_video_lesson(
+        db, title="Storytime", price=0, created_by="a",
+        instructor="Mr. Dara", category="storytelling", difficulty="intermediate",
+        cefr_level="B1", estimated_study_minutes=20,
+    )
+    fetched = await vlt.get_video_lesson(db, doc["lessonId"])
+    assert fetched["instructor"] == "Mr. Dara"
+    assert fetched["cefrLevel"] == "B1"
+    assert fetched["estimatedStudyMinutes"] == 20
+
+
+@pytest.mark.asyncio
+async def test_update_video_lesson_allows_discovery_metadata_fields():
+    db = _FakeDB()
+    doc = await vlt.create_video_lesson(db, title="X", price=0, created_by="a")
+    updated = await vlt.update_video_lesson(db, doc["lessonId"], {
+        "category": "pronunciation", "difficulty": "advanced", "cefrLevel": "C1", "instructor": "Ms. Rith",
+    })
+    assert updated["category"] == "pronunciation"
+    assert updated["cefrLevel"] == "C1"
+    assert updated["instructor"] == "Ms. Rith"
+
+
+@pytest.mark.asyncio
+async def test_record_progress_upserts_and_marks_completion():
+    db = _FakeDB()
+    doc = await vlt.record_progress(db, student_id="stu1", lesson_id="vid_1", position_sec=10, duration_sec=100)
+    assert doc["completed"] is False
+    assert await vlt.get_progress(db, "stu1", "vid_1") == doc
+
+    updated = await vlt.record_progress(db, student_id="stu1", lesson_id="vid_1", position_sec=95, duration_sec=100)
+    assert updated["completed"] is True
+    # upsert, not append — still exactly one record for this (student, lesson)
+    assert await vlt.get_progress(db, "stu1", "vid_1") == updated
+
+
+@pytest.mark.asyncio
+async def test_list_continue_watching_excludes_completed_and_other_students():
+    db = _FakeDB()
+    await vlt.record_progress(db, student_id="stu1", lesson_id="vid_1", position_sec=10, duration_sec=100)  # in progress
+    await vlt.record_progress(db, student_id="stu1", lesson_id="vid_2", position_sec=99, duration_sec=100)  # completed
+    await vlt.record_progress(db, student_id="stu2", lesson_id="vid_1", position_sec=10, duration_sec=100)  # different student
+
+    result = await vlt.list_continue_watching(db, "stu1")
+    assert [r["lessonId"] for r in result] == ["vid_1"]
+
+
+@pytest.mark.asyncio
+async def test_list_continue_watching_empty_for_student_with_no_progress():
+    db = _FakeDB()
+    result = await vlt.list_continue_watching(db, "stu1")
+    assert result == []
