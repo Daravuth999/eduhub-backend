@@ -39,6 +39,24 @@ PURCHASE_STATES = ("created", "initiating", "succeeded", "failed", "reconcile")
 # caller must check ownership before ever reaching this state machine).
 RETRYABLE_STATES = ("created", "failed")
 
+# Discovery/curation metadata (product direction: a standalone premium
+# streaming-style dashboard needs real category/level data to filter and
+# group by — these are additive fields on the same lesson document, never
+# a second schema). CEFR is optional and separate from the coarser
+# `difficulty` grouping the dashboard's Beginner/Intermediate/Advanced
+# tabs use — a lesson may set one, both, or neither.
+VIDEO_CATEGORIES = (
+    "conversation", "storytelling", "business", "pronunciation", "grammar", "vocabulary",
+)
+VIDEO_DIFFICULTIES = ("beginner", "intermediate", "advanced")
+CEFR_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
+
+# A lesson is "complete" for progress-tracking purposes once watched past
+# this fraction of its duration — matches this codebase's existing
+# convention of treating near-the-end as complete rather than requiring
+# frame-perfect 100% (accounts for credits/outro).
+PROGRESS_COMPLETE_THRESHOLD = 0.9
+
 
 def new_lesson_id() -> str:
     return "vid_" + uuid.uuid4().hex[:16]
@@ -61,6 +79,11 @@ def build_video_lesson(
     status: str = "draft",
     created_by: str = "",
     created_at: str = "",
+    instructor: str = "",
+    category: str | None = None,
+    difficulty: str | None = None,
+    cefr_level: str | None = None,
+    estimated_study_minutes: int = 0,
 ) -> dict:
     """Assemble a video lesson metadata document. `syncId` is a reference
     into the existing chapter_sync collection (sync_schema.py's canonical
@@ -69,6 +92,12 @@ def build_video_lesson(
         raise ValueError(f"invalid status: {status!r}")
     if price < 0:
         raise ValueError("price cannot be negative")
+    if category is not None and category not in VIDEO_CATEGORIES:
+        raise ValueError(f"invalid category: {category!r}")
+    if difficulty is not None and difficulty not in VIDEO_DIFFICULTIES:
+        raise ValueError(f"invalid difficulty: {difficulty!r}")
+    if cefr_level is not None and cefr_level not in CEFR_LEVELS:
+        raise ValueError(f"invalid cefr_level: {cefr_level!r}")
 
     return {
         "lessonId": lesson_id or new_lesson_id(),
@@ -83,6 +112,11 @@ def build_video_lesson(
         "revision": 1,
         "createdBy": created_by,
         "createdAt": created_at,
+        "instructor": instructor,
+        "category": category,
+        "difficulty": difficulty,
+        "cefrLevel": cefr_level,
+        "estimatedStudyMinutes": max(0, int(estimated_study_minutes)),
     }
 
 
@@ -98,6 +132,12 @@ def validate_video_lesson(doc: dict) -> tuple[bool, list[str]]:
     price = doc.get("price")
     if price is not None and (not isinstance(price, (int, float)) or price < 0):
         errors.append(f"invalid price: {price!r}")
+    if doc.get("category") not in (*VIDEO_CATEGORIES, None):
+        errors.append(f"invalid category: {doc.get('category')!r}")
+    if doc.get("difficulty") not in (*VIDEO_DIFFICULTIES, None):
+        errors.append(f"invalid difficulty: {doc.get('difficulty')!r}")
+    if doc.get("cefrLevel") not in (*CEFR_LEVELS, None):
+        errors.append(f"invalid cefrLevel: {doc.get('cefrLevel')!r}")
     return (len(errors) == 0), errors
 
 
@@ -133,3 +173,22 @@ def is_owned(purchase: dict | None) -> bool:
     function is the single place that decision is made, so every route
     that gates video content calls this, never re-derives the logic."""
     return isinstance(purchase, dict) and purchase.get("state") == "succeeded"
+
+
+def build_progress_record(
+    *, student_id: str, lesson_id: str, position_sec: float, duration_sec: float, updated_at: str = "",
+) -> dict:
+    """A student's watch position for one lesson. `_id` is deliberately
+    `{studentId}::{lessonId}` (see video_library_tools.py) — one record per
+    (student, lesson) pair, upserted on every position report, never
+    accumulated as a history log (this is "where did I leave off", not an
+    analytics event stream — see Analytics as a separate future concern)."""
+    fraction = (position_sec / duration_sec) if duration_sec > 0 else 0.0
+    return {
+        "studentId": student_id,
+        "lessonId": lesson_id,
+        "positionSec": max(0.0, round(float(position_sec), 2)),
+        "durationSec": round(float(duration_sec), 2),
+        "completed": fraction >= PROGRESS_COMPLETE_THRESHOLD,
+        "updatedAt": updated_at,
+    }
