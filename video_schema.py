@@ -85,6 +85,7 @@ def build_video_lesson(
     difficulty: str | None = None,
     cefr_level: str | None = None,
     estimated_study_minutes: int = 0,
+    featured: bool = False,
 ) -> dict:
     """Assemble a video lesson metadata document. `syncId` is a reference
     into the existing chapter_sync collection (sync_schema.py's canonical
@@ -128,6 +129,9 @@ def build_video_lesson(
         "difficulty": difficulty,
         "cefrLevel": cefr_level,
         "estimatedStudyMinutes": max(0, int(estimated_study_minutes)),
+        # Curation flag for the standalone dashboard's "Featured Lessons"
+        # row — editorial, admin-set, never derived from sales data.
+        "featured": bool(featured),
     }
 
 
@@ -202,4 +206,16 @@ def build_progress_record(
         "durationSec": round(float(duration_sec), 2),
         "completed": fraction >= PROGRESS_COMPLETE_THRESHOLD,
         "updatedAt": updated_at,
+    }
+
+
+def build_bookmark_record(*, student_id: str, lesson_id: str, created_at: str = "") -> dict:
+    """A student's saved/bookmarked lesson. Same one-record-per-
+    (student, lesson) `_id` convention as purchases/progress (see
+    video_library_tools.py) — toggling a bookmark twice is structurally
+    a no-op pair, never a duplicate row."""
+    return {
+        "studentId": student_id,
+        "lessonId": lesson_id,
+        "createdAt": created_at,
     }

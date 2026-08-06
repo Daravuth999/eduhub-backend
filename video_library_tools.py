@@ -44,6 +44,7 @@ import video_library_points_adapter as points
 import sync_studio_tools
 from video_schema import (
     RETRYABLE_STATES,
+    build_bookmark_record,
     build_progress_record,
     build_purchase_record,
     build_video_lesson,
@@ -56,6 +57,7 @@ logger = logging.getLogger("eduhub.video_library")
 LESSONS_COLL = "video_lessons"
 PURCHASES_COLL = "video_purchases"
 PROGRESS_COLL = "video_progress"
+BOOKMARKS_COLL = "video_bookmarks"
 
 
 def _utcnow_iso() -> str:
@@ -83,6 +85,8 @@ async def ensure_video_library_indexes(db) -> None:
     await db[PURCHASES_COLL].create_index([("studentId", 1), ("lessonId", 1)])
     await db[PROGRESS_COLL].create_index([("studentId", 1), ("lessonId", 1)])
     await db[PROGRESS_COLL].create_index([("studentId", 1), ("updatedAt", -1)])
+    await db[BOOKMARKS_COLL].create_index([("studentId", 1), ("lessonId", 1)])
+    await db[BOOKMARKS_COLL].create_index([("studentId", 1), ("createdAt", -1)])
     logger.info("video_library_tools: indexes ready")
 
 
@@ -124,7 +128,7 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
     safe_updates = {k: v for k, v in updates.items() if k in (
         "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "mediaRef", "durationSec", "status",
-        "instructor", "category", "difficulty", "cefrLevel", "estimatedStudyMinutes",
+        "instructor", "category", "difficulty", "cefrLevel", "estimatedStudyMinutes", "featured",
     )}
     merged = {**existing, **safe_updates}
     ok, errors = validate_video_lesson(merged)
@@ -171,6 +175,23 @@ async def attach_lesson_media(
     )
 
 
+async def delete_video_lesson(db, lesson_id: str) -> None:
+    """Video Factory delete. Published lessons must be unpublished first —
+    a lesson students can currently see/purchase can never silently vanish
+    in one step. Purchase and progress records are deliberately RETAINED
+    (they are the financial audit trail; entitlement history outlives the
+    catalog entry, matching the codebase's reconciliation discipline)."""
+    lesson = await get_video_lesson(db, lesson_id)
+    if not lesson:
+        raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
+    if lesson.get("status") == "published":
+        raise VideoLibraryError(
+            "lesson_published", "unpublish this lesson before deleting it", 409,
+        )
+    await db[LESSONS_COLL].delete_one({"lessonId": lesson_id})
+    logger.info("video_library: lesson deleted lessonId=%s", lesson_id)
+
+
 # ── Ownership (the ONLY function anything should call to decide access) ────
 async def get_purchase(db, student_id: str, lesson_id: str) -> dict | None:
     return await db[PURCHASES_COLL].find_one({"_id": _purchase_key(student_id, lesson_id)}, {"_id": 0})
@@ -204,6 +225,28 @@ async def list_continue_watching(db, student_id: str) -> list[dict]:
         {"studentId": student_id, "completed": False}, {"_id": 0},
     ).sort([("updatedAt", -1)])
     return await cursor.to_list(length=50)
+
+
+# ── Bookmarks (saved lessons) ────────────────────────────────────────────
+async def toggle_bookmark(db, *, student_id: str, lesson_id: str) -> dict:
+    """Idempotent toggle. Same deterministic `{studentId}::{lessonId}` _id
+    convention as purchases/progress — one bookmark row per pair, ever."""
+    lesson = await get_video_lesson(db, lesson_id)
+    if not lesson or lesson.get("status") != "published":
+        raise VideoLibraryError("lesson_not_found", f"no published lesson {lesson_id!r}", 404)
+    key = _purchase_key(student_id, lesson_id)
+    existing = await db[BOOKMARKS_COLL].find_one({"_id": key}, {"_id": 0})
+    if existing:
+        await db[BOOKMARKS_COLL].delete_one({"_id": key})
+        return {"bookmarked": False, "lessonId": lesson_id}
+    doc = {**build_bookmark_record(student_id=student_id, lesson_id=lesson_id, created_at=_utcnow_iso()), "_id": key}
+    await db[BOOKMARKS_COLL].update_one({"_id": key}, {"$setOnInsert": doc}, upsert=True)
+    return {"bookmarked": True, "lessonId": lesson_id}
+
+
+async def list_bookmarks(db, student_id: str) -> list[dict]:
+    cursor = db[BOOKMARKS_COLL].find({"studentId": student_id}, {"_id": 0}).sort([("createdAt", -1)])
+    return await cursor.to_list(length=200)
 
 
 async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None) -> dict:
@@ -357,6 +400,7 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
                 difficulty=payload.get("difficulty") or None,
                 cefr_level=payload.get("cefrLevel") or None,
                 estimated_study_minutes=int(payload.get("estimatedStudyMinutes", 0) or 0),
+                featured=bool(payload.get("featured", False)),
             )
         except VideoLibraryError as exc:
             _raise(exc)
@@ -402,6 +446,29 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         except VideoLibraryError as exc:
             _raise(exc)
         return {"ok": True, "lesson": doc}
+
+    @api.delete("/studio/video/lessons/{lesson_id}")
+    async def delete_lesson_route(lesson_id: str, _admin=Depends(require_admin)):
+        try:
+            await delete_video_lesson(db, lesson_id)
+        except VideoLibraryError as exc:
+            _raise(exc)
+        return {"ok": True}
+
+    @api.post("/video/lessons/{lesson_id}/bookmark")
+    async def bookmark_toggle_route(lesson_id: str, student=Depends(require_student)):
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        try:
+            out = await toggle_bookmark(db, student_id=student_id, lesson_id=lesson_id)
+        except VideoLibraryError as exc:
+            _raise(exc)
+        return {"ok": True, **out}
+
+    @api.get("/video/bookmarks/mine")
+    async def my_bookmarks_route(student=Depends(require_student)):
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        docs = await list_bookmarks(db, student_id)
+        return {"bookmarks": docs}
 
     @api.post("/admin/video/purchases/{student_id}/{lesson_id}/reconcile")
     async def reconcile_route(student_id: str, lesson_id: str, payload: dict = Body(...), admin=Depends(require_admin)):

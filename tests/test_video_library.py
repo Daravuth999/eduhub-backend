@@ -233,6 +233,13 @@ class _Coll:
                 doc.setdefault(k, []).append(v)
         return before
 
+    async def delete_one(self, query):
+        for key, doc in list(self.docs.items()):
+            if _matches(doc, query):
+                del self.docs[key]
+                return _Result(deleted_count=1)
+        return _Result(deleted_count=0)
+
     def find(self, query=None, projection=None):
         return _Cursor([d for d in self.docs.values() if _matches(d, query or {})])
 
@@ -242,6 +249,7 @@ class _FakeDB:
         self.video_lessons = _Coll()
         self.video_purchases = _Coll()
         self.video_progress = _Coll()
+        self.video_bookmarks = _Coll()
         self.chapter_sync = _Coll()  # sync_studio_tools.py's collection — cross-module reuse test
 
     def __getitem__(self, name):
@@ -251,6 +259,8 @@ class _FakeDB:
             return self.video_purchases
         if name == vlt.PROGRESS_COLL:
             return self.video_progress
+        if name == vlt.BOOKMARKS_COLL:
+            return self.video_bookmarks
         if name == "chapter_sync":
             return self.chapter_sync
         raise AssertionError(f"unexpected collection: {name}")
@@ -698,3 +708,84 @@ async def test_list_continue_watching_empty_for_student_with_no_progress():
     db = _FakeDB()
     result = await vlt.list_continue_watching(db, "stu1")
     assert result == []
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Featured flag (dashboard curation)
+# ═════════════════════════════════════════════════════════════════════════
+def test_build_video_lesson_featured_defaults_false_and_accepts_true():
+    assert schema.build_video_lesson(title="x", price=0)["featured"] is False
+    assert schema.build_video_lesson(title="x", price=0, featured=True)["featured"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_video_lesson_allows_featured_flag():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="T", price=0, created_by="a@x")
+    updated = await vlt.update_video_lesson(db, lesson["lessonId"], {"featured": True})
+    assert updated["featured"] is True
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Lesson delete (Video Factory)
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_delete_video_lesson_removes_draft():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="T", price=0, created_by="a@x")
+    await vlt.delete_video_lesson(db, lesson["lessonId"])
+    assert await vlt.get_video_lesson(db, lesson["lessonId"]) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_video_lesson_refuses_published():
+    db = _FakeDB()
+    await _seed_published_lesson(db, lesson_id="vid_pub")
+    with pytest.raises(vlt.VideoLibraryError) as exc:
+        await vlt.delete_video_lesson(db, "vid_pub")
+    assert exc.value.code == "lesson_published"
+    assert await vlt.get_video_lesson(db, "vid_pub") is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_video_lesson_not_found():
+    db = _FakeDB()
+    with pytest.raises(vlt.VideoLibraryError) as exc:
+        await vlt.delete_video_lesson(db, "vid_missing")
+    assert exc.value.code == "lesson_not_found"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Bookmarks (saved lessons)
+# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_toggle_bookmark_on_then_off():
+    db = _FakeDB()
+    await _seed_published_lesson(db, lesson_id="vid_b")
+    on = await vlt.toggle_bookmark(db, student_id="stu1", lesson_id="vid_b")
+    assert on == {"bookmarked": True, "lessonId": "vid_b"}
+    marks = await vlt.list_bookmarks(db, "stu1")
+    assert [m["lessonId"] for m in marks] == ["vid_b"]
+    off = await vlt.toggle_bookmark(db, student_id="stu1", lesson_id="vid_b")
+    assert off == {"bookmarked": False, "lessonId": "vid_b"}
+    assert await vlt.list_bookmarks(db, "stu1") == []
+
+
+@pytest.mark.asyncio
+async def test_toggle_bookmark_rejects_unpublished_lesson():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="draft", price=0, created_by="a@x")
+    with pytest.raises(vlt.VideoLibraryError) as exc:
+        await vlt.toggle_bookmark(db, student_id="stu1", lesson_id=lesson["lessonId"])
+    assert exc.value.code == "lesson_not_found"
+
+
+@pytest.mark.asyncio
+async def test_list_bookmarks_scoped_per_student():
+    db = _FakeDB()
+    await _seed_published_lesson(db, lesson_id="vid_b1")
+    await _seed_published_lesson(db, lesson_id="vid_b2")
+    await vlt.toggle_bookmark(db, student_id="stu1", lesson_id="vid_b1")
+    await vlt.toggle_bookmark(db, student_id="stu2", lesson_id="vid_b2")
+    assert [m["lessonId"] for m in await vlt.list_bookmarks(db, "stu1")] == ["vid_b1"]
+    assert [m["lessonId"] for m in await vlt.list_bookmarks(db, "stu2")] == ["vid_b2"]
