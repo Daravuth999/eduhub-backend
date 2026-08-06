@@ -8,20 +8,31 @@
 # existing proven credit path (payment_bridge._complete_points_payment)
 # passed in explicitly rather than resolved via globals() lookup, so this
 # module's conversion is decoupled from payment_bridge.py's own conversion
-# timing. The register call returns (reconcile_once, ensure_indexes) --
-# reconcile_once for server.py's existing 60s background loop, and
-# ensure_indexes (Phase 1e, Collection Ownership) so server.py's startup
-# handler creates camrapidpay_intents' indexes via this owning module
-# instead of touching the collection directly itself.
+# timing. The register call returns (reconcile_once, ensure_indexes,
+# verify_via_bank_notification) -- reconcile_once for server.py's existing
+# 60s background loop, ensure_indexes (Phase 1e, Collection Ownership) so
+# server.py's startup handler creates camrapidpay_intents' indexes via this
+# owning module instead of touching the collection directly itself, and
+# verify_via_bank_notification (Aug 2026 hybrid-verification restore) which
+# server.py wires into payment_bridge.py's existing late_binds dict so its
+# ABA/Bakong Telegram-notification bridge can offer a second, independent
+# confirmation source for a CamRapidPay-created intent.
 #
 # SECURITY / TRUTH MODEL (non-negotiable):
 #   - The webhook is a WAKE-UP TRIGGER ONLY. It never credits from its body.
 #   - The ONLY proof of payment is a server-to-server CamRapidPay status call
-#     returning Success.
-#   - All three trigger paths (webhook, polling, "I've paid") funnel through
-#     verify_camrapidpay_payment_and_credit_once(reference).
+#     returning Success -- OR (Aug 2026 hybrid-verification restore, see
+#     _camrapidpay_verify_via_bank_notification below) a strictly single-
+#     matched ABA/Bakong Telegram bank notification via payment_bridge.py's
+#     existing bridge, used only as a second confirmation source for the
+#     confirmed CamRapidPay reconciliation outage.
+#   - All CamRapidPay-Success trigger paths (webhook, polling, "I've paid")
+#     funnel through verify_camrapidpay_payment_and_credit_once(reference),
+#     UNCHANGED. The bank-notification bridge is a separate function that
+#     claims the same camrapidpay_intents document via the same atomic gate.
 #   - Crediting is guarded by an ATOMIC find_one_and_update flip so two
-#     racing triggers can never both credit (provably once).
+#     racing triggers -- from either source -- can never both credit
+#     (provably once, regardless of which one arrives first).
 #   - Points/amount/currency come from the internal intent (source of truth),
 #     never from the frontend or the webhook body.
 # ===========================================================================
@@ -131,8 +142,11 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
 
     Explicit-DI replacement for the previous ``exec()``-into-server-namespace
     loading. Behaviour is identical: same routes, same storage collections,
-    same truth model. Returns ``_camrapidpay_reconcile_once`` so the caller
-    can wire it into the existing 60s background sweep loop.
+    same truth model. Returns ``(_camrapidpay_reconcile_once,
+    _camrapidpay_ensure_indexes, _camrapidpay_verify_via_bank_notification)``
+    -- the first for the caller's existing 60s background sweep loop, the
+    third (Aug 2026 hybrid-verification restore) for wiring into
+    payment_bridge.py's late_binds dict as a second confirmation source.
     """
     _cam_intents = db["camrapidpay_intents"]
     _cam_webhook_log = db["camrapidpay_webhook_log"]
@@ -429,6 +443,235 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
             reference, credit_res.get("error"),
         )
         return {"ok": False, "status": "manual_review", "credited": False}
+
+    # -------------------------------------------------------------------
+    # Hybrid verification restore (Aug 2026 incident) — bank-notification
+    # bridge, second verification source
+    # -------------------------------------------------------------------
+    # ROOT CAUSE (confirmed with bank receipt + CamRapidPay's own merchant
+    # dashboard, both cross-checked against Render logs): CamRapidPay is not
+    # a custodial processor here — KHQR settlement lands directly in our
+    # linked Bakong/ABA account the instant a student pays. check-transaction
+    # -api is supposed to separately confirm that settlement and report
+    # Success; that reconciliation step is broken on CamRapidPay's side —
+    # confirmed transactions sit in "Pending" on BOTH their API and their own
+    # dashboard indefinitely (support case pending with CamRapidPay).
+    #
+    # This restores the hybrid resilience the ABA/manual flow already has:
+    # payment_bridge.py's existing Telegram-notification bridge (proven in
+    # production for ABA PayWay notifications, "via Bakong" transfers
+    # included per _parse_payway_message's own payment_method capture) is
+    # wired here as a SECOND, independent confirmation source for a
+    # CamRapidPay-created intent — used only when CamRapidPay's own
+    # check-transaction-api hasn't (yet, or ever) reported Success.
+    #
+    # Everything else about the money-safety model is reused, not
+    # reinvented:
+    #   - verify_camrapidpay_payment_and_credit_once() above is NOT modified
+    #     and remains the CamRapidPay-Success path exactly as today.
+    #   - This function claims the SAME camrapidpay_intents document via the
+    #     SAME atomic find_one_and_update flip (status pending/paid/expired
+    #     + credited_at:None -> "crediting"), so MongoDB's own atomicity is
+    #     what guarantees "credited only once regardless of which source
+    #     arrives first" — whichever caller's find_one_and_update reaches
+    #     Mongo first wins the claim; the other sees claimed=None and safely
+    #     no-ops. No new locking mechanism, no schema change to the intent
+    #     model, no change to duplicate-credit protection.
+    #   - Both paths converge on the exact same complete_points_payment(...)
+    #     call (the same parameter both this module and payment_bridge.py
+    #     have shared since Phase 1's explicit-DI conversion) — the same
+    #     wallet update, the same downstream receipt/notification flow.
+    #   - Strict single-match discipline mirrors payment_bridge.py's own
+    #     _find_best_intent(): exact amount match, unexpired only, and an
+    #     AMBIGUOUS match (more than one candidate) is never auto-credited —
+    #     routed to manual_review exactly like an unknown credit outcome, so
+    #     a human decides rather than the system guessing.
+    async def _camrapidpay_verify_via_bank_notification(txn: dict) -> dict:
+        """Second confirmation source for a CamRapidPay-created intent.
+
+        Called by payment_bridge.py's _process_transaction() ONLY when its
+        own ABA-intent (payment_intents) matching found nothing — this never
+        competes with or alters that existing matching/scoring/dispatch path.
+        ``txn`` is the SAME parsed-transaction dict shape payment_bridge.py
+        already stores in payment_transactions (amount, currency,
+        transaction_id, apv, payer_name, ...).
+
+        Returns {"status": "no_match"|"ambiguous"|"already_claimed"|
+        "credited"|"manual_review", "credited": bool, "reference": str|None,
+        ...}. Never raises.
+        """
+        try:
+            txn_amount = float(txn.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            return {"status": "no_match", "credited": False, "reference": None}
+        currency = str(txn.get("currency", "USD")).upper()
+        now = _cam_now()
+
+        def _amount_matches_intent(intent: dict) -> bool:
+            # Compare against whichever side of the intent matches the
+            # notification's own currency, exactly like payment_bridge.py's
+            # own strict-match compares against amount_khr for KHR notices.
+            if currency == "KHR":
+                return _cam_amount_matches(intent.get("amount_khr", 0), txn_amount)
+            return _cam_amount_matches(intent.get("amount", 0), txn_amount)
+
+        try:
+            candidates_raw = _cam_intents.find({
+                "provider": "camrapidpay",
+                "status": {"$in": ["pending", "paid"]},
+                "credited_at": None,
+            }).limit(200)
+            candidates = [d async for d in candidates_raw]
+        except Exception:  # noqa: BLE001
+            return {"status": "no_match", "credited": False, "reference": None}
+
+        matches = []
+        for intent in candidates:
+            exp_raw = intent.get("expires_at", "")
+            try:
+                exp_dt = datetime.fromisoformat(exp_raw) if exp_raw else None
+                if exp_dt and exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            except Exception:  # noqa: BLE001
+                exp_dt = None
+            if exp_dt and now > exp_dt:
+                continue  # locally expired -- not a candidate for this bridge
+            if _amount_matches_intent(intent):
+                matches.append(intent)
+
+        if len(matches) == 0:
+            # Secondary check: the live pending/paid search found nothing,
+            # but this notification might simply confirm a payment CamRapidPay's
+            # own path already credited moments ago (the common race outcome
+            # once both sources are active). Bounded to RECENTLY credited
+            # intents only -- deliberately NOT an unbounded search, so a
+            # coincidental amount match against some unrelated transaction
+            # credited days/weeks ago (e.g. every past $0.50 top-up) can
+            # never falsely report "already claimed" or pollute future
+            # ambiguity checks.
+            try:
+                recent_cutoff = (now - timedelta(seconds=_CAM_CREDITING_STALE_SECONDS * 5)).isoformat()
+                recently_credited_raw = _cam_intents.find({
+                    "provider": "camrapidpay",
+                    "status": "credited",
+                    "credited_at": {"$gt": recent_cutoff},
+                }).limit(50)
+                recently_credited = [d async for d in recently_credited_raw
+                                      if _amount_matches_intent(d)]
+            except Exception:  # noqa: BLE001
+                recently_credited = []
+            if len(recently_credited) == 1:
+                ref = recently_credited[0].get("reference", "")
+                _CAM_LOG.info(
+                    "camrapidpay: bank-notification bridge ref=%s already credited via another "
+                    "source moments ago -> no double credit",
+                    ref,
+                )
+                return {"status": "already_claimed", "credited": True, "reference": ref}
+            return {"status": "no_match", "credited": False, "reference": None}
+        if len(matches) > 1:
+            _CAM_LOG.warning(
+                "camrapidpay: bank-notification bridge AMBIGUOUS %d candidates for amount=%s%s "
+                "-> not auto-crediting (never guess)",
+                len(matches), txn_amount, currency,
+            )
+            return {"status": "ambiguous", "credited": False, "reference": None,
+                    "candidate_count": len(matches)}
+
+        reference = matches[0].get("reference", "")
+
+        # ---- Same atomic claim verify_camrapidpay_payment_and_credit_once
+        # uses on the SAME collection -- this is the single-winner gate. ----
+        claimed = await _cam_intents.find_one_and_update(
+            {"reference": reference,
+             "status": {"$in": ["pending", "paid", "expired"]},
+             "credited_at": None},
+            {"$set": {"status": "crediting",
+                      "verified_at": now.isoformat(),
+                      "crediting_at": now.isoformat(),
+                      "credited_via": "bank_notification"}},
+        )
+        if not claimed:
+            # CamRapidPay's own check (or a concurrent bank-notification
+            # bridge call) already won the race for this reference.
+            fresh = await _cam_intents.find_one({"reference": reference})
+            already = bool(fresh and (fresh.get("status") == "credited" or fresh.get("credited_at")))
+            _CAM_LOG.info(
+                "camrapidpay: bank-notification bridge ref=%s lost the atomic claim "
+                "(already %s) -> no double credit",
+                reference, "credited" if already else (fresh.get("status") if fresh else "gone"),
+            )
+            return {"status": "already_claimed", "credited": already, "reference": reference}
+
+        student_id = claimed.get("student_id")
+        pkg = {
+            "label":        claimed.get("package_label", "KHQR Top-Up"),
+            "points":       int(claimed.get("base_points", 0)),
+            "bonus_points": int(claimed.get("bonus_points", 0)),
+        }
+        credit_txn = {
+            "transaction_id": str(txn.get("transaction_id") or reference),
+            "apv":            str(txn.get("apv") or ""),
+            "order_id":       reference,
+            "amount":         claimed.get("amount_khr", 0),
+            "source":         "camrapidpay_bank_notification",
+        }
+        try:
+            credit_res = await complete_points_payment(db, student_id, credit_txn, pkg)
+        except Exception as _credit_exc:  # noqa: BLE001
+            await _cam_intents.update_one(
+                {"reference": reference, "credited_at": None},
+                {"$set": {"status": "manual_review",
+                          "error_message":
+                              f"bank_notification_credit_exception_unknown_outcome:{type(_credit_exc).__name__}"[:200],
+                          "updated_at": _cam_now().isoformat()}},
+            )
+            _CAM_LOG.error(
+                "camrapidpay: bank-notification bridge credit raised %s ref=%s -> manual_review "
+                "(UNKNOWN OUTCOME; do NOT auto-retry GAS - not reference-idempotent)",
+                type(_credit_exc).__name__, reference,
+            )
+            return {"status": "manual_review", "credited": False, "reference": reference}
+
+        if credit_res.get("ok"):
+            try:
+                await _cam_intents.update_one(
+                    {"reference": reference},
+                    {"$set": {
+                        "status":       "credited",
+                        "credited_at":  _cam_now().isoformat(),
+                        "points_added": pkg["points"] + pkg["bonus_points"],
+                        "crediting_at": None,
+                    }},
+                )
+            except Exception as _mark_exc:  # noqa: BLE001
+                _CAM_LOG.error(
+                    "camrapidpay: bank-notification bridge CREDIT SUCCEEDED but mark-credited FAILED "
+                    "ref=%s err=%s (sweep will route to manual_review; do NOT auto-retry GAS)",
+                    reference, type(_mark_exc).__name__,
+                )
+                return {"status": "crediting", "credited": True, "reference": reference,
+                        "points_added": pkg["points"] + pkg["bonus_points"]}
+            _CAM_LOG.info(
+                "camrapidpay: bank-notification bridge credited %s pts to %s ref=%s",
+                pkg["points"] + pkg["bonus_points"], student_id, reference,
+            )
+            return {"status": "credited", "credited": True, "reference": reference,
+                     "points_added": pkg["points"] + pkg["bonus_points"]}
+
+        await _cam_intents.update_one(
+            {"reference": reference, "credited_at": None},
+            {"$set": {"status": "manual_review",
+                      "error_message":
+                          f"bank_notification_credit_unknown_outcome:{str(credit_res.get('error', ''))[:160]}",
+                      "updated_at": _cam_now().isoformat()}},
+        )
+        _CAM_LOG.error(
+            "camrapidpay: bank-notification bridge matched but credit returned ok:false ref=%s err=%s "
+            "-> manual_review (UNKNOWN OUTCOME; do NOT auto-retry GAS)",
+            reference, credit_res.get("error"),
+        )
+        return {"status": "manual_review", "credited": False, "reference": reference}
 
     # -------------------------------------------------------------------
     # Endpoint 1: create intent  (authenticated student)
@@ -947,4 +1190,4 @@ def register_camrapidpay_payment_routes(api, db, require_student, complete_point
         # 3) v1.3: migrate any legacy paid_not_credited rows -> manual_review.
         await _camrapidpay_recover_legacy_paid_not_credited()
 
-    return _camrapidpay_reconcile_once, _camrapidpay_ensure_indexes
+    return _camrapidpay_reconcile_once, _camrapidpay_ensure_indexes, _camrapidpay_verify_via_bank_notification

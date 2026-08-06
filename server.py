@@ -7121,13 +7121,28 @@ _complete_points_payment, _payment_bridge_ensure_indexes = register_payment_brid
 # /api/payments/camrapidpay/webhook, GET /api/payments/camrapidpay/status/{id}.
 # When CAMRAPIDPAY_ENABLED != "true" the routes exist but report unavailable,
 # so the existing ABA/manual fallback continues unchanged. The register call
-# returns (reconcile_once, ensure_indexes); reconcile_once is assigned to the
-# same module-level name the existing 60s background loop already looks up,
-# ensure_indexes (Phase 1e) is called from the startup handler below.
+# returns (reconcile_once, ensure_indexes, verify_via_bank_notification);
+# reconcile_once is assigned to the same module-level name the existing 60s
+# background loop already looks up, ensure_indexes (Phase 1e) is called from
+# the startup handler below.
 from camrapidpay_payment_tools import register_camrapidpay_payment_routes
-_camrapidpay_reconcile_once, _camrapidpay_ensure_indexes = register_camrapidpay_payment_routes(
+_camrapidpay_reconcile_once, _camrapidpay_ensure_indexes, _camrapidpay_verify_via_bank_notification = register_camrapidpay_payment_routes(
     api, db, require_student, _complete_points_payment,
 )
+# Hybrid verification restore (Aug 2026 incident — confirmed CamRapidPay
+# reconciliation outage: real Bakong/ABA settlements never reported Success
+# by check-transaction-api, verified against a bank receipt + CamRapidPay's
+# own merchant dashboard). Fulfils payment_bridge.py's late_binds forward
+# reference (same mechanism already used for tuition_finalize_payment /
+# referral_on_points_purchase_success below) so its existing, already-
+# production-proven ABA/Bakong Telegram-notification bridge can offer a
+# second, independent confirmation source for a CamRapidPay-created intent —
+# used only when CamRapidPay's own check-transaction-api hasn't reported
+# Success. No forward-reference gap here: camrapidpay_payment_tools.py
+# registers AFTER payment_bridge.py, so _payment_bridge_late_binds already
+# exists and this key is populated immediately, not later like the two
+# below.
+_payment_bridge_late_binds["camrapidpay_verify_via_bank_notification"] = _camrapidpay_verify_via_bank_notification
 
 # ── Payment Methods Display Config (v1.6, additive, isolated) ────────────
 # Loaded AFTER payment_bridge and camrapidpay_payment_tools so it can reuse

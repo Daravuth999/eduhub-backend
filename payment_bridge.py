@@ -17,7 +17,12 @@
 # real imported module has its own separate globals() and that lookup would
 # silently return None forever. The dict is the explicit, typed stand-in for
 # that implicit forward reference. Keys used: "tuition_finalize_payment",
-# "referral_on_points_purchase_success".
+# "referral_on_points_purchase_success",
+# "camrapidpay_verify_via_bank_notification" (Aug 2026 hybrid-verification
+# restore -- see camrapidpay_payment_tools.py's own header for why this
+# bridge exists; populated immediately after camrapidpay_payment_tools.py
+# registers, no forward-reference gap since it loads right after this
+# module, not later).
 #
 # Returns _complete_points_payment, which camrapidpay_payment_tools.py's own
 # register call needs as an explicit parameter (already wired that way).
@@ -841,6 +846,55 @@ def register_payment_bridge_routes(
                     }},
                 )
             return {"status": final_status, "result": result}
+
+        # Hybrid verification restore (Aug 2026 incident) — the existing
+        # ABA-intent (payment_intents) matching above found NOTHING for this
+        # notification (intent is None). Before giving up, offer it to the
+        # CamRapidPay bridge as a second confirmation source: this same
+        # Telegram-notification pipeline already proves itself in production
+        # for ABA PayWay transfers (its own parser already captures "via
+        # Bakong" as a payment_method), and a confirmed CamRapidPay
+        # reconciliation outage means their own check-transaction-api never
+        # reports Success even when the money genuinely settles into our
+        # linked account. Only attempted when intent is None -- an
+        # AMBIGUOUS or medium-confidence ABA match must still go to human
+        # review exactly as today, never silently reinterpreted as a
+        # CamRapidPay match. camrapidpay_payment_tools.py owns 100% of the
+        # camrapidpay_intents matching/claim/credit logic (collection-
+        # ownership discipline, same as every other register_*_routes
+        # module in this codebase) -- this file only forwards the raw
+        # transaction and records the result.
+        if intent is None:
+            _cam_bridge = late_binds.get("camrapidpay_verify_via_bank_notification")
+            if _cam_bridge is not None:
+                try:
+                    cam_result = await _cam_bridge(txn_doc)
+                except Exception as _cam_bridge_exc:  # noqa: BLE001
+                    log.warning(
+                        "payment_bridge: camrapidpay bridge raised %s for txn=%s -- left unmatched",
+                        type(_cam_bridge_exc).__name__, txn_id,
+                    )
+                    cam_result = None
+                if cam_result and cam_result.get("status") != "no_match":
+                    credited = bool(cam_result.get("credited"))
+                    bridge_status = "completed" if credited else "needs_review"
+                    await db.payment_transactions.update_one(
+                        {"_id": ObjectId(txn_id)},
+                        {"$set": {
+                            "match_confidence":  "high" if credited else "low",
+                            "match_reason":      f"camrapidpay_bridge:{cam_result.get('status')}",
+                            "matched_camrapidpay_reference": cam_result.get("reference"),
+                            "status":            bridge_status,
+                            "completion_result": cam_result,
+                            "completed_at":      datetime.now(timezone.utc).isoformat() if credited else None,
+                            "updated_at":        datetime.now(timezone.utc).isoformat(),
+                        }},
+                    )
+                    log.info(
+                        "payment_bridge: camrapidpay bridge txn=%s ref=%s -> %s (credited=%s)",
+                        txn_id, cam_result.get("reference"), cam_result.get("status"), credited,
+                    )
+                    return {"status": bridge_status, "result": cam_result}
 
         return {"status": new_status, "score": score}
 
