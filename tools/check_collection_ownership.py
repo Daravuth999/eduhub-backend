@@ -106,6 +106,8 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "notification_packs": "notification_packs.py",
     # prize_pool.py (Architecture Reconstruction continuation — Prize Pool Platform)
     "prize_pools": "prize_pool.py",
+    # sync_studio_tools.py (Universal Synchronization Engine, Phase 0 foundation)
+    "chapter_sync": "sync_studio_tools.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed
