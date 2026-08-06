@@ -426,11 +426,17 @@ def _async_return(value):
     return _inner()
 
 
-def test_webhook_amount_mismatch_is_audit_only_and_never_blocks_credit(monkeypatch):
+def test_webhook_amount_mismatch_is_audit_only_and_never_blocks_credit(monkeypatch, caplog):
     """A webhook whose body amount/currency doesn't match the intent must be
     flagged for audit but must NEVER prevent the trusted server-to-server
     check from crediting -- this is the exact 'webhook mismatch (audit
-    only)' log line seen in the real incident."""
+    only)' log line seen in the real incident.
+
+    Diagnostics fix (follow-up): the got=/expected= detail previously only
+    reached Mongo's webhook_mismatch_reason field -- every real occurrence
+    had to be inferred from Render logs without the actual numbers. It must
+    now be in the WARNING line itself.
+    """
     db = FakeDB()
     _enable_camrapidpay(monkeypatch)
     ref = "EDUHUB-MISMATCH"
@@ -447,11 +453,16 @@ def test_webhook_amount_mismatch_is_audit_only_and_never_blocks_credit(monkeypat
         query_params={},
         json=lambda: _async_return({"reference": ref, "amount": 2000, "currency": "KHR"}),
     )
-    run(webhook_ep(fake_request))
+    with caplog.at_level(logging.WARNING, logger="eduhub"):
+        run(webhook_ep(fake_request))
 
     stored = run(db.camrapidpay_intents.find_one({"reference": ref}))
     assert stored["webhook_mismatch"] is True
     assert "amount got=2000" in stored["webhook_mismatch_reason"]
+    assert any(
+        ref in r.message and "amount got=2000" in r.message and "currency got=KHR" in r.message
+        for r in caplog.records
+    ), "the mismatch reason must now be visible in the log line itself, not only in Mongo"
     assert stored["status"] == "credited", "a mismatched webhook must still credit via the trusted status check"
     assert len(completer.calls) == 1
 
