@@ -151,6 +151,117 @@ def test_elevenlabs_provider_requires_generate_fn():
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# sync_provider.py — ScribeAlignmentProvider (CANDIDATE, not production-
+# wired). Confirmed request/response shape per ElevenLabs' own API
+# reference (2026-08-06): POST /v1/speech-to-text, words carry
+# {text, start, end, type, speaker_id, logprob}. All tests below inject a
+# fake http_post — zero real network calls, matching this repo's
+# no-real-network-in-tests convention.
+# ═════════════════════════════════════════════════════════════════════════
+def _scribe_word(text, start, end, *, logprob=-0.01, speaker_id=None, kind="word"):
+    return {"text": text, "start": start, "end": end, "type": kind, "speaker_id": speaker_id, "logprob": logprob}
+
+
+def test_scribe_provider_requires_api_key():
+    with pytest.raises(ValueError):
+        provider.ScribeAlignmentProvider("")
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_align_converts_logprob_to_probability():
+    async def fake_post(audio_bytes, language_code):
+        return {"language_code": "eng", "words": [_scribe_word("Hello", 0.0, 0.3, logprob=0.0)]}
+
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=fake_post)
+    result = await p.align(b"fake-audio-bytes")
+
+    word = result["sync"]["paragraphs"][0]["sentences"][0]["words"][0]
+    # logprob=0.0 -> exp(0.0) == 1.0, the maximum-confidence case.
+    assert word["confidence"]["transcript"] == pytest.approx(1.0)
+    assert "alignment" not in word["confidence"]  # honestly omitted, not fabricated
+    assert result["sync"]["providerCategory"] == "speech_recognition"
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_skips_non_word_entries():
+    async def fake_post(audio_bytes, language_code):
+        return {"words": [
+            _scribe_word("Hello", 0.0, 0.3),
+            {"type": "spacing", "start": 0.3, "end": 0.35},
+            _scribe_word("world", 0.35, 0.6),
+        ]}
+
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=fake_post)
+    result = await p.align(b"x")
+    words = result["sync"]["paragraphs"][0]["sentences"][0]["words"]
+    assert [w["word"] for w in words] == ["Hello", "world"]
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_groups_speaker_turns_into_sentences():
+    async def fake_post(audio_bytes, language_code):
+        return {"words": [
+            _scribe_word("Hello", 0.0, 0.3, speaker_id="spk_1"),
+            _scribe_word("there", 0.3, 0.6, speaker_id="spk_1"),
+            _scribe_word("Hi", 0.6, 0.9, speaker_id="spk_2"),
+        ]}
+
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=fake_post)
+    result = await p.align(b"x")
+    sentences = result["sync"]["paragraphs"][0]["sentences"]
+    assert len(sentences) == 2
+    assert sentences[0]["speakerId"] == "spk_1" and len(sentences[0]["words"]) == 2
+    assert sentences[1]["speakerId"] == "spk_2" and len(sentences[1]["words"]) == 1
+    assert {s["id"] for s in result["sync"]["speakers"]} == {"spk_1", "spk_2"}
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_single_speaker_audio_has_no_speaker_id():
+    async def fake_post(audio_bytes, language_code):
+        return {"words": [_scribe_word("Hello", 0.0, 0.3)]}  # speaker_id=None
+
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=fake_post)
+    result = await p.align(b"x")
+    sentence = result["sync"]["paragraphs"][0]["sentences"][0]
+    assert "speakerId" not in sentence
+    assert "speakers" not in result["sync"]
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_synthesize_not_implemented():
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=lambda *a, **k: None)
+    with pytest.raises(NotImplementedError):
+        await p.synthesize("hi", "voice_1")
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_passes_language_code_through():
+    seen = {}
+
+    async def fake_post(audio_bytes, language_code):
+        seen["language_code"] = language_code
+        return {"words": []}
+
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=fake_post)
+    await p.align(b"x", language_code="khm")
+    assert seen["language_code"] == "khm"
+
+
+@pytest.mark.asyncio
+async def test_scribe_provider_produces_valid_sync_document():
+    async def fake_post(audio_bytes, language_code):
+        return {"words": [
+            _scribe_word("Once", 0.0, 0.3, speaker_id="spk_1"),
+            _scribe_word("upon", 0.3, 0.6, speaker_id="spk_1"),
+        ]}
+
+    p = provider.ScribeAlignmentProvider("fake-key", http_post=fake_post)
+    result = await p.align(b"x")
+    ok, errors = schema.validate_sync_document(result["sync"])
+    assert ok, errors
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # sync_reading_profiles.py
 # ═════════════════════════════════════════════════════════════════════════
 def test_resolve_reading_profile_default_when_none():
