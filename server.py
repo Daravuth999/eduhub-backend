@@ -7307,6 +7307,35 @@ except Exception as _sync_studio_load_err:  # noqa: BLE001
         "sync_studio_tools: disabled (%s)", _sync_studio_load_err
     )
 
+# ── Video Library — independent product (additive, isolated) ───────────────
+# Per explicit product direction: a NEW learning product alongside Books,
+# architecturally independent. Does not touch db.books, book_factory_*.py,
+# or the legacy client-driven book purchase mechanism (Google Sheets/Forms).
+# Ownership is backend-verified end to end via video_library_points_adapter
+# .py's isolated GAS sendPoints call (backend-initiated) + the video_
+# purchases collection's atomic created->initiating->succeeded|failed|
+# reconcile state machine. Dedicated video_lessons/video_purchases
+# collections, never touched outside this module (tools/check_collection_
+# ownership.py --strict enforces it). Failure is non-fatal: only Video
+# Library routes go away.
+try:
+    from video_library_tools import register_video_library_routes, ensure_video_library_indexes
+
+    register_video_library_routes(api, db, require_admin, require_student)
+
+    @app.on_event("startup")
+    async def _video_library_startup():
+        try:
+            await ensure_video_library_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "video_library_tools: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _video_library_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "video_library_tools: disabled (%s)", _video_library_load_err
+    )
+
 # ── Signature Smart Interactive Book, Checkpoint 1 (additive, isolated) ────
 # Student-facing local/server progress sync for the nine premium interaction
 # block types. Flag-gated (BOOK_PREMIUM_INTERACTIONS_ENABLED, default false),

@@ -108,6 +108,9 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "prize_pools": "prize_pool.py",
     # sync_studio_tools.py (Universal Synchronization Engine, Phase 0 foundation)
     "chapter_sync": "sync_studio_tools.py",
+    # video_library_tools.py (Video Library — independent product, backend-owned entitlement)
+    "video_lessons": "video_library_tools.py",
+    "video_purchases": "video_library_tools.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed
