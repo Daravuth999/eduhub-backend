@@ -7275,6 +7275,38 @@ except Exception as _book_factory_load_err:  # noqa: BLE001
         "book_factory_jobs: disabled (%s)", _book_factory_load_err
     )
 
+# ── Universal Synchronization Engine, Phase 0 foundation (additive) ────────
+# docs/proposals/universal-synchronization-engine-technical-spec.md, approved
+# architecture. Adapts ALREADY-GENERATED ElevenLabs narration into the
+# canonical sync schema (sync_schema.py) and serves it read-only to students
+# once reviewed/approved — no upload route, no new AI provider call. Native
+# audio/video upload is explicitly deferred pending a Speech Recognition /
+# Alignment vendor decision (spec §12) and is NOT part of this registration.
+# Dedicated `chapter_sync` collection, never touches db.books.
+try:
+    from sync_studio_tools import register_sync_studio_routes, ensure_sync_studio_indexes
+
+    async def _sync_get_book_by_slug(slug: str) -> dict | None:
+        """Read-only adapter — mirrors _bf_get_book_by_slug's established
+        precedent so sync_studio_tools.py never imports db.books logic
+        directly itself."""
+        return await db.books.find_one({"slug": slug}, {"_id": 0}, sort=[("revision", -1)])
+
+    register_sync_studio_routes(api, db, require_admin, current_student, _sync_get_book_by_slug)
+
+    @app.on_event("startup")
+    async def _sync_studio_startup():
+        try:
+            await ensure_sync_studio_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "sync_studio_tools: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _sync_studio_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "sync_studio_tools: disabled (%s)", _sync_studio_load_err
+    )
+
 # ── Signature Smart Interactive Book, Checkpoint 1 (additive, isolated) ────
 # Student-facing local/server progress sync for the nine premium interaction
 # block types. Flag-gated (BOOK_PREMIUM_INTERACTIONS_ENABLED, default false),
