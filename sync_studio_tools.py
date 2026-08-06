@@ -227,20 +227,35 @@ def _validate_media_upload(raw: bytes, declared_content_type: str) -> tuple[str,
 
 
 async def create_sync_from_upload(
-    db, *, slug: str, chapter_index: int, raw: bytes, declared_content_type: str,
-    media_bucket, uploaded_by: str = "",
+    db, *, raw: bytes, declared_content_type: str, media_bucket,
+    slug: str | None = None, chapter_index: int | None = None,
+    owner_ref: str | None = None, uploaded_by: str = "",
 ) -> dict:
     """Native media upload — accepts audio OR video identically (tech spec's
     "treat audio and video the same post-ingestion" principle), stores it,
     and creates a sync document with `alignmentStatus: "awaiting_provider"`.
     No Speech Recognition/Alignment provider is called here. This is a
     complete, real, useful unit on its own: the media is genuinely stored
-    and referenced; only transcription/alignment is deferred, honestly."""
+    and referenced; only transcription/alignment is deferred, honestly.
+
+    `slug`/`chapter_index` are the Books-specific binding (optional — Media
+    Independence, spec §4: a sync document's identity is the media asset,
+    not any particular owner). `owner_ref` is a free-form alternative
+    binding string for non-Books callers (e.g. Video Library passes
+    `f"video_lesson:{lesson_id}"`) so OTHER products can reuse this exact
+    storage/schema path without this module knowing anything about videos —
+    it only ever stores whatever reference string the caller gives it."""
     ext, content_type = _validate_media_upload(raw, declared_content_type)
 
     media_id = uuid.uuid4().hex
-    key = f"sync-media/{slug}/{chapter_index}/{media_id}.{ext}"
-    metadata = {"slug": slug, "chapterIndex": str(chapter_index), "uploadedBy": uploaded_by}
+    path_hint = owner_ref or (f"{slug}/{chapter_index}" if slug is not None else "unbound")
+    key = f"sync-media/{path_hint}/{media_id}.{ext}"
+    metadata = {"uploadedBy": uploaded_by}
+    if slug is not None:
+        metadata["slug"] = slug
+        metadata["chapterIndex"] = str(chapter_index)
+    if owner_ref:
+        metadata["ownerRef"] = owner_ref
 
     media_ref = await _upload_media_to_r2(raw, key, content_type, metadata)
     if not media_ref:
@@ -265,8 +280,11 @@ async def create_sync_from_upload(
         duration_sec=0.0,
         alignment_status="awaiting_provider",
     )
-    doc["slug"] = slug
-    doc["chapterIndex"] = chapter_index
+    if slug is not None:
+        doc["slug"] = slug
+        doc["chapterIndex"] = chapter_index
+    if owner_ref:
+        doc["ownerRef"] = owner_ref
     doc["contentType"] = content_type
 
     ok, errors = validate_sync_document(doc)
