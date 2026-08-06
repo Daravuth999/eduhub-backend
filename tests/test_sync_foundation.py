@@ -460,6 +460,217 @@ async def test_transition_review_status_sync_not_found_raises_404():
     assert exc.value.http_status == 404
 
 
+@pytest.mark.parametrize(
+    "alignment_status,review_status,category,expected",
+    [
+        ("complete", "approved", "manual", True),
+        ("awaiting_provider", "approved", "manual", False),  # never servable pre-alignment
+        ("awaiting_provider", "pending", "synthesis", False),  # synthesis bypass still gated on alignment
+        ("complete", "pending", "synthesis", True),
+    ],
+)
+def test_is_servable_to_students_alignment_status_gate(alignment_status, review_status, category, expected):
+    doc = {"alignmentStatus": alignment_status, "reviewStatus": review_status, "providerCategory": category}
+    assert schema.is_servable_to_students(doc) is expected
+
+
+def test_is_servable_to_students_defaults_alignment_status_complete_for_legacy_docs():
+    # A doc with no alignmentStatus at all (pre-dates this field) must not
+    # regress to "never servable" — defaults to "complete".
+    doc = {"reviewStatus": "approved", "providerCategory": "manual"}
+    assert schema.is_servable_to_students(doc) is True
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# sync_studio_tools.py — native media upload workflow (fake GridFS bucket,
+# no real R2/network calls; R2 env vars are not set in this test environment
+# so the default path is GridFS-fallback unless a test explicitly monkey-
+# patches _upload_media_to_r2 to exercise the R2-success branch).
+# ═════════════════════════════════════════════════════════════════════════
+class _FakeGridOut:
+    def __init__(self, data: bytes, metadata: dict):
+        self._data = data
+        self._pos = 0
+        self.metadata = metadata
+        self.length = len(data)
+
+    async def seek(self, pos):
+        self._pos = pos
+
+    async def read(self, n):
+        chunk = self._data[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _FakeMediaBucket:
+    def __init__(self):
+        self.files: dict[str, tuple[bytes, dict]] = {}
+
+    async def upload_from_stream(self, filename, stream, metadata=None):
+        self.files[filename] = (stream.read(), metadata or {})
+
+    async def open_download_stream_by_name(self, filename):
+        if filename not in self.files:
+            raise FileNotFoundError(filename)
+        data, metadata = self.files[filename]
+        return _FakeGridOut(data, metadata)
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_falls_back_to_gridfs_when_r2_not_configured():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    doc = await studio.create_sync_from_upload(
+        db, slug="the-fox", chapter_index=0, raw=b"fake-mp3-bytes",
+        declared_content_type="audio/mpeg", media_bucket=bucket, uploaded_by="admin@x.com",
+    )
+    assert doc["alignmentStatus"] == "awaiting_provider"
+    assert doc["mediaRef"].startswith("gridfs://sync_media/")
+    assert doc["contentType"] == "audio/mpeg"
+    assert doc["slug"] == "the-fox" and doc["chapterIndex"] == 0
+    assert len(bucket.files) == 1
+    assert len(db.chapter_sync.docs) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_uses_r2_when_available(monkeypatch):
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+
+    async def fake_r2_upload(raw, key, content_type, metadata):
+        return "https://pub-fake.r2.dev/" + key
+
+    monkeypatch.setattr(studio, "_upload_media_to_r2", fake_r2_upload)
+
+    doc = await studio.create_sync_from_upload(
+        db, slug="the-fox", chapter_index=0, raw=b"fake-video-bytes",
+        declared_content_type="video/mp4", media_bucket=bucket,
+    )
+    assert doc["mediaRef"].startswith("https://pub-fake.r2.dev/")
+    assert doc["contentType"] == "video/mp4"
+    assert len(bucket.files) == 0  # GridFS never written when R2 succeeds
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_rejects_unsupported_content_type():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    with pytest.raises(studio.SyncStudioError) as exc:
+        await studio.create_sync_from_upload(
+            db, slug="s", chapter_index=0, raw=b"x",
+            declared_content_type="image/png", media_bucket=bucket,
+        )
+    assert exc.value.code == "unsupported_media_type"
+    assert exc.value.http_status == 415
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_rejects_empty_file():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    with pytest.raises(studio.SyncStudioError) as exc:
+        await studio.create_sync_from_upload(
+            db, slug="s", chapter_index=0, raw=b"",
+            declared_content_type="audio/mpeg", media_bucket=bucket,
+        )
+    assert exc.value.code == "empty_file"
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_rejects_oversized_file(monkeypatch):
+    monkeypatch.setattr(studio, "HARD_MAX_MEDIA_BYTES", 10)
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    with pytest.raises(studio.SyncStudioError) as exc:
+        await studio.create_sync_from_upload(
+            db, slug="s", chapter_index=0, raw=b"x" * 20,
+            declared_content_type="audio/mpeg", media_bucket=bucket,
+        )
+    assert exc.value.code == "file_too_large"
+    assert exc.value.http_status == 413
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_accepts_video_identically_to_audio():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    doc = await studio.create_sync_from_upload(
+        db, slug="s", chapter_index=1, raw=b"fake-mp4-bytes",
+        declared_content_type="video/webm", media_bucket=bucket,
+    )
+    assert doc["contentType"] == "video/webm"
+    assert doc["mediaRef"].endswith(".webm")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# sync_studio_tools.py — stream_sync_media (Range support, generalized
+# from server.py's proven studio_audio_stream fix)
+# ═════════════════════════════════════════════════════════════════════════
+class _FakeHeaders:
+    def __init__(self, range_value=None):
+        self._range = range_value
+
+    def get(self, key, default=None):
+        if key.lower() == "range":
+            return self._range
+        return default
+
+
+class _FakeRequest:
+    def __init__(self, range_value=None):
+        self.headers = _FakeHeaders(range_value)
+
+
+async def _collect(response):
+    return b"".join([chunk async for chunk in response.body_iterator])
+
+
+@pytest.mark.asyncio
+async def test_stream_sync_media_full_response_no_range():
+    bucket = _FakeMediaBucket()
+    bucket.files["a.mp3"] = (b"0123456789", {"contentType": "audio/mpeg"})
+    resp = await studio.stream_sync_media(bucket, "a.mp3", _FakeRequest())
+    assert resp.media_type == "audio/mpeg"
+    assert resp.headers["Content-Length"] == "10"
+    assert await _collect(resp) == b"0123456789"
+
+
+@pytest.mark.asyncio
+async def test_stream_sync_media_partial_range():
+    bucket = _FakeMediaBucket()
+    bucket.files["v.mp4"] = (b"0123456789", {"contentType": "video/mp4"})
+    resp = await studio.stream_sync_media(bucket, "v.mp4", _FakeRequest("bytes=0-4"))
+    assert resp.status_code == 206
+    assert resp.headers["Content-Range"] == "bytes 0-4/10"
+    assert await _collect(resp) == b"01234"
+
+
+@pytest.mark.asyncio
+async def test_stream_sync_media_suffix_range():
+    bucket = _FakeMediaBucket()
+    bucket.files["a.mp3"] = (b"0123456789", {"contentType": "audio/mpeg"})
+    resp = await studio.stream_sync_media(bucket, "a.mp3", _FakeRequest("bytes=-3"))
+    assert resp.status_code == 206
+    assert await _collect(resp) == b"789"
+
+
+@pytest.mark.asyncio
+async def test_stream_sync_media_invalid_range_returns_416():
+    bucket = _FakeMediaBucket()
+    bucket.files["a.mp3"] = (b"0123456789", {"contentType": "audio/mpeg"})
+    resp = await studio.stream_sync_media(bucket, "a.mp3", _FakeRequest("bytes=-"))
+    assert resp.status_code == 416
+
+
+@pytest.mark.asyncio
+async def test_stream_sync_media_not_found_raises_404():
+    bucket = _FakeMediaBucket()
+    with pytest.raises(studio.HTTPException) as exc:
+        await studio.stream_sync_media(bucket, "missing.mp3", _FakeRequest())
+    assert exc.value.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_transition_review_status_edited_transcript_stored_not_rekeyed():
     """Documents the deliberate Phase 0 scope gap: editedTranscript is

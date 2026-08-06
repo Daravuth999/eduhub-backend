@@ -32,6 +32,13 @@ VALID_REVIEW_STATUSES = ("pending", "in_review", "approved", "rejected")
 # Provider categories — capability, never vendor name (spec §3).
 VALID_PROVIDER_CATEGORIES = ("speech_recognition", "alignment", "synthesis", "manual")
 
+# Alignment lifecycle — separate from reviewStatus (§5's editorial workflow).
+# A freshly-uploaded media asset has no words/sentences yet at all; it sits
+# in "awaiting_provider" until a Speech Recognition/Alignment provider is
+# selected and run (tech spec §12 — vendor deliberately not yet chosen).
+# reviewStatus only becomes meaningful once alignmentStatus == "complete".
+VALID_ALIGNMENT_STATUSES = ("awaiting_provider", "queued", "processing", "complete", "failed")
+
 # Confidence key namespace shipped today. `translation`/`pronunciation` are
 # reserved (spec §13) — a consumer that doesn't recognize a key ignores it,
 # so reserving them here is documentation, not enforcement.
@@ -96,14 +103,24 @@ def build_sync_document(
     speakers: list[dict] | None = None,
     sync_id: str | None = None,
     review_status: str = "pending",
+    alignment_status: str = "complete",
 ) -> dict:
     """Assemble a canonical sync document. Callers (providers, the review
     workflow) always go through this — never hand-build the dict — so
-    SYNC_VERSION and defaulted fields stay centralized in one place."""
+    SYNC_VERSION and defaulted fields stay centralized in one place.
+
+    `alignment_status` defaults to "complete" because every EXISTING caller
+    (ElevenLabsProvider, ScribeAlignmentProvider) already has real word data
+    by the time it calls this. The native-upload path
+    (sync_studio_tools.create_sync_from_upload) is the one caller that
+    passes "awaiting_provider" explicitly, for a media asset with no
+    alignment run yet."""
     if provider_category not in VALID_PROVIDER_CATEGORIES:
         raise ValueError(f"invalid provider_category: {provider_category!r}")
     if review_status not in VALID_REVIEW_STATUSES:
         raise ValueError(f"invalid review_status: {review_status!r}")
+    if alignment_status not in VALID_ALIGNMENT_STATUSES:
+        raise ValueError(f"invalid alignment_status: {alignment_status!r}")
 
     doc = {
         "syncId": sync_id or new_sync_id(),
@@ -116,6 +133,7 @@ def build_sync_document(
         "durationSec": round(float(duration_sec), 3),
         "providerCategory": provider_category,
         "reviewStatus": review_status,
+        "alignmentStatus": alignment_status,
         "paragraphs": paragraphs,
     }
     if speakers:
@@ -138,6 +156,8 @@ def validate_sync_document(doc: dict) -> tuple[bool, list[str]]:
         errors.append(f"invalid providerCategory: {doc.get('providerCategory')!r}")
     if doc.get("reviewStatus") not in (*VALID_REVIEW_STATUSES, None):
         errors.append(f"invalid reviewStatus: {doc.get('reviewStatus')!r}")
+    if doc.get("alignmentStatus") not in (*VALID_ALIGNMENT_STATUSES, None):
+        errors.append(f"invalid alignmentStatus: {doc.get('alignmentStatus')!r}")
 
     paragraphs = doc.get("paragraphs")
     if isinstance(paragraphs, list):
@@ -164,8 +184,13 @@ def validate_sync_document(doc: dict) -> tuple[bool, list[str]]:
 def is_servable_to_students(doc: dict) -> bool:
     """Publish gate (spec §5): approved, OR a synthesis-path document — TTS
     output is auto-approved because it was generated FROM already-approved
-    text, preserving today's zero-review ElevenLabs behavior exactly."""
+    text, preserving today's zero-review ElevenLabs behavior exactly.
+    A document still awaiting alignment (freshly uploaded media with no
+    provider run yet) is NEVER servable regardless of reviewStatus — it has
+    no real words to show a student."""
     if not isinstance(doc, dict):
+        return False
+    if doc.get("alignmentStatus", "complete") != "complete":
         return False
     if doc.get("reviewStatus") == "approved":
         return True
