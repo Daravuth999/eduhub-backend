@@ -112,6 +112,7 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "video_lessons": "video_library_tools.py",
     "video_purchases": "video_library_tools.py",
     "video_progress": "video_library_tools.py",
+    "video_bookmarks": "video_library_tools.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed
