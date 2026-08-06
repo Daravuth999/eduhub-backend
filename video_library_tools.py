@@ -37,9 +37,11 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 
-from fastapi import Body, Depends, HTTPException
+from fastapi import Body, Depends, File, Form, HTTPException, UploadFile
+from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
 import video_library_points_adapter as points
+import sync_studio_tools
 from video_schema import (
     RETRYABLE_STATES,
     build_purchase_record,
@@ -114,6 +116,33 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
     await db[LESSONS_COLL].update_one({"lessonId": lesson_id}, {"$set": safe_updates})
     merged["revision"] = safe_updates["revision"]
     return merged
+
+
+async def attach_lesson_media(
+    db, lesson_id: str, *, raw: bytes, declared_content_type: str, media_bucket, uploaded_by: str = "",
+) -> dict:
+    """Upload a lesson's video/audio and bind the resulting syncId onto it.
+    Reuses sync_studio_tools.create_sync_from_upload — the SAME storage
+    validation, R2-first/GridFS-fallback, and canonical schema Books uses —
+    via its public function, never by touching the chapter_sync collection
+    directly (that stays exclusively owned by sync_studio_tools.py, per
+    tools/check_collection_ownership.py). `owner_ref` (not `slug`/
+    `chapter_index`) is how this product binds to the shared, provider-
+    neutral Universal Synchronization Engine without either module knowing
+    about the other's domain."""
+    lesson = await get_video_lesson(db, lesson_id)
+    if not lesson:
+        raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
+
+    try:
+        sync_doc = await sync_studio_tools.create_sync_from_upload(
+            db, raw=raw, declared_content_type=declared_content_type, media_bucket=media_bucket,
+            owner_ref=f"video_lesson:{lesson_id}", uploaded_by=uploaded_by,
+        )
+    except sync_studio_tools.SyncStudioError as exc:
+        raise VideoLibraryError(exc.code, exc.message, exc.http_status) from exc
+
+    return await update_video_lesson(db, lesson_id, {"syncId": sync_doc["syncId"]})
 
 
 # ── Ownership (the ONLY function anything should call to decide access) ────
@@ -239,7 +268,18 @@ async def admin_reconcile_purchase(db, student_id: str, lesson_id: str, *, resol
 
 def register_video_library_routes(api, db, require_admin, require_student) -> None:
     """Mounts Video Library routes. Matches this codebase's
-    register_*_routes(api, db, ...) DI convention exactly."""
+    register_*_routes(api, db, ...) DI convention exactly.
+
+    `media_bucket` points at the SAME GridFS bucket name
+    (sync_studio_tools.MEDIA_GRIDFS_BUCKET) sync_studio_tools.py's own
+    routes use — a second handle onto the same underlying bucket, which is
+    how every GridFS bucket handle in this codebase already works (each
+    module constructs its own AsyncIOMotorGridFSBucket(db, bucket_name=...)
+    instance; the bucket name, not the handle object, is the real identity).
+    Streaming a Video Library asset back out reuses sync_studio_tools.py's
+    existing GET /api/sync/media/{filename} route — no new streaming route
+    needed here."""
+    media_bucket = AsyncIOMotorGridFSBucket(db, bucket_name=sync_studio_tools.MEDIA_GRIDFS_BUCKET)
 
     def _raise(exc: VideoLibraryError):
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
@@ -272,6 +312,18 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
     async def update_lesson_route(lesson_id: str, payload: dict = Body(...), _admin=Depends(require_admin)):
         try:
             doc = await update_video_lesson(db, lesson_id, payload)
+        except VideoLibraryError as exc:
+            _raise(exc)
+        return {"ok": True, "lesson": doc}
+
+    @api.post("/studio/video/lessons/{lesson_id}/media")
+    async def upload_lesson_media_route(lesson_id: str, file: UploadFile = File(...), admin=Depends(require_admin)):
+        raw = await file.read()
+        try:
+            doc = await attach_lesson_media(
+                db, lesson_id, raw=raw, declared_content_type=file.content_type or "",
+                media_bucket=media_bucket, uploaded_by=getattr(admin, "email", ""),
+            )
         except VideoLibraryError as exc:
             _raise(exc)
         return {"ok": True, "lesson": doc}

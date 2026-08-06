@@ -187,7 +187,7 @@ class _Coll:
         return None
 
     async def insert_one(self, doc):
-        key = doc.get("_id", doc.get("lessonId") or doc.get("purchaseId"))
+        key = doc.get("_id") or doc.get("lessonId") or doc.get("purchaseId") or doc.get("syncId")
         self.docs[key] = dict(doc)
         return _Result(inserted_id=key)
 
@@ -235,12 +235,15 @@ class _FakeDB:
     def __init__(self):
         self.video_lessons = _Coll()
         self.video_purchases = _Coll()
+        self.chapter_sync = _Coll()  # sync_studio_tools.py's collection — cross-module reuse test
 
     def __getitem__(self, name):
         if name == vlt.LESSONS_COLL:
             return self.video_lessons
         if name == vlt.PURCHASES_COLL:
             return self.video_purchases
+        if name == "chapter_sync":
+            return self.chapter_sync
         raise AssertionError(f"unexpected collection: {name}")
 
 
@@ -277,6 +280,76 @@ async def test_update_video_lesson_not_found_raises():
     db = _FakeDB()
     with pytest.raises(vlt.VideoLibraryError) as exc:
         await vlt.update_video_lesson(db, "missing", {"price": 5})
+    assert exc.value.http_status == 404
+
+
+# ── media upload — reuses sync_studio_tools.py, no duplicated storage logic ─
+class _FakeGridOut:
+    def __init__(self, data, metadata):
+        self._data, self._pos, self.metadata, self.length = data, 0, metadata, len(data)
+
+    async def seek(self, pos):
+        self._pos = pos
+
+    async def read(self, n):
+        chunk = self._data[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _FakeMediaBucket:
+    def __init__(self):
+        self.files: dict = {}
+
+    async def upload_from_stream(self, filename, stream, metadata=None):
+        self.files[filename] = (stream.read(), metadata or {})
+
+    async def open_download_stream_by_name(self, filename):
+        data, metadata = self.files[filename]
+        return _FakeGridOut(data, metadata)
+
+
+@pytest.mark.asyncio
+async def test_attach_lesson_media_binds_sync_id_via_shared_engine():
+    """Proves the reuse claim directly: attach_lesson_media never touches
+    chapter_sync itself — it calls sync_studio_tools.create_sync_from_upload
+    (the SAME function Books uses) and only binds the returned syncId onto
+    the lesson document."""
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="Ordering Coffee", price=50, created_by="admin@x.com")
+    bucket = _FakeMediaBucket()
+
+    updated = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"fake-video-bytes",
+        declared_content_type="video/mp4", media_bucket=bucket, uploaded_by="admin@x.com",
+    )
+
+    assert updated["syncId"] is not None
+    assert updated["syncId"].startswith("sync_")
+    sync_doc = db.chapter_sync.docs[updated["syncId"]]
+    assert sync_doc["ownerRef"] == f"video_lesson:{lesson['lessonId']}"
+    assert sync_doc["alignmentStatus"] == "awaiting_provider"
+    assert len(bucket.files) == 1  # stored via GridFS fallback (no R2 env vars in tests)
+
+
+@pytest.mark.asyncio
+async def test_attach_lesson_media_rejects_unsupported_type():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+    with pytest.raises(vlt.VideoLibraryError) as exc:
+        await vlt.attach_lesson_media(
+            db, lesson["lessonId"], raw=b"x", declared_content_type="image/png", media_bucket=_FakeMediaBucket(),
+        )
+    assert exc.value.code == "unsupported_media_type"
+
+
+@pytest.mark.asyncio
+async def test_attach_lesson_media_lesson_not_found():
+    db = _FakeDB()
+    with pytest.raises(vlt.VideoLibraryError) as exc:
+        await vlt.attach_lesson_media(
+            db, "missing", raw=b"x", declared_content_type="video/mp4", media_bucket=_FakeMediaBucket(),
+        )
     assert exc.value.http_status == 404
 
 
