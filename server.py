@@ -7336,6 +7336,18 @@ except Exception as _video_library_load_err:  # noqa: BLE001
         "video_library_tools: disabled (%s)", _video_library_load_err
     )
 
+# Video Library automatic AI processing pipeline (Gemini-primary, provider-
+# neutral behind the Universal Synchronization Engine — video_pipeline_
+# tools.py). Same isolated, non-fatal registration discipline as above.
+try:
+    from video_pipeline_tools import register_video_pipeline_routes
+
+    register_video_pipeline_routes(api, db, require_admin)
+except Exception as _video_pipeline_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "video_pipeline_tools: disabled (%s)", _video_pipeline_load_err
+    )
+
 # ── Signature Smart Interactive Book, Checkpoint 1 (additive, isolated) ────
 # Student-facing local/server progress sync for the nine premium interaction
 # block types. Flag-gated (BOOK_PREMIUM_INTERACTIONS_ENABLED, default false),
