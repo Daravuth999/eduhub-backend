@@ -439,6 +439,245 @@ async def transition_review_status(
     return doc
 
 
+# ── Alignment lifecycle (Video Library pipeline writes through here — the
+#    chapter_sync collection stays exclusively owned by this module) ───────
+async def mark_alignment_processing(db, sync_id: str) -> None:
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id}, {"$set": {"alignmentStatus": "processing"}},
+    )
+
+
+async def mark_alignment_failed(db, sync_id: str) -> None:
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id}, {"$set": {"alignmentStatus": "failed"}},
+    )
+
+
+async def apply_alignment_result(db, sync_id: str, aligned: dict) -> dict:
+    """Apply a provider's alignment output (a canonical sync fragment —
+    paragraphs/speakers/duration/provider identity) onto an EXISTING sync
+    document (the one create_sync_from_upload made at upload time). The
+    document keeps its syncId/mediaRef/ownerRef; alignmentVersion is bumped
+    so re-runs are visible as versions, never silent overwrites."""
+    doc = await get_sync_document(db, sync_id)
+    if not doc:
+        raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
+
+    updates = {
+        "paragraphs": aligned.get("paragraphs") or [],
+        "durationSec": aligned.get("durationSec", 0.0),
+        "providerCategory": aligned.get("providerCategory", "speech_recognition"),
+        "providerVersion": aligned.get("providerVersion", ""),
+        "generatedAt": aligned.get("generatedAt", ""),
+        "alignmentStatus": "complete",
+        "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1,
+        "reviewStatus": "pending",
+        "approvedAt": None,
+    }
+    if aligned.get("speakers"):
+        updates["speakers"] = aligned["speakers"]
+
+    merged = {**doc, **updates}
+    ok, errors = validate_sync_document(merged)
+    if not ok:
+        raise SyncStudioError("invalid_sync_document", "; ".join(errors), 500)
+    await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$set": updates})
+    return merged
+
+
+async def suggest_speaker_labels(db, sync_id: str, labels: dict) -> None:
+    """AI-suggested speaker labels (Gemini analysis) — stored as suggestions
+    only; the Review Studio's explicit rename is what changes real labels."""
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id}, {"$set": {"speakerLabelSuggestions": {
+            str(k)[:20]: str(v)[:60] for k, v in (labels or {}).items()
+        }}},
+    )
+
+
+# ── Synchronization Review Studio — structural edit operations ───────────
+def _distribute_words_evenly(text: str, start: float, end: float) -> list[dict]:
+    """Length-weighted retiming of replacement text across a fixed span —
+    the sentence keeps its measured boundaries; only its interior words are
+    re-keyed. confidence.alignment stays absent (estimated, never 1.0)."""
+    tokens = [t for t in (text or "").split() if t]
+    if not tokens:
+        return []
+    span = max(0.0, float(end) - float(start))
+    weights = [len(t) + 1 for t in tokens]
+    total = sum(weights) or 1
+    out, cursor = [], float(start)
+    for tok, w in zip(tokens, weights):
+        dur = span * (w / total)
+        out.append({"word": tok, "start": round(cursor, 3), "end": round(cursor + dur, 3), "confidence": {}})
+        cursor += dur
+    if out:
+        out[-1]["end"] = round(float(end), 3)
+    return out
+
+
+def _recompute_bounds(paragraphs: list[dict]) -> list[dict]:
+    """Drop empty sentences/paragraphs and re-derive start/end from words —
+    words remain the single source of truth (spec §2)."""
+    cleaned: list[dict] = []
+    for p in paragraphs:
+        sentences = []
+        for s in p.get("sentences") or []:
+            words = s.get("words") or []
+            if not words:
+                continue
+            s = {**s, "start": words[0]["start"], "end": words[-1]["end"]}
+            sentences.append(s)
+        if sentences:
+            cleaned.append({**p, "sentences": sentences,
+                            "start": sentences[0]["start"], "end": sentences[-1]["end"]})
+    return cleaned
+
+
+def _apply_one_edit(doc: dict, op: dict) -> None:
+    """Apply a single review edit in place. Raises SyncStudioError on any
+    out-of-range reference — the whole batch is rejected, never half-applied
+    (caller works on a copy)."""
+    kind = op.get("op")
+    paragraphs = doc.get("paragraphs") or []
+
+    def _sentence(p_idx: int, s_idx: int) -> dict:
+        try:
+            return paragraphs[int(p_idx)]["sentences"][int(s_idx)]
+        except (IndexError, KeyError, TypeError, ValueError):
+            raise SyncStudioError("bad_reference", f"no sentence at p={p_idx} s={s_idx}", 400)
+
+    if kind == "edit_word":
+        s = _sentence(op.get("p"), op.get("s"))
+        try:
+            word = s["words"][int(op.get("w"))]
+        except (IndexError, TypeError, ValueError):
+            raise SyncStudioError("bad_reference", f"no word at w={op.get('w')}", 400)
+        new_text = str(op.get("word") or "").strip()
+        if not new_text:
+            raise SyncStudioError("empty_word", "word text cannot be empty", 400)
+        word["word"] = new_text[:80]
+
+    elif kind == "set_word_timing":
+        s = _sentence(op.get("p"), op.get("s"))
+        try:
+            word = s["words"][int(op.get("w"))]
+        except (IndexError, TypeError, ValueError):
+            raise SyncStudioError("bad_reference", f"no word at w={op.get('w')}", 400)
+        start = round(float(op.get("start", word["start"])), 3)
+        end = round(float(op.get("end", word["end"])), 3)
+        if start < 0 or end < start:
+            raise SyncStudioError("bad_timing", "end must be >= start >= 0", 400)
+        word["start"], word["end"] = start, end
+
+    elif kind == "replace_sentence_text":
+        s = _sentence(op.get("p"), op.get("s"))
+        text = str(op.get("text") or "").strip()
+        if not text:
+            raise SyncStudioError("empty_sentence", "sentence text cannot be empty", 400)
+        s["words"] = _distribute_words_evenly(text[:2000], s["start"], s["end"])
+
+    elif kind == "split_sentence":
+        p_idx, s_idx = int(op.get("p", -1)), int(op.get("s", -1))
+        s = _sentence(p_idx, s_idx)
+        at = int(op.get("at", 0))
+        words = s.get("words") or []
+        if not (0 < at < len(words)):
+            raise SyncStudioError("bad_split", f"split index {at} out of range", 400)
+        left, right = words[:at], words[at:]
+        s["words"] = left
+        new_sentence = {
+            "id": f"{s.get('id', 's')}x{uuid.uuid4().hex[:6]}",
+            "start": right[0]["start"], "end": right[-1]["end"],
+            "confidence": dict(s.get("confidence") or {}),
+            "words": right,
+        }
+        if "speakerId" in s:
+            new_sentence["speakerId"] = s["speakerId"]
+        paragraphs[p_idx]["sentences"].insert(s_idx + 1, new_sentence)
+
+    elif kind == "merge_sentences":
+        p_idx, s_idx = int(op.get("p", -1)), int(op.get("s", -1))
+        _sentence(p_idx, s_idx)
+        sentences = paragraphs[p_idx]["sentences"]
+        if s_idx + 1 >= len(sentences):
+            raise SyncStudioError("bad_merge", "no following sentence to merge into", 400)
+        sentences[s_idx]["words"] = (sentences[s_idx].get("words") or []) + (sentences[s_idx + 1].get("words") or [])
+        del sentences[s_idx + 1]
+
+    elif kind == "set_sentence_speaker":
+        s = _sentence(op.get("p"), op.get("s"))
+        speaker_id = str(op.get("speakerId") or "").strip()
+        if speaker_id:
+            s["speakerId"] = speaker_id[:20]
+            speakers = doc.setdefault("speakers", [])
+            if not any(sp.get("id") == s["speakerId"] for sp in speakers):
+                speakers.append({"id": s["speakerId"], "label": s["speakerId"]})
+        else:
+            s.pop("speakerId", None)
+
+    elif kind == "rename_speaker":
+        speaker_id = str(op.get("id") or "")
+        label = str(op.get("label") or "").strip()
+        if not label:
+            raise SyncStudioError("empty_label", "speaker label cannot be empty", 400)
+        speakers = doc.get("speakers") or []
+        for sp in speakers:
+            if sp.get("id") == speaker_id:
+                sp["label"] = label[:60]
+                break
+        else:
+            raise SyncStudioError("bad_reference", f"no speaker {speaker_id!r}", 400)
+
+    else:
+        raise SyncStudioError("unknown_op", f"unknown edit op: {kind!r}", 400)
+
+
+async def apply_sync_edits(db, sync_id: str, operations: list[dict]) -> dict:
+    """Synchronization Review Studio batch edit. All-or-nothing: operations
+    are applied to an in-memory copy, validated, then persisted in one
+    update. The FIRST edit snapshots `originalParagraphs`/`originalSpeakers`
+    for the compare-original-vs-edited view; every edit bumps
+    alignmentVersion and moves an approved/pending document to `in_review`
+    (an edited approval is no longer an approval)."""
+    import copy
+
+    doc = await get_sync_document(db, sync_id)
+    if not doc:
+        raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
+    if doc.get("alignmentStatus") != "complete":
+        raise SyncStudioError("not_aligned", "run the processing pipeline before editing", 409)
+    if not isinstance(operations, list) or not operations:
+        raise SyncStudioError("no_operations", "operations list is required", 400)
+    if len(operations) > 200:
+        raise SyncStudioError("too_many_operations", "max 200 operations per batch", 400)
+
+    working = copy.deepcopy(doc)
+    for op in operations:
+        if not isinstance(op, dict):
+            raise SyncStudioError("bad_operation", "each operation must be an object", 400)
+        _apply_one_edit(working, op)
+
+    working["paragraphs"] = _recompute_bounds(working.get("paragraphs") or [])
+    ok, errors = validate_sync_document(working)
+    if not ok:
+        raise SyncStudioError("invalid_sync_document", "; ".join(errors), 400)
+
+    updates = {
+        "paragraphs": working["paragraphs"],
+        "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1,
+        "reviewStatus": "in_review",
+        "approvedAt": None,
+    }
+    if "speakers" in working:
+        updates["speakers"] = working["speakers"]
+    if "originalParagraphs" not in doc:
+        updates["originalParagraphs"] = doc.get("paragraphs") or []
+        updates["originalSpeakers"] = doc.get("speakers") or []
+    await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$set": updates})
+    return {**doc, **updates}
+
+
 def register_sync_studio_routes(api, db, require_admin, current_student, get_book_by_slug) -> None:
     """Mounts the Universal Synchronization Engine routes. Matches
     notification_packs.py's register_*_routes(api, db, require_admin)
@@ -509,6 +748,14 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
                 speaker_relabels=payload.get("speakerRelabels"),
                 edited_transcript=payload.get("editedTranscript"),
             )
+        except SyncStudioError as exc:
+            _raise(exc)
+        return {"ok": True, "sync": doc}
+
+    @api.post("/studio/sync/{sync_id}/edit")
+    async def edit_sync_route(sync_id: str, payload: dict = Body(...), _admin=Depends(require_admin)):
+        try:
+            doc = await apply_sync_edits(db, sync_id, payload.get("operations") or [])
         except SyncStudioError as exc:
             _raise(exc)
         return {"ok": True, "sync": doc}

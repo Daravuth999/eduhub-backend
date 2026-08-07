@@ -58,6 +58,10 @@ LESSONS_COLL = "video_lessons"
 PURCHASES_COLL = "video_purchases"
 PROGRESS_COLL = "video_progress"
 BOOKMARKS_COLL = "video_bookmarks"
+NOTES_COLL = "video_notes"
+
+ALLOWED_THUMBNAIL_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+MAX_THUMBNAIL_BYTES = 5 * 1024 * 1024
 
 
 def _utcnow_iso() -> str:
@@ -87,6 +91,7 @@ async def ensure_video_library_indexes(db) -> None:
     await db[PROGRESS_COLL].create_index([("studentId", 1), ("updatedAt", -1)])
     await db[BOOKMARKS_COLL].create_index([("studentId", 1), ("lessonId", 1)])
     await db[BOOKMARKS_COLL].create_index([("studentId", 1), ("createdAt", -1)])
+    await db[NOTES_COLL].create_index([("studentId", 1), ("lessonId", 1)])
     logger.info("video_library_tools: indexes ready")
 
 
@@ -129,11 +134,32 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
     safe_updates = {k: v for k, v in updates.items() if k in (
         "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "mediaRef", "durationSec", "status",
         "instructor", "category", "difficulty", "cefrLevel", "estimatedStudyMinutes", "featured",
+        "description", "learning",
     )}
     merged = {**existing, **safe_updates}
     ok, errors = validate_video_lesson(merged)
     if not ok:
         raise VideoLibraryError("invalid_lesson", "; ".join(errors), 400)
+
+    # Publish gate — the author workflow's final step. A lesson cannot go
+    # live without playable media; and once its synchronization has real
+    # alignment data, that data must be APPROVED in the Review Studio first
+    # (spec: "Publishing should use the approved version"). A lesson whose
+    # alignment is still pending/failed may publish (graceful sync-pending
+    # playback is a player feature), but never an unreviewed completed
+    # transcript.
+    if safe_updates.get("status") == "published" and existing.get("status") != "published":
+        if not merged.get("mediaRef"):
+            raise VideoLibraryError("no_media", "upload this lesson's video/audio before publishing", 409)
+        if merged.get("syncId"):
+            sync_doc = await sync_studio_tools.get_sync_document(db, merged["syncId"])
+            if sync_doc and sync_doc.get("alignmentStatus") == "complete" \
+                    and sync_doc.get("reviewStatus") != "approved":
+                raise VideoLibraryError(
+                    "sync_not_approved",
+                    "approve this lesson's synchronization in the Review Studio before publishing",
+                    409,
+                )
     safe_updates["revision"] = int(existing.get("revision", 1)) + 1
     await db[LESSONS_COLL].update_one({"lessonId": lesson_id}, {"$set": safe_updates})
     merged["revision"] = safe_updates["revision"]
@@ -247,6 +273,25 @@ async def toggle_bookmark(db, *, student_id: str, lesson_id: str) -> dict:
 async def list_bookmarks(db, student_id: str) -> list[dict]:
     cursor = db[BOOKMARKS_COLL].find({"studentId": student_id}, {"_id": 0}).sort([("createdAt", -1)])
     return await cursor.to_list(length=200)
+
+
+# ── Study notes (backend-owned, cross-device — replaces the earlier
+#    per-device localStorage notes, which the product spec disallows) ─────
+async def get_note(db, student_id: str, lesson_id: str) -> dict | None:
+    return await db[NOTES_COLL].find_one({"_id": _purchase_key(student_id, lesson_id)}, {"_id": 0})
+
+
+async def save_note(db, *, student_id: str, lesson_id: str, text: str) -> dict:
+    doc = {
+        "studentId": student_id,
+        "lessonId": lesson_id,
+        "text": str(text or "")[:20000],
+        "updatedAt": _utcnow_iso(),
+    }
+    await db[NOTES_COLL].update_one(
+        {"_id": _purchase_key(student_id, lesson_id)}, {"$set": doc}, upsert=True,
+    )
+    return doc
 
 
 async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None) -> dict:
@@ -422,9 +467,15 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         return {"ok": True, "progress": doc}
 
     @api.get("/video/progress/mine")
-    async def my_continue_watching_route(student=Depends(require_student)):
+    async def my_continue_watching_route(all: str = "", student=Depends(require_student)):
+        """Default: incomplete lessons only (Continue Learning). `?all=1`
+        returns every progress record newest-first (Recently Watched)."""
         student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
-        docs = await list_continue_watching(db, student_id)
+        if all:
+            cursor = db[PROGRESS_COLL].find({"studentId": student_id}, {"_id": 0}).sort([("updatedAt", -1)])
+            docs = await cursor.to_list(length=100)
+        else:
+            docs = await list_continue_watching(db, student_id)
         return {"progress": docs}
 
     @api.patch("/studio/video/lessons/{lesson_id}")
@@ -445,7 +496,59 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
             )
         except VideoLibraryError as exc:
             _raise(exc)
-        return {"ok": True, "lesson": doc}
+        # Denormalize the upload's content type onto the lesson so the
+        # pipeline (and the player's audio-vs-video rendering) never has to
+        # re-fetch the sync document to know what kind of media this is.
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
+        if content_type:
+            await db[LESSONS_COLL].update_one(
+                {"lessonId": lesson_id}, {"$set": {"contentType": content_type}},
+            )
+            doc["contentType"] = content_type
+        # Automatic AI processing — the product pipeline starts the moment
+        # media lands; the Studio polls GET …/pipeline for progress. Lazy
+        # import avoids a module cycle (pipeline imports this module's
+        # collection constants at call sites, never the reverse at import).
+        import video_pipeline_tools as _pipeline
+        _pipeline.schedule_pipeline(db, lesson_id, media_bucket)
+        return {"ok": True, "lesson": doc, "pipelineScheduled": True}
+
+    @api.post("/studio/video/lessons/{lesson_id}/thumbnail")
+    async def upload_lesson_thumbnail_route(lesson_id: str, file: UploadFile = File(...), admin=Depends(require_admin)):
+        lesson = await get_video_lesson(db, lesson_id)
+        if not lesson:
+            raise HTTPException(status_code=404, detail=f"no lesson {lesson_id!r}")
+        raw = await file.read()
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
+        ext = ALLOWED_THUMBNAIL_TYPES.get(content_type)
+        if not ext:
+            raise HTTPException(status_code=415, detail=f"unsupported image type: {content_type!r} (jpeg/png/webp)")
+        if not raw:
+            raise HTTPException(status_code=400, detail="uploaded file is empty")
+        if len(raw) > MAX_THUMBNAIL_BYTES:
+            raise HTTPException(status_code=413, detail="thumbnail exceeds the 5 MB limit")
+
+        import os as _os
+        import uuid as _uuid
+        image_id = _uuid.uuid4().hex
+        key = f"video-thumbs/{lesson_id}/{image_id}.{ext}"
+        url = await sync_studio_tools._upload_media_to_r2(
+            raw, key, content_type, {"uploadedBy": getattr(admin, "email", ""), "lessonId": lesson_id},
+        )
+        if not url:
+            filename = f"thumb-{image_id}.{ext}"
+            import io as _io
+            await media_bucket.upload_from_stream(
+                filename, _io.BytesIO(raw),
+                metadata={"contentType": content_type, "lessonId": lesson_id},
+            )
+            public_base = _os.environ.get("PUBLIC_BACKEND_URL", "").rstrip("/")
+            url = f"{public_base}/api/sync/media/{filename}"
+        try:
+            doc = await update_video_lesson(db, lesson_id, {"thumbnailUrl": url})
+        except VideoLibraryError as exc:
+            _raise(exc)
+        return {"ok": True, "lesson": doc, "thumbnailUrl": url}
 
     @api.delete("/studio/video/lessons/{lesson_id}")
     async def delete_lesson_route(lesson_id: str, _admin=Depends(require_admin)):
@@ -470,6 +573,18 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         docs = await list_bookmarks(db, student_id)
         return {"bookmarks": docs}
 
+    @api.get("/video/lessons/{lesson_id}/notes")
+    async def get_notes_route(lesson_id: str, student=Depends(require_student)):
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        doc = await get_note(db, student_id, lesson_id)
+        return {"note": doc or {"lessonId": lesson_id, "text": ""}}
+
+    @api.put("/video/lessons/{lesson_id}/notes")
+    async def save_notes_route(lesson_id: str, payload: dict = Body(...), student=Depends(require_student)):
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        doc = await save_note(db, student_id=student_id, lesson_id=lesson_id, text=payload.get("text", ""))
+        return {"ok": True, "note": doc}
+
     @api.post("/admin/video/purchases/{student_id}/{lesson_id}/reconcile")
     async def reconcile_route(student_id: str, lesson_id: str, payload: dict = Body(...), admin=Depends(require_admin)):
         try:
@@ -484,10 +599,26 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
 
     # ── Student-facing Video Library ────────────────────────────────────
     @api.get("/video/lessons")
-    async def list_lessons_route(category: str = "", difficulty: str = "", student=Depends(require_student)):
+    async def list_lessons_route(category: str = "", difficulty: str = "", q: str = "", student=Depends(require_student)):
         lessons = await list_video_lessons(
             db, status="published", category=category or None, difficulty=difficulty or None,
         )
+        if q.strip():
+            # Learning-aware search: title/subtitle/instructor plus the
+            # Gemini-extracted vocabulary and key expressions — enrichment
+            # makes lessons discoverable by what they teach.
+            needle = q.strip().lower()[:80]
+
+            def _matches(lesson: dict) -> bool:
+                hay = [lesson.get("title", ""), lesson.get("subtitle", ""), lesson.get("instructor", ""),
+                       lesson.get("category") or "", (lesson.get("learning") or {}).get("summary", "")]
+                learning = lesson.get("learning") or {}
+                hay += [v.get("word", "") for v in learning.get("vocabulary") or []]
+                hay += learning.get("keyExpressions") or []
+                hay += [pv.get("phrase", "") for pv in (learning.get("phrasalVerbs") or []) + (learning.get("idioms") or [])]
+                return any(needle in str(h).lower() for h in hay)
+
+            lessons = [l for l in lessons if _matches(l)]
         student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
         out = [await serialize_lesson_for_student(db, lesson, student_id) for lesson in lessons]
         return {"lessons": out}
