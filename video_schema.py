@@ -47,6 +47,7 @@ RETRYABLE_STATES = ("created", "failed")
 # tabs use — a lesson may set one, both, or neither.
 VIDEO_CATEGORIES = (
     "conversation", "storytelling", "business", "pronunciation", "grammar", "vocabulary",
+    "ielts", "listening", "speaking",
 )
 VIDEO_DIFFICULTIES = ("beginner", "intermediate", "advanced")
 CEFR_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
@@ -56,6 +57,25 @@ CEFR_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
 # convention of treating near-the-end as complete rather than requiring
 # frame-perfect 100% (accounts for credits/outro).
 PROGRESS_COMPLETE_THRESHOLD = 0.9
+
+
+def default_teleprompter_config() -> dict:
+    """Author-configured teleprompter defaults, stored on the lesson and
+    served to students (who may override reading preferences locally)."""
+    return {
+        "mode": "auto",              # auto | conversation | storytelling
+        "wordHighlight": True,
+        "sentenceHighlight": True,
+        "paragraphHighlight": False,
+        "karaoke": False,            # karaoke fill styling on the active word
+        "fontScale": 1.0,            # 0.8 – 1.6
+        "fontFamily": "default",     # default | serif | mono
+        "lineSpacing": 1.9,          # 1.4 – 2.6
+        "autoScroll": True,
+        "scrollSpeed": 1.0,          # smooth-scroll aggressiveness 0.5 – 2
+        "centered": False,           # centered reading column
+        "showConfidence": False,     # low-confidence word tinting
+    }
 
 
 def new_lesson_id() -> str:
@@ -86,6 +106,9 @@ def build_video_lesson(
     cefr_level: str | None = None,
     estimated_study_minutes: int = 0,
     featured: bool = False,
+    description: str = "",
+    tags: list | None = None,
+    teleprompter_config: dict | None = None,
 ) -> dict:
     """Assemble a video lesson metadata document. `syncId` is a reference
     into the existing chapter_sync collection (sync_schema.py's canonical
@@ -132,6 +155,9 @@ def build_video_lesson(
         # Curation flag for the standalone dashboard's "Featured Lessons"
         # row — editorial, admin-set, never derived from sales data.
         "featured": bool(featured),
+        "description": str(description or "")[:4000],
+        "tags": [str(t)[:40] for t in (tags or []) if str(t).strip()][:20],
+        "teleprompterConfig": {**default_teleprompter_config(), **(teleprompter_config or {})},
     }
 
 
@@ -153,6 +179,12 @@ def validate_video_lesson(doc: dict) -> tuple[bool, list[str]]:
         errors.append(f"invalid difficulty: {doc.get('difficulty')!r}")
     if doc.get("cefrLevel") not in (*CEFR_LEVELS, None):
         errors.append(f"invalid cefrLevel: {doc.get('cefrLevel')!r}")
+    tags = doc.get("tags")
+    if tags is not None and not isinstance(tags, list):
+        errors.append(f"invalid tags: {tags!r}")
+    tp = doc.get("teleprompterConfig")
+    if tp is not None and not isinstance(tp, dict):
+        errors.append(f"invalid teleprompterConfig: {tp!r}")
     return (len(errors) == 0), errors
 
 

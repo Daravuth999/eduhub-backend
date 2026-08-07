@@ -674,8 +674,91 @@ async def apply_sync_edits(db, sync_id: str, operations: list[dict]) -> dict:
     if "originalParagraphs" not in doc:
         updates["originalParagraphs"] = doc.get("paragraphs") or []
         updates["originalSpeakers"] = doc.get("speakers") or []
-    await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$set": updates})
+    snapshot = {
+        "paragraphs": doc.get("paragraphs") or [],
+        "speakers": doc.get("speakers") or [],
+        "alignmentVersion": int(doc.get("alignmentVersion", 1)),
+        "reviewStatus": doc.get("reviewStatus", "pending"),
+    }
+    updates["redoHistory"] = []  # a fresh edit invalidates any redo branch
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id},
+        {"$set": updates,
+         "$push": {"editHistory": {"$each": [snapshot], "$slice": -20}}},
+    )
     return {**doc, **updates}
+
+
+def strip_history(doc: dict | None) -> dict | None:
+    """Route-response projection: edit/redo history stays server-side; the
+    client only ever needs the counts (undo/redo button enablement)."""
+    if not doc:
+        return doc
+    out = {k: v for k, v in doc.items() if k not in ("editHistory", "redoHistory")}
+    out["undoDepth"] = len(doc.get("editHistory") or [])
+    out["redoDepth"] = len(doc.get("redoHistory") or [])
+    return out
+
+
+async def undo_sync_edit(db, sync_id: str) -> dict:
+    """Restores the most recent pre-edit snapshot (Review Studio undo).
+    The undone state is pushed onto redoHistory so redo can reapply it."""
+    doc = await db[CHAPTER_SYNC_COLL].find_one({"syncId": sync_id}, {"_id": 0})
+    if not doc:
+        raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
+    history = doc.get("editHistory") or []
+    if not history:
+        raise SyncStudioError("nothing_to_undo", "no edit history to undo", 409)
+    snapshot = history[-1]
+    redo_entry = {
+        "paragraphs": doc.get("paragraphs") or [],
+        "speakers": doc.get("speakers") or [],
+        "alignmentVersion": int(doc.get("alignmentVersion", 1)),
+        "reviewStatus": doc.get("reviewStatus", "in_review"),
+    }
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id},
+        {"$set": {
+            "paragraphs": snapshot.get("paragraphs") or [],
+            "speakers": snapshot.get("speakers") or [],
+            "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1,
+            "reviewStatus": "in_review",
+            "approvedAt": None,
+            "editHistory": history[:-1],
+        },
+         "$push": {"redoHistory": {"$each": [redo_entry], "$slice": -20}}},
+    )
+    return await get_sync_document(db, sync_id)
+
+
+async def redo_sync_edit(db, sync_id: str) -> dict:
+    """Reapplies the most recently undone state (Review Studio redo)."""
+    doc = await db[CHAPTER_SYNC_COLL].find_one({"syncId": sync_id}, {"_id": 0})
+    if not doc:
+        raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
+    redo = doc.get("redoHistory") or []
+    if not redo:
+        raise SyncStudioError("nothing_to_redo", "no undone edit to reapply", 409)
+    entry = redo[-1]
+    undo_entry = {
+        "paragraphs": doc.get("paragraphs") or [],
+        "speakers": doc.get("speakers") or [],
+        "alignmentVersion": int(doc.get("alignmentVersion", 1)),
+        "reviewStatus": doc.get("reviewStatus", "in_review"),
+    }
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id},
+        {"$set": {
+            "paragraphs": entry.get("paragraphs") or [],
+            "speakers": entry.get("speakers") or [],
+            "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1,
+            "reviewStatus": "in_review",
+            "approvedAt": None,
+            "redoHistory": redo[:-1],
+        },
+         "$push": {"editHistory": {"$each": [undo_entry], "$slice": -20}}},
+    )
+    return await get_sync_document(db, sync_id)
 
 
 def register_sync_studio_routes(api, db, require_admin, current_student, get_book_by_slug) -> None:
@@ -737,7 +820,7 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
         doc = await get_sync_document(db, sync_id)
         if not doc:
             raise HTTPException(status_code=404, detail="sync document not found")
-        return {"sync": doc}
+        return {"sync": strip_history(doc)}
 
     @api.post("/studio/sync/{sync_id}/review")
     async def review_route(sync_id: str, payload: dict = Body(...), _admin=Depends(require_admin)):
@@ -750,7 +833,7 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
             )
         except SyncStudioError as exc:
             _raise(exc)
-        return {"ok": True, "sync": doc}
+        return {"ok": True, "sync": strip_history(doc)}
 
     @api.post("/studio/sync/{sync_id}/edit")
     async def edit_sync_route(sync_id: str, payload: dict = Body(...), _admin=Depends(require_admin)):
@@ -758,20 +841,37 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
             doc = await apply_sync_edits(db, sync_id, payload.get("operations") or [])
         except SyncStudioError as exc:
             _raise(exc)
-        return {"ok": True, "sync": doc}
+        fresh = await get_sync_document(db, sync_id)
+        return {"ok": True, "sync": strip_history(fresh or doc)}
+
+    @api.post("/studio/sync/{sync_id}/undo")
+    async def undo_sync_route(sync_id: str, _admin=Depends(require_admin)):
+        try:
+            doc = await undo_sync_edit(db, sync_id)
+        except SyncStudioError as exc:
+            _raise(exc)
+        return {"ok": True, "sync": strip_history(doc)}
+
+    @api.post("/studio/sync/{sync_id}/redo")
+    async def redo_sync_route(sync_id: str, _admin=Depends(require_admin)):
+        try:
+            doc = await redo_sync_edit(db, sync_id)
+        except SyncStudioError as exc:
+            _raise(exc)
+        return {"ok": True, "sync": strip_history(doc)}
 
     @api.get("/sync/{sync_id}")
     async def public_get_sync_route(sync_id: str, student=Depends(current_student)):
         doc = await get_sync_document(db, sync_id)
         if not doc or not is_servable_to_students(doc):
             raise HTTPException(status_code=404, detail="sync document not found")
-        return {"sync": doc}
+        return {"sync": strip_history(doc)}
 
     @api.get("/books/{slug}/chapters/{chapter_index}/sync")
     async def chapter_sync_route(slug: str, chapter_index: int, student=Depends(current_student)):
         doc = await get_current_chapter_sync(db, slug, chapter_index)
         if not doc or not is_servable_to_students(doc):
             raise HTTPException(status_code=404, detail="sync document not found")
-        return {"sync": doc}
+        return {"sync": strip_history(doc)}
 
     logger.info("sync_studio_tools: routes registered (/api/sync*, /api/studio/sync*)")
