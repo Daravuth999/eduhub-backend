@@ -34,7 +34,6 @@ import logging
 
 import httpx
 from fastapi import Body, Depends, HTTPException
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
 import sync_studio_tools
 import video_ai_provider
@@ -211,7 +210,11 @@ def schedule_pipeline(db, lesson_id: str, media_bucket) -> None:
 
 
 def register_video_pipeline_routes(api, db, require_admin) -> None:
-    media_bucket = AsyncIOMotorGridFSBucket(db, bucket_name=sync_studio_tools.MEDIA_GRIDFS_BUCKET)
+    # Bucket fix: resolved lazily per-request via get_media_bucket(db),
+    # not constructed eagerly here — see sync_studio_tools.get_media_
+    # bucket()'s docstring for why eager construction at this function's
+    # own synchronous, import-time call site crashed in production before
+    # any event loop existed.
 
     @api.get("/studio/video/lessons/{lesson_id}/pipeline")
     async def pipeline_status_route(lesson_id: str, _admin=Depends(require_admin)):
@@ -229,7 +232,7 @@ def register_video_pipeline_routes(api, db, require_admin) -> None:
             raise HTTPException(status_code=409, detail="upload media before running the pipeline")
         if (lesson.get("pipeline") or {}).get("state") == "running":
             raise HTTPException(status_code=409, detail="pipeline already running")
-        schedule_pipeline(db, lesson_id, media_bucket)
+        schedule_pipeline(db, lesson_id, sync_studio_tools.get_media_bucket(db))
         return {"ok": True, "scheduled": True, "aiEngine": "gemini" if video_ai_provider.ai_available() else "mock"}
 
     logger.info("video_pipeline_tools: routes registered (/api/studio/video/*/pipeline)")

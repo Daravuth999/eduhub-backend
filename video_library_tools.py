@@ -38,7 +38,6 @@ import datetime as _dt
 import logging
 
 from fastapi import Body, Depends, File, Form, HTTPException, UploadFile
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
 import video_library_points_adapter as points
 import sync_studio_tools
@@ -464,16 +463,16 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
     """Mounts Video Library routes. Matches this codebase's
     register_*_routes(api, db, ...) DI convention exactly.
 
-    `media_bucket` points at the SAME GridFS bucket name
-    (sync_studio_tools.MEDIA_GRIDFS_BUCKET) sync_studio_tools.py's own
-    routes use — a second handle onto the same underlying bucket, which is
-    how every GridFS bucket handle in this codebase already works (each
-    module constructs its own AsyncIOMotorGridFSBucket(db, bucket_name=...)
-    instance; the bucket name, not the handle object, is the real identity).
-    Streaming a Video Library asset back out reuses sync_studio_tools.py's
-    existing GET /api/sync/media/{filename} route — no new streaming route
-    needed here."""
-    media_bucket = AsyncIOMotorGridFSBucket(db, bucket_name=sync_studio_tools.MEDIA_GRIDFS_BUCKET)
+    The media GridFS bucket is resolved lazily via
+    sync_studio_tools.get_media_bucket(db) at each request-time usage site
+    below — a second handle onto the SAME underlying bucket
+    (sync_studio_tools.MEDIA_GRIDFS_BUCKET), sharing that module's cache
+    rather than constructing a second instance eagerly here. Eager
+    construction at this function's own synchronous, import-time call
+    site used to crash before any event loop existed — see
+    get_media_bucket()'s docstring. Streaming a Video Library asset back
+    out reuses sync_studio_tools.py's existing GET /api/sync/media/
+    {filename} route — no new streaming route needed here."""
 
     def _raise(exc: VideoLibraryError):
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
@@ -547,7 +546,7 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         try:
             doc = await attach_lesson_media(
                 db, lesson_id, raw=raw, declared_content_type=file.content_type or "",
-                media_bucket=media_bucket, uploaded_by=getattr(admin, "email", ""),
+                media_bucket=sync_studio_tools.get_media_bucket(db), uploaded_by=getattr(admin, "email", ""),
             )
         except VideoLibraryError as exc:
             _raise(exc)
@@ -565,7 +564,7 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         # import avoids a module cycle (pipeline imports this module's
         # collection constants at call sites, never the reverse at import).
         import video_pipeline_tools as _pipeline
-        _pipeline.schedule_pipeline(db, lesson_id, media_bucket)
+        _pipeline.schedule_pipeline(db, lesson_id, sync_studio_tools.get_media_bucket(db))
         return {"ok": True, "lesson": doc, "pipelineScheduled": True}
 
     @api.post("/studio/video/lessons/{lesson_id}/thumbnail")
@@ -593,7 +592,7 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         if not url:
             filename = f"thumb-{image_id}.{ext}"
             import io as _io
-            await media_bucket.upload_from_stream(
+            await sync_studio_tools.get_media_bucket(db).upload_from_stream(
                 filename, _io.BytesIO(raw),
                 metadata={"contentType": content_type, "lessonId": lesson_id},
             )

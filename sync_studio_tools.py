@@ -72,6 +72,32 @@ logger = logging.getLogger("eduhub.sync_studio")
 CHAPTER_SYNC_COLL = "chapter_sync"
 MEDIA_GRIDFS_BUCKET = "sync_media"
 
+_media_bucket_cache: AsyncIOMotorGridFSBucket | None = None
+
+
+def get_media_bucket(db) -> AsyncIOMotorGridFSBucket:
+    """Lazily constructs (and caches) the shared media GridFS bucket.
+
+    Bug fix: AsyncIOMotorGridFSBucket's constructor calls
+    database.get_io_loop(), which resolves asyncio.get_event_loop() the
+    FIRST time it's accessed on a given Motor client — and raises
+    RuntimeError("There is no current event loop in thread 'MainThread'.")
+    if called before any event loop is running. The three video-library
+    modules previously constructed this bucket eagerly at
+    register_*_routes() time, which runs synchronously during `server.py`
+    import — before uvicorn's loop exists — silently disabling all three
+    modules' routes in production (confirmed via Render deploy logs) even
+    though every local test passed, because the test suite's in-memory
+    fake DB never exercises the real Motor class. server.py's own
+    `audio_bucket` avoids this by constructing inside `@app.on_event(
+    "startup")`, i.e. only once a loop is actually running; this accessor
+    achieves the same effect without requiring its own startup hook,
+    since it's called from within request-time async route handlers."""
+    global _media_bucket_cache
+    if _media_bucket_cache is None:
+        _media_bucket_cache = AsyncIOMotorGridFSBucket(db, bucket_name=MEDIA_GRIDFS_BUCKET)
+    return _media_bucket_cache
+
 # reviewStatus transition graph (spec §5): pending -> in_review -> approved |
 # rejected; rejected -> in_review allows a re-submit loop after a provider
 # re-run. approved is terminal via this endpoint (no un-approve here).
@@ -770,11 +796,11 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
     established precedent of injecting this rather than importing db.books
     logic directly into a sibling module).
 
-    `media_bucket` is created here, not injected — AsyncIOMotorGridFSBucket
-    only needs a db handle at construction time (the same pattern server.py
-    itself uses for `audio_bucket`, created at module scope before any
-    request loop runs)."""
-    media_bucket = AsyncIOMotorGridFSBucket(db, bucket_name=MEDIA_GRIDFS_BUCKET)
+    The media GridFS bucket is resolved lazily via get_media_bucket(db)
+    at each request-time usage site below, not constructed eagerly here —
+    see get_media_bucket()'s docstring for why (constructing it during
+    this function's own synchronous, import-time call would crash before
+    any event loop exists)."""
 
     def _raise(exc: SyncStudioError):
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
@@ -805,7 +831,7 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
             doc = await create_sync_from_upload(
                 db, slug=slug, chapter_index=chapterIndex, raw=raw,
                 declared_content_type=file.content_type or "",
-                media_bucket=media_bucket, uploaded_by=getattr(admin, "email", ""),
+                media_bucket=get_media_bucket(db), uploaded_by=getattr(admin, "email", ""),
             )
         except SyncStudioError as exc:
             _raise(exc)
@@ -813,7 +839,7 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
 
     @api.get("/sync/media/{filename}")
     async def media_stream_route(filename: str, request: Request):
-        return await stream_sync_media(media_bucket, filename, request)
+        return await stream_sync_media(get_media_bucket(db), filename, request)
 
     @api.get("/studio/sync/{sync_id}")
     async def studio_get_sync_route(sync_id: str, _admin=Depends(require_admin)):
