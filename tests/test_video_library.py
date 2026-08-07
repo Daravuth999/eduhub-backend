@@ -582,6 +582,53 @@ async def test_admin_reconcile_rejects_invalid_resolution():
     assert exc.value.code == "invalid_resolution"
 
 
+@pytest.mark.asyncio
+async def test_list_reconcile_purchases_returns_only_reconcile_state_enriched_with_lesson_title(monkeypatch):
+    db = _FakeDB()
+    await _seed_published_lesson(db, price=50, lesson_id="vid_1")
+    await _seed_published_lesson(db, price=50, lesson_id="vid_2")
+
+    async def fake_debit_ambiguous(student_id, password, amount):
+        return {"outcome": points.OUTCOME_AMBIGUOUS, "reason": "network_error", "nonce": "n1"}
+
+    monkeypatch.setattr(vlt.points, "debit_purchase", fake_debit_ambiguous)
+    await vlt.initiate_purchase(db, student_id="stu1", lesson_id="vid_1", password="pw")  # -> reconcile
+    await vlt.initiate_purchase(db, student_id="stu2", lesson_id="vid_2", password="pw")  # -> reconcile
+    await vlt.admin_reconcile_purchase(db, "stu2", "vid_2", resolution="failed", actor="admin@x.com")  # resolved, no longer reconcile
+
+    queue = await vlt.list_reconcile_purchases(db)
+    assert len(queue) == 1
+    assert queue[0]["studentId"] == "stu1"
+    assert queue[0]["lessonTitle"] == "Ordering Coffee"
+
+
+@pytest.mark.asyncio
+async def test_list_reconcile_purchases_empty_when_nothing_pending():
+    db = _FakeDB()
+    assert await vlt.list_reconcile_purchases(db) == []
+
+
+@pytest.mark.asyncio
+async def test_list_my_purchases_scoped_per_student_newest_first():
+    db = _FakeDB()
+    await _seed_published_lesson(db, price=50, lesson_id="vid_1")
+    await _seed_published_lesson(db, price=30, lesson_id="vid_2")
+    await db[vlt.PURCHASES_COLL].insert_one(
+        schema.build_purchase_record(student_id="stu1", lesson_id="vid_1", price=50, created_at="t0")
+        | {"_id": "stu1::vid_1", "state": "succeeded", "updatedAt": "2026-01-01T00:00:00Z"}
+    )
+    await db[vlt.PURCHASES_COLL].insert_one(
+        schema.build_purchase_record(student_id="stu1", lesson_id="vid_2", price=30, created_at="t0")
+        | {"_id": "stu1::vid_2", "state": "succeeded", "updatedAt": "2026-02-01T00:00:00Z"}
+    )
+    await db[vlt.PURCHASES_COLL].insert_one(
+        schema.build_purchase_record(student_id="stu2", lesson_id="vid_1", price=50, created_at="t0")
+        | {"_id": "stu2::vid_1", "state": "succeeded", "updatedAt": "2026-01-15T00:00:00Z"}
+    )
+    mine = await vlt.list_my_purchases(db, "stu1")
+    assert [p["lessonId"] for p in mine] == ["vid_2", "vid_1"]  # newest updatedAt first
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # video_schema.py — discovery metadata (product direction: standalone
 # premium dashboard needs real category/level data)

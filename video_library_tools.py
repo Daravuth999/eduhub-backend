@@ -227,6 +227,28 @@ async def student_owns_lesson(db, student_id: str, lesson_id: str) -> bool:
     return is_owned(await get_purchase(db, student_id, lesson_id))
 
 
+async def list_my_purchases(db, student_id: str) -> list[dict]:
+    """Every purchase record for this student, newest first — powers a
+    "My Lessons" (purchased-only) view. Includes every state (not just
+    succeeded) so a student can see a `reconcile`/`failed` attempt too,
+    not just their successful unlocks."""
+    cursor = db[PURCHASES_COLL].find({"studentId": student_id}, {"_id": 0}).sort([("updatedAt", -1)])
+    return await cursor.to_list(length=200)
+
+
+async def list_reconcile_purchases(db) -> list[dict]:
+    """Admin-only. Every purchase currently parked in `reconcile` — the
+    ambiguous-GAS-outcome state that is NEVER auto-resolved (see this
+    module's own docstring). Enriches each record with the lesson's title
+    so an admin isn't resolving a queue of bare IDs."""
+    cursor = db[PURCHASES_COLL].find({"state": "reconcile"}, {"_id": 0}).sort([("updatedAt", 1)])
+    purchases = await cursor.to_list(length=200)
+    for p in purchases:
+        lesson = await get_video_lesson(db, p["lessonId"])
+        p["lessonTitle"] = (lesson or {}).get("title", "")
+    return purchases
+
+
 # ── Progress ("where did I leave off") ──────────────────────────────────────
 async def record_progress(db, *, student_id: str, lesson_id: str, position_sec: float, duration_sec: float) -> dict:
     doc = build_progress_record(
@@ -584,6 +606,11 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
         doc = await save_note(db, student_id=student_id, lesson_id=lesson_id, text=payload.get("text", ""))
         return {"ok": True, "note": doc}
+
+    @api.get("/admin/video/purchases/reconcile")
+    async def list_reconcile_purchases_route(_admin=Depends(require_admin)):
+        docs = await list_reconcile_purchases(db)
+        return {"purchases": docs}
 
     @api.post("/admin/video/purchases/{student_id}/{lesson_id}/reconcile")
     async def reconcile_route(student_id: str, lesson_id: str, payload: dict = Body(...), admin=Depends(require_admin)):
