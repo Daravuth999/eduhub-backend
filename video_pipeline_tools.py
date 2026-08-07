@@ -67,6 +67,7 @@ def build_pipeline_record(provider_version: str) -> dict:
         "startedAt": _now(),
         "finishedAt": None,
         "error": None,
+        "log": [{"at": _now(), "step": "queued", "status": "info", "message": "Processing run scheduled"}],
     }
 
 
@@ -77,7 +78,12 @@ async def _set_step(db, lesson_id: str, step: str, status: str, error: str | Non
         f"pipeline.steps.{step}.at": _now(),
         "pipeline.currentStep": step,
     }
-    await db[LESSONS_COLL].update_one({"lessonId": lesson_id}, {"$set": updates})
+    entry = {"at": _now(), "step": step, "status": status,
+             "message": error or f"{step.replace('_', ' ')} {status}"}
+    await db[LESSONS_COLL].update_one(
+        {"lessonId": lesson_id},
+        {"$set": updates, "$push": {"pipeline.log": {"$each": [entry], "$slice": -80}}},
+    )
 
 
 async def _finish(db, lesson_id: str, state: str, error: str | None = None) -> None:

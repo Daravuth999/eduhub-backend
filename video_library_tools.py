@@ -97,7 +97,12 @@ async def ensure_video_library_indexes(db) -> None:
 
 # ── Lesson metadata (admin, Video Factory) ─────────────────────────────────
 async def create_video_lesson(db, *, title: str, price: int, created_by: str, **kwargs) -> dict:
-    doc = build_video_lesson(title=title, price=price, created_by=created_by, created_at=_utcnow_iso(), **kwargs)
+    if not str(title or "").strip():
+        raise VideoLibraryError("invalid_lesson", "title must not be blank", 400)
+    try:
+        doc = build_video_lesson(title=title, price=price, created_by=created_by, created_at=_utcnow_iso(), **kwargs)
+    except (ValueError, TypeError) as exc:
+        raise VideoLibraryError("invalid_lesson", str(exc), 400)
     ok, errors = validate_video_lesson(doc)
     if not ok:
         raise VideoLibraryError("invalid_lesson", "; ".join(errors), 400)
@@ -134,8 +139,15 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
     safe_updates = {k: v for k, v in updates.items() if k in (
         "title", "subtitle", "thumbnailUrl", "price", "tier", "syncId", "mediaRef", "durationSec", "status",
         "instructor", "category", "difficulty", "cefrLevel", "estimatedStudyMinutes", "featured",
-        "description", "learning",
+        "description", "learning", "tags", "teleprompterConfig",
     )}
+    if "teleprompterConfig" in safe_updates:
+        from video_schema import default_teleprompter_config
+        cfg = safe_updates["teleprompterConfig"]
+        if not isinstance(cfg, dict):
+            raise VideoLibraryError("invalid_lesson", "teleprompterConfig must be an object", 400)
+        base = {**default_teleprompter_config(), **(existing.get("teleprompterConfig") or {})}
+        safe_updates["teleprompterConfig"] = {k: cfg.get(k, base[k]) for k in base}
     merged = {**existing, **safe_updates}
     ok, errors = validate_video_lesson(merged)
     if not ok:
@@ -199,6 +211,24 @@ async def attach_lesson_media(
     return await update_video_lesson(
         db, lesson_id, {"syncId": sync_doc["syncId"], "mediaRef": sync_doc["mediaRef"]},
     )
+
+
+async def detach_lesson_media(db, lesson_id: str) -> dict:
+    """Media delete — clears mediaRef/syncId/contentType/pipeline/duration
+    so a fresh upload starts clean. Refused while published (students would
+    lose a playable lesson in one step — unpublish first)."""
+    lesson = await get_video_lesson(db, lesson_id)
+    if not lesson:
+        raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
+    if lesson.get("status") == "published":
+        raise VideoLibraryError("lesson_published", "unpublish this lesson before removing its media", 409)
+    await db[LESSONS_COLL].update_one(
+        {"lessonId": lesson_id},
+        {"$set": {"mediaRef": None, "syncId": None, "durationSec": 0.0},
+         "$unset": {"pipeline": "", "contentType": "", "learning": ""}},
+    )
+    logger.info("video_library: media detached lessonId=%s", lesson_id)
+    return await get_video_lesson(db, lesson_id)
 
 
 async def delete_video_lesson(db, lesson_id: str) -> None:
@@ -468,6 +498,9 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
                 cefr_level=payload.get("cefrLevel") or None,
                 estimated_study_minutes=int(payload.get("estimatedStudyMinutes", 0) or 0),
                 featured=bool(payload.get("featured", False)),
+                description=payload.get("description", ""),
+                tags=payload.get("tags") or [],
+                teleprompter_config=payload.get("teleprompterConfig") or None,
             )
         except VideoLibraryError as exc:
             _raise(exc)
@@ -571,6 +604,42 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         except VideoLibraryError as exc:
             _raise(exc)
         return {"ok": True, "lesson": doc, "thumbnailUrl": url}
+
+    @api.delete("/studio/video/lessons/{lesson_id}/media")
+    async def delete_lesson_media_route(lesson_id: str, _admin=Depends(require_admin)):
+        try:
+            doc = await detach_lesson_media(db, lesson_id)
+        except VideoLibraryError as exc:
+            _raise(exc)
+        return {"ok": True, "lesson": doc}
+
+    @api.get("/studio/video/lessons/{lesson_id}/stats")
+    async def lesson_stats_route(lesson_id: str, _admin=Depends(require_admin)):
+        lesson = await get_video_lesson(db, lesson_id)
+        if not lesson:
+            raise HTTPException(status_code=404, detail=f"no lesson {lesson_id!r}")
+        purchases = await db[PURCHASES_COLL].find({"lessonId": lesson_id}, {"_id": 0}).to_list(length=1000)
+        progress = await db[PROGRESS_COLL].find({"lessonId": lesson_id}, {"_id": 0}).to_list(length=1000)
+        bookmarks_count = await db[BOOKMARKS_COLL].count_documents({"lessonId": lesson_id})
+        by_state: dict = {}
+        for p in purchases:
+            by_state[p.get("state", "?")] = by_state.get(p.get("state", "?"), 0) + 1
+        owned = by_state.get("succeeded", 0)
+        completed = sum(1 for p in progress if p.get("completed"))
+        avg_fraction = 0.0
+        fractions = [p["positionSec"] / p["durationSec"] for p in progress if p.get("durationSec")]
+        if fractions:
+            avg_fraction = round(sum(min(1.0, f) for f in fractions) / len(fractions), 3)
+        return {"stats": {
+            "lessonId": lesson_id,
+            "purchases": by_state,
+            "owners": owned,
+            "revenuePoints": owned * int(lesson.get("price") or 0),
+            "learners": len(progress),
+            "completions": completed,
+            "avgProgress": avg_fraction,
+            "bookmarks": bookmarks_count,
+        }}
 
     @api.delete("/studio/video/lessons/{lesson_id}")
     async def delete_lesson_route(lesson_id: str, _admin=Depends(require_admin)):
