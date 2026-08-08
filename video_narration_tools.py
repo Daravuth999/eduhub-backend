@@ -58,6 +58,7 @@ import sync_studio_tools
 import video_ai_provider
 import video_narration_jobs as jobs
 import video_pipeline_tools
+import video_render_tools
 import video_scene_schema
 
 logger = logging.getLogger("eduhub.video_narration")
@@ -254,6 +255,22 @@ async def _store_audio(db, raw_bytes: bytes, key: str, lesson_id: str) -> str:
     filename = f"{uuid.uuid4().hex}.mp3"
     await media_bucket.upload_from_stream(
         filename, io.BytesIO(raw_bytes), metadata={"contentType": "audio/mpeg", "lessonId": lesson_id},
+    )
+    return f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/{filename}"
+
+
+async def _store_video(db, raw_bytes: bytes, key: str, lesson_id: str) -> str:
+    """Same R2-first/GridFS-fallback pattern as _store_audio, for the
+    rendered final-master MP4 (content-type video/mp4 instead of audio)."""
+    media_ref = await sync_studio_tools._upload_media_to_r2(
+        raw_bytes, key, "video/mp4", {"lessonId": lesson_id},
+    )
+    if media_ref:
+        return media_ref
+    media_bucket = sync_studio_tools.get_media_bucket(db)
+    filename = f"{uuid.uuid4().hex}.mp4"
+    await media_bucket.upload_from_stream(
+        filename, io.BytesIO(raw_bytes), metadata={"contentType": "video/mp4", "lessonId": lesson_id},
     )
     return f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/{filename}"
 
@@ -537,36 +554,95 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+# ── Final render (physically embeds the approved narration audio into the
+# original video — REPLACE mode only; see video_render_tools.py's docstring
+# for the honest scope statement on ducking/mixing multiple source layers
+# and music/SFX generation, neither of which is implemented) ──────────────
+async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter) -> dict:
+    job = await jobs.get_or_create_job(db, lesson_id)
+    if job["render"]["state"] == jobs.S_COMPLETED:
+        return job  # cost-safe no-op — never re-render already-successful work
+    if job["assembly"]["state"] != jobs.S_COMPLETED:
+        raise VideoNarrationError("not_assembled", "assemble the narration track before rendering", 409)
+
+    claimed, attempt = await jobs.claim_stage(db, lesson_id, "render")
+    if claimed is None:
+        raise VideoNarrationError("busy_or_done", "render is already running or completed", 409)
+    genver = claimed["render"]["generationVersion"]
+    if not await jobs.fence_provider(db, lesson_id, "render", attempt, genver):
+        return await jobs.get_or_create_job(db, lesson_id)
+
+    try:
+        lesson = await lesson_getter(lesson_id)
+        if not lesson or not lesson.get("mediaRef"):
+            await jobs.fail_terminal(db, lesson_id, "render", attempt, genver, "lesson has no source media")
+            return await jobs.get_or_create_job(db, lesson_id)
+
+        video_bytes, video_ct = await video_pipeline_tools.load_media_bytes(db, media_bucket, lesson["mediaRef"])
+        assembly_result = claimed["assembly"]["result"]
+        audio_bytes, _ct = await video_pipeline_tools.load_media_bytes(
+            db, sync_studio_tools.get_media_bucket(db), assembly_result["mediaRef"],
+        )
+
+        try:
+            rendered_bytes = await video_render_tools.mux_narration_into_video(video_bytes, video_ct, audio_bytes)
+        except video_render_tools.RenderError as exc:
+            if exc.code == "ffmpeg_unavailable":
+                await jobs.fail_terminal(db, lesson_id, "render", attempt, genver, exc.message)
+            else:
+                await jobs.fail_stage(db, lesson_id, "render", attempt, genver, exc.message)
+            return await jobs.get_or_create_job(db, lesson_id)
+
+        key = f"video-narration/{lesson_id}/master/{attempt}.mp4"
+        media_ref = await _store_video(db, rendered_bytes, key, lesson_id)
+        result = {
+            "mediaRef": media_ref, "mode": "replace", "sourceMediaRef": lesson["mediaRef"],
+            "audioMediaRef": assembly_result["mediaRef"], "sizeBytes": len(rendered_bytes),
+            "renderedAt": _now(),
+        }
+        await jobs.complete_stage(db, lesson_id, "render", attempt, genver, result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("video_narration: render failed lesson=%s", lesson_id)
+        await jobs.fail_unknown(db, lesson_id, "render", attempt, genver, f"{type(exc).__name__}: {exc}")
+    return await jobs.get_or_create_job(db, lesson_id)
+
+
 async def publish_narration(db, lesson_id: str) -> dict:
     """The explicit human-approval gate — an assembled narration track is
     NEVER surfaced to students until this is called. Distinct from the
     sync document's own auto-servable status (providerCategory=='synthesis'
     is already publish-eligible per is_servable_to_students — the SAME
     rule Book Factory TTS narration relies on), which governs whether the
-    DATA is well-formed, not whether the LESSON exposes it to students."""
+    DATA is well-formed, not whether the LESSON exposes it to students.
+
+    If a final master has ALSO been rendered (job.render completed), publish
+    additionally exposes it as aiNarrationMasterMediaRef — a real MP4 with
+    the narration audio physically embedded — WITHOUT removing the
+    audio-only aiNarrationMediaRef fields, so lessons that haven't rendered
+    a master yet keep working exactly as before via the additive track."""
     job = await jobs.get_or_create_job(db, lesson_id)
     if job["assembly"]["state"] != jobs.S_COMPLETED:
         raise VideoNarrationError("not_assembled", "assemble the narration track before publishing", 409)
     result = job["assembly"]["result"]
-    await db[LESSONS_COLL].update_one(
-        {"lessonId": lesson_id},
-        {"$set": {
-            "aiNarrationSyncId": result["syncId"],
-            "aiNarrationMediaRef": result["mediaRef"],
-            "aiNarrationDurationSec": result["durationSec"],
-            "aiNarrationPublished": True,
-        }},
-    )
+    updates = {
+        "aiNarrationSyncId": result["syncId"],
+        "aiNarrationMediaRef": result["mediaRef"],
+        "aiNarrationDurationSec": result["durationSec"],
+        "aiNarrationPublished": True,
+    }
+    if job["render"]["state"] == jobs.S_COMPLETED:
+        updates["aiNarrationMasterMediaRef"] = job["render"]["result"]["mediaRef"]
+    await db[LESSONS_COLL].update_one({"lessonId": lesson_id}, {"$set": updates})
     await db[jobs.COLL].update_one({"_id": lesson_id}, {"$set": {"published": True, "updatedAt": _now()}})
     return await jobs.get_or_create_job(db, lesson_id)
 
 
 async def unpublish_narration(db, lesson_id: str) -> dict:
     """Reversible — pulls the narration track back from students without
-    destroying any generated work (the sync document/audio/job all stay
-    intact; only the lesson-level exposure flag flips off)."""
+    destroying any generated work (the sync document/audio/render job all
+    stay intact; only the lesson-level exposure flags flip off)."""
     await db[LESSONS_COLL].update_one(
-        {"lessonId": lesson_id}, {"$set": {"aiNarrationPublished": False}},
+        {"lessonId": lesson_id}, {"$set": {"aiNarrationPublished": False, "aiNarrationMasterMediaRef": None}},
     )
     await db[jobs.COLL].update_one({"_id": lesson_id}, {"$set": {"published": False, "updatedAt": _now()}})
     return await jobs.get_or_create_job(db, lesson_id)
@@ -656,6 +732,17 @@ def register_video_narration_routes(api, db, require_admin, *, lesson_getter, sy
         _need_enabled()
         try:
             job = await assemble_narration_track(db, lesson_id)
+        except VideoNarrationError as exc:
+            _raise(exc)
+        return {"ok": True, "job": job}
+
+    @api.post("/studio/video/lessons/{lesson_id}/narration/render")
+    async def render_route(lesson_id: str, _admin=Depends(require_admin)):
+        _need_enabled()
+        try:
+            job = await render_final_master(
+                db, lesson_id, sync_studio_tools.get_media_bucket(db), lesson_getter=lesson_getter,
+            )
         except VideoNarrationError as exc:
             _raise(exc)
         return {"ok": True, "job": job}

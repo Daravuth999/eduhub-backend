@@ -86,6 +86,7 @@ def test_status_reports_provider_readiness_when_keys_present(monkeypatch):
     ("post", "/api/studio/video/lessons/vid_1/narration/voice-production/sc_1/ln_1/generate"),
     ("post", "/api/studio/video/lessons/vid_1/narration/voice-production/sc_1/ln_1/reset"),
     ("post", "/api/studio/video/lessons/vid_1/narration/assemble"),
+    ("post", "/api/studio/video/lessons/vid_1/narration/render"),
     ("post", "/api/studio/video/lessons/vid_1/narration/publish"),
     ("post", "/api/studio/video/lessons/vid_1/narration/unpublish"),
 ])

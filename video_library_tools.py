@@ -375,6 +375,15 @@ async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None)
         out.pop("aiNarrationSyncId", None)
         out.pop("aiNarrationMediaRef", None)
         out.pop("aiNarrationDurationSec", None)
+        out.pop("aiNarrationMasterMediaRef", None)
+    else:
+        # A rendered final master (real embedded-audio MP4) is an OPTIONAL
+        # upgrade over the audio-only additive track — most lessons won't
+        # have one, so this stays honestly False rather than ever implying
+        # a master exists when only the additive track was published.
+        out["aiNarrationMasterAvailable"] = bool(out.get("aiNarrationMasterMediaRef"))
+        if not out["aiNarrationMasterAvailable"]:
+            out.pop("aiNarrationMasterMediaRef", None)
     return out
 
 

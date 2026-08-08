@@ -480,3 +480,106 @@ async def test_unpublish_is_reversible_without_destroying_generated_work(monkeyp
     # The generated work itself is untouched — re-publishing needs no rework.
     job = await jobs.get_or_create_job(db, "vid_1")
     assert job["assembly"]["state"] == jobs.S_COMPLETED
+
+
+# ── Final render (physically embedded audio via video_render_tools) ───────
+async def _assembled_job(db, monkeypatch):
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    client = _FakeElevenLabsClient()
+    await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    await vnt.assemble_narration_track(db, "vid_1")
+    return bucket
+
+
+async def _fake_mux(video_bytes, video_ct, audio_bytes):
+    return b"FAKE-RENDERED-MP4:" + video_bytes + b":" + audio_bytes
+
+
+@pytest.mark.asyncio
+async def test_render_requires_assembly_first():
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    with pytest.raises(vnt.VideoNarrationError) as exc:
+        await vnt.render_final_master(db, "vid_1", None, lesson_getter=_lesson_getter)
+    assert exc.value.code == "not_assembled"
+
+
+@pytest.mark.asyncio
+async def test_render_happy_path_produces_master_and_publish_exposes_it(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _fake_mux)
+
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_COMPLETED
+    assert job["render"]["result"]["mediaRef"].startswith("gridfs://sync_media/")
+    assert job["render"]["result"]["mode"] == "replace"
+    # Source video is never overwritten — provenance is tracked separately.
+    assert job["render"]["result"]["sourceMediaRef"] == LESSON["mediaRef"]
+
+    db.video_lessons.docs["vid_1"] = dict(LESSON)
+    published = await vnt.publish_narration(db, "vid_1")
+    lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert lesson["aiNarrationMasterMediaRef"] == job["render"]["result"]["mediaRef"]
+    assert published["published"] is True
+
+
+@pytest.mark.asyncio
+async def test_render_is_cost_safe_never_reruns_when_completed(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    calls = []
+
+    async def _counting_mux(video_bytes, video_ct, audio_bytes):
+        calls.append(1)
+        return await _fake_mux(video_bytes, video_ct, audio_bytes)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _counting_mux)
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_render_fails_terminal_when_ffmpeg_unavailable(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+
+    async def _unavailable_mux(video_bytes, video_ct, audio_bytes):
+        raise vnt.video_render_tools.RenderError("ffmpeg_unavailable", "ffmpeg not found", 503)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _unavailable_mux)
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_FAILED_TERMINAL
+    assert "ffmpeg" in job["render"]["lastError"].lower()
+
+
+@pytest.mark.asyncio
+async def test_render_fails_retryable_on_a_transient_render_error(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+
+    async def _failing_mux(video_bytes, video_ct, audio_bytes):
+        raise vnt.video_render_tools.RenderError("ffmpeg_failed", "exit code 1", 500)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _failing_mux)
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_FAILED_RETRYABLE
+
+
+@pytest.mark.asyncio
+async def test_unpublish_clears_master_ref_without_destroying_the_render(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _fake_mux)
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    db.video_lessons.docs["vid_1"] = dict(LESSON)
+    await vnt.publish_narration(db, "vid_1")
+
+    await vnt.unpublish_narration(db, "vid_1")
+    lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert not lesson.get("aiNarrationMasterMediaRef")
+    job = await jobs.get_or_create_job(db, "vid_1")
+    assert job["render"]["state"] == jobs.S_COMPLETED  # the rendered file itself is untouched

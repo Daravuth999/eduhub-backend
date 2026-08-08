@@ -464,6 +464,48 @@ async def test_lesson_with_no_narration_at_all_shows_available_false():
     assert "aiNarrationSyncId" not in out
 
 
+# ── Final-master exposure (physically embedded-audio MP4, optional upgrade
+# over the audio-only additive track — most lessons won't have one) ───────
+@pytest.mark.asyncio
+async def test_master_available_when_published_narration_has_a_rendered_master():
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=0, lesson_id="vid_n5")
+    lesson["aiNarrationPublished"] = True
+    lesson["aiNarrationSyncId"] = "sync_narr_5"
+    lesson["aiNarrationMediaRef"] = "https://pub-x.r2.dev/narr5.mp3"
+    lesson["aiNarrationMasterMediaRef"] = "https://pub-x.r2.dev/master5.mp4"
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["aiNarrationAvailable"] is True
+    assert out["aiNarrationMasterAvailable"] is True
+    assert out["aiNarrationMasterMediaRef"] == "https://pub-x.r2.dev/master5.mp4"
+
+
+@pytest.mark.asyncio
+async def test_master_unavailable_when_only_the_additive_track_is_published():
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=0, lesson_id="vid_n6")
+    lesson["aiNarrationPublished"] = True
+    lesson["aiNarrationSyncId"] = "sync_narr_6"
+    lesson["aiNarrationMediaRef"] = "https://pub-x.r2.dev/narr6.mp3"
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["aiNarrationAvailable"] is True
+    assert out["aiNarrationMasterAvailable"] is False
+    assert "aiNarrationMasterMediaRef" not in out
+
+
+@pytest.mark.asyncio
+async def test_master_hidden_for_unowned_paid_lesson_even_if_rendered():
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=50, lesson_id="vid_n7")
+    lesson["aiNarrationPublished"] = True
+    lesson["aiNarrationMediaRef"] = "https://pub-x.r2.dev/narr7.mp3"
+    lesson["aiNarrationMasterMediaRef"] = "https://pub-x.r2.dev/master7.mp4"
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["owned"] is False
+    assert "aiNarrationMasterMediaRef" not in out
+    assert "aiNarrationMasterAvailable" not in out
+
+
 # ── purchase state machine ───────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_initiate_purchase_succeeds_and_grants_ownership(monkeypatch):

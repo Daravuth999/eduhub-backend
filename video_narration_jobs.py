@@ -128,6 +128,7 @@ async def get_or_create_job(db, lesson_id: str) -> dict:
         "voiceAssignments": {},
         "voiceProduction": {},
         "assembly": new_stage(),
+        "render": new_stage(),
         "published": False,
         "createdAt": now,
         "updatedAt": now,
@@ -136,6 +137,13 @@ async def get_or_create_job(db, lesson_id: str) -> dict:
         {"_id": lesson_id},
         {"$setOnInsert": fresh},
         upsert=True,
+    )
+    # Additive backfill for jobs created before the "render" stage existed —
+    # never overwrites anything, matches this codebase's "old rows/routes
+    # are preserved, additive-only" convention (see CLAUDE.md).
+    await db[COLL].update_one(
+        {"_id": lesson_id, "render": {"$exists": False}},
+        {"$set": {"render": new_stage()}},
     )
     doc = await db[COLL].find_one({"_id": lesson_id}, {"_id": 0})
     return doc or fresh
