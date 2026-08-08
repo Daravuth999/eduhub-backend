@@ -55,6 +55,38 @@ def test_normalize_story_analysis_defaults_audio_observations_when_missing_from_
     assert result["scenes"][0]["audioObservations"] == {"dialogue": "", "music": "", "ambience": "", "sfx": ""}
 
 
+def test_build_scene_bounds_emotional_context():
+    sc = vss.build_scene(start=0.0, end=1.0, emotional_context="x" * 500)
+    assert len(sc["emotionalContext"]) == 400
+
+
+def test_build_scene_defaults_emotional_context_to_empty_string():
+    sc = vss.build_scene(start=0.0, end=1.0)
+    assert sc["emotionalContext"] == ""
+
+
+def test_normalize_story_analysis_parses_emotional_context_from_raw_scene():
+    raw = {"scenes": [{
+        "title": "reunion", "start": 0, "end": 5,
+        "emotionalContext": "Emma is relieved to see her grandfather after months apart.",
+    }]}
+    result = vss.normalize_story_analysis(raw)
+    assert result["scenes"][0]["emotionalContext"] == "Emma is relieved to see her grandfather after months apart."
+
+
+def test_build_script_line_allows_a_rich_performance_direction_not_just_a_word():
+    line = vss.build_script_line(
+        speaker="Emma", text="Are you okay?",
+        emotion="Gentle concern, natural conversational pace, a slight hesitation before asking.",
+    )
+    assert line["emotion"] == "Gentle concern, natural conversational pace, a slight hesitation before asking."
+
+
+def test_build_script_line_bounds_emotion_at_300_chars():
+    line = vss.build_script_line(speaker="Emma", text="Hi", emotion="x" * 500)
+    assert len(line["emotion"]) == 300
+
+
 def test_validate_story_analysis_rejects_duplicate_scene_ids():
     doc = vss.build_story_analysis(scenes=[
         vss.build_scene(scene_id="sc_1"),

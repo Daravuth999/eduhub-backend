@@ -125,6 +125,8 @@ def narration_status_payload() -> dict:
         "geminiReady": narration_gemini_ready(),
         "elevenLabsReady": narration_elevenlabs_ready(),
         "storageReady": narration_storage_ready(),
+        "music": narration_music_status(),
+        "sfx": narration_sfx_status(),
     }
 
 
@@ -200,6 +202,51 @@ async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str
 
     duration = word_timestamps[-1]["end"] if word_timestamps else 0.0
     return {"audio_base64": audio_base64, "word_timestamps": word_timestamps, "duration": duration}
+
+
+# ── ElevenLabs sound-effect generation — a REAL, separate ElevenLabs REST
+#    endpoint (POST /v1/sound-generation), distinct from the text-to-speech
+#    endpoint above. This is genuine "AI SFX" capability (item 7's ADD
+#    case for SFX), not fabricated: same api key, same provider, its own
+#    documented contract (raw audio bytes back, no per-character alignment
+#    — sound effects have no word timing to reshape). Music generation has
+#    NO equivalent verified endpoint wired here — see narration_music_
+#    status() below, which reports it honestly as unsupported rather than
+#    guessing at an unverified contract. ─────────────────────────────────
+def narration_music_status() -> dict:
+    return {
+        "supported": False,
+        "reason": "No verified ElevenLabs music-generation endpoint is integrated in this stack.",
+    }
+
+
+def narration_sfx_status() -> dict:
+    return {"supported": True, "provider": "elevenlabs", "endpoint": "sound-generation"}
+
+
+async def elevenlabs_generate_sfx(text: str, *, duration_seconds: float | None = None,
+                                   http_client=None) -> bytes:
+    api_key = _env("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise VideoNarrationError("no_api_key", "ELEVENLABS_API_KEY is not configured")
+    if not (text or "").strip():
+        raise VideoNarrationError("no_sfx_description", "no sound description to generate from")
+
+    body: dict = {"text": text[:450]}
+    if duration_seconds is not None:
+        body["duration_seconds"] = max(0.5, min(22.0, float(duration_seconds)))
+
+    url = "https://api.elevenlabs.io/v1/sound-generation"
+    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+    if http_client is not None:
+        r = await http_client.post(url, headers=headers, json=body)
+    else:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0), follow_redirects=True) as cli:
+            r = await cli.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        code = "provider_rejected" if r.status_code < 500 else "provider_unavailable"
+        raise VideoNarrationError(code, f"ElevenLabs HTTP {r.status_code}: {(r.text or '')[:200]}")
+    return r.content
 
 
 def _strip_id3_tags(buf: bytes) -> bytes:
@@ -478,6 +525,65 @@ async def reset_line_voice(db, lesson_id: str, scene_id: str, line_id: str) -> d
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+# ── Per-scene SFX generation — genuinely separate from voice production:
+#    one optional ElevenLabs Sound Effects asset per scene, sourced from
+#    Gemini's own audioObservations.sfx description for that scene (never
+#    an invented sound; if Gemini reported nothing, there is nothing to
+#    generate from and the stage fails honestly rather than guessing).
+#    NOT wired into assembly/render yet — see build_audio_timeline's
+#    docstring for exactly what "ADD" currently means for this asset. ────
+async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=None) -> dict:
+    job = await jobs.get_or_create_job(db, lesson_id)
+    if job["storyAnalysis"]["state"] != jobs.S_COMPLETED:
+        raise VideoNarrationError("no_story_yet", "run whole-story analysis first", 409)
+    scenes = (job["storyAnalysis"]["result"] or {}).get("scenes") or []
+    scene = next((s for s in scenes if s.get("sceneId") == scene_id), None)
+    if not scene:
+        raise VideoNarrationError("scene_not_found", f"no scene {scene_id!r} in the story analysis", 404)
+    sfx_description = (scene.get("audioObservations") or {}).get("sfx") or ""
+    if not sfx_description.strip():
+        raise VideoNarrationError(
+            "no_sfx_description", f"Gemini reported no sound effects for scene {scene_id!r}", 409,
+        )
+
+    path = f"sfx.{scene_id}"
+    if not jobs.get_path(job, path):
+        await db[jobs.COLL].update_one({"_id": lesson_id}, {"$set": {path: jobs.new_stage()}})
+
+    claimed, attempt = await jobs.claim_stage(db, lesson_id, path)
+    if claimed is None:
+        return await jobs.get_or_create_job(db, lesson_id)  # already completed/in-flight — cost-safe no-op
+    genver = jobs.get_path(claimed, path)["generationVersion"]
+    if not await jobs.fence_provider(db, lesson_id, path, attempt, genver):
+        return await jobs.get_or_create_job(db, lesson_id)
+
+    try:
+        audio_bytes = await elevenlabs_generate_sfx(sfx_description, http_client=http_client)
+    except VideoNarrationError as exc:
+        if exc.code == "no_api_key":
+            await jobs.fail_terminal(db, lesson_id, path, attempt, genver, exc.message)
+        else:
+            await jobs.fail_stage(db, lesson_id, path, attempt, genver, exc.message)
+        return await jobs.get_or_create_job(db, lesson_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("video_narration: sfx generation failed lesson=%s scene=%s", lesson_id, scene_id)
+        await jobs.fail_unknown(db, lesson_id, path, attempt, genver, f"{type(exc).__name__}: {exc}")
+        return await jobs.get_or_create_job(db, lesson_id)
+
+    if not audio_bytes:
+        await jobs.fail_stage(db, lesson_id, path, attempt, genver, "provider returned no audio")
+        return await jobs.get_or_create_job(db, lesson_id)
+
+    key = f"video-narration/{lesson_id}/{scene_id}/sfx/{attempt}.mp3"
+    media_ref = await _store_audio(db, audio_bytes, key, lesson_id)
+    result = {
+        "sceneId": scene_id, "sourceText": sfx_description, "mediaRef": media_ref,
+        "provider": "elevenlabs", "providerAssetId": media_ref,
+    }
+    await jobs.complete_stage(db, lesson_id, path, attempt, genver, result)
+    return await jobs.get_or_create_job(db, lesson_id)
+
+
 # ── Assembly (additive narration track — no video muxing) ────────────────
 async def assemble_narration_track(db, lesson_id: str) -> dict:
     job = await jobs.get_or_create_job(db, lesson_id)
@@ -552,6 +658,78 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         }},
     )
     return await jobs.get_or_create_job(db, lesson_id)
+
+
+# ── Audio timeline (read-only, structured — item 8) ───────────────────────
+def build_audio_timeline(job: dict) -> dict:
+    """Deterministic reconstruction of the production timeline from data the
+    job ALREADY has — never a new source of truth, never fabricated. Reuses
+    the exact same cumulative-offset algorithm assemble_narration_track
+    uses to build the assembled sync document, so a line's reported start
+    here matches where it actually lands in the assembled/rendered audio.
+
+    Offsets are only trustworthy through the first not-yet-completed line —
+    once a gap is hit, every remaining entry (and totalDurationSec) reports
+    None rather than a guessed number; this function does not know the
+    provider will ever finish generating that line the same way. SFX assets
+    are listed with their generation status but no start/duration: they are
+    NOT wired into assembly/render yet (see generate_scene_sfx's docstring)
+    — this timeline shows what SFX exists, not where it plays, since that
+    placement decision doesn't exist in the pipeline yet."""
+    scenes = (job.get("scriptBlueprint", {}).get("result") or {}).get("scenes") or []
+    voice_production = job.get("voiceProduction") or {}
+    sfx_map = job.get("sfx") or {}
+
+    tracks: list[dict] = []
+    cursor = 0.0
+    trustworthy = True
+    for scene in scenes:
+        vp_lines = (voice_production.get(scene["sceneId"], {}) or {}).get("lines") or {}
+        for line in scene.get("lines") or []:
+            stage = vp_lines.get(line["lineId"]) or {}
+            state = stage.get("state", jobs.S_PENDING)
+            result = stage.get("result") or {}
+            is_narrator = (line.get("speaker") or "").strip().lower() == "narrator"
+            entry = {
+                "sceneId": scene["sceneId"], "lineId": line["lineId"],
+                "role": "narrator" if is_narrator else "character",
+                "type": "narration" if is_narrator else "dialogue",
+                "speaker": line.get("speaker", ""),
+                "start": None, "duration": None, "end": None,
+                "provider": "elevenlabs", "providerAssetId": result.get("mediaRef"),
+                "generationStatus": state,
+                "version": stage.get("generationVersion", 0),
+                "volume": 1.0, "treatment": "add", "provenance": "ai",
+            }
+            if state == jobs.S_COMPLETED and trustworthy:
+                duration = float(result.get("durationSec") or 0.0)
+                entry["start"] = round(cursor, 3)
+                entry["duration"] = round(duration, 3)
+                entry["end"] = round(cursor + duration, 3)
+                cursor += duration
+            else:
+                trustworthy = False
+            tracks.append(entry)
+
+    for scene_id, stage in sfx_map.items():
+        result = stage.get("result") or {}
+        tracks.append({
+            "sceneId": scene_id, "lineId": None, "role": "sfx", "type": "sfx", "speaker": None,
+            "start": None, "duration": None, "end": None,
+            "provider": "elevenlabs", "providerAssetId": result.get("mediaRef"),
+            "generationStatus": stage.get("state", jobs.S_PENDING),
+            "version": stage.get("generationVersion", 0),
+            "volume": 1.0, "treatment": "add", "provenance": "ai",
+        })
+
+    return {
+        "tracks": tracks,
+        "totalDurationSec": round(cursor, 3) if trustworthy and tracks else None,
+        "sourceAudio": {
+            "treatment": job.get("sourceAudioTreatment", "mute"),
+            "provenance": "original",
+        },
+    }
 
 
 async def set_source_audio_treatment(db, lesson_id: str, treatment: str) -> dict:
@@ -747,6 +925,21 @@ def register_video_narration_routes(api, db, require_admin, *, lesson_getter, sy
         except VideoNarrationError as exc:
             _raise(exc)
         return {"ok": True, "job": job}
+
+    @api.post("/studio/video/lessons/{lesson_id}/narration/sfx/{scene_id}/generate")
+    async def generate_scene_sfx_route(lesson_id: str, scene_id: str, _admin=Depends(require_admin)):
+        _need_enabled()
+        try:
+            job = await generate_scene_sfx(db, lesson_id, scene_id)
+        except VideoNarrationError as exc:
+            _raise(exc)
+        return {"ok": True, "job": job}
+
+    @api.get("/studio/video/lessons/{lesson_id}/narration/timeline")
+    async def narration_timeline_route(lesson_id: str, _admin=Depends(require_admin)):
+        _need_enabled()
+        job = await jobs.get_or_create_job(db, lesson_id)
+        return {"timeline": build_audio_timeline(job)}
 
     @api.post("/studio/video/lessons/{lesson_id}/narration/assemble")
     async def assemble_route(lesson_id: str, _admin=Depends(require_admin)):

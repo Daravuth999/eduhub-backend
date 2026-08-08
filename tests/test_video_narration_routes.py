@@ -61,6 +61,8 @@ def test_status_reports_flags_even_while_disabled(monkeypatch, visible, enabled)
     assert body == {
         "visible": visible, "enabled": enabled,
         "geminiReady": False, "elevenLabsReady": False, "storageReady": False,
+        "music": {"supported": False, "reason": body["music"]["reason"]},
+        "sfx": {"supported": True, "provider": "elevenlabs", "endpoint": "sound-generation"},
     }
 
 

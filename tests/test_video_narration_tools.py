@@ -173,10 +173,11 @@ class _FakeMediaBucket:
 
 
 class _FakeHttpResponse:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(self, status_code=200, payload=None, text="", content=b""):
         self.status_code = status_code
         self._payload = payload or {}
         self.text = text
+        self.content = content
 
     def json(self):
         return self._payload
@@ -642,3 +643,180 @@ async def test_render_defaults_to_mute_when_treatment_never_set(monkeypatch):
     monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _capturing_mux)
     await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
     assert seen["treatment"] == "mute"
+
+
+# ── Per-scene SFX generation (real ElevenLabs Sound Effects endpoint) ─────
+class _FakeSfxClient:
+    """Simulates POST /v1/sound-generation — raw audio bytes back, no
+    per-character alignment (there is none for a sound effect)."""
+    def __init__(self, status_code=200):
+        self.calls = []
+        self.status_code = status_code
+
+    async def post(self, url, headers=None, json=None, **kwargs):
+        self.calls.append((url, json))
+        if self.status_code != 200:
+            return _FakeHttpResponse(self.status_code, text="provider error")
+        return _FakeHttpResponse(200, content=f"sfx-for:{json['text']}".encode())
+
+
+async def _job_with_sfx_scene(db, monkeypatch, *, sfx_text="a door creaks open"):
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    scene_id = job["storyAnalysis"]["result"]["scenes"][0]["sceneId"]
+    doc = db.video_narration_jobs.docs["vid_1"]
+    doc["storyAnalysis"]["result"]["scenes"][0]["audioObservations"]["sfx"] = sfx_text
+    return scene_id
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_requires_story_analysis_first():
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    with pytest.raises(vnt.VideoNarrationError) as exc:
+        await vnt.generate_scene_sfx(db, "vid_1", "sc_1")
+    assert exc.value.code == "no_story_yet"
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_fails_honestly_when_gemini_reported_no_sfx(monkeypatch):
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    scene_id = job["storyAnalysis"]["result"]["scenes"][0]["sceneId"]
+
+    with pytest.raises(vnt.VideoNarrationError) as exc:
+        await vnt.generate_scene_sfx(db, "vid_1", scene_id)
+    assert exc.value.code == "no_sfx_description"
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_happy_path_stores_audio_and_completes(monkeypatch):
+    db = _FakeDB()
+    scene_id = await _job_with_sfx_scene(db, monkeypatch)
+    client = _FakeSfxClient()
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+
+    job = await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=client)
+    assert job["sfx"][scene_id]["state"] == jobs.S_COMPLETED
+    assert job["sfx"][scene_id]["result"]["sourceText"] == "a door creaks open"
+    assert job["sfx"][scene_id]["result"]["provider"] == "elevenlabs"
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_is_cost_safe_never_reruns_when_completed(monkeypatch):
+    db = _FakeDB()
+    scene_id = await _job_with_sfx_scene(db, monkeypatch)
+    client = _FakeSfxClient()
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+
+    await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=client)
+    await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=client)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_fails_terminal_without_api_key(monkeypatch):
+    db = _FakeDB()
+    scene_id = await _job_with_sfx_scene(db, monkeypatch)
+
+    job = await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_FakeSfxClient())
+    assert job["sfx"][scene_id]["state"] == jobs.S_FAILED_TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_fails_retryable_on_provider_rejection(monkeypatch):
+    db = _FakeDB()
+    scene_id = await _job_with_sfx_scene(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+
+    job = await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_FakeSfxClient(status_code=400))
+    assert job["sfx"][scene_id]["state"] == jobs.S_FAILED_RETRYABLE
+
+
+def test_narration_music_status_is_honestly_unsupported():
+    status = vnt.narration_music_status()
+    assert status["supported"] is False
+    assert "reason" in status
+
+
+def test_narration_sfx_status_reports_the_real_endpoint():
+    status = vnt.narration_sfx_status()
+    assert status == {"supported": True, "provider": "elevenlabs", "endpoint": "sound-generation"}
+
+
+# ── Audio timeline (read-only, structured reconstruction) ─────────────────
+@pytest.mark.asyncio
+async def test_build_audio_timeline_empty_before_any_script_exists():
+    db = _FakeDB()
+    job = await jobs.get_or_create_job(db, "vid_1")
+    timeline = vnt.build_audio_timeline(job)
+    assert timeline["tracks"] == []
+    assert timeline["totalDurationSec"] is None
+    assert timeline["sourceAudio"]["treatment"] == "mute"
+
+
+@pytest.mark.asyncio
+async def test_build_audio_timeline_reports_null_offsets_until_lines_are_generated(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    job = await jobs.get_or_create_job(db, "vid_1")
+
+    timeline = vnt.build_audio_timeline(job)
+    assert len(timeline["tracks"]) == 1
+    assert timeline["tracks"][0]["generationStatus"] == "pending"
+    assert timeline["tracks"][0]["start"] is None
+    assert timeline["totalDurationSec"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_audio_timeline_computes_real_cumulative_offsets_once_generated(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    client = _FakeElevenLabsClient()
+    job = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+
+    timeline = vnt.build_audio_timeline(job)
+    track = timeline["tracks"][0]
+    assert track["generationStatus"] == "completed"
+    assert track["start"] == 0.0
+    assert track["duration"] == job["voiceProduction"][scene_id]["lines"][line_id]["result"]["durationSec"]
+    assert track["end"] == track["duration"]
+    assert timeline["totalDurationSec"] == track["duration"]
+    assert track["role"] == "narrator"
+    assert track["treatment"] == "add"
+    assert track["provenance"] == "ai"
+
+
+@pytest.mark.asyncio
+async def test_build_audio_timeline_includes_sfx_entries_without_fabricated_placement(monkeypatch):
+    db = _FakeDB()
+    scene_id = await _job_with_sfx_scene(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_FakeSfxClient())
+    job = await jobs.get_or_create_job(db, "vid_1")
+
+    timeline = vnt.build_audio_timeline(job)
+    sfx_tracks = [t for t in timeline["tracks"] if t["role"] == "sfx"]
+    assert len(sfx_tracks) == 1
+    assert sfx_tracks[0]["sceneId"] == scene_id
+    assert sfx_tracks[0]["generationStatus"] == "completed"
+    assert sfx_tracks[0]["start"] is None  # not wired into placement/timing yet — never fabricated
+
+
+@pytest.mark.asyncio
+async def test_build_audio_timeline_reflects_source_audio_treatment_choice():
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    await vnt.set_source_audio_treatment(db, "vid_1", "duck")
+    job = await jobs.get_or_create_job(db, "vid_1")
+
+    timeline = vnt.build_audio_timeline(job)
+    assert timeline["sourceAudio"] == {"treatment": "duck", "provenance": "original"}

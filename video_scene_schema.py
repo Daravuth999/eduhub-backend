@@ -80,6 +80,7 @@ def build_scene(
     narrative_role: str = "other",
     confidence: float | None = None,
     audio_observations: dict | None = None,
+    emotional_context: str = "",
 ) -> dict:
     return {
         "sceneId": scene_id or new_scene_id(),
@@ -92,6 +93,10 @@ def build_scene(
         "narrativeRole": narrative_role if narrative_role in NARRATIVE_ROLES else "other",
         "confidence": confidence,
         "audioObservations": _clean_audio_observations(audio_observations),
+        # Who feels what and why, and how characters relate in this scene —
+        # feeds the script-drafting prompt so performance direction is
+        # grounded in real scene context rather than a generic mood label.
+        "emotionalContext": str(emotional_context or "")[:400],
     }
 
 
@@ -172,6 +177,7 @@ def normalize_story_analysis(raw, *, extract_json=None) -> dict | None:
                     if isinstance(item.get("confidence"), (int, float)) else None
                 ),
                 audio_observations=item.get("audioObservations"),
+                emotional_context=_s(item.get("emotionalContext"), 400),
             ))
 
     raw_characters = data.get("characters")
@@ -195,6 +201,15 @@ def normalize_story_analysis(raw, *, extract_json=None) -> dict | None:
 
 
 # ── ScriptBlueprint (Mode B) ──────────────────────────────────────────────
+# `emotion` is the line's PERFORMANCE DIRECTION — natural-language context
+# (pace, warmth, hesitation, restraint, relationship to the listener, why
+# the line is being said) that video_narration_tools.elevenlabs_generate_
+# line feeds into ElevenLabs' real eleven_v3 bracket-instruction mechanism
+# (`f"[{acting_note}] {text}"`, already live before this field existed —
+# this is not a new/invented ElevenLabs capability, only richer content
+# going into an existing one). Bounded at 300 chars: enough for a real
+# directorial note, not so much that a bad Gemini response can dominate
+# the line's own text.
 def build_script_line(
     *, line_id: str | None = None, speaker: str = "", text: str = "", emotion: str = "",
 ) -> dict:
@@ -202,7 +217,7 @@ def build_script_line(
         "lineId": line_id or new_line_id(),
         "speaker": str(speaker or "")[:60],
         "text": str(text or "")[:600],
-        "emotion": str(emotion or "")[:40],
+        "emotion": str(emotion or "")[:300],
     }
 
 

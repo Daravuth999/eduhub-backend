@@ -130,6 +130,7 @@ async def get_or_create_job(db, lesson_id: str) -> dict:
         "assembly": new_stage(),
         "render": new_stage(),
         "sourceAudioTreatment": "mute",
+        "sfx": {},  # keyed by sceneId -> lazily-created stage doc, same pattern as voiceProduction
         "published": False,
         "createdAt": now,
         "updatedAt": now,
@@ -152,6 +153,12 @@ async def get_or_create_job(db, lesson_id: str) -> dict:
     await db[COLL].update_one(
         {"_id": lesson_id, "sourceAudioTreatment": {"$exists": False}},
         {"$set": {"sourceAudioTreatment": "mute"}},
+    )
+    # Additive backfill for jobs created before per-scene SFX generation
+    # existed — an empty map is the correct "nothing generated yet" state.
+    await db[COLL].update_one(
+        {"_id": lesson_id, "sfx": {"$exists": False}},
+        {"$set": {"sfx": {}}},
     )
     doc = await db[COLL].find_one({"_id": lesson_id}, {"_id": 0})
     return doc or fresh

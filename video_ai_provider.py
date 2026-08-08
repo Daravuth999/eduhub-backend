@@ -244,7 +244,9 @@ _STORY_PROMPT_TEMPLATE = (
     '"narrativeRole": "<one of setup,development,conflict,climax,resolution,other>", '
     '"audioObservations": {{"dialogue": "<what speech you hear, or empty>", '
     '"music": "<any music you hear, or empty>", "ambience": "<background/room tone, or empty>", '
-    '"sfx": "<any sound effects, or empty>"}}}}\n'
+    '"sfx": "<any sound effects, or empty>"}}, '
+    '"emotionalContext": "<who feels what and why in this scene, and how the characters relate '
+    'to each other here — 1 sentence, or empty if purely factual/narration>"}}\n'
     "  ]\n"
     "}}\n"
     "Rules:\n"
@@ -268,7 +270,11 @@ _SCRIPT_PROMPT_TEMPLATE = (
     '{{"scenes": [\n'
     '  {{"sceneId": "<EXACT sceneId from the story analysis below>", "lines": [\n'
     '    {{"speaker": "<\'Narrator\' or a character name from the story analysis>", '
-    '"text": "<one line to be voiced>", "emotion": "<short mood word, optional>"}}\n'
+    '"text": "<one line to be voiced>", '
+    '"emotion": "<a short PERFORMANCE DIRECTION for the voice actor — natural language, '
+    "not a single mood word. Describe pace, warmth/restraint, hesitation, and WHY the "
+    "line is said given the scene's emotional/relationship context, e.g. "
+    '\'Gentle concern, natural conversational pace, a slight hesitation before asking\'>"}}\n'
     "  ]}}\n"
     "]}}\n"
     "Rules:\n"
@@ -277,7 +283,10 @@ _SCRIPT_PROMPT_TEMPLATE = (
     "- Write natural, concise lines appropriate for the CEFR level implied by the transcript.\n"
     "- A later scene's narration MAY reference what happened in earlier scenes — you have the "
     "whole story below, not just this one scene.\n"
-    "- 'Narrator' is always a valid speaker for scene-setting/description lines.\n\n"
+    "- 'Narrator' is always a valid speaker for scene-setting/description lines.\n"
+    "- Ground each line's performance direction in the scene's actual emotionalContext/"
+    "relationships, not a generic label — two lines with the same one-word mood should still "
+    "get different, specific direction if the context differs.\n\n"
     "Lesson title: {title}\n\n"
     "Story analysis (JSON):\n{story_json}\n\n"
     "Original transcript (reference only):\n{transcript}"
@@ -300,6 +309,7 @@ def _mock_story_analysis(transcript_text: str) -> dict:
                 "dialogue": "(mock — enable Gemini for real audio observations)",
                 "music": "", "ambience": "", "sfx": "",
             },
+            emotional_context="(mock mode — enable Gemini for real emotional/relationship context)",
         )],
         narrative_arc="(mock mode — enable Gemini for a real narrative arc)",
         engine="mock",
@@ -310,7 +320,10 @@ def _mock_script_blueprint(scene_ids_in_order: list[str]) -> dict:
     from video_scene_schema import build_scene_script, build_script_blueprint, build_script_line
     scenes = [
         build_scene_script(scene_id=sid, lines=[
-            build_script_line(speaker="Narrator", text="(mock — enable Gemini for a real drafted script)"),
+            build_script_line(
+                speaker="Narrator", text="(mock — enable Gemini for a real drafted script)",
+                emotion="(mock mode — enable Gemini for real performance direction)",
+            ),
         ])
         for sid in scene_ids_in_order
     ]
