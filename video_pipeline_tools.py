@@ -52,9 +52,37 @@ PIPELINE_STEPS = (
 
 MAX_TRANSCRIBE_BYTES = 300 * 1024 * 1024
 
+# Watchdog ceiling for one complete pipeline run. Root-cause fix for a real
+# production incident: the shared Mongo client (server.py) sets no
+# socketTimeoutMS, so a stalled read on a dead/half-open connection (or a
+# hung GridFS/R2 fetch) can await forever with no exception ever raised —
+# run_pipeline's own try/except is correct but never fires, leaving
+# pipeline.state="running" in Mongo permanently, with nothing in-process to
+# ever revisit it. asyncio.wait_for() below bounds the whole run so a hang
+# becomes a truthful "failed" state instead of eternal "running". Generous
+# for a single lesson (Gemini transcription + educational analysis).
+PIPELINE_TIMEOUT_S = 600
+
 
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_in(seconds: int) -> str:
+    return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _pipeline_is_stale(pipeline_doc: dict | None) -> bool:
+    """A 'running' pipeline whose startedAt is older than the watchdog
+    ceiling is orphaned — almost certainly a process restart/redeploy that
+    killed the in-flight asyncio task before it ever reached run_pipeline's
+    except block (a process death is not an exception; nothing catches it).
+    Without this, such a lesson could never be retried: the atomic claim
+    below would refuse forever, since pipeline.state is stuck at "running"."""
+    started = (pipeline_doc or {}).get("startedAt")
+    if not started:
+        return False
+    return started < _iso_in(-PIPELINE_TIMEOUT_S)
 
 
 def build_pipeline_record(provider_version: str) -> dict:
@@ -121,11 +149,22 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
 
     provider = video_ai_provider.get_video_ai_provider()
 
+    # Stale-claim override: a "running" pipeline whose startedAt is older
+    # than PIPELINE_TIMEOUT_S is orphaned (see _pipeline_is_stale) — allow
+    # reclaiming it instead of refusing forever, mirroring video_narration_
+    # jobs.py's own CLAIM_LEASE_S reclaim pattern from this same codebase.
     claimed = await db[LESSONS_COLL].find_one_and_update(
-        {"lessonId": lesson_id, "pipeline.state": {"$ne": "running"}},
+        {
+            "lessonId": lesson_id,
+            "$or": [
+                {"pipeline.state": {"$ne": "running"}},
+                {"pipeline.startedAt": {"$lt": _iso_in(-PIPELINE_TIMEOUT_S)}},
+            ],
+        },
         {"$set": {"pipeline": build_pipeline_record(provider.provider_version)}},
     )
-    if claimed is None and (lesson.get("pipeline") or {}).get("state") == "running":
+    if claimed is None and (lesson.get("pipeline") or {}).get("state") == "running" \
+            and not _pipeline_is_stale(lesson.get("pipeline")):
         raise RuntimeError("pipeline already running for this lesson")
     if claimed is None:
         # lesson had no pipeline field at all — seed it directly
@@ -135,7 +174,8 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         )
 
     sync_id = lesson["syncId"]
-    try:
+
+    async def _run_stages() -> None:
         # 1 — media check + load
         await _set_step(db, lesson_id, "media_check", "running")
         raw, content_type = await load_media_bytes(db, media_bucket, lesson["mediaRef"])
@@ -182,12 +222,22 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         await _set_step(db, lesson_id, "review_ready", "complete")
         await _finish(db, lesson_id, "complete")
         logger.info("video_pipeline: complete lesson=%s provider=%s", lesson_id, provider.provider_version)
+
+    try:
+        # Watchdog: bounds the whole run so a stalled I/O call (dead Mongo
+        # connection, hung GridFS/R2 fetch — see PIPELINE_TIMEOUT_S) becomes
+        # a truthful "failed" state instead of an eternal "running" one.
+        await asyncio.wait_for(_run_stages(), timeout=PIPELINE_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001
+        message = (
+            f"Processing timed out after {PIPELINE_TIMEOUT_S}s (stalled I/O — retry is safe)"
+            if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
+        )
         logger.exception("video_pipeline: FAILED lesson=%s", lesson_id)
         current = await db[LESSONS_COLL].find_one({"lessonId": lesson_id}, {"_id": 0, "pipeline": 1})
         step = ((current or {}).get("pipeline") or {}).get("currentStep") or "media_check"
-        await _set_step(db, lesson_id, step, "failed", f"{type(exc).__name__}: {exc}")
-        await _finish(db, lesson_id, "failed", f"{type(exc).__name__}: {exc}")
+        await _set_step(db, lesson_id, step, "failed", message)
+        await _finish(db, lesson_id, "failed", message)
         try:
             await sync_studio_tools.mark_alignment_failed(db, sync_id)
         except Exception:  # noqa: BLE001
@@ -230,7 +280,11 @@ def register_video_pipeline_routes(api, db, require_admin) -> None:
             raise HTTPException(status_code=404, detail="lesson not found")
         if not lesson.get("mediaRef") or not lesson.get("syncId"):
             raise HTTPException(status_code=409, detail="upload media before running the pipeline")
-        if (lesson.get("pipeline") or {}).get("state") == "running":
+        pipeline_doc = lesson.get("pipeline") or {}
+        # A "running" pipeline older than the watchdog ceiling is orphaned
+        # (see _pipeline_is_stale) — let the admin retry it manually instead
+        # of the button staying refused forever with no way out.
+        if pipeline_doc.get("state") == "running" and not _pipeline_is_stale(pipeline_doc):
             raise HTTPException(status_code=409, detail="pipeline already running")
         schedule_pipeline(db, lesson_id, sync_studio_tools.get_media_bucket(db))
         return {"ok": True, "scheduled": True, "aiEngine": "gemini" if video_ai_provider.ai_available() else "mock"}
