@@ -114,6 +114,9 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "video_progress": "video_library_tools.py",
     "video_bookmarks": "video_library_tools.py",
     "video_notes": "video_library_tools.py",
+    # video_narration_jobs.py (AI Narration production engine — Gemini
+    # whole-story analysis + ElevenLabs per-line voice generation)
+    "video_narration_jobs": "video_narration_jobs.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed

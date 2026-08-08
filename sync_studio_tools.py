@@ -482,32 +482,111 @@ async def mark_alignment_failed(db, sync_id: str) -> None:
 async def apply_alignment_result(db, sync_id: str, aligned: dict) -> dict:
     """Apply a provider's alignment output (a canonical sync fragment —
     paragraphs/speakers/duration/provider identity) onto an EXISTING sync
-    document (the one create_sync_from_upload made at upload time). The
-    document keeps its syncId/mediaRef/ownerRef; alignmentVersion is bumped
-    so re-runs are visible as versions, never silent overwrites."""
+    document (the one create_sync_from_upload made at upload time).
+
+    Approved-version protection (data-loss fix): if the CURRENT document is
+    already `reviewStatus == "approved"` — meaning a teacher has reviewed
+    and signed off on it, and students are actively being served it — this
+    function MUST NOT touch the production fields at all. Instead the new
+    result is staged as `candidate`, a sibling field holding the same
+    shape (paragraphs/speakers/durationSec/providerCategory/
+    providerVersion/generatedAt/alignmentVersion). Students keep seeing the
+    untouched approved version (`is_servable_to_students` only ever reads
+    the top-level fields) until an admin explicitly calls
+    `resolve_sync_candidate(..., action="approve")` via the Review Studio.
+    A candidate is fully discardable via action="reject" with zero effect
+    on the current approved version. This is the fix for a real production
+    bug: re-running the pipeline used to silently overwrite an approved,
+    teacher-edited transcript with no way to recover it.
+
+    If the document was NOT yet approved (first run, or still mid-review),
+    there is no teacher-approved production content to protect — behavior
+    is unchanged from before: a direct in-place update, versioned via
+    alignmentVersion."""
     doc = await get_sync_document(db, sync_id)
     if not doc:
         raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
 
-    updates = {
+    result_fields = {
         "paragraphs": aligned.get("paragraphs") or [],
         "durationSec": aligned.get("durationSec", 0.0),
         "providerCategory": aligned.get("providerCategory", "speech_recognition"),
         "providerVersion": aligned.get("providerVersion", ""),
         "generatedAt": aligned.get("generatedAt", ""),
+    }
+    if aligned.get("speakers"):
+        result_fields["speakers"] = aligned["speakers"]
+
+    if doc.get("reviewStatus") == "approved":
+        candidate = {**result_fields, "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1}
+        # Validate the candidate's shape against a document that otherwise
+        # keeps the current (approved) top-level fields — the candidate
+        # must be structurally sound on its own, but must never be
+        # persisted into the fields students actually read.
+        check_doc = {**doc, **result_fields}
+        ok, errors = validate_sync_document(check_doc)
+        if not ok:
+            raise SyncStudioError("invalid_sync_document", "; ".join(errors), 500)
+        updates = {"candidate": candidate, "alignmentStatus": "complete"}
+        await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$set": updates})
+        return {**doc, **updates}
+
+    updates = {
+        **result_fields,
         "alignmentStatus": "complete",
         "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1,
         "reviewStatus": "pending",
         "approvedAt": None,
     }
-    if aligned.get("speakers"):
-        updates["speakers"] = aligned["speakers"]
-
     merged = {**doc, **updates}
     ok, errors = validate_sync_document(merged)
     if not ok:
         raise SyncStudioError("invalid_sync_document", "; ".join(errors), 500)
     await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$set": updates})
+    return merged
+
+
+async def resolve_sync_candidate(db, sync_id: str, *, action: str) -> dict:
+    """Admin-explicit resolution of a pending re-processing candidate
+    (see apply_alignment_result). "approve" promotes the candidate onto
+    the production fields (students now see it) and clears `candidate`;
+    "reject" simply discards `candidate` — the current approved version
+    is untouched either way until this is explicitly called."""
+    if action not in ("approve", "reject"):
+        raise SyncStudioError("invalid_action", f"invalid action: {action!r}", 400)
+
+    doc = await get_sync_document(db, sync_id)
+    if not doc:
+        raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
+    candidate = doc.get("candidate")
+    if not candidate:
+        raise SyncStudioError("no_candidate", "this document has no pending candidate", 409)
+
+    if action == "reject":
+        await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$unset": {"candidate": ""}})
+        doc.pop("candidate", None)
+        return doc
+
+    updates = {
+        "paragraphs": candidate.get("paragraphs") or [],
+        "durationSec": candidate.get("durationSec", doc.get("durationSec", 0.0)),
+        "providerCategory": candidate.get("providerCategory", doc.get("providerCategory")),
+        "providerVersion": candidate.get("providerVersion", doc.get("providerVersion")),
+        "generatedAt": candidate.get("generatedAt", doc.get("generatedAt")),
+        "alignmentVersion": candidate.get("alignmentVersion", int(doc.get("alignmentVersion", 1)) + 1),
+        "reviewStatus": "approved",
+        "approvedAt": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if "speakers" in candidate:
+        updates["speakers"] = candidate["speakers"]
+    merged = {**doc, **updates}
+    merged.pop("candidate", None)
+    ok, errors = validate_sync_document(merged)
+    if not ok:
+        raise SyncStudioError("invalid_sync_document", "; ".join(errors), 500)
+    await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id}, {"$set": updates, "$unset": {"candidate": ""}},
+    )
     return merged
 
 
@@ -882,6 +961,14 @@ def register_sync_studio_routes(api, db, require_admin, current_student, get_boo
     async def redo_sync_route(sync_id: str, _admin=Depends(require_admin)):
         try:
             doc = await redo_sync_edit(db, sync_id)
+        except SyncStudioError as exc:
+            _raise(exc)
+        return {"ok": True, "sync": strip_history(doc)}
+
+    @api.post("/studio/sync/{sync_id}/candidate")
+    async def candidate_route(sync_id: str, payload: dict = Body(...), _admin=Depends(require_admin)):
+        try:
+            doc = await resolve_sync_candidate(db, sync_id, action=payload.get("action", ""))
         except SyncStudioError as exc:
             _raise(exc)
         return {"ok": True, "sync": strip_history(doc)}

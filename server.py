@@ -7348,6 +7348,25 @@ except Exception as _video_pipeline_load_err:  # noqa: BLE001
         "video_pipeline_tools: disabled (%s)", _video_pipeline_load_err
     )
 
+# AI Narration production engine — Gemini whole-story analysis + ElevenLabs
+# per-line voice generation, on its own dedicated video_narration_jobs
+# collection (tools/check_collection_ownership.py --strict enforces it).
+# Same isolated, non-fatal registration discipline as the two blocks above.
+try:
+    from video_library_tools import get_video_lesson as _vn_lesson_getter
+    from sync_studio_tools import get_sync_document as _vn_sync_getter
+    from video_narration_tools import register_video_narration_routes
+
+    register_video_narration_routes(
+        api, db, require_admin,
+        lesson_getter=lambda lesson_id: _vn_lesson_getter(db, lesson_id),
+        sync_getter=lambda sync_id: _vn_sync_getter(db, sync_id),
+    )
+except Exception as _video_narration_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "video_narration_tools: disabled (%s)", _video_narration_load_err
+    )
+
 # ── Signature Smart Interactive Book, Checkpoint 1 (additive, isolated) ────
 # Student-facing local/server progress sync for the nine premium interaction
 # block types. Flag-gated (BOOK_PREMIUM_INTERACTIONS_ENABLED, default false),

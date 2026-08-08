@@ -409,6 +409,61 @@ async def test_paid_lesson_shows_sync_id_when_owned():
     assert out["mediaRef"] == "https://pub-x.r2.dev/vid.mp4"
 
 
+# ── AI Narration track exposure (additive audio track, admin-gated) ──────
+@pytest.mark.asyncio
+async def test_narration_hidden_for_unowned_paid_lesson_even_if_published(monkeypatch):
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=50, lesson_id="vid_n1")
+    lesson["aiNarrationPublished"] = True
+    lesson["aiNarrationSyncId"] = "sync_narr_1"
+    lesson["aiNarrationMediaRef"] = "https://pub-x.r2.dev/narr.mp3"
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["owned"] is False
+    assert out["aiNarrationAvailable"] is False
+    assert "aiNarrationSyncId" not in out
+    assert "aiNarrationMediaRef" not in out
+    assert "aiNarrationPublished" not in out  # internal flag never leaks raw
+
+
+@pytest.mark.asyncio
+async def test_narration_hidden_when_owned_but_not_yet_published():
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=0, lesson_id="vid_n2")
+    # Assembled but the admin has not clicked publish yet.
+    lesson["aiNarrationSyncId"] = "sync_narr_2"
+    lesson["aiNarrationMediaRef"] = "https://pub-x.r2.dev/narr2.mp3"
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["owned"] is True
+    assert out["aiNarrationAvailable"] is False
+    assert "aiNarrationSyncId" not in out
+    assert "aiNarrationMediaRef" not in out
+
+
+@pytest.mark.asyncio
+async def test_narration_visible_when_owned_and_published():
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=0, lesson_id="vid_n3")
+    lesson["aiNarrationPublished"] = True
+    lesson["aiNarrationSyncId"] = "sync_narr_3"
+    lesson["aiNarrationMediaRef"] = "https://pub-x.r2.dev/narr3.mp3"
+    lesson["aiNarrationDurationSec"] = 42.0
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["owned"] is True
+    assert out["aiNarrationAvailable"] is True
+    assert out["aiNarrationSyncId"] == "sync_narr_3"
+    assert out["aiNarrationMediaRef"] == "https://pub-x.r2.dev/narr3.mp3"
+    assert out["aiNarrationDurationSec"] == 42.0
+
+
+@pytest.mark.asyncio
+async def test_lesson_with_no_narration_at_all_shows_available_false():
+    db = _FakeDB()
+    lesson = await _seed_published_lesson(db, price=0, lesson_id="vid_n4")
+    out = await vlt.serialize_lesson_for_student(db, lesson, "stu1")
+    assert out["aiNarrationAvailable"] is False
+    assert "aiNarrationSyncId" not in out
+
+
 # ── purchase state machine ───────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_initiate_purchase_succeeds_and_grants_ownership(monkeypatch):

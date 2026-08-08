@@ -225,3 +225,161 @@ def test_recompute_bounds_drops_empty_and_rederives():
     for p in cleaned:
         assert p["start"] == p["sentences"][0]["start"]
         assert p["end"] == p["sentences"][-1]["end"]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# analyze_story (Mode A whole-story analysis) — mock path, real-provider
+# malformed-response rejection, and the no-fallback-to-another-AI guarantee.
+# ═════════════════════════════════════════════════════════════════════════
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def _gemini_envelope(text: str) -> dict:
+    return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+
+
+class _FakeHttpClient:
+    def __init__(self, response: _FakeResponse):
+        self._response = response
+        self.calls = []
+
+    async def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self._response
+
+    async def get(self, url, **kwargs):
+        return self._response
+
+
+def test_analyze_story_mock_path_when_no_api_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    out = asyncio.run(vai.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="Hello there."))
+    assert out["ok"] and out["engine"] == "mock"
+    assert out["storyAnalysis"]["scenes"]
+    assert out["storyAnalysis"]["engine"] == "mock"
+
+
+def test_analyze_story_rejects_empty_media():
+    out = asyncio.run(vai.analyze_story(b"", "video/mp4", transcript_text="x"))
+    assert out == {"ok": False, "reason": "empty_media"}
+
+
+def test_analyze_story_real_provider_happy_path(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+    raw = {
+        "summary": "A short story about a coffee shop.",
+        "narrativeArc": "setup -> resolution",
+        "characters": [{"name": "Emma", "description": "the customer"}],
+        "scenes": [
+            {"start": 0, "end": 5, "title": "Greeting", "narrativeRole": "setup",
+             "speakers": ["S1"], "characters": ["Emma"]},
+        ],
+    }
+    client = _FakeHttpClient(_FakeResponse(200, _gemini_envelope(__import__("json").dumps(raw))))
+    out = asyncio.run(vai.analyze_story(
+        b"fake-video-bytes", "video/mp4", transcript_text="Hi there.", http_client=client,
+    ))
+    assert out["ok"] is True
+    assert out["engine"] == "gemini"
+    assert out["storyAnalysis"]["summary"] == "A short story about a coffee shop."
+    assert len(out["storyAnalysis"]["scenes"]) == 1
+    assert client.calls, "should have made a real (fake-injected) HTTP call"
+
+
+def test_analyze_story_rejects_malformed_gemini_response(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+    client = _FakeHttpClient(_FakeResponse(200, _gemini_envelope("not valid json at all")))
+    out = asyncio.run(vai.analyze_story(
+        b"fake-video-bytes", "video/mp4", transcript_text="x", http_client=client,
+    ))
+    assert out == {"ok": False, "reason": "bad_response"}
+
+
+def test_analyze_story_never_falls_back_to_another_provider_on_http_error(monkeypatch):
+    """A rejected Gemini call must surface as a failed/waiting state — never
+    silently substitute GPT/Emergent/any other AI provider."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+    client = _FakeHttpClient(_FakeResponse(500, {}, text="internal error"))
+    out = asyncio.run(vai.analyze_story(
+        b"fake-video-bytes", "video/mp4", transcript_text="x", http_client=client,
+    ))
+    assert out["ok"] is False
+    assert out["reason"] == "provider_rejected"
+    assert "engine" not in out or out.get("engine") != "gpt"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# draft_script_blueprint (Mode B) — grounded in story analysis, mock path,
+# malformed-response rejection, unknown-scene-id rejection.
+# ═════════════════════════════════════════════════════════════════════════
+def _story_with_two_scenes():
+    return {
+        "summary": "x", "scenes": [
+            {"sceneId": "sc_1", "start": 0, "end": 5, "title": "One", "narrativeRole": "setup",
+             "characters": [], "speakers": ["S1"], "confidence": None},
+            {"sceneId": "sc_2", "start": 5, "end": 10, "title": "Two", "narrativeRole": "resolution",
+             "characters": [], "speakers": ["S1"], "confidence": None},
+        ],
+    }
+
+
+def test_draft_script_blueprint_mock_path_covers_every_scene(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    out = asyncio.run(vai.draft_script_blueprint(_story_with_two_scenes(), transcript_text="hi"))
+    assert out["ok"] and out["engine"] == "mock"
+    assert [s["sceneId"] for s in out["scriptBlueprint"]["scenes"]] == ["sc_1", "sc_2"]
+
+
+def test_draft_script_blueprint_rejects_when_no_scenes():
+    out = asyncio.run(vai.draft_script_blueprint({"scenes": []}, transcript_text="hi"))
+    assert out == {"ok": False, "reason": "no_scenes"}
+
+
+def test_draft_script_blueprint_real_provider_happy_path(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+    raw = {"scenes": [
+        {"sceneId": "sc_1", "lines": [{"speaker": "Narrator", "text": "It begins."}]},
+        {"sceneId": "sc_2", "lines": [{"speaker": "Emma", "text": "The end."}]},
+    ]}
+    client = _FakeHttpClient(_FakeResponse(200, _gemini_envelope(__import__("json").dumps(raw))))
+    out = asyncio.run(vai.draft_script_blueprint(
+        _story_with_two_scenes(), transcript_text="x", http_client=client,
+    ))
+    assert out["ok"] is True
+    assert out["scriptBlueprint"]["scenes"][0]["lines"][0]["text"] == "It begins."
+    assert out["scriptBlueprint"]["scenes"][1]["lines"][0]["speaker"] == "Emma"
+
+
+def test_draft_script_blueprint_drops_lines_for_unknown_scene_id(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+    raw = {"scenes": [{"sceneId": "sc_ghost", "lines": [{"speaker": "Narrator", "text": "hi"}]}]}
+    client = _FakeHttpClient(_FakeResponse(200, _gemini_envelope(__import__("json").dumps(raw))))
+    out = asyncio.run(vai.draft_script_blueprint(
+        _story_with_two_scenes(), transcript_text="x", http_client=client,
+    ))
+    assert out["ok"] is True
+    scene_ids = [s["sceneId"] for s in out["scriptBlueprint"]["scenes"]]
+    assert scene_ids == ["sc_1", "sc_2"]  # only known scenes, unknown dropped
+    assert out["scriptBlueprint"]["scenes"][0]["lines"] == []  # honest empty, nothing fabricated
+
+
+def test_draft_script_blueprint_rejects_malformed_response(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+    client = _FakeHttpClient(_FakeResponse(200, _gemini_envelope("garbage, not json")))
+    out = asyncio.run(vai.draft_script_blueprint(
+        _story_with_two_scenes(), transcript_text="x", http_client=client,
+    ))
+    assert out == {"ok": False, "reason": "bad_response"}

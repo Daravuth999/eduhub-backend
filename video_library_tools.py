@@ -351,13 +351,30 @@ async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None)
     its syncId AND mediaRef (the actual protected content — transcript
     reference and the playable video file itself) once owned — everything
     else (title, thumbnail, price, instructor, category) is always visible
-    so a student can browse and decide whether to purchase."""
+    so a student can browse and decide whether to purchase.
+
+    AI Narration track exposure mirrors the same discipline, with an
+    ADDITIONAL gate: `aiNarrationPublished` (set only by an explicit admin
+    action in video_narration_tools.py — never automatically, per "human
+    approval is required, never auto-publish AI-generated narration").
+    `aiNarrationAvailable` is the one clean boolean the frontend needs;
+    the raw `aiNarrationSyncId`/`aiNarrationMediaRef`/`aiNarrationPublished`
+    fields never leave this function for an unowned or unpublished lesson —
+    a student never even learns a narration track exists yet."""
     price = int(lesson.get("price") or 0)
     owned = price <= 0 or (bool(student_id) and await student_owns_lesson(db, student_id, lesson["lessonId"]))
     out = {**lesson, "owned": owned}
     if not owned:
         out.pop("syncId", None)
         out.pop("mediaRef", None)
+
+    narration_available = owned and bool(out.get("aiNarrationPublished"))
+    out["aiNarrationAvailable"] = narration_available
+    out.pop("aiNarrationPublished", None)
+    if not narration_available:
+        out.pop("aiNarrationSyncId", None)
+        out.pop("aiNarrationMediaRef", None)
+        out.pop("aiNarrationDurationSec", None)
     return out
 
 

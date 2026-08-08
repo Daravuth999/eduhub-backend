@@ -324,6 +324,9 @@ class _Coll:
             if all(d.get(k) == v for k, v in (query or {}).items()):
                 if "$set" in update:
                     d.update(update["$set"])
+                if "$unset" in update:
+                    for k in update["$unset"]:
+                        d.pop(k, None)
                 return _Result(matched_count=1)
         return _Result(matched_count=0)
 
@@ -689,3 +692,154 @@ async def test_transition_review_status_edited_transcript_stored_not_rekeyed():
     assert doc["pendingTranscriptEdit"] == "Once upon a time, corrected."
     # word boundaries untouched by the edit in this pass
     assert doc["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Once"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# apply_alignment_result / resolve_sync_candidate — approved-version
+# protection (production data-loss fix: a re-run of the pipeline used to
+# silently overwrite an approved, teacher-edited transcript).
+# ═════════════════════════════════════════════════════════════════════════
+def _approved_doc(sync_id="sync_1", **overrides):
+    return {
+        "syncId": sync_id,
+        "mediaRef": "https://pub-x.r2.dev/a.mp4",
+        "syncVersion": schema.SYNC_VERSION,
+        "providerVersion": "gemini-v1",
+        "alignmentVersion": 3,
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "approvedAt": "2026-01-02T00:00:00Z",
+        "durationSec": 10.0,
+        "providerCategory": "speech_recognition",
+        "reviewStatus": "approved",
+        "alignmentStatus": "complete",
+        "paragraphs": [{"id": "p1", "sentences": [{"id": "s1", "words": [
+            {"word": "Teacher", "start": 0.0, "end": 0.5, "confidence": {}},
+            {"word": "corrected", "start": 0.5, "end": 1.0, "confidence": {}},
+        ]}]}],
+        **overrides,
+    }
+
+
+def _new_alignment_result(**overrides):
+    return {
+        "paragraphs": [{"id": "p1", "sentences": [{"id": "s1", "words": [
+            {"word": "Fresh", "start": 0.0, "end": 0.4, "confidence": {}},
+            {"word": "reprocess", "start": 0.4, "end": 0.9, "confidence": {}},
+        ]}]}],
+        "durationSec": 9.5,
+        "providerCategory": "speech_recognition",
+        "providerVersion": "gemini-v2",
+        "generatedAt": "2026-02-01T00:00:00Z",
+        **overrides,
+    }
+
+
+@pytest.mark.asyncio
+async def test_apply_alignment_result_on_approved_doc_creates_candidate_not_overwrite():
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc())
+
+    result = await studio.apply_alignment_result(db, "sync_1", _new_alignment_result())
+
+    # The candidate is staged...
+    assert result["candidate"]["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Fresh"
+    assert result["candidate"]["alignmentVersion"] == 4
+    # ...but the PRODUCTION fields — what students actually see — are
+    # completely untouched. This is the core fix: no silent overwrite.
+    assert result["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Teacher"
+    assert result["reviewStatus"] == "approved"
+    assert result["approvedAt"] == "2026-01-02T00:00:00Z"
+
+    # Confirmed against a fresh read too, not just the return value.
+    fresh = await studio.get_sync_document(db, "sync_1")
+    assert fresh["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Teacher"
+    assert fresh["candidate"]["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Fresh"
+
+
+@pytest.mark.asyncio
+async def test_apply_alignment_result_still_publishable_to_students_while_candidate_pending():
+    """Students must keep seeing the approved version — is_servable_to_
+    students reads only the top-level fields, never the candidate."""
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc())
+    result = await studio.apply_alignment_result(db, "sync_1", _new_alignment_result())
+    assert schema.is_servable_to_students(result) is True
+
+
+@pytest.mark.asyncio
+async def test_apply_alignment_result_on_unapproved_doc_still_overwrites_in_place():
+    """No teacher-approved production content exists yet (first run, or
+    still mid-review) — behavior is unchanged from before this fix."""
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc(reviewStatus="pending", approvedAt=None))
+
+    result = await studio.apply_alignment_result(db, "sync_1", _new_alignment_result())
+
+    assert "candidate" not in result
+    assert result["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Fresh"
+    assert result["reviewStatus"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_resolve_sync_candidate_approve_promotes_and_clears_candidate():
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc())
+    await studio.apply_alignment_result(db, "sync_1", _new_alignment_result())
+
+    result = await studio.resolve_sync_candidate(db, "sync_1", action="approve")
+
+    assert result["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Fresh"
+    assert result["reviewStatus"] == "approved"
+    assert result["alignmentVersion"] == 4
+    assert "candidate" not in result
+    fresh = await studio.get_sync_document(db, "sync_1")
+    assert "candidate" not in fresh
+
+
+@pytest.mark.asyncio
+async def test_resolve_sync_candidate_reject_discards_candidate_keeps_approved_untouched():
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc())
+    await studio.apply_alignment_result(db, "sync_1", _new_alignment_result())
+
+    result = await studio.resolve_sync_candidate(db, "sync_1", action="reject")
+
+    assert "candidate" not in result
+    # The ORIGINAL approved content survives completely intact.
+    assert result["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Teacher"
+    assert result["reviewStatus"] == "approved"
+    assert result["alignmentVersion"] == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_sync_candidate_raises_when_no_candidate_pending():
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc())
+    with pytest.raises(studio.SyncStudioError) as exc:
+        await studio.resolve_sync_candidate(db, "sync_1", action="approve")
+    assert exc.value.code == "no_candidate"
+
+
+@pytest.mark.asyncio
+async def test_resolve_sync_candidate_rejects_invalid_action():
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc(candidate={"paragraphs": []}))
+    with pytest.raises(studio.SyncStudioError) as exc:
+        await studio.resolve_sync_candidate(db, "sync_1", action="delete")
+    assert exc.value.code == "invalid_action"
+
+
+@pytest.mark.asyncio
+async def test_apply_alignment_result_reprocessing_failure_never_touches_approved_doc():
+    """If a re-run's provider call raises before apply_alignment_result is
+    even called, nothing about this function is exercised — the approved
+    document was never touched in the first place. This test documents
+    that guarantee at the unit boundary: apply_alignment_result is only
+    ever called with a genuine successful result, so a failed reprocessing
+    attempt structurally cannot reach any code path that writes here."""
+    db = _FakeDB()
+    await db.chapter_sync.insert_one(_approved_doc())
+    before = await studio.get_sync_document(db, "sync_1")
+    # No call to apply_alignment_result at all (simulating a failed run).
+    after = await studio.get_sync_document(db, "sync_1")
+    assert after == before

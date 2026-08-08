@@ -52,6 +52,7 @@ from sync_schema import (
     build_sync_document,
     build_word,
 )
+from video_scene_schema import normalize_script_blueprint, normalize_story_analysis
 
 log = logging.getLogger("eduhub.video_ai")
 
@@ -225,6 +226,165 @@ _ASR_PROMPT = (
 )
 
 
+_STORY_PROMPT_TEMPLATE = (
+    "You are a professional story analyst for an English-learning video "
+    "platform. You have the FULL video attached, plus its already-"
+    "transcribed dialogue below for speaker-id reference. Analyze the "
+    "WHOLE story as one continuous narrative — never analyze isolated "
+    "fragments in isolation from what came before.\n"
+    "Output STRICT JSON only — no markdown, with EXACTLY these keys:\n"
+    "{{\n"
+    '  "summary": "<2-4 sentence overview of the whole story>",\n'
+    '  "narrativeArc": "<1-2 sentences: setup / development / conflict / resolution>",\n'
+    '  "characters": [{{"name": "<name or role>", "description": "<who they are>"}}],\n'
+    '  "scenes": [\n'
+    '    {{"start": <seconds as number>, "end": <seconds as number>, '
+    '"title": "<short title>", "description": "<1-2 sentences>", '
+    '"characters": ["<name>"], "speakers": ["<speaker id from the transcript, e.g. S1>"], '
+    '"narrativeRole": "<one of setup,development,conflict,climax,resolution,other>"}}\n'
+    "  ]\n"
+    "}}\n"
+    "Rules:\n"
+    "- Scenes must be in chronological order and together cover the whole video.\n"
+    "- Reuse the EXACT SAME speaker ids (S1, S2, ...) the transcript below uses.\n"
+    "- A scene with no dialogue (pure narration/action) is still valid — leave speakers empty.\n\n"
+    "Lesson title: {title}\n\n"
+    "Transcript (reference only — analyze the actual attached video, not just this text):\n{transcript}"
+)
+
+_SCRIPT_PROMPT_TEMPLATE = (
+    "You are a professional narration/dialogue scriptwriter for an "
+    "English-learning video platform. Below is a whole-story analysis of "
+    "a lesson video (already understood scene-by-scene, in order) and its "
+    "original transcript for reference. Draft a scene-by-scene narration/"
+    "dialogue SCRIPT that a voice actor will read aloud over this video.\n"
+    "Output STRICT JSON only — no markdown:\n"
+    '{{"scenes": [\n'
+    '  {{"sceneId": "<EXACT sceneId from the story analysis below>", "lines": [\n'
+    '    {{"speaker": "<\'Narrator\' or a character name from the story analysis>", '
+    '"text": "<one line to be voiced>", "emotion": "<short mood word, optional>"}}\n'
+    "  ]}}\n"
+    "]}}\n"
+    "Rules:\n"
+    "- Use the EXACT sceneId values from the story analysis — do not invent new ones.\n"
+    "- Every scene must appear, even if its lines array is empty.\n"
+    "- Write natural, concise lines appropriate for the CEFR level implied by the transcript.\n"
+    "- A later scene's narration MAY reference what happened in earlier scenes — you have the "
+    "whole story below, not just this one scene.\n"
+    "- 'Narrator' is always a valid speaker for scene-setting/description lines.\n\n"
+    "Lesson title: {title}\n\n"
+    "Story analysis (JSON):\n{story_json}\n\n"
+    "Original transcript (reference only):\n{transcript}"
+)
+
+
+def _mock_story_analysis(transcript_text: str) -> dict:
+    """Deterministic offline stand-in — same discipline as _mock_learning:
+    clearly a stub (single generic scene), never pretends to be real
+    visual/narrative understanding."""
+    from video_scene_schema import build_scene, build_story_analysis
+    return build_story_analysis(
+        summary="Offline mock story analysis — enable Gemini for real scene/character understanding.",
+        characters=[{"name": "S1", "description": "(mock — speaker from transcript)"}],
+        scenes=[build_scene(
+            start=0.0, end=0.0, title="Full lesson (mock — not scene-split)",
+            description="Mock mode does not perform real visual scene detection.",
+            speakers=["S1"], narrative_role="other",
+        )],
+        narrative_arc="(mock mode — enable Gemini for a real narrative arc)",
+        engine="mock",
+    )
+
+
+def _mock_script_blueprint(scene_ids_in_order: list[str]) -> dict:
+    from video_scene_schema import build_scene_script, build_script_blueprint, build_script_line
+    scenes = [
+        build_scene_script(scene_id=sid, lines=[
+            build_script_line(speaker="Narrator", text="(mock — enable Gemini for a real drafted script)"),
+        ])
+        for sid in scene_ids_in_order
+    ]
+    return build_script_blueprint(scenes=scenes, engine="mock")
+
+
+async def analyze_story(media_bytes: bytes, content_type: str, *, transcript_text: str,
+                         title: str = "", http_client=None) -> dict:
+    """Mode A whole-story Gemini analysis. Returns
+        {"ok": True, "storyAnalysis": <contract>, "engine": "gemini"|"mock"}
+        {"ok": False, "reason": ...}
+    Never raises. No fallback to any other AI provider — if Gemini is
+    unavailable and mock mode is not forced by env, real production calls
+    will simply return {"ok": False, "reason": "no_api_key"} rather than
+    silently substituting a different vendor."""
+    if not media_bytes:
+        return {"ok": False, "reason": "empty_media"}
+    if not ai_available():
+        return {"ok": True, "storyAnalysis": _mock_story_analysis(transcript_text), "engine": "mock"}
+    try:
+        provider = GeminiVideoProvider(http_client=http_client)
+        raw_text = await provider.analyze_story_raw(
+            media_bytes, content_type, transcript_text=transcript_text, title=title,
+        )
+        analysis = normalize_story_analysis(raw_text, extract_json=_extract_json)
+        if analysis is None:
+            return {"ok": False, "reason": "bad_response"}
+        import datetime as _dt
+        analysis["generatedAt"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        analysis["engine"] = "gemini"
+        return {"ok": True, "storyAnalysis": analysis, "engine": "gemini"}
+    except VideoAiError as exc:
+        return {"ok": False, "reason": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("video-ai: story analysis error %s", type(exc).__name__)
+        return {"ok": False, "reason": "analysis_failed"}
+
+
+async def draft_script_blueprint(story_analysis: dict, *, transcript_text: str = "",
+                                  title: str = "", http_client=None) -> dict:
+    """Mode B script blueprint draft, GROUNDED in the whole-story analysis
+    (never scene-by-scene in isolation — Gemini sees every scene at once,
+    so a later scene's narration can reference earlier ones). Returns
+        {"ok": True, "scriptBlueprint": <contract>, "engine": "gemini"|"mock"}
+        {"ok": False, "reason": ...}
+    Never raises. No fallback to any other AI provider."""
+    scenes = (story_analysis or {}).get("scenes") or []
+    scene_ids = [sc["sceneId"] for sc in scenes if isinstance(sc, dict) and sc.get("sceneId")]
+    if not scene_ids:
+        return {"ok": False, "reason": "no_scenes"}
+
+    if not ai_available():
+        return {"ok": True, "scriptBlueprint": _mock_script_blueprint(scene_ids), "engine": "mock"}
+
+    try:
+        prompt = _SCRIPT_PROMPT_TEMPLATE.format(
+            title=title or "Untitled lesson",
+            story_json=json.dumps(story_analysis)[:20000],
+            transcript=(transcript_text or "")[:16000],
+        )
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"},
+        }
+        if http_client is not None:
+            r = await http_client.post(_GEN_URL.format(model=_model()), params={"key": _api_key()}, json=body)
+        else:
+            async with httpx.AsyncClient(timeout=_ANALYZE_TIMEOUT) as cli:
+                r = await cli.post(_GEN_URL.format(model=_model()), params={"key": _api_key()}, json=body)
+        if r.status_code != 200:
+            log.warning("video-ai: script-blueprint HTTP %s | body=%s", r.status_code, (r.text or "")[:300])
+            return {"ok": False, "reason": "provider_rejected"}
+        blueprint = normalize_script_blueprint(
+            _candidate_text(r.json()), scene_ids, extract_json=_extract_json,
+        )
+        if blueprint is None:
+            return {"ok": False, "reason": "bad_response"}
+        blueprint["engine"] = "gemini"
+        return {"ok": True, "scriptBlueprint": blueprint, "engine": "gemini"}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("video-ai: script blueprint error %s", type(exc).__name__)
+        return {"ok": False, "reason": "draft_failed"}
+
+
 class GeminiVideoProvider:
     """Speech Recognition capability via Gemini multimodal understanding —
     the Video Library's primary engine per product direction."""
@@ -285,6 +445,17 @@ class GeminiVideoProvider:
             raise VideoAiError("files_processing_failed", f"Files API state: {state}")
         return uri
 
+    async def _media_part(self, media_bytes: bytes, content_type: str) -> dict:
+        """Shared inline-vs-Files-API branching used by every media-grounded
+        Gemini call this provider makes (ASR, whole-story analysis)."""
+        if len(media_bytes) <= _INLINE_MAX_BYTES:
+            return {"inline_data": {
+                "mime_type": content_type or "application/octet-stream",
+                "data": base64.b64encode(media_bytes).decode("ascii"),
+            }}
+        uri = await self._upload_to_files_api(media_bytes, content_type)
+        return {"file_data": {"mime_type": content_type, "file_uri": uri}}
+
     async def align(self, media_bytes: bytes, content_type: str = "audio/mpeg") -> dict:
         """Transcribe + segment the media into the canonical sync schema.
         Returns {"sync": <canonical doc>, "transcriptText": str}. Raises
@@ -292,15 +463,7 @@ class GeminiVideoProvider:
         if not media_bytes:
             raise VideoAiError("empty_media", "no media bytes to transcribe")
 
-        media_part: dict
-        if len(media_bytes) <= _INLINE_MAX_BYTES:
-            media_part = {"inline_data": {
-                "mime_type": content_type or "application/octet-stream",
-                "data": base64.b64encode(media_bytes).decode("ascii"),
-            }}
-        else:
-            uri = await self._upload_to_files_api(media_bytes, content_type)
-            media_part = {"file_data": {"mime_type": content_type, "file_uri": uri}}
+        media_part = await self._media_part(media_bytes, content_type)
 
         body = {
             "contents": [{"role": "user", "parts": [{"text": _ASR_PROMPT}, media_part]}],
@@ -330,6 +493,35 @@ class GeminiVideoProvider:
             str(s.get("text") or "").strip() for s in segments if str(s.get("text") or "").strip()
         )
         return {"sync": sync, "transcriptText": transcript}
+
+    async def analyze_story_raw(self, media_bytes: bytes, content_type: str, *,
+                                 transcript_text: str, title: str = "") -> str:
+        """Whole-video story understanding (Mode A): the SAME uploaded
+        media Gemini already transcribed, re-sent with the already-computed
+        transcript as grounding context, so scene/character detection is
+        genuinely visual+narrative understanding of the full video — never
+        scene-by-scene in isolation. Returns the raw model text (the caller
+        normalizes it via video_scene_schema.normalize_story_analysis).
+        Raises VideoAiError on provider failure."""
+        if not media_bytes:
+            raise VideoAiError("empty_media", "no media bytes to analyze")
+        media_part = await self._media_part(media_bytes, content_type)
+        prompt = _STORY_PROMPT_TEMPLATE.format(
+            title=title or "Untitled lesson", transcript=(transcript_text or "")[:24000],
+        )
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}, media_part]}],
+            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+        }
+        r = await self._post(
+            _GEN_URL.format(model=self._model),
+            params={"key": self._api_key}, json=body,
+        )
+        if r.status_code != 200:
+            log.warning("video-ai: story-analysis HTTP %s | model=%s | body=%s",
+                        r.status_code, self._model, (r.text or "")[:400])
+            raise VideoAiError("provider_rejected", f"Gemini HTTP {r.status_code}")
+        return _candidate_text(r.json())
 
 
 # ── Mock provider (no key required — pipeline always exercisable) ────────
