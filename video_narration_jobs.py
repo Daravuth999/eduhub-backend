@@ -129,6 +129,7 @@ async def get_or_create_job(db, lesson_id: str) -> dict:
         "voiceProduction": {},
         "assembly": new_stage(),
         "render": new_stage(),
+        "sourceAudioTreatment": "mute",
         "published": False,
         "createdAt": now,
         "updatedAt": now,
@@ -144,6 +145,13 @@ async def get_or_create_job(db, lesson_id: str) -> dict:
     await db[COLL].update_one(
         {"_id": lesson_id, "render": {"$exists": False}},
         {"$set": {"render": new_stage()}},
+    )
+    # Additive backfill for jobs created before sourceAudioTreatment existed
+    # — defaults to "mute", the exact prior (pre-treatment) render behavior,
+    # so no existing job's render output changes silently.
+    await db[COLL].update_one(
+        {"_id": lesson_id, "sourceAudioTreatment": {"$exists": False}},
+        {"$set": {"sourceAudioTreatment": "mute"}},
     )
     doc = await db[COLL].find_one({"_id": lesson_id}, {"_id": 0})
     return doc or fresh

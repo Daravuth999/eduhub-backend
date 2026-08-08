@@ -241,13 +241,19 @@ _STORY_PROMPT_TEMPLATE = (
     '    {{"start": <seconds as number>, "end": <seconds as number>, '
     '"title": "<short title>", "description": "<1-2 sentences>", '
     '"characters": ["<name>"], "speakers": ["<speaker id from the transcript, e.g. S1>"], '
-    '"narrativeRole": "<one of setup,development,conflict,climax,resolution,other>"}}\n'
+    '"narrativeRole": "<one of setup,development,conflict,climax,resolution,other>", '
+    '"audioObservations": {{"dialogue": "<what speech you hear, or empty>", '
+    '"music": "<any music you hear, or empty>", "ambience": "<background/room tone, or empty>", '
+    '"sfx": "<any sound effects, or empty>"}}}}\n'
     "  ]\n"
     "}}\n"
     "Rules:\n"
     "- Scenes must be in chronological order and together cover the whole video.\n"
     "- Reuse the EXACT SAME speaker ids (S1, S2, ...) the transcript below uses.\n"
-    "- A scene with no dialogue (pure narration/action) is still valid — leave speakers empty.\n\n"
+    "- A scene with no dialogue (pure narration/action) is still valid — leave speakers empty.\n"
+    "- audioObservations describes what you HEAR in the ORIGINAL audio track of this scene — "
+    "this is your own listening description, not a claim that those sounds can be isolated. "
+    "Leave any field \"\" if you don't notice that layer.\n\n"
     "Lesson title: {title}\n\n"
     "Transcript (reference only — analyze the actual attached video, not just this text):\n{transcript}"
 )
@@ -290,6 +296,10 @@ def _mock_story_analysis(transcript_text: str) -> dict:
             start=0.0, end=0.0, title="Full lesson (mock — not scene-split)",
             description="Mock mode does not perform real visual scene detection.",
             speakers=["S1"], narrative_role="other",
+            audio_observations={
+                "dialogue": "(mock — enable Gemini for real audio observations)",
+                "music": "", "ambience": "", "sfx": "",
+            },
         )],
         narrative_arc="(mock mode — enable Gemini for a real narrative arc)",
         engine="mock",

@@ -493,8 +493,8 @@ async def _assembled_job(db, monkeypatch):
     return bucket
 
 
-async def _fake_mux(video_bytes, video_ct, audio_bytes):
-    return b"FAKE-RENDERED-MP4:" + video_bytes + b":" + audio_bytes
+async def _fake_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
+    return b"FAKE-RENDERED-MP4:" + video_bytes + b":" + audio_bytes + b":" + treatment.encode()
 
 
 @pytest.mark.asyncio
@@ -532,9 +532,9 @@ async def test_render_is_cost_safe_never_reruns_when_completed(monkeypatch):
     bucket = await _assembled_job(db, monkeypatch)
     calls = []
 
-    async def _counting_mux(video_bytes, video_ct, audio_bytes):
+    async def _counting_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
         calls.append(1)
-        return await _fake_mux(video_bytes, video_ct, audio_bytes)
+        return await _fake_mux(video_bytes, video_ct, audio_bytes, treatment=treatment)
 
     monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _counting_mux)
     await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
@@ -547,7 +547,7 @@ async def test_render_fails_terminal_when_ffmpeg_unavailable(monkeypatch):
     db = _FakeDB()
     bucket = await _assembled_job(db, monkeypatch)
 
-    async def _unavailable_mux(video_bytes, video_ct, audio_bytes):
+    async def _unavailable_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
         raise vnt.video_render_tools.RenderError("ffmpeg_unavailable", "ffmpeg not found", 503)
 
     monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _unavailable_mux)
@@ -561,7 +561,7 @@ async def test_render_fails_retryable_on_a_transient_render_error(monkeypatch):
     db = _FakeDB()
     bucket = await _assembled_job(db, monkeypatch)
 
-    async def _failing_mux(video_bytes, video_ct, audio_bytes):
+    async def _failing_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
         raise vnt.video_render_tools.RenderError("ffmpeg_failed", "exit code 1", 500)
 
     monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _failing_mux)
@@ -583,3 +583,62 @@ async def test_unpublish_clears_master_ref_without_destroying_the_render(monkeyp
     assert not lesson.get("aiNarrationMasterMediaRef")
     job = await jobs.get_or_create_job(db, "vid_1")
     assert job["render"]["state"] == jobs.S_COMPLETED  # the rendered file itself is untouched
+
+
+# ── Source audio treatment (mute/duck/preserve — whole-track only) ────────
+@pytest.mark.asyncio
+async def test_new_job_defaults_source_audio_treatment_to_mute():
+    db = _FakeDB()
+    job = await jobs.get_or_create_job(db, "vid_1")
+    assert job["sourceAudioTreatment"] == "mute"
+
+
+@pytest.mark.asyncio
+async def test_set_source_audio_treatment_persists_a_valid_choice():
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    job = await vnt.set_source_audio_treatment(db, "vid_1", "duck")
+    assert job["sourceAudioTreatment"] == "duck"
+
+
+@pytest.mark.asyncio
+async def test_set_source_audio_treatment_rejects_unknown_value():
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    with pytest.raises(vnt.VideoNarrationError) as exc:
+        await vnt.set_source_audio_treatment(db, "vid_1", "surgical_remove")
+    assert exc.value.code == "invalid_treatment"
+    job = await jobs.get_or_create_job(db, "vid_1")
+    assert job["sourceAudioTreatment"] == "mute"  # rejected — unchanged
+
+
+@pytest.mark.asyncio
+async def test_render_passes_the_chosen_treatment_through_to_mux(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    await vnt.set_source_audio_treatment(db, "vid_1", "preserve")
+    seen = {}
+
+    async def _capturing_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
+        seen["treatment"] = treatment
+        return await _fake_mux(video_bytes, video_ct, audio_bytes, treatment=treatment)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _capturing_mux)
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert seen["treatment"] == "preserve"
+    assert job["render"]["result"]["sourceAudioTreatment"] == "preserve"
+
+
+@pytest.mark.asyncio
+async def test_render_defaults_to_mute_when_treatment_never_set(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    seen = {}
+
+    async def _capturing_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
+        seen["treatment"] = treatment
+        return await _fake_mux(video_bytes, video_ct, audio_bytes, treatment=treatment)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _capturing_mux)
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert seen["treatment"] == "mute"

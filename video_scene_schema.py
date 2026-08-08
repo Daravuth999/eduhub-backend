@@ -39,6 +39,34 @@ def new_line_id() -> str:
     return "ln_" + uuid.uuid4().hex[:8]
 
 
+def _s(v, limit=400) -> str:
+    return str(v)[:limit] if isinstance(v, (str, int, float)) else ""
+
+
+def _str_list(v, limit=30, item_limit=60) -> list[str]:
+    if not isinstance(v, list):
+        return []
+    return [_s(x, item_limit) for x in v if _s(x, item_limit)][:limit]
+
+
+# Free-text per-scene observations of what Gemini heard in the ORIGINAL
+# audio track — item 5's "can Gemini understand/classify existing audio"
+# question, answered honestly: this is Gemini DESCRIBING content it
+# perceives (a real multimodal-understanding capability), never a claim
+# that those layers can be technically SEPARATED into stems — that is a
+# distinct, unimplemented capability (see video_render_tools.py's
+# treatment-mode docstring). An empty string means "nothing observed",
+# not "silence confirmed" — Gemini's confidence here is descriptive, not
+# a guaranteed detector.
+AUDIO_OBSERVATION_KEYS = ("dialogue", "music", "ambience", "sfx")
+
+
+def _clean_audio_observations(v) -> dict:
+    if not isinstance(v, dict):
+        v = {}
+    return {k: _s(v.get(k), 200) for k in AUDIO_OBSERVATION_KEYS}
+
+
 # ── StoryAnalysis (Mode A) ────────────────────────────────────────────────
 def build_scene(
     *,
@@ -51,6 +79,7 @@ def build_scene(
     speakers: list[str] | None = None,
     narrative_role: str = "other",
     confidence: float | None = None,
+    audio_observations: dict | None = None,
 ) -> dict:
     return {
         "sceneId": scene_id or new_scene_id(),
@@ -62,6 +91,7 @@ def build_scene(
         "speakers": [str(s)[:20] for s in (speakers or []) if str(s).strip()][:20],
         "narrativeRole": narrative_role if narrative_role in NARRATIVE_ROLES else "other",
         "confidence": confidence,
+        "audioObservations": _clean_audio_observations(audio_observations),
     }
 
 
@@ -108,16 +138,6 @@ def validate_story_analysis(doc: dict) -> tuple[bool, list[str]]:
     return (len(errors) == 0), errors
 
 
-def _s(v, limit=400) -> str:
-    return str(v)[:limit] if isinstance(v, (str, int, float)) else ""
-
-
-def _str_list(v, limit=30, item_limit=60) -> list[str]:
-    if not isinstance(v, list):
-        return []
-    return [_s(x, item_limit) for x in v if _s(x, item_limit)][:limit]
-
-
 def normalize_story_analysis(raw, *, extract_json=None) -> dict | None:
     """Coerce raw Gemini JSON into the bounded StoryAnalysis contract.
     Malformed/garbage input never reaches production data — returns None
@@ -151,6 +171,7 @@ def normalize_story_analysis(raw, *, extract_json=None) -> dict | None:
                     float(item["confidence"])
                     if isinstance(item.get("confidence"), (int, float)) else None
                 ),
+                audio_observations=item.get("audioObservations"),
             ))
 
     raw_characters = data.get("characters")

@@ -23,3 +23,8 @@ redis>=5.0         # eduhub_platform.events RedisTransport (Architecture Reconst
                    # deployment never imports it at runtime.
 reportlab>=4.2,<5  # tuition_receipt_pdf.py — pure-Python PDF invoice generation, no system libs
 pymupdf>=1.24,<2   # tuition_receipt_pdf.py — PDF->PNG rasterization (self-contained wheel, no poppler/Cairo)
+imageio-ffmpeg>=0.5,<1  # video_render_tools.py — self-contained ffmpeg binary fallback for final-
+                        # master rendering when no system ffmpeg is on PATH (e.g. Render's default
+                        # Python buildpack); same "pure-Python wheel, no system libs" pattern as
+                        # reportlab/pymupdf above. Live-verified locally to resolve and execute a
+                        # real ffmpeg 7.1 binary via pip install alone.

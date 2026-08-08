@@ -554,6 +554,24 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+async def set_source_audio_treatment(db, lesson_id: str, treatment: str) -> dict:
+    """Sets how the ORIGINAL video's audio track is handled when the final
+    master is rendered: mute (replace it entirely — the default, and the
+    only option with zero regression risk), duck (keep it faint under the
+    narration), or preserve (keep it near-full alongside the narration).
+    Whole-track only — see video_render_tools.py's docstring for why
+    per-layer (dialogue/music/ambience/sfx) treatment isn't offered: this
+    stack has no audio source-separation capability to act on it safely.
+    Never triggers a re-render itself — takes effect on the NEXT render."""
+    if treatment not in video_render_tools.SOURCE_AUDIO_TREATMENTS:
+        raise VideoNarrationError("invalid_treatment", f"unknown source audio treatment {treatment!r}", 400)
+    await jobs.get_or_create_job(db, lesson_id)
+    await db[jobs.COLL].update_one(
+        {"_id": lesson_id}, {"$set": {"sourceAudioTreatment": treatment, "updatedAt": _now()}},
+    )
+    return await jobs.get_or_create_job(db, lesson_id)
+
+
 # ── Final render (physically embeds the approved narration audio into the
 # original video — REPLACE mode only; see video_render_tools.py's docstring
 # for the honest scope statement on ducking/mixing multiple source layers
@@ -583,9 +601,12 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
         audio_bytes, _ct = await video_pipeline_tools.load_media_bytes(
             db, sync_studio_tools.get_media_bucket(db), assembly_result["mediaRef"],
         )
+        treatment = claimed.get("sourceAudioTreatment") or video_render_tools.DEFAULT_SOURCE_AUDIO_TREATMENT
 
         try:
-            rendered_bytes = await video_render_tools.mux_narration_into_video(video_bytes, video_ct, audio_bytes)
+            rendered_bytes = await video_render_tools.mux_narration_into_video(
+                video_bytes, video_ct, audio_bytes, treatment=treatment,
+            )
         except video_render_tools.RenderError as exc:
             if exc.code == "ffmpeg_unavailable":
                 await jobs.fail_terminal(db, lesson_id, "render", attempt, genver, exc.message)
@@ -598,7 +619,7 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
         result = {
             "mediaRef": media_ref, "mode": "replace", "sourceMediaRef": lesson["mediaRef"],
             "audioMediaRef": assembly_result["mediaRef"], "sizeBytes": len(rendered_bytes),
-            "renderedAt": _now(),
+            "sourceAudioTreatment": treatment, "renderedAt": _now(),
         }
         await jobs.complete_stage(db, lesson_id, "render", attempt, genver, result)
     except Exception as exc:  # noqa: BLE001
@@ -732,6 +753,17 @@ def register_video_narration_routes(api, db, require_admin, *, lesson_getter, sy
         _need_enabled()
         try:
             job = await assemble_narration_track(db, lesson_id)
+        except VideoNarrationError as exc:
+            _raise(exc)
+        return {"ok": True, "job": job}
+
+    @api.put("/studio/video/lessons/{lesson_id}/narration/source-audio-treatment")
+    async def set_source_audio_treatment_route(
+        lesson_id: str, payload: dict = Body(...), _admin=Depends(require_admin),
+    ):
+        _need_enabled()
+        try:
+            job = await set_source_audio_treatment(db, lesson_id, str(payload.get("treatment") or ""))
         except VideoNarrationError as exc:
             _raise(exc)
         return {"ok": True, "job": job}

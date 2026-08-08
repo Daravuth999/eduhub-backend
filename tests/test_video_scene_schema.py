@@ -17,6 +17,44 @@ def test_build_scene_defaults_and_bounds():
     assert sc["sceneId"].startswith("sc_")
 
 
+def test_build_scene_defaults_audio_observations_when_omitted():
+    sc = vss.build_scene(start=0.0, end=1.0)
+    assert sc["audioObservations"] == {"dialogue": "", "music": "", "ambience": "", "sfx": ""}
+
+
+def test_build_scene_bounds_and_cleans_audio_observations():
+    sc = vss.build_scene(start=0.0, end=1.0, audio_observations={
+        "dialogue": "x" * 300, "music": "soft piano", "sfx": 42, "unexpected_key": "ignored",
+    })
+    assert len(sc["audioObservations"]["dialogue"]) == 200
+    assert sc["audioObservations"]["music"] == "soft piano"
+    assert sc["audioObservations"]["ambience"] == ""
+    assert sc["audioObservations"]["sfx"] == "42"
+    assert "unexpected_key" not in sc["audioObservations"]
+
+
+def test_build_scene_handles_non_dict_audio_observations():
+    sc = vss.build_scene(start=0.0, end=1.0, audio_observations="not a dict")
+    assert sc["audioObservations"] == {"dialogue": "", "music": "", "ambience": "", "sfx": ""}
+
+
+def test_normalize_story_analysis_parses_audio_observations_from_raw_scene():
+    raw = {"scenes": [{
+        "title": "with audio", "start": 0, "end": 5,
+        "audioObservations": {"dialogue": "two speakers talking", "music": "", "ambience": "café noise", "sfx": ""},
+    }]}
+    result = vss.normalize_story_analysis(raw)
+    scene = result["scenes"][0]
+    assert scene["audioObservations"]["dialogue"] == "two speakers talking"
+    assert scene["audioObservations"]["ambience"] == "café noise"
+
+
+def test_normalize_story_analysis_defaults_audio_observations_when_missing_from_raw_scene():
+    raw = {"scenes": [{"title": "no audio field", "start": 0, "end": 5}]}
+    result = vss.normalize_story_analysis(raw)
+    assert result["scenes"][0]["audioObservations"] == {"dialogue": "", "music": "", "ambience": "", "sfx": ""}
+
+
 def test_validate_story_analysis_rejects_duplicate_scene_ids():
     doc = vss.build_story_analysis(scenes=[
         vss.build_scene(scene_id="sc_1"),

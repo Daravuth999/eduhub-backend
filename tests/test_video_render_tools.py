@@ -23,9 +23,38 @@ def test_ffmpeg_available_returns_a_bool():
     assert isinstance(vrt.ffmpeg_available(), bool)
 
 
+def test_ffmpeg_source_reports_system_when_on_path():
+    assert vrt.ffmpeg_source() in ("system", "bundled", None)
+
+
+def test_ffmpeg_source_reports_bundled_when_system_missing_but_imageio_ffmpeg_resolves(monkeypatch):
+    monkeypatch.setattr(vrt.shutil, "which", lambda name: None)
+    import imageio_ffmpeg  # noqa: F401 — only relevant if this dependency is actually installed
+    assert vrt.ffmpeg_source() == "bundled"
+
+
+def test_ffmpeg_source_reports_none_when_nothing_resolves(monkeypatch):
+    monkeypatch.setattr(vrt.shutil, "which", lambda name: None)
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    assert vrt.ffmpeg_source() is None
+
+
+@pytest.mark.asyncio
+async def test_mux_rejects_unknown_treatment():
+    with pytest.raises(vrt.RenderError) as exc_info:
+        await vrt.mux_narration_into_video(b"fake-video", "video/mp4", b"fake-audio", treatment="surgical_remove")
+    assert exc_info.value.code == "invalid_treatment"
+
+
+
 @pytest.mark.asyncio
 async def test_mux_raises_ffmpeg_unavailable_when_binary_missing(monkeypatch):
-    monkeypatch.setattr(vrt.shutil, "which", lambda name: None)
+    # Simulates a deployment with NEITHER a system ffmpeg on PATH NOR the
+    # imageio-ffmpeg fallback installed — the genuine "nothing resolves"
+    # case. Only mocking shutil.which is insufficient in an environment
+    # where imageio-ffmpeg IS installed (it would legitimately fall back
+    # to the bundled binary, which is exactly the behavior being added).
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
     with pytest.raises(vrt.RenderError) as exc_info:
         await vrt.mux_narration_into_video(b"fake-video", "video/mp4", b"fake-audio")
     assert exc_info.value.code == "ffmpeg_unavailable"
@@ -106,3 +135,79 @@ async def test_mux_raises_ffmpeg_failed_on_genuinely_malformed_input():
     with pytest.raises(vrt.RenderError) as exc_info:
         await vrt.mux_narration_into_video(b"not-a-real-video-file", "video/mp4", b"not-a-real-audio-file")
     assert exc_info.value.code == "ffmpeg_failed"
+
+
+async def _make_video_with_audio_clip(*, duration: float = 0.5) -> bytes:
+    """A source clip that genuinely HAS its own original audio track — needed
+    to exercise duck/preserve, which only differ from mute when the source
+    actually has audio to keep."""
+    import os
+    import tempfile
+    import uuid
+
+    path = os.path.join(tempfile.gettempdir(), f"vrt_srcaudio_{uuid.uuid4().hex}.mp4")
+    args = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=red:s=64x64:d={duration}",
+        "-f", "lavfi", "-i", f"sine=frequency=220:duration={duration}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", path,
+    ]
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, tuple(args), 30.0)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_duck_treatment_produces_a_master_with_embedded_audio():
+    video_with_audio = await _make_video_with_audio_clip()
+    narration = await _make_test_clip(kind="audio_only")
+
+    rendered = await vrt.mux_narration_into_video(video_with_audio, "video/mp4", narration, treatment="duck")
+
+    assert len(rendered) > 0
+    assert await vrt.probe_has_audio_stream(rendered) is True
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_preserve_treatment_produces_a_master_with_embedded_audio():
+    video_with_audio = await _make_video_with_audio_clip()
+    narration = await _make_test_clip(kind="audio_only")
+
+    rendered = await vrt.mux_narration_into_video(video_with_audio, "video/mp4", narration, treatment="preserve")
+
+    assert len(rendered) > 0
+    assert await vrt.probe_has_audio_stream(rendered) is True
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_duck_treatment_honestly_downgrades_to_mute_when_source_has_no_audio():
+    """A silent source can't be "kept faintly audible" — amix needs two real
+    audio inputs. This must still succeed by falling back to mute, never by
+    fabricating a mixed track that doesn't exist."""
+    video_only = await _make_test_clip(kind="video_only")
+    narration = await _make_test_clip(kind="audio_only")
+
+    rendered = await vrt.mux_narration_into_video(video_only, "video/mp4", narration, treatment="duck")
+
+    assert len(rendered) > 0
+    assert await vrt.probe_has_audio_stream(rendered) is True
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_falls_back_to_ffmpeg_stderr_parsing_when_ffprobe_missing(monkeypatch):
+    """When ffprobe genuinely isn't on the system (a real possibility on a
+    minimal deploy image), verification must not just return False by
+    default — it must actually parse ffmpeg's own stderr for a real answer."""
+    video_only = await _make_test_clip(kind="video_only")
+    audio_only = await _make_test_clip(kind="audio_only")
+    rendered = await vrt.mux_narration_into_video(video_only, "video/mp4", audio_only)
+
+    monkeypatch.setattr(vrt, "_resolve_ffprobe", lambda: None)
+    assert await vrt.probe_has_audio_stream(rendered) is True
