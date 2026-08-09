@@ -49,6 +49,7 @@ import datetime as _dt
 import io
 import logging
 import os
+import re
 import uuid
 
 import httpx
@@ -138,6 +139,23 @@ def narration_status_payload() -> dict:
 #    without a circular import). Feeds sync_provider.ElevenLabsProvider so
 #    the ACTUAL reshaping into the canonical schema is fully reused, not
 #    reimplemented. ──────────────────────────────────────────────────────
+def _short_acting_cue(acting_note: str) -> str:
+    """Derives a short, natural delivery cue from a fuller directorial note
+    for the ACTUAL text sent to ElevenLabs. eleven_v3's real, documented
+    bracket mechanism is for brief cues (e.g. "[softly]", "[hesitates]") —
+    not a full paragraph-length director's note. Sending the whole 300-char
+    `emotion` field verbatim (as this function used to) risks the model
+    reading it back as literal spoken content instead of treating it as a
+    style instruction — exactly the "too many/too long cues make speech
+    artificial" failure mode. The FULL note is untouched everywhere else
+    (Author Studio still shows it in full) — this only shortens what's
+    physically placed inside the TTS bracket. Takes the first clause (up to
+    the first comma/period/semicolon), capped at ~60 chars so it stays a
+    cue, not a script."""
+    first_clause = re.split(r"[.,;]", acting_note, maxsplit=1)[0].strip()
+    return first_clause[:60].strip() or acting_note[:60].strip()
+
+
 async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str | None = None,
                                     voice_settings: dict | None = None, http_client=None) -> dict:
     api_key = _env("ELEVENLABS_API_KEY")
@@ -147,7 +165,8 @@ async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str
         raise VideoNarrationError("no_voice", "no voice_id supplied")
 
     use_acting = bool(acting_note) and len(text.strip()) > 10
-    tts_text = f"[{acting_note}] {text}" if use_acting else text
+    tts_cue = _short_acting_cue(acting_note) if use_acting else ""
+    tts_text = f"[{tts_cue}] {text}" if use_acting else text
     model = _env("ELEVENLABS_MODEL") or "eleven_v3"
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
@@ -201,7 +220,31 @@ async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str
         word_timestamps.append({"word": current_word.strip(),
                                  "start": round(word_start, 3), "end": round(word_end, 3)})
 
+    # duration is measured against the FULL alignment (the real audio file's
+    # true length, whatever it contains) — computed BEFORE the strip below,
+    # since downstream timeline placement (assemble_narration_track's
+    # cumulative offset) must reflect the real clip length regardless of
+    # what's in it.
     duration = word_timestamps[-1]["end"] if word_timestamps else 0.0
+
+    # Root-cause fix for a real production bug: ElevenLabs' alignment
+    # covers the WHOLE tts_text string, including the "[{tts_cue}]" prefix
+    # — so word_timestamps previously contained the acting-note's own words
+    # indistinguishable from the actual spoken line. Since these are
+    # sentence/word-level timestamps, this array becomes the sync
+    # document's words via sync_schema.build_word — i.e. it IS the student
+    # transcript and the karaoke highlight source, not just an internal
+    # detail. A leaked acting note (e.g. "[Warm, reassuring tone,
+    # highlighting Maya's...]") rendered verbatim in the Video Library
+    # transcript and got highlighted by karaoke exactly like this. Fixed at
+    # the source, deterministically: the bracket prefix's own word count
+    # (tokenized the SAME way the alignment loop above tokenizes — split on
+    # space/newline) tells us exactly how many leading entries in
+    # word_timestamps belong to the prefix, never to the real line.
+    if use_acting:
+        prefix_word_count = len(f"[{tts_cue}]".split())
+        word_timestamps = word_timestamps[prefix_word_count:]
+
     return {"audio_base64": audio_base64, "word_timestamps": word_timestamps, "duration": duration}
 
 
@@ -638,6 +681,33 @@ async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=N
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+def _strip_bracketed_instruction_words(raw_words: list[dict]) -> list[dict]:
+    """Defense-in-depth for the student-facing sync document: drops any
+    contiguous "[...]" run of word-timestamp tokens — a fragment of a
+    bracketed production instruction (e.g. "[Warm, reassuring tone]"),
+    never real spoken dialogue. elevenlabs_generate_line already strips
+    the acting-note bracket at the source, deterministically — this is a
+    second, independent guard at the sentence-building boundary, so a
+    line generated before that fix shipped (whose stored wordTimestamps
+    may still be contaminated) can never leak into a newly (re)assembled
+    narration track either. Stateful (tracks "currently inside an open
+    bracket") rather than per-token, since an interior word of a multi-
+    word note (e.g. "and" in "[Uplifting and hopeful]") carries no bracket
+    character of its own and a per-token check alone would miss it."""
+    out: list[dict] = []
+    suppressing = False
+    for w in raw_words:
+        token = str(w.get("word") or "").strip()
+        if not suppressing and token.startswith("["):
+            suppressing = True
+        if suppressing:
+            if token.endswith("]"):
+                suppressing = False
+            continue
+        out.append(w)
+    return out
+
+
 # ── Assembly (additive narration track — no video muxing) ────────────────
 async def assemble_narration_track(db, lesson_id: str) -> dict:
     job = await jobs.get_or_create_job(db, lesson_id)
@@ -662,10 +732,18 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     if not ordered_results:
         raise VideoNarrationError("no_lines", "the script has no lines to assemble", 409)
 
+    # Loudness normalization runs per-line, BEFORE stitching: ElevenLabs
+    # renders each line independently, so raw output loudness genuinely
+    # varies line to line — normalizing the already-assembled track as one
+    # blob afterward would just average that inconsistency out rather than
+    # correcting it. video_render_tools.normalize_line_loudness never
+    # changes clip duration, so the timestamps built below (from
+    # ElevenLabs' own alignment) remain accurate against the normalized
+    # audio actually stored.
     audio_segments = []
     for entry in ordered_results:
         raw, _ct = await video_pipeline_tools.load_media_bytes(db, sync_studio_tools.get_media_bucket(db), entry["mediaRef"])
-        audio_segments.append(raw)
+        audio_segments.append(await video_render_tools.normalize_line_loudness(raw))
     stitched = _stitch_mp3_segments(audio_segments)
 
     sentences = []
@@ -675,7 +753,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     for entry, scene_id in zip(ordered_results, ordered_scene_ids):
         offset = cursor
         scene_starts.setdefault(scene_id, offset)
-        raw_words = entry.get("wordTimestamps") or []
+        raw_words = _strip_bracketed_instruction_words(entry.get("wordTimestamps") or [])
         words = [
             sync_schema.build_word(
                 w.get("word", ""), float(w.get("start", 0.0)) + offset, float(w.get("end", 0.0)) + offset,

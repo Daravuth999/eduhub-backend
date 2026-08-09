@@ -54,6 +54,20 @@ DEFAULT_SOURCE_AUDIO_TREATMENT = "mute"  # exact prior behavior — no regressio
 DUCK_VOLUME = 0.15   # source audio kept faintly audible under the narration
 PRESERVE_VOLUME = 0.85  # source audio kept near-full alongside the narration
 
+# ElevenLabs renders each line independently, so raw output loudness varies
+# line to line (observed live: some lines too loud, others nearly
+# inaudible once assembled back to back). These are real ITU-R BS.1770/
+# EBU R128 loudness-normalization targets fed to ffmpeg's own documented
+# `loudnorm` filter — not invented parameters, and not a naive per-clip
+# gain multiply (which would just move the inconsistency around; a true
+# loudness measurement targets perceived volume, which is not linear with
+# amplitude). -16 LUFS is a standard, natural level for clear spoken
+# narration/audiobook content — audible without sounding shouted next to
+# the -23 LUFS broadcast convention or -14 LUFS music-streaming norms.
+LOUDNESS_TARGET_LUFS = -16.0
+LOUDNESS_TRUE_PEAK_DBTP = -1.5  # headroom against inter-sample clipping on lossy re-encode
+LOUDNESS_RANGE_LU = 11.0  # generous enough to keep natural emotional dynamics, not flatten them
+
 
 class RenderError(Exception):
     def __init__(self, code: str, message: str = "", http_status: int = 400) -> None:
@@ -196,6 +210,57 @@ async def extract_audio_track(
         return data or None
     except RenderError:
         return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+async def normalize_line_loudness(audio_bytes: bytes, *, timeout: float = 60.0) -> bytes:
+    """Single-pass loudness normalization for one ElevenLabs-generated
+    line, applied before it's stitched into the assembled narration track
+    (see video_narration_tools.assemble_narration_track). Real ffmpeg
+    `loudnorm` filter (ITU-R BS.1770 / EBU R128 measurement, not a naive
+    gain multiply) targeting LOUDNESS_TARGET_LUFS/_TRUE_PEAK_DBTP/_RANGE_LU
+    above — this measures PERCEIVED loudness and adjusts the gain envelope
+    to match it, so a line ElevenLabs rendered quietly and one it rendered
+    loudly land at the same audible level without clipping, while a
+    single line's own internal dynamics (a whisper rising to a shout) are
+    preserved rather than compressed flat.
+
+    Purely additive polish, never a correctness dependency: if ffmpeg is
+    unavailable or the filter fails for any reason, the ORIGINAL bytes are
+    returned unchanged (same "never block on an enhancement" convention as
+    extract_audio_track above) — assembly must never fail because
+    normalization didn't run. Does not alter clip duration, so the
+    already-measured word/sentence timestamps from ElevenLabs' alignment
+    stay accurate against the normalized audio."""
+    if not audio_bytes:
+        return audio_bytes
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return audio_bytes
+    work_id = uuid.uuid4().hex
+    in_path = os.path.join(tempfile.gettempdir(), f"vnr_loud_{work_id}_in.mp3")
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_loud_{work_id}_out.mp3")
+    try:
+        with open(in_path, "wb") as f:
+            f.write(audio_bytes)
+        loudnorm = f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP={LOUDNESS_TRUE_PEAK_DBTP}:LRA={LOUDNESS_RANGE_LU}"
+        args = (ffmpeg, "-y", "-i", in_path, "-af", loudnorm, "-ar", "44100", out_path)
+        code, _out, err = await _run(*args, timeout=timeout)
+        if code != 0:
+            logger.info("video_render: loudness normalization skipped (ffmpeg exit %s): %s",
+                        code, err.decode("utf-8", errors="replace")[-300:])
+            return audio_bytes
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return data or audio_bytes
+    except RenderError:
+        return audio_bytes
     finally:
         for p in (in_path, out_path):
             try:

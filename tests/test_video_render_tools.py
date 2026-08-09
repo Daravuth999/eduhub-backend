@@ -10,6 +10,9 @@ a render" discipline.
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
+import uuid
 
 import pytest
 
@@ -345,3 +348,106 @@ async def test_extract_audio_track_dramatically_shrinks_a_representative_lesson_
     assert len(extracted) < len(video_with_audio)
     duration = await vrt.probe_audio_duration_seconds(extracted)
     assert duration == pytest.approx(6.0, abs=0.3)
+
+
+# ── loudness normalization (root cause for "some lines too loud, others
+#    nearly inaudible") ────────────────────────────────────────────────────
+async def _make_sine_clip_at_volume(*, volume: float, duration: float = 4.0) -> bytes:
+    """A real MP3 sine clip at a controlled, explicit amplitude — lets a
+    test assert on ACTUAL measured loudness convergence, not just "it ran"."""
+    path = os.path.join(tempfile.gettempdir(), f"vrt_loud_src_{uuid.uuid4().hex}.mp3")
+    args = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+            "-af", f"volume={volume}", "-c:a", "libmp3lame", path]
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, tuple(args), 30.0)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+async def _measure_integrated_loudness(audio_bytes: bytes) -> float | None:
+    """Real EBU R128 measurement (ffmpeg's own ebur128 filter) — parses the
+    "I: <value> LUFS" summary line ffmpeg writes to stderr. Used only to
+    VERIFY the fix's effect in this test file; not part of the shipped
+    normalize_line_loudness implementation itself (which uses loudnorm's
+    own single-pass measure+adjust, no separate probe needed in production)."""
+    import re as _re
+    path = os.path.join(tempfile.gettempdir(), f"vrt_measure_{uuid.uuid4().hex}.mp3")
+    with open(path, "wb") as f:
+        f.write(audio_bytes)
+    try:
+        ffmpeg = vrt._resolve_ffmpeg()
+        args = (ffmpeg, "-i", path, "-af", "ebur128=framelog=verbose", "-f", "null", "-")
+        _code, _out, err = await vrt._run(*args, timeout=30.0)
+        text = err.decode("utf-8", errors="replace")
+        matches = _re.findall(r"^\s*I:\s*(-?\d+(?:\.\d+)?)\s*LUFS", text, flags=_re.MULTILINE)
+        return float(matches[-1]) if matches else None
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_normalize_line_loudness_brings_a_quiet_and_a_loud_clip_close_together():
+    """The actual reported defect: ElevenLabs renders each line
+    independently at inconsistent volumes. Proves real ffmpeg loudnorm
+    measurably closes the gap between a quiet clip and a normal one —
+    not just that bytes came back."""
+    quiet = await _make_sine_clip_at_volume(volume=0.05)
+    normal = await _make_sine_clip_at_volume(volume=0.5)
+
+    quiet_before = await _measure_integrated_loudness(quiet)
+    normal_before = await _measure_integrated_loudness(normal)
+    assert quiet_before is not None and normal_before is not None
+    gap_before = abs(quiet_before - normal_before)
+
+    quiet_after = await vrt.normalize_line_loudness(quiet)
+    normal_after = await vrt.normalize_line_loudness(normal)
+    loud_quiet_after = await _measure_integrated_loudness(quiet_after)
+    loud_normal_after = await _measure_integrated_loudness(normal_after)
+    assert loud_quiet_after is not None and loud_normal_after is not None
+    gap_after = abs(loud_quiet_after - loud_normal_after)
+
+    assert gap_after < gap_before
+    assert gap_after < 2.0  # LUFS — genuinely close, not just "closer"
+    # Lands near the documented target, not an arbitrary level.
+    assert loud_quiet_after == pytest.approx(vrt.LOUDNESS_TARGET_LUFS, abs=1.5)
+    assert loud_normal_after == pytest.approx(vrt.LOUDNESS_TARGET_LUFS, abs=1.5)
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_normalize_line_loudness_does_not_change_duration():
+    """Karaoke/word timestamps are measured against the PRE-normalization
+    ElevenLabs alignment — normalization must never shift clip duration
+    enough to drift that timing."""
+    clip = await _make_sine_clip_at_volume(volume=0.2, duration=3.0)
+    normalized = await vrt.normalize_line_loudness(clip)
+
+    before = await vrt.probe_audio_duration_seconds(clip)
+    after = await vrt.probe_audio_duration_seconds(normalized)
+    assert after == pytest.approx(before, abs=0.15)
+
+
+@pytest.mark.asyncio
+async def test_normalize_line_loudness_returns_original_bytes_when_ffmpeg_unavailable(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    original = b"fake-mp3-bytes"
+    assert await vrt.normalize_line_loudness(original) == original
+
+
+@pytest.mark.asyncio
+async def test_normalize_line_loudness_returns_original_bytes_on_ffmpeg_failure(monkeypatch):
+    async def _failing_run(*args, timeout):
+        return 1, b"", b"ffmpeg: invalid data"
+
+    monkeypatch.setattr(vrt, "_run", _failing_run)
+    original = b"fake-mp3-bytes"
+    assert await vrt.normalize_line_loudness(original) == original
+
+
+@pytest.mark.asyncio
+async def test_normalize_line_loudness_passthrough_on_empty_input():
+    assert await vrt.normalize_line_loudness(b"") == b""

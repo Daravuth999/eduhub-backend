@@ -201,15 +201,18 @@ def normalize_story_analysis(raw, *, extract_json=None) -> dict | None:
 
 
 # ── ScriptBlueprint (Mode B) ──────────────────────────────────────────────
-# `emotion` is the line's PERFORMANCE DIRECTION — natural-language context
-# (pace, warmth, hesitation, restraint, relationship to the listener, why
-# the line is being said) that video_narration_tools.elevenlabs_generate_
-# line feeds into ElevenLabs' real eleven_v3 bracket-instruction mechanism
-# (`f"[{acting_note}] {text}"`, already live before this field existed —
-# this is not a new/invented ElevenLabs capability, only richer content
-# going into an existing one). Bounded at 300 chars: enough for a real
-# directorial note, not so much that a bad Gemini response can dominate
-# the line's own text.
+# `emotion` is the line's full PERFORMANCE DIRECTION — natural-language
+# context (pace, warmth, hesitation, restraint, relationship to the
+# listener, why the line is being said). This full note is production data
+# only: it is shown in Author Studio and used to derive a short delivery
+# cue for ElevenLabs (video_narration_tools._short_acting_cue +
+# elevenlabs_generate_line's real eleven_v3 bracket-instruction mechanism,
+# `f"[{cue}] {text}"` — not a new/invented ElevenLabs capability). It must
+# NEVER reach the student-facing sync document / transcript / karaoke —
+# elevenlabs_generate_line strips the bracket's own word_timestamps
+# entries before they can become sync_schema words. Bounded at 300 chars:
+# enough for a real directorial note, not so much that a bad Gemini
+# response can dominate the line's own text.
 def build_script_line(
     *, line_id: str | None = None, speaker: str = "", text: str = "", emotion: str = "",
 ) -> dict:

@@ -217,6 +217,74 @@ def _fake_bucket_patch(monkeypatch, bucket):
     monkeypatch.setattr(sync_studio_tools, "get_media_bucket", lambda db: bucket)
 
 
+# ── regression coverage for a real production bug: the ElevenLabs acting-
+#    note bracket leaking into word_timestamps (which becomes the sync
+#    document's words — the student transcript AND the karaoke highlight
+#    source). A leaked note like "[Warm, reassuring tone, highlighting
+#    Maya's...]" rendered verbatim to students and got karaoke-highlighted
+#    exactly like a real spoken word. ─────────────────────────────────────
+class TestElevenlabsGenerateLineActingNoteStripped:
+    def test_short_acting_cue_takes_the_first_clause_and_stays_short(self):
+        cue = vnt._short_acting_cue(
+            "Warm, reassuring tone, highlighting Maya's understanding and empathy for Daniel's situation.",
+        )
+        assert cue == "Warm"
+        assert len(cue) <= 60
+
+    def test_short_acting_cue_falls_back_to_a_bounded_prefix_with_no_punctuation(self):
+        cue = vnt._short_acting_cue("a" * 200)
+        assert len(cue) <= 60
+
+    @pytest.mark.asyncio
+    async def test_word_timestamps_never_contain_the_acting_note(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        result = await vnt.elevenlabs_generate_line(
+            "He knew he was not alone.", "voice_1",
+            acting_note="Uplifting and hopeful, conveying the relief in Daniel's expression.",
+            http_client=client,
+        )
+        words = [w["word"] for w in result["word_timestamps"]]
+        joined = " ".join(words)
+        assert "Uplifting" not in joined
+        assert "hopeful" not in joined
+        assert "[" not in joined and "]" not in joined
+        # The real spoken line survives intact and in order.
+        assert words == ["He", "knew", "he", "was", "not", "alone."]
+
+    @pytest.mark.asyncio
+    async def test_duration_reflects_the_full_audio_including_any_bracket_time(self, monkeypatch):
+        """duration must still reflect the REAL full clip length (used to
+        place the NEXT line's offset in the assembled track) even though
+        the bracket's words are stripped from what's returned as the
+        transcript-facing word_timestamps."""
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        text = "Hello there, how are you doing today?"
+        with_note = await vnt.elevenlabs_generate_line(
+            text, "voice_1", acting_note="Quiet and cautious.", http_client=client,
+        )
+        without_note = await vnt.elevenlabs_generate_line(text, "voice_1", http_client=client)
+        assert with_note["duration"] > without_note["duration"]
+
+    @pytest.mark.asyncio
+    async def test_no_acting_note_is_a_pure_passthrough(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        result = await vnt.elevenlabs_generate_line("Oh no.", "voice_1", http_client=client)
+        assert [w["word"] for w in result["word_timestamps"]] == ["Oh", "no."]
+
+    @pytest.mark.asyncio
+    async def test_very_short_lines_skip_acting_direction_entirely(self, monkeypatch):
+        """use_acting requires len(text.strip()) > 10 — a very short line
+        (e.g. a single interjection) is sent as-is, with no bracket to strip."""
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        result = await vnt.elevenlabs_generate_line("Oh no.", "voice_1", acting_note="Startled.", http_client=client)
+        assert [w["word"] for w in result["word_timestamps"]] == ["Oh", "no."]
+        assert "[" not in client.calls[0][1]["text"]
+
+
 LESSON = {
     "lessonId": "vid_1", "title": "Ordering Coffee", "mediaRef": "gridfs://sync_media/vid_1.mp4",
     "syncId": "sync_1", "contentType": "video/mp4",
@@ -426,6 +494,41 @@ async def test_assemble_requires_all_lines_complete(monkeypatch):
     with pytest.raises(vnt.VideoNarrationError) as exc:
         await vnt.assemble_narration_track(db, "vid_1")
     assert exc.value.code == "no_lines" or exc.value.code == "not_all_lines_complete"
+
+
+@pytest.mark.asyncio
+async def test_assemble_strips_pre_existing_contaminated_word_timestamps(monkeypatch):
+    """Defense-in-depth: a line generated BEFORE the elevenlabs_generate_
+    line source fix shipped may still have a contaminated wordTimestamps
+    array stored in Mongo (bracket-fragment tokens mixed in with the real
+    spoken words). Re-assembling that job today must never let those
+    fragments reach the sync document — _looks_like_production_metadata
+    is the independent guard at this second boundary."""
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    path = f"voiceProduction.{scene_id}.lines.{line_id}"
+    contaminated_result = {
+        "speaker": "Narrator", "text": "He knew he was not alone.", "mediaRef": "gridfs://sync_media/line.mp3",
+        "wordTimestamps": [
+            {"word": "[Uplifting", "start": 0.0, "end": 0.3},
+            {"word": "and", "start": 0.3, "end": 0.5},
+            {"word": "hopeful]", "start": 0.5, "end": 0.9},
+            {"word": "He", "start": 1.0, "end": 1.2},
+            {"word": "knew", "start": 1.2, "end": 1.4},
+        ],
+        "durationSec": 1.4, "voiceId": "voice_1", "voiceStale": False,
+    }
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], f"{path}.state", jobs.S_COMPLETED)
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], f"{path}.result", contaminated_result)
+    await bucket.upload_from_stream("line.mp3", __import__("io").BytesIO(b"fake-audio"), {"contentType": "audio/mpeg"})
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    sync_id = job["assembly"]["result"]["syncId"]
+    sync_doc = await db.chapter_sync.find_one({"syncId": sync_id})
+    words = [w["word"] for s in sync_doc["paragraphs"][0]["sentences"] for w in s["words"]]
+
+    assert words == ["He", "knew"]
+    assert not any("[" in w or "]" in w for w in words)
 
 
 @pytest.mark.asyncio
