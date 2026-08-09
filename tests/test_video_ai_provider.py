@@ -96,6 +96,97 @@ async def test_align_asr_actually_requests_the_flash_model():
     assert "gemini-2.5-pro" not in client.calls[0]
 
 
+# ── ASR response-parsing robustness — root-caused against a real production
+#    failure ("VideoAIError: Gemini returned no parsable segments") where a
+#    genuinely valid Gemini answer was being treated as unparsable. ────────
+@pytest.mark.asyncio
+async def test_align_rejects_empty_media_without_any_provider_call():
+    provider = vap.GeminiVideoProvider(http_client=_RecordingGeminiClient(_FakeHttpResponse()))
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"", "audio/mpeg")
+    assert exc.value.code == "empty_media"
+
+
+@pytest.mark.asyncio
+async def test_align_accepts_a_bare_top_level_segments_array():
+    """A real, observed Gemini response-shape variance: instead of the
+    requested {"language":...,"segments":[...]} wrapper, the model returns
+    the segments array directly at the top level. This is a well-formed,
+    usable answer and must never be treated as a parsing failure."""
+    client = _RecordingGeminiClient(_gemini_json_response(
+        [{"speaker": "S1", "start": 0.0, "end": 1.2, "text": "Hello there."}],
+    ))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    result = await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert result["transcriptText"] == "Hello there."
+    assert result["sync"]["paragraphs"][0]["sentences"][0]["words"][0]["word"] == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_align_bare_array_skips_non_dict_entries_honestly():
+    client = _RecordingGeminiClient(_gemini_json_response(
+        [{"speaker": "S1", "start": 0.0, "end": 1.0, "text": "Real segment."}, "garbage", 42, None],
+    ))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    result = await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert result["transcriptText"] == "Real segment."
+
+
+@pytest.mark.asyncio
+async def test_align_raises_bad_response_with_no_extra_diagnostic_for_plain_garbage_text():
+    """A normal-looking response (STOP finish reason, real candidates) that
+    simply isn't valid/parsable JSON must still fail cleanly — the
+    diagnostic suffix is genuinely absent here, not fabricated, so the
+    message matches the original plain wording."""
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": "Sorry, I cannot help with that."}]},
+                         "finishReason": "STOP"}],
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert exc.value.code == "bad_response"
+    assert exc.value.message == "Gemini returned no parsable segments"
+
+
+@pytest.mark.asyncio
+async def test_align_surfaces_a_safety_block_reason_instead_of_a_generic_failure():
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [], "promptFeedback": {"blockReason": "SAFETY"},
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert exc.value.code == "bad_response"
+    assert "blockReason=SAFETY" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_align_surfaces_a_truncated_max_tokens_response_honestly():
+    """A response cut off before completing valid JSON (e.g. a very long
+    lesson producing more segments than the output token budget allows)
+    must be reported as a truncation, not a generic unparsable-segments
+    message that hides the real, actionable cause."""
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": '{"language":"en","segments":[{"speaker":"S1"'}]},
+                         "finishReason": "MAX_TOKENS"}],
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert exc.value.code == "bad_response"
+    assert "finishReason=MAX_TOKENS" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_align_reports_no_candidates_returned_when_response_is_empty():
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {"candidates": []}))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert "no candidates returned" in exc.value.message
+
+
 @pytest.mark.asyncio
 async def test_analyze_story_actually_requests_the_pro_model():
     client = _RecordingGeminiClient(_gemini_json_response({

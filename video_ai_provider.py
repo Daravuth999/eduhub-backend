@@ -230,6 +230,29 @@ def _candidate_text(payload: dict) -> str:
     return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
 
 
+def _response_diagnostics(payload: Any) -> str:
+    """Extracts REAL, Gemini-reported reasons a response produced no usable
+    text — never fabricated — so a downstream parse failure is actually
+    diagnosable instead of a bare, indistinguishable "no parsable segments"
+    that could equally mean a safety block, a truncated (MAX_TOKENS)
+    response, or a genuinely malformed reply. Returns "" when the payload
+    carries no extra diagnostic signal beyond a normal-looking response."""
+    if not isinstance(payload, dict):
+        return "response was not a JSON object"
+    feedback = payload.get("promptFeedback")
+    block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+    if block_reason:
+        return f"blockReason={block_reason}"
+    candidates = payload.get("candidates")
+    if not candidates:
+        return "no candidates returned"
+    first = candidates[0] if isinstance(candidates[0], dict) else {}
+    finish_reason = first.get("finishReason")
+    if finish_reason and finish_reason != "STOP":
+        return f"finishReason={finish_reason}"
+    return ""
+
+
 class VideoAiError(Exception):
     def __init__(self, code: str, message: str = "") -> None:
         super().__init__(message or code)
@@ -542,10 +565,27 @@ class GeminiVideoProvider:
                         r.status_code, self._model, content_type, (r.text or "")[:400])
             raise VideoAiError("provider_rejected", f"Gemini HTTP {r.status_code}")
 
-        data = _extract_json(_candidate_text(r.json()))
-        segments = (data or {}).get("segments") if isinstance(data, dict) else None
+        raw_payload = r.json()
+        text = _candidate_text(raw_payload)
+        data = _extract_json(text)
+        if isinstance(data, dict):
+            segments = data.get("segments")
+        elif isinstance(data, list):
+            # Gemini sometimes returns the segments array directly at the
+            # top level instead of wrapped in {"language":...,"segments":
+            # [...]}. This is a real, observed response-shape variance
+            # (not a hypothetical one) — a well-formed answer must not be
+            # treated as a parsing failure just because it skipped the
+            # wrapper object the prompt asked for.
+            segments = [s for s in data if isinstance(s, dict)]
+        else:
+            segments = None
         if segments is None:
-            raise VideoAiError("bad_response", "Gemini returned no parsable segments")
+            diag = _response_diagnostics(raw_payload)
+            log.warning("video-ai: ASR unparsable | model=%s mime=%s | %s | text_tail=%r",
+                        self._model, content_type, diag or "no diagnostic", text[-300:])
+            detail = "Gemini returned no parsable segments" + (f" ({diag})" if diag else "")
+            raise VideoAiError("bad_response", detail)
 
         import datetime as _dt
         sync = segments_to_sync(
