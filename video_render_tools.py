@@ -247,6 +247,104 @@ async def mux_narration_into_video(
                 pass
 
 
+async def probe_audio_duration_seconds(audio_bytes: bytes, *, timeout: float = 30.0) -> float | None:
+    """Best-effort duration probe for a standalone audio clip (e.g. a
+    generated SFX asset) — ffprobe only, no ffmpeg-stderr fallback: unlike
+    probe_has_audio_stream's yes/no question, parsing an exact duration out
+    of ffmpeg's free-text stderr reliably is materially more fragile, and
+    this value is informational (timeline display) rather than required
+    for any render to succeed. Returns None — never raises, never guesses
+    — whenever ffprobe isn't available or the probe fails for any reason."""
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe or not audio_bytes:
+        return None
+    work_id = uuid.uuid4().hex
+    path = os.path.join(tempfile.gettempdir(), f"vnr_dur_{work_id}.mp3")
+    try:
+        with open(path, "wb") as f:
+            f.write(audio_bytes)
+        code, out, _err = await _run(
+            ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
+            timeout=timeout,
+        )
+        if code != 0:
+            return None
+        return round(float(out.decode("utf-8", errors="replace").strip()), 3)
+    except (RenderError, ValueError):
+        return None
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+async def overlay_audio_at_offset(
+    base_audio_bytes: bytes, overlay_audio_bytes: bytes, offset_seconds: float,
+    *, overlay_volume: float = 1.0, timeout: float = 120.0,
+) -> bytes:
+    """Mixes a second audio clip (e.g. a generated SFX asset) into a base
+    track (e.g. the assembled narration) starting at `offset_seconds` —
+    reuses this SAME module's ffmpeg resolver/execution plumbing rather
+    than a second mixing engine, per the "build on the existing renderer"
+    requirement.
+
+    The BASE track's own duration and internal timing are always preserved
+    exactly (`amix ... duration=first`) — an overlay is additive, never a
+    splice, so anything already timed against the base track's audio (word/
+    sentence timestamps computed before this call) remains accurate
+    afterward. An overlay landing near/after the base track's own end is
+    simply attenuated by ffmpeg's own duration truncation, not an error.
+
+    Raises RenderError with the same honest codes as mux_narration_into_
+    video — this is never allowed to silently return the un-mixed base
+    track disguised as a successful mix; callers that treat SFX mixing as
+    optional must catch RenderError themselves and skip that overlay."""
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        raise RenderError("ffmpeg_unavailable", "Server-side audio mixing is unavailable (ffmpeg not found).", 503)
+    if not base_audio_bytes or not overlay_audio_bytes:
+        raise RenderError("empty_input", "base or overlay audio input was empty", 400)
+
+    work_id = uuid.uuid4().hex
+    base_path = os.path.join(tempfile.gettempdir(), f"vnr_mix_{work_id}_base.mp3")
+    overlay_path = os.path.join(tempfile.gettempdir(), f"vnr_mix_{work_id}_overlay.mp3")
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_mix_{work_id}_out.mp3")
+    try:
+        with open(base_path, "wb") as f:
+            f.write(base_audio_bytes)
+        with open(overlay_path, "wb") as f:
+            f.write(overlay_audio_bytes)
+
+        delay_ms = max(0, int(round(offset_seconds * 1000)))
+        filter_complex = (
+            f"[1:a]adelay={delay_ms}|{delay_ms},volume={overlay_volume}[ov];"
+            "[0:a][ov]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        )
+        args = (
+            ffmpeg, "-y",
+            "-i", base_path, "-i", overlay_path,
+            "-filter_complex", filter_complex,
+            "-map", "[aout]",
+            "-c:a", "libmp3lame",
+            out_path,
+        )
+        code, _out, err = await _run(*args, timeout=timeout)
+        if code != 0:
+            tail = err.decode("utf-8", errors="replace")[-800:]
+            raise RenderError("ffmpeg_failed", f"ffmpeg exited {code}: {tail}", 500)
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (base_path, overlay_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 async def probe_has_audio_stream(video_bytes: bytes, *, content_type: str = "video/mp4",
                                   timeout: float = 30.0) -> bool:
     """Media-inspection verification (not just 'the browser could play an

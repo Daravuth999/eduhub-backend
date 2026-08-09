@@ -8,6 +8,7 @@ regeneration, and that nothing is ever auto-published to students.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import pytest
@@ -820,3 +821,243 @@ async def test_build_audio_timeline_reflects_source_audio_treatment_choice():
 
     timeline = vnt.build_audio_timeline(job)
     assert timeline["sourceAudio"] == {"treatment": "duck", "provenance": "original"}
+
+
+# ── SFX mixed into the assembled narration track (real production wiring) ─
+@pytest.mark.asyncio
+async def test_assembly_mixes_a_completed_sfx_asset_into_the_narration_track(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=_FakeElevenLabsClient())
+
+    doc = db.video_narration_jobs.docs["vid_1"]
+    doc["storyAnalysis"]["result"]["scenes"][0]["audioObservations"]["sfx"] = "a bell rings"
+    await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_FakeSfxClient())
+
+    mixed_calls = []
+
+    async def _fake_overlay(base, overlay, offset, **kwargs):
+        mixed_calls.append((base, overlay, offset))
+        return base + b":mixed:" + overlay
+
+    monkeypatch.setattr(vnt.video_render_tools, "overlay_audio_at_offset", _fake_overlay)
+    job = await vnt.assemble_narration_track(db, "vid_1")
+
+    assert job["assembly"]["result"]["sfxMixed"] == [scene_id]
+    assert job["assembly"]["result"]["sfxSkipped"] == []
+    assert len(mixed_calls) == 1
+    assert mixed_calls[0][2] == 0.0  # the scene's only line starts at cursor 0
+
+
+@pytest.mark.asyncio
+async def test_assembly_skips_an_sfx_asset_whose_scene_has_no_narration_line(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=_FakeElevenLabsClient())
+
+    doc = db.video_narration_jobs.docs["vid_1"]
+    doc["sfx"] = {"sc_orphan": {"state": jobs.S_COMPLETED, "result": {"mediaRef": "gridfs://sync_media/orphan.mp3"}}}
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["result"]["sfxMixed"] == []
+    assert job["assembly"]["result"]["sfxSkipped"] == [
+        {"sceneId": "sc_orphan", "reason": "scene has no narration line to anchor timing to"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_assembly_never_fails_when_sfx_mixing_hits_a_render_error(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=_FakeElevenLabsClient())
+
+    doc = db.video_narration_jobs.docs["vid_1"]
+    doc["storyAnalysis"]["result"]["scenes"][0]["audioObservations"]["sfx"] = "a bell rings"
+    await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_FakeSfxClient())
+
+    async def _unavailable_overlay(base, overlay, offset, **kwargs):
+        raise vnt.video_render_tools.RenderError("ffmpeg_unavailable", "ffmpeg not found", 503)
+
+    monkeypatch.setattr(vnt.video_render_tools, "overlay_audio_at_offset", _unavailable_overlay)
+    job = await vnt.assemble_narration_track(db, "vid_1")
+
+    assert job["assembly"]["state"] == jobs.S_COMPLETED  # SFX mixing failure never blocks assembly
+    assert job["assembly"]["result"]["sfxSkipped"] == [{"sceneId": scene_id, "reason": "ffmpeg not found"}]
+
+
+@pytest.mark.asyncio
+async def test_assembly_with_no_sfx_reports_empty_mixed_and_skipped_lists(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    job = await jobs.get_or_create_job(db, "vid_1")
+    assert job["assembly"]["result"]["sfxMixed"] == []
+    assert job["assembly"]["result"]["sfxSkipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_audio_timeline_reports_real_sfx_start_once_its_scene_narration_is_generated(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=_FakeElevenLabsClient())
+
+    doc = db.video_narration_jobs.docs["vid_1"]
+    doc["storyAnalysis"]["result"]["scenes"][0]["audioObservations"]["sfx"] = "a bell rings"
+    await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_FakeSfxClient())
+
+    job = await jobs.get_or_create_job(db, "vid_1")
+    timeline = vnt.build_audio_timeline(job)
+    sfx_track = next(t for t in timeline["tracks"] if t["role"] == "sfx")
+    assert sfx_track["start"] == 0.0  # the scene's only (now-generated) line starts at 0
+
+
+# ── Real end-to-end production pipeline (genuine ffmpeg media throughout) ─
+NO_FFMPEG_E2E = not vnt.video_render_tools.ffmpeg_available()
+NO_FFPROBE_E2E = not vnt.video_render_tools.ffprobe_available()
+
+
+async def _make_real_media(*, kind: str, duration: float = 0.4) -> bytes:
+    """Generates genuinely real, playable media via ffmpeg lavfi sources —
+    no fixtures checked into the repo, no fake byte strings — so every
+    downstream mixing/muxing step in the e2e test below operates on real
+    audio/video, and every claim of "the master has an embedded audio
+    stream" is verified with real ffprobe rather than assumed."""
+    import os
+    import tempfile
+    import uuid
+
+    vrt = vnt.video_render_tools
+    work_id = uuid.uuid4().hex
+    if kind == "video_with_audio":
+        path = os.path.join(tempfile.gettempdir(), f"vnt_e2e_{work_id}.mp4")
+        args = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=red:s=64x64:d={duration}",
+            "-f", "lavfi", "-i", f"sine=frequency=220:duration={duration}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", path,
+        ]
+    elif kind == "audio":
+        path = os.path.join(tempfile.gettempdir(), f"vnt_e2e_{work_id}.mp3")
+        args = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+                "-c:a", "libmp3lame", path]
+    else:
+        raise ValueError(kind)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, tuple(args), 30.0)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+class _RealAudioElevenLabsClient:
+    """Same request/response SHAPE as _FakeElevenLabsClient (so the real
+    reshape/alignment code is exercised identically), but returns a
+    genuinely real, playable audio clip instead of an arbitrary byte
+    string — required so this test's downstream real-ffmpeg mixing/muxing
+    has real audio to operate on."""
+    def __init__(self, audio_bytes: bytes):
+        self._audio_bytes = audio_bytes
+        self.calls = []
+
+    async def post(self, url, headers=None, json=None, **kwargs):
+        self.calls.append((url, json))
+        text = json["text"]
+        chars = list(text)
+        starts = [i * 0.05 for i in range(len(chars))]
+        ends = [(i + 1) * 0.05 for i in range(len(chars))]
+        return _FakeHttpResponse(200, {
+            "audio_base64": base64.b64encode(self._audio_bytes).decode(),
+            "alignment": {"characters": chars, "character_start_times_seconds": starts,
+                          "character_end_times_seconds": ends},
+        })
+
+
+class _RealSfxClient:
+    def __init__(self, audio_bytes: bytes):
+        self._audio_bytes = audio_bytes
+        self.calls = []
+
+    async def post(self, url, headers=None, json=None, **kwargs):
+        self.calls.append((url, json))
+        return _FakeHttpResponse(200, content=self._audio_bytes)
+
+
+@pytest.mark.skipif(NO_FFMPEG_E2E or NO_FFPROBE_E2E, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_real_end_to_end_production_pipeline_with_genuine_ffmpeg_media(monkeypatch):
+    """One real, continuous pass through the ENTIRE production chain this
+    module owns: story analysis -> script -> voice assignment -> per-line
+    ElevenLabs generation -> SFX generation -> automatic timeline placement
+    -> source-audio treatment -> assembly (real SFX mix) -> final render
+    (real mux) -> publish. Gemini/ElevenLabs themselves are NOT live-called
+    (no credentials in this environment — mock story/script generation and
+    fake HTTP clients stand in for them, exactly as every other test in
+    this file already does), but every byte of audio/video touched from
+    that point on is genuine ffmpeg output, and every "it worked" claim is
+    checked with real ffprobe, never assumed from a function simply
+    returning without raising."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+
+    source_video = await _make_real_media(kind="video_with_audio", duration=0.6)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(source_video), {"contentType": "video/mp4"})
+
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_COMPLETED
+    scene_id = job["storyAnalysis"]["result"]["scenes"][0]["sceneId"]
+    db.video_narration_jobs.docs["vid_1"]["storyAnalysis"]["result"]["scenes"][0]["audioObservations"]["sfx"] = "a soft chime"
+
+    job = await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["scriptBlueprint"]["state"] == jobs.S_COMPLETED
+    line_id = job["scriptBlueprint"]["result"]["scenes"][0]["lines"][0]["lineId"]
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    narration_clip = await _make_real_media(kind="audio", duration=0.5)
+    job = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id,
+                                         http_client=_RealAudioElevenLabsClient(narration_clip))
+    assert job["voiceProduction"][scene_id]["lines"][line_id]["state"] == jobs.S_COMPLETED
+
+    sfx_clip = await _make_real_media(kind="audio", duration=0.2)
+    job = await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_RealSfxClient(sfx_clip))
+    assert job["sfx"][scene_id]["state"] == jobs.S_COMPLETED
+    assert job["sfx"][scene_id]["result"]["durationSec"] is not None  # real ffprobe measurement
+
+    timeline = vnt.build_audio_timeline(job)
+    narration_track = next(t for t in timeline["tracks"] if t["role"] == "narrator")
+    sfx_track = next(t for t in timeline["tracks"] if t["role"] == "sfx")
+    assert narration_track["start"] == 0.0
+    assert sfx_track["start"] == 0.0  # same scene, automatically anchored to the same offset
+
+    job = await vnt.set_source_audio_treatment(db, "vid_1", "duck")
+    assert job["sourceAudioTreatment"] == "duck"
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["state"] == jobs.S_COMPLETED
+    assert job["assembly"]["result"]["sfxMixed"] == [scene_id]
+    assembled_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(
+        db, bucket, job["assembly"]["result"]["mediaRef"],
+    )
+    assert await vnt.video_render_tools.probe_audio_duration_seconds(assembled_bytes) is not None
+
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_COMPLETED
+    master_ref = job["render"]["result"]["mediaRef"]
+    master_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(db, bucket, master_ref)
+    assert len(master_bytes) > 0
+    assert await vnt.video_render_tools.probe_has_audio_stream(master_bytes) is True
+
+    db.video_lessons.docs["vid_1"] = dict(LESSON)
+    published = await vnt.publish_narration(db, "vid_1")
+    lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert lesson["aiNarrationMasterMediaRef"] == master_ref
+    assert published["published"] is True

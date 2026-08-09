@@ -530,8 +530,11 @@ async def reset_line_voice(db, lesson_id: str, scene_id: str, line_id: str) -> d
 #    Gemini's own audioObservations.sfx description for that scene (never
 #    an invented sound; if Gemini reported nothing, there is nothing to
 #    generate from and the stage fails honestly rather than guessing).
-#    NOT wired into assembly/render yet — see build_audio_timeline's
-#    docstring for exactly what "ADD" currently means for this asset. ────
+#    A completed SFX asset here is picked up automatically by
+#    assemble_narration_track, which mixes it into the assembled track at
+#    its scene's own narration start offset — see that function's comments
+#    for the exact mixing/skip logic and build_audio_timeline for how the
+#    resulting placement is reported back to the Author. ─────────────────
 async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=None) -> dict:
     job = await jobs.get_or_create_job(db, lesson_id)
     if job["storyAnalysis"]["state"] != jobs.S_COMPLETED:
@@ -574,11 +577,13 @@ async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=N
         await jobs.fail_stage(db, lesson_id, path, attempt, genver, "provider returned no audio")
         return await jobs.get_or_create_job(db, lesson_id)
 
+    duration_sec = await video_render_tools.probe_audio_duration_seconds(audio_bytes)
+
     key = f"video-narration/{lesson_id}/{scene_id}/sfx/{attempt}.mp3"
     media_ref = await _store_audio(db, audio_bytes, key, lesson_id)
     result = {
         "sceneId": scene_id, "sourceText": sfx_description, "mediaRef": media_ref,
-        "provider": "elevenlabs", "providerAssetId": media_ref,
+        "provider": "elevenlabs", "providerAssetId": media_ref, "durationSec": duration_sec,
     }
     await jobs.complete_stage(db, lesson_id, path, attempt, genver, result)
     return await jobs.get_or_create_job(db, lesson_id)
@@ -592,6 +597,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         raise VideoNarrationError("no_script", "no script blueprint to assemble", 409)
 
     ordered_results: list[dict] = []
+    ordered_scene_ids: list[str] = []
     for scene in scenes:
         vp_lines = ((job.get("voiceProduction") or {}).get(scene["sceneId"], {}) or {}).get("lines") or {}
         for line in scene.get("lines") or []:
@@ -602,6 +608,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
                     f"scene {scene['sceneId']} line {line['lineId']} is not generated yet", 409,
                 )
             ordered_results.append(stage["result"])
+            ordered_scene_ids.append(scene["sceneId"])
 
     if not ordered_results:
         raise VideoNarrationError("no_lines", "the script has no lines to assemble", 409)
@@ -615,8 +622,10 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     sentences = []
     cursor = 0.0
     speaker_ids: list[str] = []
-    for entry in ordered_results:
+    scene_starts: dict[str, float] = {}
+    for entry, scene_id in zip(ordered_results, ordered_scene_ids):
         offset = cursor
+        scene_starts.setdefault(scene_id, offset)
         raw_words = entry.get("wordTimestamps") or []
         words = [
             sync_schema.build_word(
@@ -633,6 +642,34 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         line_duration = float(entry.get("durationSec") or (words[-1]["end"] - offset if words else 0.0))
         cursor = offset + line_duration
 
+    # Mix any completed SFX into the stitched track BEFORE it's persisted —
+    # additive overlay via video_render_tools.overlay_audio_at_offset, which
+    # never shifts the base track's own timing (see its docstring), so the
+    # word/sentence timestamps computed above (from the PRE-mix narration)
+    # remain accurate against the POST-mix audio actually stored below.
+    # Best-effort and non-fatal: SFX is an enhancement, never something
+    # that can block narration assembly (an unavailable ffmpeg, or an SFX
+    # scene with no narration line in it to anchor timing to, is recorded
+    # and skipped, never raised).
+    sfx_mixed: list[str] = []
+    sfx_skipped: list[dict] = []
+    for scene_id, stage in (job.get("sfx") or {}).items():
+        if stage.get("state") != jobs.S_COMPLETED:
+            continue
+        result = stage.get("result") or {}
+        offset = scene_starts.get(scene_id)
+        if offset is None:
+            sfx_skipped.append({"sceneId": scene_id, "reason": "scene has no narration line to anchor timing to"})
+            continue
+        try:
+            sfx_bytes, _ct = await video_pipeline_tools.load_media_bytes(
+                db, sync_studio_tools.get_media_bucket(db), result["mediaRef"],
+            )
+            stitched = await video_render_tools.overlay_audio_at_offset(stitched, sfx_bytes, offset)
+            sfx_mixed.append(scene_id)
+        except video_render_tools.RenderError as exc:
+            sfx_skipped.append({"sceneId": scene_id, "reason": exc.message})
+
     paragraph = sync_schema.build_paragraph("p1", sentences)
     sync_doc = sync_schema.build_sync_document(
         media_ref="", provider_category="synthesis", provider_version="video-narration-v1",
@@ -648,7 +685,10 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         raise VideoNarrationError("invalid_assembled_sync", "; ".join(errors), 500)
 
     await db[sync_studio_tools.CHAPTER_SYNC_COLL].insert_one(dict(sync_doc))
-    assembly_result = {"syncId": sync_doc["syncId"], "mediaRef": media_ref, "durationSec": cursor}
+    assembly_result = {
+        "syncId": sync_doc["syncId"], "mediaRef": media_ref, "durationSec": cursor,
+        "sfxMixed": sfx_mixed, "sfxSkipped": sfx_skipped,
+    }
     await db[jobs.COLL].update_one(
         {"_id": lesson_id},
         {"$set": {
@@ -671,11 +711,13 @@ def build_audio_timeline(job: dict) -> dict:
     Offsets are only trustworthy through the first not-yet-completed line —
     once a gap is hit, every remaining entry (and totalDurationSec) reports
     None rather than a guessed number; this function does not know the
-    provider will ever finish generating that line the same way. SFX assets
-    are listed with their generation status but no start/duration: they are
-    NOT wired into assembly/render yet (see generate_scene_sfx's docstring)
-    — this timeline shows what SFX exists, not where it plays, since that
-    placement decision doesn't exist in the pipeline yet."""
+    provider will ever finish generating that line the same way. An SFX
+    asset's start reflects the ACTUAL offset assemble_narration_track mixes
+    it in at (its scene's first narration line) once that offset is known —
+    honestly None for a scene with no narration line to anchor to, or while
+    any earlier line is still ungenerated. SFX duration/end are only filled
+    in when generate_scene_sfx's ffprobe-based duration measurement
+    succeeded (see its docstring) — otherwise None, never guessed."""
     scenes = (job.get("scriptBlueprint", {}).get("result") or {}).get("scenes") or []
     voice_production = job.get("voiceProduction") or {}
     sfx_map = job.get("sfx") or {}
@@ -683,6 +725,7 @@ def build_audio_timeline(job: dict) -> dict:
     tracks: list[dict] = []
     cursor = 0.0
     trustworthy = True
+    scene_starts: dict[str, float] = {}
     for scene in scenes:
         vp_lines = (voice_production.get(scene["sceneId"], {}) or {}).get("lines") or {}
         for line in scene.get("lines") or []:
@@ -690,6 +733,8 @@ def build_audio_timeline(job: dict) -> dict:
             state = stage.get("state", jobs.S_PENDING)
             result = stage.get("result") or {}
             is_narrator = (line.get("speaker") or "").strip().lower() == "narrator"
+            if trustworthy:
+                scene_starts.setdefault(scene["sceneId"], cursor)
             entry = {
                 "sceneId": scene["sceneId"], "lineId": line["lineId"],
                 "role": "narrator" if is_narrator else "character",
@@ -713,9 +758,13 @@ def build_audio_timeline(job: dict) -> dict:
 
     for scene_id, stage in sfx_map.items():
         result = stage.get("result") or {}
+        start = scene_starts.get(scene_id)
+        duration = result.get("durationSec")
         tracks.append({
             "sceneId": scene_id, "lineId": None, "role": "sfx", "type": "sfx", "speaker": None,
-            "start": None, "duration": None, "end": None,
+            "start": round(start, 3) if start is not None else None,
+            "duration": round(duration, 3) if duration is not None else None,
+            "end": round(start + duration, 3) if start is not None and duration is not None else None,
             "provider": "elevenlabs", "providerAssetId": result.get("mediaRef"),
             "generationStatus": stage.get("state", jobs.S_PENDING),
             "version": stage.get("generationVersion", 0),

@@ -211,3 +211,61 @@ async def test_probe_falls_back_to_ffmpeg_stderr_parsing_when_ffprobe_missing(mo
 
     monkeypatch.setattr(vrt, "_resolve_ffprobe", lambda: None)
     assert await vrt.probe_has_audio_stream(rendered) is True
+
+
+# ── SFX-into-narration mixing (overlay_audio_at_offset) + duration probe ──
+@pytest.mark.asyncio
+async def test_overlay_raises_ffmpeg_unavailable_when_binary_missing(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    with pytest.raises(vrt.RenderError) as exc_info:
+        await vrt.overlay_audio_at_offset(b"base", b"overlay", 1.0)
+    assert exc_info.value.code == "ffmpeg_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_overlay_raises_on_empty_inputs():
+    with pytest.raises(vrt.RenderError) as exc_info:
+        await vrt.overlay_audio_at_offset(b"", b"overlay", 0.0)
+    assert exc_info.value.code == "empty_input"
+    with pytest.raises(vrt.RenderError) as exc_info:
+        await vrt.overlay_audio_at_offset(b"base", b"", 0.0)
+    assert exc_info.value.code == "empty_input"
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_overlay_raises_ffmpeg_failed_on_genuinely_malformed_input():
+    with pytest.raises(vrt.RenderError) as exc_info:
+        await vrt.overlay_audio_at_offset(b"not-real-audio", b"also-not-real", 0.0)
+    assert exc_info.value.code == "ffmpeg_failed"
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_overlay_produces_a_real_mixed_track_preserving_base_duration():
+    base = await _make_test_clip(kind="audio_only", duration=1.0)
+    overlay = await _make_test_clip(kind="audio_only", duration=0.3)
+
+    mixed = await vrt.overlay_audio_at_offset(base, overlay, 0.5)
+
+    assert len(mixed) > 0
+    assert await vrt.probe_audio_duration_seconds(mixed) == pytest.approx(1.0, abs=0.15)
+
+
+@pytest.mark.skipif(NO_FFPROBE, reason="ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_audio_duration_seconds_reports_a_real_duration():
+    clip = await _make_test_clip(kind="audio_only", duration=0.7)
+    duration = await vrt.probe_audio_duration_seconds(clip)
+    assert duration == pytest.approx(0.7, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_probe_audio_duration_seconds_returns_none_without_ffprobe(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffprobe", lambda: None)
+    assert await vrt.probe_audio_duration_seconds(b"anything") is None
+
+
+@pytest.mark.asyncio
+async def test_probe_audio_duration_seconds_returns_none_for_empty_input():
+    assert await vrt.probe_audio_duration_seconds(b"") is None
