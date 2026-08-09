@@ -199,56 +199,112 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         # them.
         await _set_step(db, lesson_id, "audio_extraction", "running")
         transcribe_bytes, transcribe_ct = raw, stored_ct
+        # has_audio starts True (the audio-only branch below never probes,
+        # and an "unknown" probe result must be treated as "might have
+        # audio, proceed as before" — see probe_audio_stream_status's own
+        # docstring). Only a POSITIVELY CONFIRMED absent stream sets this
+        # False; ambiguity must never cause real speech to be skipped.
+        has_audio = True
         if "video" in (stored_ct or "").lower():
-            try:
-                extracted = await video_render_tools.extract_audio_track(raw, stored_ct)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("video_pipeline: audio extraction errored lesson=%s (%s)", lesson_id, exc)
-                extracted = None
-            if extracted:
-                transcribe_bytes, transcribe_ct = extracted, "audio/mpeg"
-                await _set_step(db, lesson_id, "audio_extraction", "complete")
-            else:
+            audio_status = await video_render_tools.probe_audio_stream_status(raw, content_type=stored_ct)
+            if audio_status == "absent":
+                # Root-cause fix for a real production incident: a genuinely
+                # silent video was previously falling through to "extraction
+                # failed — send the original video", which then sent the
+                # ENTIRE raw file (sometimes 100+MB) through Gemini's Files
+                # API purely to be told there is no speech — slow enough to
+                # trip the pipeline watchdog on a large upload. A confirmed-
+                # absent audio stream is known locally, in milliseconds, via
+                # ffprobe, so speech recognition is skipped outright instead.
+                has_audio = False
                 await _set_step(
                     db, lesson_id, "audio_extraction", "complete",
-                    "extraction unavailable or failed — sending original video to the provider",
+                    "no audio track detected — this video is silent",
                 )
+            else:
+                try:
+                    extracted = await video_render_tools.extract_audio_track(raw, stored_ct)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("video_pipeline: audio extraction errored lesson=%s (%s)", lesson_id, exc)
+                    extracted = None
+                if extracted:
+                    transcribe_bytes, transcribe_ct = extracted, "audio/mpeg"
+                    await _set_step(db, lesson_id, "audio_extraction", "complete")
+                else:
+                    await _set_step(
+                        db, lesson_id, "audio_extraction", "complete",
+                        "extraction unavailable or failed — sending original video to the provider",
+                    )
         else:
             await _set_step(db, lesson_id, "audio_extraction", "complete", "media is already audio-only")
 
-        # 3 — speech recognition (Gemini / mock, provider-neutral surface)
-        await _set_step(db, lesson_id, "speech_recognition", "running")
-        await sync_studio_tools.mark_alignment_processing(db, sync_id)
-        result = await provider.align(transcribe_bytes, transcribe_ct)
-        transcript_text = result.get("transcriptText", "")
-        await _set_step(db, lesson_id, "speech_recognition", "complete")
+        # 3 — speech recognition (Gemini / mock, provider-neutral surface).
+        # Skipped entirely — never "running" then "failed" — for a
+        # confirmed-silent video: there is nothing to transcribe, and this
+        # is an expected, valid production mode (a purely visual lesson),
+        # not an error condition (see Section 5/13 of the silent-video
+        # production spec this satisfies).
+        if has_audio:
+            await _set_step(db, lesson_id, "speech_recognition", "running")
+            await sync_studio_tools.mark_alignment_processing(db, sync_id)
+            result = await provider.align(transcribe_bytes, transcribe_ct)
+            transcript_text = result.get("transcriptText", "")
+            await _set_step(db, lesson_id, "speech_recognition", "complete")
 
-        # 3 — synchronization generation (canonical schema, versioned)
-        await _set_step(db, lesson_id, "synchronization", "running")
-        sync_doc = await sync_studio_tools.apply_alignment_result(db, sync_id, result["sync"])
-        duration = float(sync_doc.get("durationSec") or 0.0)
-        if duration > 0:
-            await db[LESSONS_COLL].update_one(
-                {"lessonId": lesson_id, "durationSec": {"$in": [0, 0.0, None]}},
-                {"$set": {"durationSec": round(duration, 3)}},
-            )
-        await _set_step(db, lesson_id, "synchronization", "complete")
-
-        # 4 — Gemini educational analysis (never sinks the pipeline)
-        await _set_step(db, lesson_id, "educational_analysis", "running")
-        analysis = await video_ai_provider.analyze_transcript(
-            transcript_text, title=lesson.get("title", ""),
-        )
-        if analysis.get("ok"):
-            learning = {**analysis["learning"], "engine": analysis.get("engine"), "generatedAt": _now()}
-            await db[LESSONS_COLL].update_one(
-                {"lessonId": lesson_id}, {"$set": {"learning": learning}},
-            )
-            if learning.get("speakerLabels"):
-                await sync_studio_tools.suggest_speaker_labels(db, sync_id, learning["speakerLabels"])
-            await _set_step(db, lesson_id, "educational_analysis", "complete")
+            # 3 — synchronization generation (canonical schema, versioned)
+            await _set_step(db, lesson_id, "synchronization", "running")
+            sync_doc = await sync_studio_tools.apply_alignment_result(db, sync_id, result["sync"])
+            duration = float(sync_doc.get("durationSec") or 0.0)
+            if duration > 0:
+                await db[LESSONS_COLL].update_one(
+                    {"lessonId": lesson_id, "durationSec": {"$in": [0, 0.0, None]}},
+                    {"$set": {"durationSec": round(duration, 3)}},
+                )
+            await _set_step(db, lesson_id, "synchronization", "complete")
         else:
-            await _set_step(db, lesson_id, "educational_analysis", "failed", analysis.get("reason"))
+            transcript_text = ""
+            await _set_step(db, lesson_id, "speech_recognition", "skipped",
+                             "no audio track — nothing to transcribe")
+            # An empty-but-valid sync document (the SAME shape a real
+            # zero-segment Gemini answer would produce via segments_to_
+            # sync([...])) — so every downstream consumer (Story Analysis's
+            # transcript lookup, Sync Review Studio, the student Teleprompter)
+            # sees one consistent, genuinely valid document, never one stuck
+            # mid-"processing".
+            empty_sync = video_ai_provider.segments_to_sync(
+                [], provider_category="speech_recognition", provider_version="no-audio-v1",
+                generated_at=_now(),
+            )
+            await sync_studio_tools.apply_alignment_result(db, sync_id, empty_sync)
+            await _set_step(db, lesson_id, "synchronization", "skipped",
+                             "no transcript to synchronize — this video has no audio")
+
+        # 4 — Gemini educational analysis (never sinks the pipeline). An
+        # empty transcript — whether from a silent video or from real audio
+        # that simply has no speech — is an EXPECTED, valid state, never a
+        # failure: this text-based stage genuinely has nothing to analyze,
+        # and the visual Story Analysis path (Gemini 2.5 Pro, independent
+        # of this pipeline) is what understands a purely visual lesson.
+        if not transcript_text.strip():
+            await _set_step(
+                db, lesson_id, "educational_analysis", "skipped",
+                "no transcript to analyze — run Story Analysis for visual understanding",
+            )
+        else:
+            await _set_step(db, lesson_id, "educational_analysis", "running")
+            analysis = await video_ai_provider.analyze_transcript(
+                transcript_text, title=lesson.get("title", ""),
+            )
+            if analysis.get("ok"):
+                learning = {**analysis["learning"], "engine": analysis.get("engine"), "generatedAt": _now()}
+                await db[LESSONS_COLL].update_one(
+                    {"lessonId": lesson_id}, {"$set": {"learning": learning}},
+                )
+                if learning.get("speakerLabels"):
+                    await sync_studio_tools.suggest_speaker_labels(db, sync_id, learning["speakerLabels"])
+                await _set_step(db, lesson_id, "educational_analysis", "complete")
+            else:
+                await _set_step(db, lesson_id, "educational_analysis", "failed", analysis.get("reason"))
 
         # 5 — review ready
         await _set_step(db, lesson_id, "review_ready", "complete")

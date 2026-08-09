@@ -154,6 +154,58 @@ async def test_probe_correctly_reports_false_for_a_video_only_file():
     assert await vrt.probe_has_audio_stream(video_only) is False
 
 
+# ── probe_audio_stream_status: tri-state present/absent/unknown ───────────
+# The root cause this exists to fix: silently treating "could not verify"
+# the same as "confirmed no audio" would make a video that DOES have
+# speech silently skip real speech recognition just because ffprobe
+# momentarily failed — far worse than the slow-but-correct prior behavior.
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_status_reports_absent_for_a_genuinely_silent_video():
+    video_only = await _make_test_clip(kind="video_only")
+    assert await vrt.probe_audio_stream_status(video_only) == "absent"
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_status_reports_present_for_a_video_with_real_audio():
+    video_with_audio = await _make_video_with_audio_clip()
+    assert await vrt.probe_audio_stream_status(video_with_audio) == "present"
+
+
+@pytest.mark.asyncio
+async def test_probe_status_reports_unknown_for_empty_bytes():
+    assert await vrt.probe_audio_stream_status(b"") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_probe_status_reports_unknown_when_ffprobe_and_ffmpeg_both_missing(monkeypatch):
+    monkeypatch.setattr(vrt.shutil, "which", lambda name: None)
+    assert await vrt.probe_audio_stream_status(b"anything") == "unknown"
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_status_reports_unknown_for_genuinely_unreadable_bytes(monkeypatch):
+    """A file ffmpeg/ffprobe can't even open (corrupt/garbage bytes) is a
+    real "could not verify" — must never be reported as "absent", since
+    that would incorrectly authorize a caller to skip real ASR."""
+    monkeypatch.setattr(vrt, "_resolve_ffprobe", lambda: None)
+    status = await vrt.probe_audio_stream_status(b"not-a-real-video-file")
+    assert status == "unknown"
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_has_audio_stream_treats_both_absent_and_unknown_as_false():
+    """probe_has_audio_stream's existing boolean contract must be
+    unchanged by the tri-state refactor — both "absent" and "unknown"
+    still resolve to False for its existing callers."""
+    video_only = await _make_test_clip(kind="video_only")
+    assert await vrt.probe_has_audio_stream(video_only) is False
+    assert await vrt.probe_has_audio_stream(b"") is False
+
+
 @pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
 @pytest.mark.asyncio
 async def test_mux_raises_ffmpeg_failed_on_genuinely_malformed_input():

@@ -591,18 +591,21 @@ async def overlay_audio_at_offset(
                 pass
 
 
-async def probe_has_audio_stream(video_bytes: bytes, *, content_type: str = "video/mp4",
-                                  timeout: float = 30.0) -> bool:
-    """Media-inspection verification (not just 'the browser could play an
-    overlay') — confirms a file genuinely contains an audio stream, per
-    the explicit 'physically embedded, not just playable' requirement.
-    Uses ffprobe when available; falls back to parsing the resolved
-    ffmpeg binary's own stderr stream listing when it isn't (imageio-
-    ffmpeg does not bundle ffprobe). Returns False (never raises) when
-    nothing can be resolved — callers must treat that as 'could not
-    verify', not 'verified absent'."""
+async def probe_audio_stream_status(video_bytes: bytes, *, content_type: str = "video/mp4",
+                                     timeout: float = 30.0) -> str:
+    """Tri-state media-inspection verification: `"present"`, `"absent"`, or
+    `"unknown"`. Distinguishing `"absent"` (POSITIVELY confirmed — ffprobe/
+    ffmpeg genuinely read the file and found no audio stream) from
+    `"unknown"` (ffprobe/ffmpeg unavailable, or the probe itself failed to
+    read the file) matters for any caller that wants to SKIP audio
+    processing when there's genuinely nothing to process: treating
+    `"unknown"` the same as `"absent"` would silently skip real speech
+    recognition on a video that DOES have audio, just because probing
+    momentarily couldn't run. Only `"absent"` is a safe signal to skip —
+    `"unknown"` must always be handled the same as `"present"` (proceed as
+    if audio might be there)."""
     if not video_bytes:
-        return False
+        return "unknown"
     ext = ".mp4" if "mp4" in (content_type or "") else ".bin"
     work_id = uuid.uuid4().hex
     path = os.path.join(tempfile.gettempdir(), f"vnr_probe_{work_id}{ext}")
@@ -617,23 +620,46 @@ async def probe_has_audio_stream(video_bytes: bytes, *, content_type: str = "vid
                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", path,
                 timeout=timeout,
             )
-            return code == 0 and b"audio" in out
+            if code != 0:
+                return "unknown"
+            return "present" if b"audio" in out else "absent"
 
         ffmpeg = _resolve_ffmpeg()
         if not ffmpeg:
-            return False
+            return "unknown"
         # No dedicated ffprobe binary — ffmpeg itself prints full stream
         # info to stderr whenever given an input, even with no output
         # requested (a standard, documented technique). Exit code is
-        # nonzero in that case (no output specified) — that's expected;
-        # only the stream listing in stderr is inspected.
+        # nonzero in that case (no output specified) — that's expected.
+        # An empty/garbled stderr with no stream listing at all means the
+        # input itself couldn't be read (corrupt bytes, unsupported
+        # container) — that is "unknown", never "absent".
         _code, _out, err = await _run(ffmpeg, "-i", path, timeout=timeout)
-        return b"Audio:" in err
+        if b"Stream #" not in err:
+            return "unknown"
+        return "present" if b"Audio:" in err else "absent"
     except RenderError:
-        return False
+        return "unknown"
     finally:
         try:
             if os.path.exists(path):
                 os.remove(path)
         except OSError:
             pass
+
+
+async def probe_has_audio_stream(video_bytes: bytes, *, content_type: str = "video/mp4",
+                                  timeout: float = 30.0) -> bool:
+    """Media-inspection verification (not just 'the browser could play an
+    overlay') — confirms a file genuinely contains an audio stream, per
+    the explicit 'physically embedded, not just playable' requirement.
+    Thin boolean wrapper over probe_audio_stream_status(): both "absent"
+    and "unknown" resolve to False here, which is the correct conservative
+    choice for this function's existing callers (e.g. deciding whether to
+    duck/preserve source audio during a mux — when audio can't be
+    confirmed, treating it as absent and falling back to mute is safe).
+    Callers that need to tell "confirmed absent" apart from "could not
+    verify" (e.g. deciding whether to SKIP speech recognition entirely)
+    must call probe_audio_stream_status() directly instead."""
+    status = await probe_audio_stream_status(video_bytes, content_type=content_type, timeout=timeout)
+    return status == "present"

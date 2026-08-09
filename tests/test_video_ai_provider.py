@@ -187,6 +187,39 @@ async def test_align_reports_no_candidates_returned_when_response_is_empty():
     assert "no candidates returned" in exc.value.message
 
 
+# ── Story Analysis must work for a silent video — no ASR/transcript
+#    dependency, and the prompt must say so explicitly (Section 4). ────────
+def test_story_prompt_explicitly_tells_gemini_the_video_may_have_no_audio():
+    prompt = vap._STORY_PROMPT_TEMPLATE
+    assert "NO AUDIO" in prompt
+    assert "silent" in prompt.lower()
+    assert "visual" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_works_with_a_genuinely_empty_transcript():
+    """A silent video passes transcript_text="" — analyze_story must still
+    call Gemini with the real video and succeed; an empty transcript is a
+    valid, expected input, never a reason to fail before even trying."""
+    client = _RecordingGeminiClient(_gemini_json_response({
+        "summary": "A visual-only story.", "narrativeArc": "setup/resolution",
+        "characters": [{"name": "Maya", "description": "the protagonist"}],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 5.0, "title": "Opening",
+             "description": "Maya walks into a quiet room.", "characters": ["Maya"], "speakers": [],
+             "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "Maya feels curious."},
+        ],
+    }))
+    result = await vap.analyze_story(
+        b"fake-silent-video-bytes", "video/mp4", transcript_text="", http_client=client,
+    )
+    assert result["ok"] is True
+    assert result["storyAnalysis"]["scenes"][0]["speakers"] == []  # no invented speaker
+    assert len(client.calls) == 1  # the video was genuinely sent, not skipped
+
+
 @pytest.mark.asyncio
 async def test_analyze_story_actually_requests_the_pro_model():
     client = _RecordingGeminiClient(_gemini_json_response({

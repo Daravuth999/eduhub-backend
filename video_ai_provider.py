@@ -280,9 +280,19 @@ _ASR_PROMPT = (
 _STORY_PROMPT_TEMPLATE = (
     "You are a professional story analyst for an English-learning video "
     "platform. You have the FULL video attached, plus its already-"
-    "transcribed dialogue below for speaker-id reference. Analyze the "
-    "WHOLE story as one continuous narrative — never analyze isolated "
+    "transcribed dialogue below (if any) for speaker-id reference. Analyze "
+    "the WHOLE story as one continuous narrative — never analyze isolated "
     "fragments in isolation from what came before.\n"
+    "IMPORTANT: the video may contain NO AUDIO AT ALL — no dialogue, "
+    "narration, music, or sound effects. This is a normal, fully supported "
+    "case, not an error. Do NOT depend on dialogue, transcript, narration, "
+    "music, or sound effects to understand the story — analyze the visual "
+    "footage directly: character actions, facial expressions, body "
+    "language, environment, objects, and how the scene visually changes. "
+    "If the transcript below is empty, that means the source is silent or "
+    "has no speech — proceed with visual-only analysis; leave "
+    "audioObservations fields empty rather than inventing sounds, and "
+    "leave a scene's speakers empty rather than inventing a speaker.\n"
     "Output STRICT JSON only — no markdown, with EXACTLY these keys:\n"
     "{{\n"
     '  "summary": "<2-4 sentence overview of the whole story>",\n'
@@ -316,7 +326,8 @@ _STORY_PROMPT_TEMPLATE = (
     "beat — never invent one to fill the list, and never guess a timestamp you are not confident "
     "about.\n\n"
     "Lesson title: {title}\n\n"
-    "Transcript (reference only — analyze the actual attached video, not just this text):\n{transcript}"
+    "Transcript (reference only — analyze the actual attached video, not just this text; "
+    "empty means no speech was detected — analyze the video visually):\n{transcript}"
 )
 
 _SCRIPT_PROMPT_TEMPLATE = (

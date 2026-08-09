@@ -311,3 +311,174 @@ async def test_extraction_exception_is_caught_and_falls_back_honestly(monkeypatc
 
     assert pipeline["state"] == "complete"
     assert provider.calls[0] == (b"fake-video-bytes", "video/mp4")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Silent video — a first-class supported production mode, not an error.
+# Root-cause fix for a real production incident: a genuinely silent video
+# (no audio stream at all) previously fell through to "extraction failed —
+# send the original video", which then sent the ENTIRE raw file through
+# Gemini's Files API purely to be told there is no speech — slow enough to
+# trip the pipeline's 600s watchdog on a large upload and surface as a
+# confusing "stalled" failure. A confirmed-absent audio stream is now
+# detected locally via ffprobe in milliseconds, and speech recognition/
+# synchronization/educational analysis are honestly SKIPPED — never
+# "running" forever, never "failed" — while the pipeline still reaches
+# "complete" so Story Analysis (independent of this pipeline entirely) is
+# immediately usable.
+# ═════════════════════════════════════════════════════════════════════════
+async def _make_silent_video(*, duration: float = 1.0) -> bytes:
+    """A real, ffmpeg-generated video with NO audio stream whatsoever."""
+    import os
+    import tempfile
+    import uuid
+
+    path = os.path.join(tempfile.gettempdir(), f"vae_silent_{uuid.uuid4().hex}.mp4")
+    args = [
+        "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=green:s=64x64:d={duration}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", path,
+    ]
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, tuple(args), 30.0)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_silent_video_skips_speech_recognition_without_calling_the_provider(monkeypatch):
+    _stub_downstream(monkeypatch)
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    provider = _RecordingProvider()
+    monkeypatch.setattr(vpt.video_ai_provider, "get_video_ai_provider", lambda: provider)
+    silent_video = await _make_silent_video()
+
+    pipeline = await vpt.run_pipeline(db, "vid_1", _FakeBucket(silent_video, "video/mp4"))
+
+    assert pipeline["state"] == "complete"  # never stuck, never a red failure
+    assert pipeline["steps"]["audio_extraction"]["status"] == "complete"
+    assert "no audio" in pipeline["steps"]["audio_extraction"]["error"].lower()
+    assert pipeline["steps"]["speech_recognition"]["status"] == "skipped"
+    assert pipeline["steps"]["synchronization"]["status"] == "skipped"
+    assert pipeline["steps"]["educational_analysis"]["status"] == "skipped"
+    assert pipeline["steps"]["review_ready"]["status"] == "complete"
+    assert provider.calls == []  # the whole point: never call the provider on silence
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_silent_video_never_attempts_audio_extraction(monkeypatch):
+    """Extraction itself is pointless when there's confirmed no audio
+    stream to pull — this must be skipped too, not just its slow ASR
+    consequence."""
+    _stub_downstream(monkeypatch)
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    provider = _RecordingProvider()
+    monkeypatch.setattr(vpt.video_ai_provider, "get_video_ai_provider", lambda: provider)
+    extraction_calls = []
+
+    async def _spy(*a, **k):
+        extraction_calls.append(1)
+        return None
+
+    monkeypatch.setattr(vpt.video_render_tools, "extract_audio_track", _spy)
+    silent_video = await _make_silent_video()
+
+    await vpt.run_pipeline(db, "vid_1", _FakeBucket(silent_video, "video/mp4"))
+    assert extraction_calls == []
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_silent_video_still_applies_a_valid_empty_sync_document(monkeypatch):
+    """apply_alignment_result must still be called with a genuinely valid
+    (though empty) sync fragment — downstream consumers like Story
+    Analysis's transcript lookup must see a real document, never one
+    stuck at alignmentStatus="processing"."""
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    provider = _RecordingProvider()
+    monkeypatch.setattr(vpt.video_ai_provider, "get_video_ai_provider", lambda: provider)
+
+    applied = []
+
+    async def _fake_apply(db_, sync_id, aligned):
+        applied.append(aligned)
+        return {"durationSec": 0.0}
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(vpt.sync_studio_tools, "mark_alignment_processing", _noop)
+    monkeypatch.setattr(vpt.sync_studio_tools, "apply_alignment_result", _fake_apply)
+    monkeypatch.setattr(vpt.sync_studio_tools, "suggest_speaker_labels", _noop)
+    monkeypatch.setattr(vpt.sync_studio_tools, "mark_alignment_failed", _noop)
+    silent_video = await _make_silent_video()
+
+    pipeline = await vpt.run_pipeline(db, "vid_1", _FakeBucket(silent_video, "video/mp4"))
+
+    assert pipeline["state"] == "complete"
+    assert len(applied) == 1
+    from sync_schema import validate_sync_document
+    ok, errors = validate_sync_document({
+        "syncId": "x", "mediaRef": "", "syncVersion": 1, **applied[0],
+    })
+    assert ok, errors
+    assert applied[0]["paragraphs"] == [{"id": "p1", "start": 0.0, "end": 0.0, "confidence": {}, "sentences": []}]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_probe_never_skips_real_speech_recognition(monkeypatch):
+    """If the probe can't confirm anything (ffmpeg/ffprobe unavailable, or
+    the input is unreadable), the pipeline must proceed exactly as before
+    — never silently skip real ASR just because verification failed. This
+    is the safety property that makes the tri-state probe correct."""
+    _stub_downstream(monkeypatch)
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    provider = _RecordingProvider()
+    monkeypatch.setattr(vpt.video_ai_provider, "get_video_ai_provider", lambda: provider)
+
+    async def _unknown(*a, **k):
+        return "unknown"
+
+    monkeypatch.setattr(vpt.video_render_tools, "probe_audio_stream_status", _unknown)
+
+    pipeline = await vpt.run_pipeline(db, "vid_1", _FakeBucket(b"fake-video-bytes", "video/mp4"))
+
+    assert pipeline["steps"]["speech_recognition"]["status"] == "complete"
+    assert len(provider.calls) == 1  # real ASR still ran — ambiguity never authorizes a skip
+
+
+@pytest.mark.asyncio
+async def test_a_real_provider_failure_on_a_video_with_audio_still_fails_the_stage(monkeypatch):
+    """Confirming Section 13's distinction holds: an ACTUAL provider
+    failure (not an expected absence) must still produce a real failed
+    state, never be swallowed as if it were a silent-video skip."""
+    _stub_downstream(monkeypatch)
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+
+    class _FailingProvider:
+        category = "speech_recognition"
+        provider_version = "failing-test-v1"
+
+        async def align(self, media_bytes, content_type="audio/mpeg"):
+            raise video_ai_provider.VideoAiError("provider_rejected", "Gemini HTTP 500")
+
+    monkeypatch.setattr(vpt.video_ai_provider, "get_video_ai_provider", lambda: _FailingProvider())
+
+    async def _unknown(*a, **k):
+        return "unknown"  # can't confirm silence — must still attempt real ASR
+
+    monkeypatch.setattr(vpt.video_render_tools, "probe_audio_stream_status", _unknown)
+
+    pipeline = await vpt.run_pipeline(db, "vid_1", _FakeBucket(b"fake-video-bytes", "video/mp4"))
+
+    assert pipeline["state"] == "failed"
+    assert pipeline["steps"]["speech_recognition"]["status"] == "failed"
+    assert "provider_rejected" in pipeline["error"] or "VideoAiError" in pipeline["error"]
