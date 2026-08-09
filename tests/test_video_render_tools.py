@@ -269,3 +269,57 @@ async def test_probe_audio_duration_seconds_returns_none_without_ffprobe(monkeyp
 @pytest.mark.asyncio
 async def test_probe_audio_duration_seconds_returns_none_for_empty_input():
     assert await vrt.probe_audio_duration_seconds(b"") is None
+
+
+# ── extract_audio_track — root-cause fix for the "130MB video stuck at
+#    speech_recognition" incident: send audio, not the whole video ───────
+@pytest.mark.asyncio
+async def test_extract_audio_track_returns_none_for_empty_input():
+    assert await vrt.extract_audio_track(b"") is None
+
+
+@pytest.mark.asyncio
+async def test_extract_audio_track_returns_none_without_ffmpeg(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    assert await vrt.extract_audio_track(b"anything", "video/mp4") is None
+
+
+@pytest.mark.asyncio
+async def test_extract_audio_track_returns_none_for_a_video_with_no_audio_stream(monkeypatch):
+    video_only = await _make_test_clip(kind="video_only")
+    assert await vrt.extract_audio_track(video_only, "video/mp4") is None
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_extract_audio_track_produces_real_playable_audio_from_a_real_video():
+    video_with_audio = await _make_video_with_audio_clip(duration=1.0)
+
+    extracted = await vrt.extract_audio_track(video_with_audio, "video/mp4")
+
+    assert extracted is not None
+    assert len(extracted) > 0
+    duration = await vrt.probe_audio_duration_seconds(extracted)
+    assert duration == pytest.approx(1.0, abs=0.2)
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_extract_audio_track_dramatically_shrinks_a_representative_lesson_sized_clip():
+    """Reproduces the reported incident's relevant media characteristic —
+    NOT the literal 130MB/3-minute file (impractical to generate in a unit
+    test), but the property that actually matters: a video whose audio
+    content is what needs transcribing, at a duration long enough that the
+    resulting size reduction is representative rather than noise-dominated
+    (short clips have disproportionate container/codec overhead). A real,
+    uncompressed-video-heavy source (raw color frames re-encoded) makes the
+    video stream intentionally large relative to its short duration, so
+    the extracted-audio-only track is verified to be genuinely smaller —
+    not merely "some bytes came back"."""
+    video_with_audio = await _make_video_with_audio_clip(duration=6.0)
+    extracted = await vrt.extract_audio_track(video_with_audio, "video/mp4")
+
+    assert extracted is not None
+    assert len(extracted) < len(video_with_audio)
+    duration = await vrt.probe_audio_duration_seconds(extracted)
+    assert duration == pytest.approx(6.0, abs=0.3)

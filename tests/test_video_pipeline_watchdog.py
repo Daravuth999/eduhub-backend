@@ -182,6 +182,18 @@ def _stub_sync_studio(monkeypatch):
     monkeypatch.setattr(vpt.sync_studio_tools, "suggest_speaker_labels", _noop)
     monkeypatch.setattr(vpt.sync_studio_tools, "mark_alignment_failed", _noop)
 
+    # Audio extraction's own correctness (real ffmpeg) is covered by
+    # video_render_tools' test file — stubbed here as a fast no-op so this
+    # file's own artificially tiny PIPELINE_TIMEOUT_S (see _fast_watchdog)
+    # isn't spent on a real subprocess spawn unrelated to what this file
+    # actually tests. Returning None is itself a real, honest code path
+    # (extraction unavailable/failed -> fall back to the original bytes),
+    # not a shortcut around the pipeline's own logic.
+    async def _no_extraction(*a, **k):
+        return None
+
+    monkeypatch.setattr(vpt.video_render_tools, "extract_audio_track", _no_extraction)
+
 
 # ── the actual regression: a stalled I/O call must become a truthful
 #    "failed" state, never an eternal "running" one ────────────────────────

@@ -37,6 +37,7 @@ from fastapi import Body, Depends, HTTPException
 
 import sync_studio_tools
 import video_ai_provider
+import video_render_tools
 
 logger = logging.getLogger("eduhub.video_pipeline")
 
@@ -44,6 +45,7 @@ LESSONS_COLL = "video_lessons"  # same constant as video_library_tools.LESSONS_C
 
 PIPELINE_STEPS = (
     "media_check",
+    "audio_extraction",
     "speech_recognition",
     "synchronization",
     "educational_analysis",
@@ -184,10 +186,40 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         stored_ct = lesson.get("contentType") or content_type
         await _set_step(db, lesson_id, "media_check", "complete")
 
-        # 2 — speech recognition (Gemini / mock, provider-neutral surface)
+        # 2 — audio extraction (root-cause fix: speech recognition never
+        # needs video frames, but a video-typed lesson was previously sent
+        # to the provider in full — for a large upload that means a slow
+        # large-file provider upload/processing round trip for no reason.
+        # Extracting just the audio track first shrinks a typical few-
+        # minute lesson from tens/hundreds of MB down to a few MB, which
+        # usually fits the provider's inline-request path entirely. Best-
+        # effort and never fatal: any failure here honestly falls back to
+        # sending the original media, exactly the pipeline's prior
+        # behavior — this step can only make things faster, never break
+        # them.
+        await _set_step(db, lesson_id, "audio_extraction", "running")
+        transcribe_bytes, transcribe_ct = raw, stored_ct
+        if "video" in (stored_ct or "").lower():
+            try:
+                extracted = await video_render_tools.extract_audio_track(raw, stored_ct)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("video_pipeline: audio extraction errored lesson=%s (%s)", lesson_id, exc)
+                extracted = None
+            if extracted:
+                transcribe_bytes, transcribe_ct = extracted, "audio/mpeg"
+                await _set_step(db, lesson_id, "audio_extraction", "complete")
+            else:
+                await _set_step(
+                    db, lesson_id, "audio_extraction", "complete",
+                    "extraction unavailable or failed — sending original video to the provider",
+                )
+        else:
+            await _set_step(db, lesson_id, "audio_extraction", "complete", "media is already audio-only")
+
+        # 3 — speech recognition (Gemini / mock, provider-neutral surface)
         await _set_step(db, lesson_id, "speech_recognition", "running")
         await sync_studio_tools.mark_alignment_processing(db, sync_id)
-        result = await provider.align(raw, stored_ct)
+        result = await provider.align(transcribe_bytes, transcribe_ct)
         transcript_text = result.get("transcriptText", "")
         await _set_step(db, lesson_id, "speech_recognition", "complete")
 

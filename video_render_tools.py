@@ -143,6 +143,68 @@ async def source_has_audio_stream(video_bytes: bytes, video_content_type: str = 
     return await probe_has_audio_stream(video_bytes, content_type=video_content_type, timeout=timeout)
 
 
+async def extract_audio_track(
+    video_bytes: bytes, content_type: str = "video/mp4", *, timeout: float = 180.0,
+) -> bytes | None:
+    """Pulls just the audio track out of a video — for handing to a speech-
+    recognition provider instead of the whole video. A speech-recognition
+    prompt needs no visual frames, and audio-only is dramatically smaller
+    (mono/16kHz/64kbps): a typical few-minute lesson video shrinks from
+    tens/hundreds of MB down to a few MB, which usually fits under a
+    provider's inline-request size threshold entirely — avoiding a large
+    upload + server-side processing/polling round trip for the common case.
+
+    Root-cause context (real production incident: a ~3-minute/130MB upload
+    stuck at "speech_recognition: running"): the pipeline was previously
+    sending the ENTIRE video to Gemini's Files API for every video-typed
+    lesson, regardless of length, which is by far the slowest path
+    available (large raw upload, then server-side video processing before
+    the transcription request can even be made) for a capability (ASR)
+    that never needed the video frames in the first place.
+
+    Best-effort and NEVER a hard requirement: returns None (never raises)
+    when ffmpeg can't be resolved, the source has no audio stream, or
+    extraction genuinely fails for any reason — callers must fall back to
+    sending the original media, since Gemini's multimodal ASR does accept
+    video directly and this is purely a size/speed optimization, not a
+    correctness dependency."""
+    if not video_bytes:
+        return None
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+
+    ext = ".mp4" if "mp4" in (content_type or "") else ".bin"
+    work_id = uuid.uuid4().hex
+    in_path = os.path.join(tempfile.gettempdir(), f"vnr_extract_{work_id}_in{ext}")
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_extract_{work_id}_out.mp3")
+    try:
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
+        args = (
+            ffmpeg, "-y", "-i", in_path,
+            "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
+            out_path,
+        )
+        code, _out, err = await _run(*args, timeout=timeout)
+        if code != 0:
+            logger.info("video_render: audio extraction skipped (ffmpeg exit %s): %s",
+                        code, err.decode("utf-8", errors="replace")[-300:])
+            return None
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return data or None
+    except RenderError:
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 async def mux_narration_into_video(
     video_bytes: bytes, video_content_type: str, audio_bytes: bytes,
     *, treatment: str = DEFAULT_SOURCE_AUDIO_TREATMENT, timeout: float = 300.0,
