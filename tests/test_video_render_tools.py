@@ -124,6 +124,28 @@ async def test_real_mux_produces_a_file_with_a_genuine_embedded_audio_stream():
 
 @pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
 @pytest.mark.asyncio
+async def test_real_mux_output_is_faststart_moov_before_mdat():
+    """Proves -movflags +faststart actually took effect on a REAL rendered
+    file — not just that the flag is present in the ffmpeg invocation.
+    Without faststart, ffmpeg writes the MP4 "moov" atom (the index a
+    browser needs before it can report duration/seek points) AFTER "mdat"
+    (the actual media bytes), forcing the browser to fetch the entire file
+    before playback metadata resolves — the live-observed stuck "--:--"
+    duration / indefinite loading spinner on longer lessons. A correctly
+    faststart'd file has moov's box header appear before mdat's."""
+    video_only = await _make_test_clip(kind="video_only")
+    audio_only = await _make_test_clip(kind="audio_only")
+
+    rendered = await vrt.mux_narration_into_video(video_only, "video/mp4", audio_only)
+
+    moov_pos = rendered.find(b"moov")
+    mdat_pos = rendered.find(b"mdat")
+    assert moov_pos != -1 and mdat_pos != -1, "expected a real MP4 with both atoms present"
+    assert moov_pos < mdat_pos, "moov atom must precede mdat — faststart did not take effect"
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
 async def test_probe_correctly_reports_false_for_a_video_only_file():
     video_only = await _make_test_clip(kind="video_only")
     assert await vrt.probe_has_audio_stream(video_only) is False

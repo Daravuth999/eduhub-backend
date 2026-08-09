@@ -227,7 +227,14 @@ async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata:
         logger.info("sync_studio_tools: uploaded %s (%d bytes) url=%s", key, len(raw), url)
         return url
     except Exception as exc:  # noqa: BLE001
-        logger.warning("sync_studio_tools: R2 upload failed for key=%s (%s) — falling back to GridFS", key, exc)
+        # logger.exception (not .warning(str(exc))) — a bare str() of a
+        # botocore ClientError/EndpointConnectionError is often just
+        # "An error occurred" with no distinguishing detail; the full
+        # traceback is what actually lets an operator tell "credentials
+        # rejected" apart from "network unreachable" apart from "bucket
+        # missing" the next time an upload silently lands in GridFS instead
+        # of R2 (the exact opacity this project was flagged for).
+        logger.exception("sync_studio_tools: R2 upload failed for key=%s — falling back to GridFS", key)
         return None
 
 

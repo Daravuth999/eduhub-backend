@@ -267,6 +267,15 @@ async def mux_narration_into_video(
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
 
+        # -movflags +faststart relocates the MP4 "moov" atom (the index the
+        # browser needs to read before it knows duration/seek points) to the
+        # FRONT of the file. ffmpeg writes it at the END by default, which is
+        # harmless for local files but means a browser streaming this master
+        # over HTTP must download the entire multi-minute video before
+        # duration/seeking resolve — observed live as a stuck "--:--"
+        # duration and an indefinite loading spinner on longer lessons. This
+        # is a pure atom-relocation (no re-encode, no quality/timing change),
+        # so it's zero-risk to add.
         if effective_treatment == "mute":
             args = (
                 ffmpeg, "-y",
@@ -275,6 +284,7 @@ async def mux_narration_into_video(
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
+                "-movflags", "+faststart",
                 out_path,
             )
         else:
@@ -291,6 +301,7 @@ async def mux_narration_into_video(
                 "-map", "0:v:0", "-map", "[aout]",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
+                "-movflags", "+faststart",
                 out_path,
             )
 
