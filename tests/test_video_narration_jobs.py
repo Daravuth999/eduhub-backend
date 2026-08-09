@@ -233,8 +233,30 @@ async def test_fail_stage_becomes_retryable_then_terminal_after_budget_exhausted
         new_state = await jobs.fail_stage(db, "vid_1", "storyAnalysis", attempt, genver, "boom")
 
     assert new_state == jobs.S_FAILED_TERMINAL
-    reclaim, _ = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
-    assert reclaim is None  # terminal is never auto-retryable
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_is_reclaimable_only_by_an_explicit_manual_retry():
+    """failed_terminal is never auto-retried (nothing in this codebase
+    calls claim_stage except in direct response to an explicit route call,
+    which in production only happens from the Studio's own "Retry"
+    button — see RETRYABLE_STATES in VoiceProductionPanel.jsx, which
+    already lists failed_terminal). claim_stage must honor that manual
+    retry rather than refuse it with a permanent 409, which was the actual
+    production bug: a stage that legitimately exhausted its retry budget
+    could never be retried again from the UI at all."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    for _ in range(jobs.MAX_RETRIES + 1):
+        claimed, attempt = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+        genver = claimed["storyAnalysis"]["generationVersion"]
+        await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt, genver)
+        await jobs.fail_stage(db, "vid_1", "storyAnalysis", attempt, genver, "boom")
+    assert (await db.video_narration_jobs.find_one({"_id": "vid_1"}))["storyAnalysis"]["state"] == jobs.S_FAILED_TERMINAL
+
+    reclaim, attempt = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    assert reclaim is not None
+    assert reclaim["storyAnalysis"]["state"] == jobs.S_CLAIMED
 
 
 @pytest.mark.asyncio
@@ -273,7 +295,14 @@ async def test_concurrent_claims_only_one_wins():
 
 
 @pytest.mark.asyncio
-async def test_fail_unknown_is_never_auto_retryable():
+async def test_fail_unknown_is_reclaimable_only_by_an_explicit_manual_retry():
+    """unknown_outcome (the provider's actual outcome couldn't be
+    determined) must never be auto-retried — but, like failed_terminal, an
+    explicit admin "Retry" click must actually work. Before this fix,
+    claim_stage's filter omitted unknown_outcome entirely (despite
+    RETRY_ELIGIBLE declaring it retry-eligible), so a stage demoted to
+    unknown_outcome could never be claimed again — the exact production
+    deadlock this suite now guards against."""
     db = _FakeDB()
     await jobs.get_or_create_job(db, "vid_1")
     claimed, attempt = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
@@ -281,5 +310,110 @@ async def test_fail_unknown_is_never_auto_retryable():
     await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt, genver)
     state = await jobs.fail_unknown(db, "vid_1", "storyAnalysis", attempt, genver, "network timeout mid-request")
     assert state == jobs.S_UNKNOWN
+
+    reclaim, attempt2 = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    assert reclaim is not None
+    assert reclaim["storyAnalysis"]["state"] == jobs.S_CLAIMED
+    assert attempt2 != attempt
+
+
+@pytest.mark.asyncio
+async def test_fence_provider_refreshes_the_lease_to_the_callers_watchdog_bound():
+    """CLAIM_LEASE_S (180s) covers the claim-to-fence handoff, not the
+    provider call itself. Before this fix, claimExpiresAt stayed fixed at
+    the ORIGINAL claim's 180s deadline even while a legitimately slow but
+    healthy provider call (e.g. a 300s ffmpeg render mux) was still
+    honestly in progress — making it indistinguishable from a crashed
+    stage to any staleness check. fence_provider must refresh it to
+    whatever the caller's own outer watchdog bound is."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    claimed, attempt = await jobs.claim_stage(db, "vid_1", "render")
+    genver = claimed["render"]["generationVersion"]
+    short_lease_expiry = claimed["render"]["claimExpiresAt"]
+
+    await jobs.fence_provider(db, "vid_1", "render", attempt, genver, lease_s=900)
+
+    doc = await db.video_narration_jobs.find_one({"_id": "vid_1"})
+    assert doc["render"]["claimExpiresAt"] > short_lease_expiry
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_job_heals_a_stage_stranded_past_its_lease():
+    """The core fix for the production deadlock: a worker crash mid-flight
+    leaves a stage at provider_pending/claimed forever, because the ONLY
+    prior demotion path required someone to call claim_stage again for
+    that exact stage — and the Studio UI hides its Retry button for
+    exactly those two states (they look "still active"). Reading the job
+    must self-heal a genuinely expired stage to unknown_outcome so the
+    next poll shows a retryable state."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    claimed, attempt = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    genver = claimed["storyAnalysis"]["generationVersion"]
+    await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt, genver, lease_s=900)
+
+    # Simulate a process crash: the lease has genuinely expired.
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], "storyAnalysis.claimExpiresAt", "2000-01-01T00:00:00+00:00")
+
+    healed = await jobs.get_or_create_job(db, "vid_1")
+    assert healed["storyAnalysis"]["state"] == jobs.S_UNKNOWN
+    assert "restarted" in healed["storyAnalysis"]["lastError"].lower()
+
+    # And it's now genuinely retryable, closing the loop end-to-end.
     reclaim, _ = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
-    assert reclaim is None
+    assert reclaim is not None
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_job_never_touches_a_still_fresh_in_flight_stage():
+    """The safety half of the same fix: a stage genuinely, healthily still
+    running (lease not yet expired) must NEVER be touched — that's exactly
+    the "ambiguous in-flight provider call must never be silently
+    repeated" guarantee this whole engine exists to protect."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    claimed, attempt = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    genver = claimed["storyAnalysis"]["generationVersion"]
+    await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt, genver, lease_s=900)
+
+    untouched = await jobs.get_or_create_job(db, "vid_1")
+    assert untouched["storyAnalysis"]["state"] == jobs.S_PROVIDER_PENDING
+
+    reclaim, _ = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    assert reclaim is None  # still genuinely in flight — must not be reclaimable
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_job_heals_a_stranded_claimed_stage_for_ui_visibility():
+    """A stage that never even reached provider_pending (crashed between
+    claim and fence) is already directly reclaimable by claim_stage's own
+    filter — but the Studio UI ALSO hides its Retry button while state
+    looks like "claimed" (label: "Starting"). Heal it to unknown_outcome
+    too so the UI is never stuck showing an unretryable-looking state for
+    something the backend would actually accept right now."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    await jobs.claim_stage(db, "vid_1", "storyAnalysis")  # never fenced — crashed here
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], "storyAnalysis.claimExpiresAt", "2000-01-01T00:00:00+00:00")
+
+    healed = await jobs.get_or_create_job(db, "vid_1")
+    assert healed["storyAnalysis"]["state"] == jobs.S_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_job_heals_stranded_nested_scene_line_stages():
+    """The sweep must walk dynamically-keyed nested stages (voiceProduction.
+    <scene>.lines.<line>, sfx.<scene>) too, not just the four fixed
+    top-level stages — it can't be a hardcoded path list."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    path = "voiceProduction.sc1.lines.ln0"
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], path, jobs.new_stage())
+    claimed, attempt = await jobs.claim_stage(db, "vid_1", path)
+    genver = _get_dotted(claimed, path)["generationVersion"]
+    await jobs.fence_provider(db, "vid_1", path, attempt, genver, lease_s=900)
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], f"{path}.claimExpiresAt", "2000-01-01T00:00:00+00:00")
+
+    healed = await jobs.get_or_create_job(db, "vid_1")
+    assert _get_dotted(healed, path)["state"] == jobs.S_UNKNOWN

@@ -298,6 +298,77 @@ def test_route_refuses_retry_while_genuinely_running(monkeypatch):
     assert "already running" in r.json()["detail"]
 
 
+# ── read-time self-heal: GET .../pipeline must never keep reporting
+#    "running" once the watchdog ceiling has passed — otherwise the
+#    Studio's own retry button (hidden while `running`) never reappears,
+#    a genuine dead end distinct from the run_pipeline-level watchdog
+#    above (which only fires if the SAME process that started the run is
+#    still alive to await it) ────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_get_pipeline_status_heals_an_orphaned_running_pipeline_on_read(monkeypatch):
+    _stub_sync_studio(monkeypatch)
+    db = _FakeDB()
+    lesson = dict(LESSON)
+    lesson["pipeline"] = {
+        "state": "running", "currentStep": "speech_recognition", "provider": "mock-asr-v1",
+        "steps": {s: {"status": "pending", "error": None, "at": None} for s in vpt.PIPELINE_STEPS},
+        "startedAt": "2020-01-01T00:00:00Z", "finishedAt": None, "error": None, "log": [],
+    }
+    await db.video_lessons.insert_one(lesson)
+
+    status = await vpt.get_pipeline_status(db, "vid_1")
+
+    assert status["pipeline"]["state"] == "failed"
+    assert "restarted" in status["pipeline"]["error"].lower()
+    assert status["pipeline"]["steps"]["speech_recognition"]["status"] == "failed"
+
+    # And it's now genuinely retryable end-to-end, closing the loop.
+    pipeline = await vpt.run_pipeline(db, "vid_1", _FastBucket())
+    assert pipeline["state"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_get_pipeline_status_never_touches_a_still_fresh_running_pipeline():
+    db = _FakeDB()
+    lesson = dict(LESSON)
+    lesson["pipeline"] = {
+        "state": "running", "currentStep": "media_check", "provider": "mock-asr-v1",
+        "steps": {s: {"status": "pending", "error": None, "at": None} for s in vpt.PIPELINE_STEPS},
+        "startedAt": vpt._now(), "finishedAt": None, "error": None, "log": [],
+    }
+    await db.video_lessons.insert_one(lesson)
+
+    status = await vpt.get_pipeline_status(db, "vid_1")
+
+    assert status["pipeline"]["state"] == "running"  # still genuinely in flight
+
+
+def test_pipeline_status_route_self_heals_and_the_retry_route_then_accepts(monkeypatch):
+    """End-to-end proof at the HTTP layer: polling the status route for an
+    orphaned lesson flips it to failed, and the retry route (which the
+    Studio's now-visible Retry button calls) accepts immediately after —
+    no more permanent 409 dead end."""
+    monkeypatch.setattr(vpt, "schedule_pipeline", lambda *a, **k: None)
+    monkeypatch.setattr(vpt.sync_studio_tools, "get_media_bucket", lambda db: object())
+    db = _FakeDB()
+    lesson = dict(LESSON)
+    lesson["pipeline"] = {
+        "state": "running", "currentStep": "speech_recognition", "provider": "mock-asr-v1",
+        "steps": {s: {"status": "pending", "error": None, "at": None} for s in vpt.PIPELINE_STEPS},
+        "startedAt": "2020-01-01T00:00:00Z", "finishedAt": None, "error": None, "log": [],
+    }
+    asyncio.run(db.video_lessons.insert_one(lesson))
+    client = _make_client(db)
+
+    status = client.get("/api/studio/video/lessons/vid_1/pipeline")
+    assert status.status_code == 200
+    assert status.json()["pipeline"]["state"] == "failed"
+
+    retry = client.post("/api/studio/video/lessons/vid_1/pipeline/run")
+    assert retry.status_code == 200
+    assert retry.json()["scheduled"] is True
+
+
 def test_route_allows_retry_once_orphaned_running_pipeline_is_stale(monkeypatch):
     # schedule_pipeline is a fire-and-forget asyncio.create_task — stub it
     # so this test verifies the route's 409-vs-200 decision only, not a real

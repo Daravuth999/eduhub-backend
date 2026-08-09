@@ -375,7 +375,7 @@ async def run_story_analysis(db, lesson_id: str, media_bucket, *, lesson_getter,
     if claimed is None:
         raise VideoNarrationError("busy_or_done", "story analysis is already running or completed", 409)
     genver = claimed["storyAnalysis"]["generationVersion"]
-    if not await jobs.fence_provider(db, lesson_id, "storyAnalysis", attempt, genver):
+    if not await jobs.fence_provider(db, lesson_id, "storyAnalysis", attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
     async def _do() -> None:
@@ -424,7 +424,7 @@ async def run_script_blueprint(db, lesson_id: str, *, lesson_getter, sync_getter
     if claimed is None:
         raise VideoNarrationError("busy_or_done", "script blueprint is already running or completed", 409)
     genver = claimed["scriptBlueprint"]["generationVersion"]
-    if not await jobs.fence_provider(db, lesson_id, "scriptBlueprint", attempt, genver):
+    if not await jobs.fence_provider(db, lesson_id, "scriptBlueprint", attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
     async def _do() -> None:
@@ -501,7 +501,7 @@ async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *
     if claimed is None:
         return await jobs.get_or_create_job(db, lesson_id)  # already completed/in-flight — cost-safe no-op
     genver = jobs.get_path(claimed, path)["generationVersion"]
-    if not await jobs.fence_provider(db, lesson_id, path, attempt, genver):
+    if not await jobs.fence_provider(db, lesson_id, path, attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
     voice_assignments = claimed.get("voiceAssignments") or {}
@@ -599,7 +599,7 @@ async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=N
     if claimed is None:
         return await jobs.get_or_create_job(db, lesson_id)  # already completed/in-flight — cost-safe no-op
     genver = jobs.get_path(claimed, path)["generationVersion"]
-    if not await jobs.fence_provider(db, lesson_id, path, attempt, genver):
+    if not await jobs.fence_provider(db, lesson_id, path, attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
     try:
@@ -863,7 +863,7 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
     if claimed is None:
         raise VideoNarrationError("busy_or_done", "render is already running or completed", 409)
     genver = claimed["render"]["generationVersion"]
-    if not await jobs.fence_provider(db, lesson_id, "render", attempt, genver):
+    if not await jobs.fence_provider(db, lesson_id, "render", attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
     async def _do() -> None:

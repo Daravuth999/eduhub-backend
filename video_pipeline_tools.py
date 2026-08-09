@@ -279,6 +279,45 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
     return (final or {}).get("pipeline") or {}
 
 
+async def get_pipeline_status(db, lesson_id: str) -> dict:
+    """Read path for the Studio's ~2.5s poller. Self-heals a stale
+    "running" pipeline THE MOMENT it's observed: if the recorded run
+    started longer ago than PIPELINE_TIMEOUT_S, the process that was
+    running it is provably gone (a redeploy/crash/OOM kill — run_pipeline's
+    own asyncio.wait_for watchdog dies WITH the process, so it never gets
+    a chance to fire and mark the job failed). Without this, PipelinePanel.
+    jsx's retry button stays hidden forever (`!running &&` — see its
+    render logic), a genuine dead end: pipeline_run_route already has the
+    matching _pipeline_is_stale override to allow a manual retry, but
+    nothing can ever reach it if the button that calls it is never shown.
+    Marking it failed HERE, on every poll, means the very next poll shows
+    an honest, retryable state instead of an indefinite spinner."""
+    doc = await db[LESSONS_COLL].find_one(
+        {"lessonId": lesson_id}, {"_id": 0, "pipeline": 1, "learning": 1, "syncId": 1},
+    )
+    if not doc:
+        return {}
+    pipeline_doc = doc.get("pipeline")
+    if pipeline_doc and pipeline_doc.get("state") == "running" and _pipeline_is_stale(pipeline_doc):
+        message = (
+            f"Processing stalled — no progress in over {PIPELINE_TIMEOUT_S}s "
+            "(the server likely restarted mid-run). Safe to retry."
+        )
+        current_step = pipeline_doc.get("currentStep") or PIPELINE_STEPS[0]
+        await _set_step(db, lesson_id, current_step, "failed", message)
+        await _finish(db, lesson_id, "failed", message)
+        sync_id = doc.get("syncId")
+        if sync_id:
+            try:
+                await sync_studio_tools.mark_alignment_failed(db, sync_id)
+            except Exception:  # noqa: BLE001
+                pass
+        doc = await db[LESSONS_COLL].find_one(
+            {"lessonId": lesson_id}, {"_id": 0, "pipeline": 1, "learning": 1, "syncId": 1},
+        )
+    return doc or {}
+
+
 def schedule_pipeline(db, lesson_id: str, media_bucket) -> None:
     """Fire-and-forget background run — the upload route returns immediately
     and the Studio polls GET …/pipeline for progress."""
@@ -300,7 +339,7 @@ def register_video_pipeline_routes(api, db, require_admin) -> None:
 
     @api.get("/studio/video/lessons/{lesson_id}/pipeline")
     async def pipeline_status_route(lesson_id: str, _admin=Depends(require_admin)):
-        doc = await db[LESSONS_COLL].find_one({"lessonId": lesson_id}, {"_id": 0, "pipeline": 1, "learning": 1, "syncId": 1})
+        doc = await get_pipeline_status(db, lesson_id)
         if not doc:
             raise HTTPException(status_code=404, detail="lesson not found")
         return {"pipeline": doc.get("pipeline"), "learning": doc.get("learning"), "syncId": doc.get("syncId")}

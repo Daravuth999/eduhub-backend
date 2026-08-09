@@ -113,12 +113,66 @@ async def ensure_video_narration_job_indexes(db) -> None:
     await db[COLL].create_index("lessonId", unique=True)
 
 
+def _is_stage_dict(value) -> bool:
+    return isinstance(value, dict) and "state" in value and "claimExpiresAt" in value
+
+
+def _collect_stranded_stage_paths(node, prefix: str, now: str, out: list[str]) -> None:
+    """Recursively finds every stage dict (storyAnalysis/scriptBlueprint/
+    assembly/render, plus the dynamically-keyed voiceProduction.<scene>.
+    lines.<line> and sfx.<scene> stages) sitting in claimed/provider_pending
+    with an EXPIRED claimExpiresAt — proof the process that was running it
+    is gone (a redeploy/crash/OOM kill: the in-process asyncio.wait_for
+    watchdog dies WITH the process, so it never gets a chance to mark the
+    stage failed). Walks generically rather than a hardcoded path list so
+    it doesn't need updating every time a new stage type is added."""
+    if not isinstance(node, dict):
+        return
+    if _is_stage_dict(node):
+        if node.get("state") in (S_CLAIMED, S_PROVIDER_PENDING) \
+                and node.get("claimExpiresAt") and node["claimExpiresAt"] < now:
+            out.append(prefix)
+        return
+    for key, value in node.items():
+        if isinstance(value, dict):
+            _collect_stranded_stage_paths(value, f"{prefix}.{key}" if prefix else key, now, out)
+
+
+async def _heal_stranded_stages(db, lesson_id: str, doc: dict) -> dict:
+    """Self-heal on READ: without this, a stage stranded past its lease by
+    a dead process stays claimed/provider_pending forever, because the
+    ONLY existing demotion path (claim_stage's own lazy check) requires
+    someone to call claim_stage again for that exact stage — and the
+    Studio UI hides its Retry button for exactly those two "looks still
+    active" states (see RETRYABLE_STATES in VoiceProductionPanel.jsx), so
+    nothing ever calls it again. Demoting to unknown_outcome here means
+    the very next poll (every ~2.5s) shows an honest, retryable state
+    instead of an indefinite "Processing" with no way out. Never touches a
+    genuinely fresh in-flight stage — only one whose own claimExpiresAt
+    (refreshed by fence_provider to the caller's real outer watchdog
+    bound) has already passed."""
+    now = _now_iso()
+    stale_paths: list[str] = []
+    _collect_stranded_stage_paths(doc, "", now, stale_paths)
+    if not stale_paths:
+        return doc
+    updates = {"updatedAt": now}
+    for path in stale_paths:
+        updates[f"{path}.state"] = S_UNKNOWN
+        updates[f"{path}.lastError"] = (
+            "Processing stalled — the server likely restarted mid-run. Safe to retry."
+        )
+    await db[COLL].update_one({"_id": lesson_id}, {"$set": updates})
+    fresh = await db[COLL].find_one({"_id": lesson_id}, {"_id": 0})
+    return fresh or doc
+
+
 async def get_or_create_job(db, lesson_id: str) -> dict:
     """Fetch the lesson's production job, creating an empty one on first
     use. Never overwrites an existing job (idempotent)."""
     doc = await db[COLL].find_one({"_id": lesson_id}, {"_id": 0})
     if doc:
-        return doc
+        return await _heal_stranded_stages(db, lesson_id, doc)
     now = _now_iso()
     fresh = {
         "_id": lesson_id,
@@ -168,9 +222,17 @@ async def claim_stage(db, doc_id: str, path: str, *, max_retries: int = MAX_RETR
                        lease_s: int = CLAIM_LEASE_S) -> tuple[dict | None, str]:
     """Atomic compare-and-set claim for one stage. Demotes a stale
     provider_pending lease to unknown_outcome FIRST (never auto-reclaimed
-    — manual retry only, so an ambiguous in-flight provider call is never
-    silently repeated), then wins only if the stage is pending, an EXPIRED
-    claimed lease, or failed_retryable with attempts remaining.
+    by THIS demotion step — an ambiguous in-flight provider call is never
+    silently repeated), then wins if the stage is pending, an EXPIRED
+    claimed lease, failed_retryable with attempts remaining, OR one of the
+    two states an admin can explicitly retry from the Studio UI:
+    failed_terminal and unknown_outcome (RETRY_ELIGIBLE /
+    TERMINAL_RETRY_ELIGIBLE below name exactly these — this filter is what
+    actually honors them). Both require a deliberate "Retry" click (this
+    function is never called automatically for them), matching the
+    "manual retry only" contract: unlike failed_retryable, there is no
+    attempt-count ceiling here, since each click is a conscious admin
+    decision, not an automatic loop.
 
     Returns (claimed_job_doc | None, attemptId). None means the claim was
     lost — the caller must not proceed (someone else is already working
@@ -191,6 +253,8 @@ async def claim_stage(db, doc_id: str, path: str, *, max_retries: int = MAX_RETR
             {f"{path}.state": S_CLAIMED, f"{path}.claimExpiresAt": {"$lt": now}},
             {f"{path}.state": S_FAILED_RETRYABLE,
              f"{path}.attemptCount": {"$lt": max_retries + 1}},
+            {f"{path}.state": S_FAILED_TERMINAL},
+            {f"{path}.state": S_UNKNOWN},
         ],
     }
     claim_update = {
@@ -208,18 +272,31 @@ async def claim_stage(db, doc_id: str, path: str, *, max_retries: int = MAX_RETR
     return claimed, attempt
 
 
-async def fence_provider(db, doc_id: str, path: str, attempt: str, genver: int) -> bool:
+async def fence_provider(db, doc_id: str, path: str, attempt: str, genver: int, *,
+                          lease_s: int = CLAIM_LEASE_S) -> bool:
     """claimed → provider_pending, fenced on attemptId + generationVersion.
     The provider (Gemini/ElevenLabs) is called ONLY when this returns True
     — this is what makes a superseded/duplicate attempt structurally unable
-    to spend money."""
+    to spend money.
+
+    Also REFRESHES claimExpiresAt to now + lease_s. CLAIM_LEASE_S (180s) is
+    sized for the claim-to-fence handoff, not the provider call itself —
+    without this refresh, claimExpiresAt would stay fixed at the ORIGINAL
+    claim_stage() call's 180s deadline even while a legitimately slow but
+    healthy provider call (e.g. render's ffmpeg mux, which can genuinely
+    take several minutes) is still honestly in progress, making it
+    indistinguishable from a crashed one to any staleness check. Callers
+    should pass their own outer watchdog bound (e.g. video_narration_
+    tools.STAGE_TIMEOUT_S) so "stale" means "even the in-process
+    asyncio.wait_for watchdog would already have fired by now" — i.e.
+    genuinely proof of a dead process, never a still-working one."""
     now = _now_iso()
     kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
     fenced = await db[COLL].find_one_and_update(
         {"_id": doc_id, f"{path}.attemptId": attempt, f"{path}.generationVersion": genver,
          f"{path}.state": S_CLAIMED},
         {"$set": {f"{path}.state": S_PROVIDER_PENDING, f"{path}.providerRequestStartedAt": now,
-                  "updatedAt": now}},
+                  f"{path}.claimExpiresAt": _iso_in(lease_s), "updatedAt": now}},
         **kwargs,
     )
     return fenced is not None
