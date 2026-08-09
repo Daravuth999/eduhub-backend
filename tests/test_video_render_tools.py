@@ -507,3 +507,64 @@ async def test_generate_silence_clip_returns_none_on_ffmpeg_failure(monkeypatch)
 
     monkeypatch.setattr(vrt, "_run", _failing_run)
     assert await vrt.generate_silence_clip(2.0) is None
+
+
+# ── bounded time compression (scene-overrun handling) ──────────────────────
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_time_compress_clip_genuinely_shortens_a_real_clip_by_the_requested_factor():
+    clip = await _make_sine_clip_at_volume(volume=0.3, duration=4.0)
+    original_duration = await vrt.probe_audio_duration_seconds(clip)
+
+    compressed = await vrt.time_compress_clip(clip, 1.05)
+
+    assert compressed is not None
+    compressed_duration = await vrt.probe_audio_duration_seconds(compressed)
+    assert compressed_duration == pytest.approx(original_duration / 1.05, abs=0.15)
+
+
+@pytest.mark.asyncio
+async def test_time_compress_clip_uses_the_pitch_preserving_atempo_filter_not_a_resample(monkeypatch):
+    """Confirms the actual implementation choice: ffmpeg's `atempo` is a
+    real, documented time-scale filter that explicitly preserves pitch —
+    a naive sample-rate-based speedup would NOT (it would raise pitch
+    audibly, sounding like a chipmunk). This locks in that the real
+    invocation always requests atempo, never a bare `-r`/resample trick."""
+    captured_args = []
+
+    async def _capturing_run(*args, timeout):
+        captured_args.append(args)
+        return 1, b"", b"forced failure, args capture only"
+
+    monkeypatch.setattr(vrt, "_run", _capturing_run)
+    await vrt.time_compress_clip(b"fake-mp3-bytes", 1.05)
+
+    assert len(captured_args) == 1
+    joined = " ".join(captured_args[0])
+    assert "atempo=1.0500" in joined
+
+
+@pytest.mark.asyncio
+async def test_time_compress_clip_rejects_factors_outside_the_valid_atempo_range():
+    assert await vrt.time_compress_clip(b"fake-mp3", 0.1) is None
+    assert await vrt.time_compress_clip(b"fake-mp3", 3.0) is None
+
+
+@pytest.mark.asyncio
+async def test_time_compress_clip_returns_none_for_empty_input():
+    assert await vrt.time_compress_clip(b"", 1.05) is None
+
+
+@pytest.mark.asyncio
+async def test_time_compress_clip_returns_none_when_ffmpeg_unavailable(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    assert await vrt.time_compress_clip(b"fake-mp3", 1.05) is None
+
+
+@pytest.mark.asyncio
+async def test_time_compress_clip_returns_none_on_ffmpeg_failure(monkeypatch):
+    async def _failing_run(*args, timeout):
+        return 1, b"", b"ffmpeg: invalid filter"
+
+    monkeypatch.setattr(vrt, "_run", _failing_run)
+    assert await vrt.time_compress_clip(b"fake-mp3", 1.05) is None

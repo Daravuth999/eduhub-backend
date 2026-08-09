@@ -92,6 +92,7 @@ def test_status_reports_provider_readiness_when_keys_present(monkeypatch):
     ("post", "/api/studio/video/lessons/vid_1/narration/render/reset"),
     ("post", "/api/studio/video/lessons/vid_1/narration/publish"),
     ("post", "/api/studio/video/lessons/vid_1/narration/unpublish"),
+    ("post", "/api/studio/video/lessons/vid_1/narration/rebuild"),
 ])
 def test_every_narration_route_503s_while_disabled(monkeypatch, method, path):
     monkeypatch.setenv("VIDEO_NARRATION_ENABLED", "false")

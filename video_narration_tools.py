@@ -149,11 +149,24 @@ def _short_acting_cue(acting_note: str) -> str:
     style instruction — exactly the "too many/too long cues make speech
     artificial" failure mode. The FULL note is untouched everywhere else
     (Author Studio still shows it in full) — this only shortens what's
-    physically placed inside the TTS bracket. Takes the first clause (up to
-    the first comma/period/semicolon), capped at ~60 chars so it stays a
-    cue, not a script."""
-    first_clause = re.split(r"[.,;]", acting_note, maxsplit=1)[0].strip()
-    return first_clause[:60].strip() or acting_note[:60].strip()
+    physically placed inside the TTS bracket. Accumulates comma/period/
+    semicolon-separated segments (e.g. "Warm" + "reassuring tone") up to a
+    ~60-char budget, so several short descriptors survive together instead
+    of being cut at the very first comma — "Warm, reassuring tone" reads as
+    a real delivery cue; "Warm" alone throws away useful direction for no
+    reason. Still never exceeds the budget: a single segment longer than it
+    is hard-capped, exactly as before."""
+    max_len = 60
+    segments = [s.strip() for s in re.split(r"[.,;]", acting_note) if s.strip()]
+    if not segments:
+        return acting_note[:max_len].strip()
+    cue = segments[0]
+    for segment in segments[1:]:
+        candidate = f"{cue}, {segment}"
+        if len(candidate) > max_len:
+            break
+        cue = candidate
+    return cue[:max_len].strip()
 
 
 async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str | None = None,
@@ -750,6 +763,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     # fallback, never a fabricated gap.
     story_scenes = (job.get("storyAnalysis", {}).get("result") or {}).get("scenes") or []
     scene_time_map: dict[str, tuple[float, float]] = {}
+    scene_visual_events: dict[str, list[dict]] = {}
     for sc in story_scenes:
         if not isinstance(sc, dict) or not sc.get("sceneId"):
             continue
@@ -760,6 +774,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
             continue
         if s_end > s_start >= 0:
             scene_time_map[sc["sceneId"]] = (s_start, s_end)
+        scene_visual_events[sc["sceneId"]] = sc.get("visualEvents") or []
 
     # Loudness normalization runs per-line, BEFORE stitching: ElevenLabs
     # renders each line independently, so raw output loudness genuinely
@@ -777,9 +792,10 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     scene_timing_notes: list[dict] = []
     seen_scenes: set[str] = set()
     for entry, scene_id in zip(ordered_results, ordered_scene_ids):
+        scene_bounds = scene_time_map.get(scene_id)
         if scene_id not in seen_scenes:
             seen_scenes.add(scene_id)
-            intended_start = scene_time_map.get(scene_id, (None, None))[0]
+            intended_start = scene_bounds[0] if scene_bounds else None
             if intended_start is not None and intended_start > cursor + 0.05:
                 gap = intended_start - cursor
                 silence = await video_render_tools.generate_silence_clip(gap)
@@ -787,19 +803,19 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
                     audio_segments.append(silence)
                     cursor += gap
                     scene_timing_notes.append({
-                        "sceneId": scene_id, "paddedSec": round(gap, 3),
+                        "sceneId": scene_id, "type": "padding", "paddedSec": round(gap, 3),
                         "reason": "waited for the scene's real visual start",
                     })
                 else:
                     scene_timing_notes.append({
-                        "sceneId": scene_id, "paddedSec": 0.0,
+                        "sceneId": scene_id, "type": "padding_unavailable", "paddedSec": 0.0,
                         "reason": "scene's visual start is later than the narration cursor, but real "
                                   "silence padding was unavailable (ffmpeg missing/failed) — narration "
                                   "starts immediately instead",
                     })
             elif intended_start is not None and intended_start < cursor - 0.05:
                 scene_timing_notes.append({
-                    "sceneId": scene_id, "paddedSec": 0.0,
+                    "sceneId": scene_id, "type": "overran", "paddedSec": 0.0,
                     "reason": "the prior scene's narration overran into this scene's visual start — "
                               "not corrected (would require compressing or stretching real audio)",
                 })
@@ -808,12 +824,60 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         scene_starts.setdefault(scene_id, offset)
 
         raw, _ct = await video_pipeline_tools.load_media_bytes(db, sync_studio_tools.get_media_bucket(db), entry["mediaRef"])
-        audio_segments.append(await video_render_tools.normalize_line_loudness(raw))
+        normalized = await video_render_tools.normalize_line_loudness(raw)
 
         raw_words = _strip_bracketed_instruction_words(entry.get("wordTimestamps") or [])
+        line_duration = float(entry.get("durationSec") or (raw_words[-1]["end"] if raw_words else 0.0))
+
+        # Overrun handling: if THIS line's own audio would run past its
+        # scene's real end, apply a small, pitch-preserving time
+        # compression (ffmpeg atempo — never a naive resample, never a
+        # large/robotic-sounding factor; see MAX_SAFE_TIME_COMPRESSION) to
+        # fit it back within the scene window. The audio and the (already
+        # real, ElevenLabs-measured) relative word timestamps are scaled
+        # by the EXACT SAME factor, so karaoke stays accurate against the
+        # actual compressed audio that gets stored — never a fabricated
+        # number. If the overrun is too large for a safe compression to
+        # fix, or compression itself is unavailable, the line is left at
+        # its natural, undamaged length and the overrun is recorded
+        # honestly — never silently ignored, never destructively stretched.
+        compression_factor = 1.0
+        if scene_bounds is not None:
+            available = scene_bounds[1] - offset
+            if available > 0 and line_duration > available + 0.05:
+                needed = line_duration / available
+                if needed <= video_render_tools.MAX_SAFE_TIME_COMPRESSION:
+                    compressed = await video_render_tools.time_compress_clip(normalized, needed)
+                    if compressed:
+                        normalized = compressed
+                        compression_factor = needed
+                        scene_timing_notes.append({
+                            "sceneId": scene_id, "type": "compressed", "compressedBy": round(needed, 4),
+                            "reason": f"line overran its scene end by {round(line_duration - available, 3)}s — "
+                                      "safely time-compressed to fit (pitch-preserving)",
+                        })
+                        line_duration = available
+                    else:
+                        scene_timing_notes.append({
+                            "sceneId": scene_id, "type": "compression_unavailable", "paddedSec": 0.0,
+                            "reason": "line overran its scene end, but real time-compression was "
+                                      "unavailable (ffmpeg missing/failed) — left at its natural length",
+                        })
+                else:
+                    scene_timing_notes.append({
+                        "sceneId": scene_id, "type": "overran", "paddedSec": 0.0,
+                        "reason": f"line overran its scene end by more than a safe compression could fix "
+                                  f"({round(needed, 2)}x needed) — left at its natural length rather than "
+                                  "risk unnatural, robotic-sounding speech",
+                    })
+
+        audio_segments.append(normalized)
+
         words = [
             sync_schema.build_word(
-                w.get("word", ""), float(w.get("start", 0.0)) + offset, float(w.get("end", 0.0)) + offset,
+                w.get("word", ""),
+                float(w.get("start", 0.0)) / compression_factor + offset,
+                float(w.get("end", 0.0)) / compression_factor + offset,
                 confidence=sync_schema.build_confidence(transcript=1.0, alignment=None),
             )
             for w in raw_words if w.get("word")
@@ -823,7 +887,6 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
             if sid and sid not in speaker_ids:
                 speaker_ids.append(sid)
             sentences.append(sync_schema.build_sentence(f"s{len(sentences) + 1}", words, speaker_id=sid or None))
-        line_duration = float(entry.get("durationSec") or (words[-1]["end"] - offset if words else 0.0))
         cursor = offset + line_duration
 
     stitched = _stitch_mp3_segments(audio_segments)
@@ -847,6 +910,23 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         if offset is None:
             sfx_skipped.append({"sceneId": scene_id, "reason": "scene has no narration line to anchor timing to"})
             continue
+
+        # Anchor to the scene's own visual event ONLY when there is exactly
+        # ONE for this scene — a 1:1, unambiguous relationship (e.g. "00:18.4
+        # - laptop closes"). Zero events means Gemini never confidently
+        # reported a beat to anchor to; two or more means there is no
+        # reliable way to know WHICH one this SFX belongs to. Either way,
+        # guessing would fabricate a timing relationship that was never
+        # actually given — the honest fallback is the scene's own real
+        # start, exactly as before this anchoring existed.
+        bounds = scene_time_map.get(scene_id)
+        events = scene_visual_events.get(scene_id) or []
+        if len(events) == 1 and bounds is not None:
+            event_ts = events[0].get("timestamp")
+            if isinstance(event_ts, (int, float)):
+                scene_start, scene_end = bounds
+                delta = max(0.0, min(float(event_ts) - scene_start, scene_end - scene_start))
+                offset = offset + delta
         try:
             sfx_bytes, _ct = await video_pipeline_tools.load_media_bytes(
                 db, sync_studio_tools.get_media_bucket(db), result["mediaRef"],
@@ -1113,6 +1193,41 @@ async def unpublish_narration(db, lesson_id: str) -> dict:
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+async def rebuild_narration_production(db, lesson_id: str, media_bucket, *, lesson_getter) -> dict:
+    """One-call safe rebuild for a lesson whose narration was already
+    assembled/rendered (optionally published) and needs regenerating after
+    a fix to assembly/render logic — e.g. the overrun-compression and SFX
+    visual-event anchoring corrections in this module. Reuses every
+    already-generated per-line ElevenLabs/SFX asset as-is (assembly never
+    re-calls a provider); the only real cost is a fresh ffmpeg mux.
+
+    Sequence: re-assemble (always safe — re-running assembly never spends
+    a provider call, and picks up every fix made since the last assembly)
+    -> reset the render stage IF a render already existed (render_final_
+    master's own cost-safe guard would otherwise refuse to redo a
+    "completed" render that is now stale) -> render a fresh final master
+    -> re-publish ONLY if the lesson was already published before this
+    call started, so a rebuild never auto-publishes an unreviewed lesson
+    for the first time. Never deletes or duplicates R2/GridFS objects for
+    prior attempts — each stage's own existing storage-key scheme (keyed by
+    attempt number) already avoids collisions."""
+    job = await jobs.get_or_create_job(db, lesson_id)
+    was_published = bool(job.get("published"))
+    had_render = job["render"]["state"] == jobs.S_COMPLETED
+
+    job = await assemble_narration_track(db, lesson_id)
+
+    if had_render:
+        job = await reset_render(db, lesson_id)
+
+    job = await render_final_master(db, lesson_id, media_bucket, lesson_getter=lesson_getter)
+
+    if was_published:
+        job = await publish_narration(db, lesson_id)
+
+    return job
+
+
 # ── Routes ────────────────────────────────────────────────────────────────
 def register_video_narration_routes(api, db, require_admin, *, lesson_getter, sync_getter) -> None:
     """`lesson_getter(lesson_id)` / `sync_getter(sync_id)` are injected
@@ -1260,6 +1375,17 @@ def register_video_narration_routes(api, db, require_admin, *, lesson_getter, sy
     async def unpublish_route(lesson_id: str, _admin=Depends(require_admin)):
         _need_enabled()
         job = await unpublish_narration(db, lesson_id)
+        return {"ok": True, "job": job}
+
+    @api.post("/studio/video/lessons/{lesson_id}/narration/rebuild")
+    async def rebuild_narration_production_route(lesson_id: str, _admin=Depends(require_admin)):
+        _need_enabled()
+        try:
+            job = await rebuild_narration_production(
+                db, lesson_id, sync_studio_tools.get_media_bucket(db), lesson_getter=lesson_getter,
+            )
+        except VideoNarrationError as exc:
+            _raise(exc)
         return {"ok": True, "job": job}
 
     logger.info("video_narration_tools: routes registered (/api/studio/video/*/narration/*)")

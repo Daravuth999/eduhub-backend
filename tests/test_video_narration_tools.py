@@ -224,12 +224,23 @@ def _fake_bucket_patch(monkeypatch, bucket):
 #    Maya's...]" rendered verbatim to students and got karaoke-highlighted
 #    exactly like a real spoken word. ─────────────────────────────────────
 class TestElevenlabsGenerateLineActingNoteStripped:
-    def test_short_acting_cue_takes_the_first_clause_and_stays_short(self):
+    def test_short_acting_cue_accumulates_short_segments_up_to_the_budget(self):
+        """Multiple short comma-separated descriptors should survive
+        together, not just the very first one — "Warm" alone throws away
+        useful direction that "Warm, reassuring tone" still keeps concise."""
         cue = vnt._short_acting_cue(
             "Warm, reassuring tone, highlighting Maya's understanding and empathy for Daniel's situation.",
         )
-        assert cue == "Warm"
+        assert cue == "Warm, reassuring tone"
         assert len(cue) <= 60
+
+    def test_short_acting_cue_stops_before_a_segment_would_exceed_the_budget(self):
+        cue = vnt._short_acting_cue("quiet, concerned, slightly breathless and visibly shaken throughout")
+        assert cue.startswith("quiet, concerned")
+        assert len(cue) <= 60
+        # Never a mid-word truncation past the budget — every accepted
+        # segment fit whole, or wasn't accepted at all.
+        assert not cue.endswith(",")
 
     def test_short_acting_cue_falls_back_to_a_bounded_prefix_with_no_punctuation(self):
         cue = vnt._short_acting_cue("a" * 200)
@@ -690,6 +701,73 @@ async def test_reset_render_refuses_when_nothing_has_been_rendered_yet():
     assert exc.value.code == "nothing_to_reset"
 
 
+# ── rebuild_narration_production: one-call safe rebuild ───────────────────
+@pytest.mark.asyncio
+async def test_rebuild_reassembles_and_renders_without_publishing_an_unpublished_lesson(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _fake_mux)
+    db.video_lessons.docs["vid_1"] = dict(LESSON)
+
+    job = await vnt.rebuild_narration_production(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["assembly"]["state"] == jobs.S_COMPLETED
+    assert job["render"]["state"] == jobs.S_COMPLETED
+    assert job.get("published") is not True
+
+    lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert not lesson.get("aiNarrationPublished")
+
+
+@pytest.mark.asyncio
+async def test_rebuild_forces_a_genuinely_fresh_render_and_republishes_an_already_published_lesson(monkeypatch):
+    """The safe rebuild path this exists for: a lesson that was already
+    rendered AND published (e.g. "The Wrong Email!") needs its assembly
+    and render regenerated after a fix — WITHOUT a second ElevenLabs spend
+    and WITHOUT students losing access mid-rebuild (the old master keeps
+    serving until the new one lands)."""
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _fake_mux)
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    db.video_lessons.docs["vid_1"] = dict(LESSON)
+    await vnt.publish_narration(db, "vid_1")
+    first_master_ref = (await db.video_lessons.find_one({"lessonId": "vid_1"}))["aiNarrationMasterMediaRef"]
+
+    # assemble_narration_track only ever reads already-completed voice-
+    # production lines — it structurally cannot call ElevenLabs again, so
+    # the "no re-spend" guarantee holds for free; what this test proves is
+    # the RENDER side: a genuinely fresh mux runs (not the cost-safe no-op).
+    mux_calls = []
+
+    async def _counting_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
+        mux_calls.append(1)
+        return await _fake_mux(video_bytes, video_ct, audio_bytes, treatment=treatment)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _counting_mux)
+
+    job = await vnt.rebuild_narration_production(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_COMPLETED
+    assert len(mux_calls) == 1  # a genuinely fresh mux ran, not the cost-safe no-op
+
+    lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert lesson["aiNarrationPublished"] is True  # re-published automatically, it was already live
+    assert lesson["aiNarrationMasterMediaRef"] == job["render"]["result"]["mediaRef"]
+    assert lesson["aiNarrationMasterMediaRef"] != first_master_ref  # a genuinely new master
+
+
+@pytest.mark.asyncio
+async def test_rebuild_before_any_render_existed_renders_for_the_first_time(monkeypatch):
+    """No prior render means reset_render must never be called (it would
+    raise nothing_to_reset) — rebuild should just render for the first
+    time, exactly like calling render_final_master directly."""
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _fake_mux)
+
+    job = await vnt.rebuild_narration_production(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_COMPLETED
+
+
 @pytest.mark.asyncio
 async def test_render_fails_terminal_when_ffmpeg_unavailable(monkeypatch):
     db = _FakeDB()
@@ -995,6 +1073,73 @@ async def test_assembly_mixes_a_completed_sfx_asset_into_the_narration_track(mon
     assert job["assembly"]["result"]["sfxSkipped"] == []
     assert len(mixed_calls) == 1
     assert mixed_calls[0][2] == 0.0  # the scene's only line starts at cursor 0
+
+
+# ── SFX 1:1 visual-event anchoring ────────────────────────────────────────
+async def _sfx_event_anchor_offset(db, monkeypatch, *, visual_events: list[dict]) -> float:
+    """Common scaffolding for the three visual-event-anchoring tests below:
+    one scene with a real (0.0-10.0) window, one narration line, one
+    completed SFX asset, and a caller-controlled visualEvents list. Returns
+    the single offset overlay_audio_at_offset was actually called with."""
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await _single_scene_job(db, monkeypatch, bucket, text="Narrator line for the anchored scene.", scene_end=10.0)
+    await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=_FakeElevenLabsClient())
+
+    doc = db.video_narration_jobs.docs["vid_1"]
+    doc["storyAnalysis"]["result"]["scenes"][0]["visualEvents"] = visual_events
+    doc["storyAnalysis"]["result"]["scenes"][0]["audioObservations"]["sfx"] = "a sound effect"
+    await vnt.generate_scene_sfx(db, "vid_1", "sc1", http_client=_FakeSfxClient())
+
+    mixed_calls: list[float] = []
+
+    async def _fake_overlay(base, overlay, offset, **kwargs):
+        mixed_calls.append(offset)
+        return base + b":mixed:" + overlay
+
+    monkeypatch.setattr(vnt.video_render_tools, "overlay_audio_at_offset", _fake_overlay)
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["result"]["sfxMixed"] == ["sc1"]
+    assert len(mixed_calls) == 1
+    return mixed_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_sfx_anchors_to_the_scenes_single_unambiguous_visual_event(monkeypatch):
+    """The 1:1-cardinality anchoring rule: when a scene has EXACTLY ONE
+    visual event, its SFX lands at that event's own real timestamp (e.g.
+    "laptop closes" at 4.2s into the scene) instead of just the scene's
+    start — a deterministic, unambiguous relationship, never a guess."""
+    db = _FakeDB()
+    offset = await _sfx_event_anchor_offset(
+        db, monkeypatch, visual_events=[{"timestamp": 4.2, "description": "laptop closes"}],
+    )
+    assert offset == pytest.approx(4.2, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_sfx_falls_back_to_scene_start_when_no_visual_events(monkeypatch):
+    """Zero visual events means Gemini never confidently reported a beat
+    to anchor to — the honest fallback is the scene's own real start,
+    exactly as before event-anchoring existed."""
+    db = _FakeDB()
+    offset = await _sfx_event_anchor_offset(db, monkeypatch, visual_events=[])
+    assert offset == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_sfx_falls_back_to_scene_start_when_visual_events_are_ambiguous(monkeypatch):
+    """Two or more visual events means there is no reliable way to know
+    WHICH one this SFX belongs to — guessing would fabricate a timing
+    relationship that was never actually given, so this must fall back to
+    the scene's own real start rather than pick either candidate."""
+    db = _FakeDB()
+    offset = await _sfx_event_anchor_offset(db, monkeypatch, visual_events=[
+        {"timestamp": 2.0, "description": "door opens"},
+        {"timestamp": 6.0, "description": "door closes"},
+    ])
+    assert offset == pytest.approx(0.0, abs=0.01)
 
 
 @pytest.mark.asyncio
@@ -1320,6 +1465,288 @@ async def test_real_multi_scene_narration_is_anchored_to_real_scene_start_times(
     sentences = sync_doc["paragraphs"][0]["sentences"]
     scene2_sentence = sentences[1]  # sc1's line assembled first, sc2's second
     assert scene2_sentence["words"][0]["start"] == pytest.approx(3.0, abs=0.2)
+
+
+# ── Scene overrun handling: bounded, pitch-preserving time compression ────
+async def _single_scene_job(db, monkeypatch, bucket, *, text, scene_end):
+    """Builds a one-scene, one-line job with a caller-controlled scene end
+    time, so the narration line's (fabricated, alignment-derived) duration
+    can be made to overrun it by an exact, chosen amount."""
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+
+    story_analysis = {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": scene_end, "title": "Opening", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_analyze_story(*a, **k):
+        return {"ok": True, "storyAnalysis": story_analysis, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _fake_analyze_story)
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_COMPLETED
+
+    script_blueprint = {
+        "scenes": [{"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": text, "emotion": ""}]}],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_draft_script(*a, **k):
+        return {"ok": True, "scriptBlueprint": script_blueprint, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _fake_draft_script)
+    job = await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["scriptBlueprint"]["state"] == jobs.S_COMPLETED
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+
+
+@pytest.mark.skipif(NO_FFMPEG_E2E or NO_FFPROBE_E2E, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_real_overrunning_narration_line_is_safely_time_compressed_to_fit_its_scene(monkeypatch):
+    """The production-grade correction this test exists to prove: a
+    narration line whose real spoken length would run PAST its scene's
+    real end time must be safely, transparently time-compressed (ffmpeg's
+    pitch-preserving atempo, never a naive resample) to land exactly at
+    the scene boundary — never silently left overrunning, and never sped
+    up beyond MAX_SAFE_TIME_COMPRESSION. Verified with genuine ffmpeg
+    compression, real ffprobe duration measurement, and correctly scaled
+    karaoke word timestamps."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+
+    text = "This narration line runs slightly long for its scene."
+    raw_duration = len(text) * 0.05  # _RealAudioElevenLabsClient's 0.05s/char fabricated alignment
+    needed_factor = 1.05
+    assert needed_factor <= vnt.video_render_tools.MAX_SAFE_TIME_COMPRESSION
+    scene_end = raw_duration / needed_factor
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await _single_scene_job(db, monkeypatch, bucket, text=text, scene_end=scene_end)
+
+    real_clip = await _make_real_media(kind="audio", duration=0.3)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=_RealAudioElevenLabsClient(real_clip))
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["state"] == jobs.S_COMPLETED
+
+    # Honest record: the overrun was detected and safely compressed, not
+    # silently ignored and not fabricated.
+    timing_notes = job["assembly"]["result"]["sceneTiming"]
+    note = next(n for n in timing_notes if n["sceneId"] == "sc1" and n["type"] == "compressed")
+    assert note["compressedBy"] == pytest.approx(needed_factor, abs=0.01)
+
+    # Real audio proof: ffmpeg's atempo genuinely shortened the real clip —
+    # the assembled track's actual playtime is measurably shorter than the
+    # original real clip it was generated from.
+    real_clip_duration = await vnt.video_render_tools.probe_audio_duration_seconds(real_clip)
+    assembled_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(
+        db, bucket, job["assembly"]["result"]["mediaRef"],
+    )
+    assembled_duration = await vnt.video_render_tools.probe_audio_duration_seconds(assembled_bytes)
+    assert assembled_duration < real_clip_duration
+
+    # Karaoke proof: the word timestamps are scaled by the SAME factor the
+    # real audio was compressed by, so the line's last word now lands at
+    # the scene's real end instead of past it.
+    sync_doc = await db.chapter_sync.find_one({"syncId": job["assembly"]["result"]["syncId"]})
+    words = sync_doc["paragraphs"][0]["sentences"][0]["words"]
+    assert words[-1]["end"] == pytest.approx(scene_end, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_overrun_too_large_for_safe_compression_is_recorded_honestly_not_forced(monkeypatch):
+    """When a line would need MORE than MAX_SAFE_TIME_COMPRESSION to fit,
+    compression must never even be attempted (would risk unnatural,
+    robotic-sounding speech) — the overrun is instead recorded honestly
+    and the line is left at its real, undamaged length."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+
+    text = "A line so long it massively overruns its tiny scene window here."
+    raw_duration = len(text) * 0.1  # _FakeElevenLabsClient's 0.1s/char alignment
+    scene_end = raw_duration / 2.0  # would need a destructive 2x speed-up — far beyond the safe bound
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await _single_scene_job(db, monkeypatch, bucket, text=text, scene_end=scene_end)
+    client = _FakeElevenLabsClient()
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=client)
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    timing_notes = job["assembly"]["result"]["sceneTiming"]
+    note = next(n for n in timing_notes if n["sceneId"] == "sc1" and n["type"] == "overran")
+    assert "risk unnatural" in note["reason"]
+
+    # Never compressed: the real word timestamps are untouched, proving no
+    # destructive speed-up was silently applied.
+    sync_doc = await db.chapter_sync.find_one({"syncId": job["assembly"]["result"]["syncId"]})
+    words = sync_doc["paragraphs"][0]["sentences"][0]["words"]
+    assert words[-1]["end"] == pytest.approx(raw_duration, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_overrun_within_safe_bound_but_compression_unavailable_is_recorded_honestly(monkeypatch):
+    """A safely-compressible overrun where real time-compression genuinely
+    fails (here: the fake test audio bytes aren't decodable media, so
+    ffmpeg's atempo pass fails exactly as it would if ffmpeg itself were
+    missing) must fall back to the line's natural length and record the
+    limitation honestly — never fabricate a compression that didn't
+    actually happen."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+
+    text = "This narration line runs slightly long for its scene."
+    raw_duration = len(text) * 0.1  # _FakeElevenLabsClient's 0.1s/char alignment
+    scene_end = raw_duration / 1.05  # safely compressible in principle
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await _single_scene_job(db, monkeypatch, bucket, text=text, scene_end=scene_end)
+    client = _FakeElevenLabsClient()
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=client)
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    timing_notes = job["assembly"]["result"]["sceneTiming"]
+    note = next(n for n in timing_notes if n["sceneId"] == "sc1" and n["type"] == "compression_unavailable")
+    assert "unavailable" in note["reason"]
+
+    sync_doc = await db.chapter_sync.find_one({"syncId": job["assembly"]["result"]["syncId"]})
+    words = sync_doc["paragraphs"][0]["sentences"][0]["words"]
+    assert words[-1]["end"] == pytest.approx(raw_duration, abs=0.01)
+
+
+@pytest.mark.skipif(NO_FFMPEG_E2E or NO_FFPROBE_E2E, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_real_combined_multi_scene_overrun_sfx_anchor_and_render_pipeline(monkeypatch):
+    """One real, continuous pass proving every production-timing correction
+    in this module works TOGETHER, not just in isolation: two scenes with a
+    real visual gap between them; scene 2's narration line genuinely
+    overruns its own scene end and must be safely time-compressed to fit;
+    scene 1 has exactly one visual event and its SFX must land there, not
+    at the scene's plain start; and the whole thing renders to a real,
+    faststart MP4 master with karaoke timestamps that never point past the
+    scene they belong to. Every claim below is checked with genuine ffmpeg/
+    ffprobe output, never assumed from a function simply not raising."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    source_video = await _make_real_media(kind="video_with_audio", duration=6.0)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(source_video), {"contentType": "video/mp4"})
+
+    text1 = "Scene one line."
+    text2 = "This second scene line overruns its own window just a little too much."
+    raw_duration2 = len(text2) * 0.05  # _RealAudioElevenLabsClient's 0.05s/char fabricated alignment
+    needed_factor = 1.05
+    assert needed_factor <= vnt.video_render_tools.MAX_SAFE_TIME_COMPRESSION
+    sc2_start = 3.0
+    sc2_end = sc2_start + raw_duration2 / needed_factor
+
+    story_analysis = {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 1.0, "title": "Opening", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": "a laptop closing"},
+             "emotionalContext": "", "visualEvents": [{"timestamp": 0.4, "description": "laptop closes"}],
+             "confidence": None},
+            {"sceneId": "sc2", "start": sc2_start, "end": sc2_end, "title": "Later", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "development",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_analyze_story(*a, **k):
+        return {"ok": True, "storyAnalysis": story_analysis, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _fake_analyze_story)
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_COMPLETED
+
+    script_blueprint = {
+        "scenes": [
+            {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": text1, "emotion": ""}]},
+            {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": text2, "emotion": ""}]},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_draft_script(*a, **k):
+        return {"ok": True, "scriptBlueprint": script_blueprint, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _fake_draft_script)
+    job = await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["scriptBlueprint"]["state"] == jobs.S_COMPLETED
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+
+    clip1 = await _make_real_media(kind="audio", duration=0.3)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=_RealAudioElevenLabsClient(clip1))
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+
+    clip2 = await _make_real_media(kind="audio", duration=0.4)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc2", "ln2", http_client=_RealAudioElevenLabsClient(clip2))
+    assert job["voiceProduction"]["sc2"]["lines"]["ln2"]["state"] == jobs.S_COMPLETED
+
+    sfx_clip = await _make_real_media(kind="audio", duration=0.2)
+    job = await vnt.generate_scene_sfx(db, "vid_1", "sc1", http_client=_RealSfxClient(sfx_clip))
+    assert job["sfx"]["sc1"]["state"] == jobs.S_COMPLETED
+
+    real_overlay = vnt.video_render_tools.overlay_audio_at_offset
+    sfx_offsets: list[float] = []
+
+    async def _capturing_overlay(base, overlay, offset, **kwargs):
+        sfx_offsets.append(offset)
+        return await real_overlay(base, overlay, offset, **kwargs)
+
+    monkeypatch.setattr(vnt.video_render_tools, "overlay_audio_at_offset", _capturing_overlay)
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["state"] == jobs.S_COMPLETED
+
+    # SFX anchored to sc1's single real visual event (0.4s into the scene),
+    # not just the scene's plain start (0.0) — real ffmpeg mix, real offset.
+    assert job["assembly"]["result"]["sfxMixed"] == ["sc1"]
+    assert sfx_offsets == [pytest.approx(0.4, abs=0.01)]
+
+    # sc2's overrunning line was safely compressed, not silently dropped.
+    timing_notes = job["assembly"]["result"]["sceneTiming"]
+    padding_note = next(n for n in timing_notes if n["sceneId"] == "sc2" and n["type"] == "padding")
+    assert padding_note["paddedSec"] > 0
+    compression_note = next(n for n in timing_notes if n["sceneId"] == "sc2" and n["type"] == "compressed")
+    assert compression_note["compressedBy"] == pytest.approx(needed_factor, abs=0.01)
+
+    # Karaoke proof: scene 2's last word lands AT its real scene end, never
+    # past it — the compression genuinely fixed the overrun in the actual
+    # assembled timeline, not just in the honesty log.
+    sync_doc = await db.chapter_sync.find_one({"syncId": job["assembly"]["result"]["syncId"]})
+    sentences = sync_doc["paragraphs"][0]["sentences"]
+    assert sentences[1]["words"][-1]["end"] == pytest.approx(sc2_end, abs=0.1)
+
+    # Real render proof: a genuine, faststart MP4 master with an embedded
+    # audio stream — the whole pipeline survives all the way to publish.
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_COMPLETED
+    master_ref = job["render"]["result"]["mediaRef"]
+    master_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(db, bucket, master_ref)
+    assert await vnt.video_render_tools.probe_has_audio_stream(master_bytes) is True
+    moov_pos, mdat_pos = master_bytes.find(b"moov"), master_bytes.find(b"mdat")
+    assert moov_pos != -1 and mdat_pos != -1 and moov_pos < mdat_pos, "faststart did not take effect"
+
+    db.video_lessons.docs["vid_1"] = dict(LESSON)
+    published = await vnt.publish_narration(db, "vid_1")
+    assert published["published"] is True
 
 
 # ── Stage watchdog — root-cause fix for a job stuck forever in "claimed"/

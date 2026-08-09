@@ -321,6 +321,63 @@ async def generate_silence_clip(duration_sec: float, *, sample_rate: int = 44100
             pass
 
 
+# A narration line is only ever compressed within this range — small enough
+# that ffmpeg's atempo (a real, pitch-preserving time-scale filter, not a
+# naive resample that would shift pitch) stays inaudibly natural. Above
+# this, video_narration_tools.assemble_narration_track deliberately does
+# NOT compress — it records the overrun honestly instead, per the explicit
+# "do not create robotic speech" / "do not arbitrarily speed voices up"
+# requirement. Chosen from atempo's own documented sweet spot (values
+# under ~1.15x are broadly considered transparent for speech).
+MAX_SAFE_TIME_COMPRESSION = 1.08
+
+
+async def time_compress_clip(audio_bytes: bytes, factor: float, *, timeout: float = 60.0) -> bytes | None:
+    """Real, pitch-preserving time compression via ffmpeg's `atempo` filter
+    — a genuine, documented ffmpeg audio filter (not an invented
+    capability), used ONLY to fit a narration line that would otherwise
+    overrun its scene's real end time back within that window, and ONLY
+    for small factors (see MAX_SAFE_TIME_COMPRESSION) so the result stays
+    natural rather than becoming audibly sped-up or robotic. `factor` > 1.0
+    speeds up (shortens) the clip; e.g. 1.05 plays 5% faster.
+
+    Best-effort, never fabricates: returns None (never raises, never
+    silently skips the compression while claiming success) when ffmpeg is
+    unavailable, factor is out of atempo's valid range, or generation
+    fails for any reason — the caller MUST treat None as "compression
+    unavailable" and fall back to recording the overrun honestly, never as
+    a zero-cost compression that didn't actually happen."""
+    if not audio_bytes or factor is None or not (0.5 <= factor <= 2.0):
+        return None
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    work_id = uuid.uuid4().hex
+    in_path = os.path.join(tempfile.gettempdir(), f"vnr_tempo_{work_id}_in.mp3")
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_tempo_{work_id}_out.mp3")
+    try:
+        with open(in_path, "wb") as f:
+            f.write(audio_bytes)
+        args = (ffmpeg, "-y", "-i", in_path, "-af", f"atempo={factor:.4f}", "-ar", "44100", out_path)
+        code, _out, err = await _run(*args, timeout=timeout)
+        if code != 0:
+            logger.info("video_render: time compression skipped (ffmpeg exit %s): %s",
+                        code, err.decode("utf-8", errors="replace")[-300:])
+            return None
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return data or None
+    except RenderError:
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 async def mux_narration_into_video(
     video_bytes: bytes, video_content_type: str, audio_bytes: bytes,
     *, treatment: str = DEFAULT_SOURCE_AUDIO_TREATMENT, timeout: float = 300.0,
