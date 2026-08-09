@@ -1061,3 +1061,95 @@ async def test_real_end_to_end_production_pipeline_with_genuine_ffmpeg_media(mon
     lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
     assert lesson["aiNarrationMasterMediaRef"] == master_ref
     assert published["published"] is True
+
+
+# ── Stage watchdog — root-cause fix for a job stuck forever in "claimed"/
+# "provider_pending" ("Processing" in the UI, no retry button available)
+# if the awaited provider call never resolves (stalled connection, worker
+# restart mid-flight) — the exact same incident class already fixed once
+# in video_pipeline_tools.py's PIPELINE_TIMEOUT_S. ───────────────────────
+@pytest.mark.asyncio
+async def test_story_analysis_timeout_fails_retryable_not_stuck_forever(monkeypatch):
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+    monkeypatch.setattr(vnt, "STAGE_TIMEOUT_S", 0.05)
+
+    async def _hangs(*a, **k):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _hangs)
+
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_FAILED_RETRYABLE
+    assert "timed out" in job["storyAnalysis"]["lastError"].lower()
+
+
+@pytest.mark.asyncio
+async def test_script_blueprint_timeout_fails_retryable_not_stuck_forever(monkeypatch):
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+    await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    monkeypatch.setattr(vnt, "STAGE_TIMEOUT_S", 0.05)
+
+    async def _hangs(*a, **k):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _hangs)
+
+    job = await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["scriptBlueprint"]["state"] == jobs.S_FAILED_RETRYABLE
+    assert "timed out" in job["scriptBlueprint"]["lastError"].lower()
+
+
+@pytest.mark.asyncio
+async def test_generate_line_voice_timeout_fails_retryable_not_stuck_forever(monkeypatch):
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    monkeypatch.setattr(vnt, "STAGE_TIMEOUT_S", 0.05)
+
+    class _HangingClient:
+        async def post(self, url, headers=None, json=None, **kwargs):
+            await asyncio.sleep(3600)
+
+    job = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=_HangingClient())
+    stage = job["voiceProduction"][scene_id]["lines"][line_id]
+    assert stage["state"] == jobs.S_FAILED_RETRYABLE
+    assert "timed out" in stage["lastError"].lower()
+
+
+@pytest.mark.asyncio
+async def test_generate_scene_sfx_timeout_fails_retryable_not_stuck_forever(monkeypatch):
+    db = _FakeDB()
+    scene_id = await _job_with_sfx_scene(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    monkeypatch.setattr(vnt, "STAGE_TIMEOUT_S", 0.05)
+
+    class _HangingClient:
+        async def post(self, url, headers=None, json=None, **kwargs):
+            await asyncio.sleep(3600)
+
+    job = await vnt.generate_scene_sfx(db, "vid_1", scene_id, http_client=_HangingClient())
+    assert job["sfx"][scene_id]["state"] == jobs.S_FAILED_RETRYABLE
+    assert "timed out" in job["sfx"][scene_id]["lastError"].lower()
+
+
+@pytest.mark.asyncio
+async def test_render_timeout_fails_retryable_not_stuck_forever(monkeypatch):
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    monkeypatch.setattr(vnt, "STAGE_TIMEOUT_S", 0.05)
+
+    async def _hangs(*a, **k):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _hangs)
+
+    job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert job["render"]["state"] == jobs.S_FAILED_RETRYABLE
+    assert "timed out" in job["render"]["lastError"].lower()

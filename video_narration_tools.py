@@ -43,6 +43,7 @@ Emergent, or any other LLM.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime as _dt
 import io
@@ -346,6 +347,24 @@ async def set_voice_assignments(db, lesson_id: str, assignments: dict) -> dict:
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+# Root-cause fix for the same class of incident already fixed once in
+# video_pipeline_tools.py (PIPELINE_TIMEOUT_S): every provider-calling
+# stage below claims a job stage (state -> "claimed" -> "provider_pending")
+# and previously had NO enclosing watchdog — if the awaited provider call
+# ever failed to resolve (a stalled connection, an event-loop stall, a
+# worker restart mid-flight) the stage stayed in "provider_pending"
+# ("Processing" in the UI) forever, with no automatic recovery AND no
+# manual retry available (RETRYABLE_STATES in the Studio panel excludes
+# "claimed"/"provider_pending" by design, since a genuinely in-flight
+# attempt must never be double-claimed). asyncio.wait_for bounds each
+# stage the same way the ASR pipeline is already bounded, converting an
+# indefinite hang into an honest, retryable failure. 900s is generous for
+# a full-video Gemini Files-API round trip (upload + processing poll +
+# generation) — see video_ai_provider.py's own internal per-call timeouts,
+# which this is a backstop for, not a replacement of.
+STAGE_TIMEOUT_S = 900
+
+
 # ── Mode A: whole-story analysis ─────────────────────────────────────────
 async def run_story_analysis(db, lesson_id: str, media_bucket, *, lesson_getter, sync_getter) -> dict:
     job = await jobs.get_or_create_job(db, lesson_id)
@@ -359,12 +378,12 @@ async def run_story_analysis(db, lesson_id: str, media_bucket, *, lesson_getter,
     if not await jobs.fence_provider(db, lesson_id, "storyAnalysis", attempt, genver):
         return await jobs.get_or_create_job(db, lesson_id)
 
-    try:
+    async def _do() -> None:
         lesson = await lesson_getter(lesson_id)
         if not lesson or not lesson.get("mediaRef") or not lesson.get("syncId"):
             await jobs.fail_terminal(db, lesson_id, "storyAnalysis", attempt, genver,
                                       "lesson has no uploaded media/transcript yet")
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
         sync_doc = await sync_getter(lesson["syncId"])
         transcript_text = _transcript_text_from_sync(sync_doc)
         raw, content_type = await video_pipeline_tools.load_media_bytes(db, media_bucket, lesson["mediaRef"])
@@ -373,13 +392,20 @@ async def run_story_analysis(db, lesson_id: str, media_bucket, *, lesson_getter,
         )
         if not result.get("ok"):
             await jobs.fail_stage(db, lesson_id, "storyAnalysis", attempt, genver, result.get("reason", "unknown"))
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
         ok, errors = video_scene_schema.validate_story_analysis(result["storyAnalysis"])
         if not ok:
             await jobs.fail_terminal(db, lesson_id, "storyAnalysis", attempt, genver,
                                       "invalid_story_analysis: " + "; ".join(errors))
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
         await jobs.complete_stage(db, lesson_id, "storyAnalysis", attempt, genver, result["storyAnalysis"])
+
+    try:
+        await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("video_narration: story analysis timed out lesson=%s", lesson_id)
+        await jobs.fail_stage(db, lesson_id, "storyAnalysis", attempt, genver,
+                               f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
     except Exception as exc:  # noqa: BLE001
         logger.exception("video_narration: story analysis failed lesson=%s", lesson_id)
         await jobs.fail_unknown(db, lesson_id, "storyAnalysis", attempt, genver, f"{type(exc).__name__}: {exc}")
@@ -401,7 +427,7 @@ async def run_script_blueprint(db, lesson_id: str, *, lesson_getter, sync_getter
     if not await jobs.fence_provider(db, lesson_id, "scriptBlueprint", attempt, genver):
         return await jobs.get_or_create_job(db, lesson_id)
 
-    try:
+    async def _do() -> None:
         story_analysis = claimed["storyAnalysis"]["result"]
         lesson = await lesson_getter(lesson_id)
         sync_doc = await sync_getter(lesson["syncId"]) if lesson and lesson.get("syncId") else None
@@ -411,14 +437,21 @@ async def run_script_blueprint(db, lesson_id: str, *, lesson_getter, sync_getter
         )
         if not result.get("ok"):
             await jobs.fail_stage(db, lesson_id, "scriptBlueprint", attempt, genver, result.get("reason", "unknown"))
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
         scene_ids = {sc["sceneId"] for sc in story_analysis.get("scenes", []) if sc.get("sceneId")}
         ok, errors = video_scene_schema.validate_script_blueprint(result["scriptBlueprint"], known_scene_ids=scene_ids)
         if not ok:
             await jobs.fail_terminal(db, lesson_id, "scriptBlueprint", attempt, genver,
                                       "invalid_script: " + "; ".join(errors))
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
         await jobs.complete_stage(db, lesson_id, "scriptBlueprint", attempt, genver, result["scriptBlueprint"])
+
+    try:
+        await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("video_narration: script blueprint timed out lesson=%s", lesson_id)
+        await jobs.fail_stage(db, lesson_id, "scriptBlueprint", attempt, genver,
+                               f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
     except Exception as exc:  # noqa: BLE001
         logger.exception("video_narration: script blueprint failed lesson=%s", lesson_id)
         await jobs.fail_unknown(db, lesson_id, "scriptBlueprint", attempt, genver, f"{type(exc).__name__}: {exc}")
@@ -479,9 +512,18 @@ async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *
         return await jobs.get_or_create_job(db, lesson_id)
 
     try:
-        raw = await elevenlabs_generate_line(
-            line["text"], voice_id, acting_note=line.get("emotion") or None, http_client=http_client,
+        raw = await asyncio.wait_for(
+            elevenlabs_generate_line(
+                line["text"], voice_id, acting_note=line.get("emotion") or None, http_client=http_client,
+            ),
+            timeout=STAGE_TIMEOUT_S,
         )
+    except asyncio.TimeoutError:
+        logger.warning("video_narration: line generation timed out lesson=%s scene=%s line=%s",
+                        lesson_id, scene_id, line_id)
+        await jobs.fail_stage(db, lesson_id, path, attempt, genver,
+                               f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
+        return await jobs.get_or_create_job(db, lesson_id)
     except VideoNarrationError as exc:
         if exc.code == "no_api_key":
             await jobs.fail_terminal(db, lesson_id, path, attempt, genver, exc.message)
@@ -561,7 +603,14 @@ async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=N
         return await jobs.get_or_create_job(db, lesson_id)
 
     try:
-        audio_bytes = await elevenlabs_generate_sfx(sfx_description, http_client=http_client)
+        audio_bytes = await asyncio.wait_for(
+            elevenlabs_generate_sfx(sfx_description, http_client=http_client), timeout=STAGE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("video_narration: sfx generation timed out lesson=%s scene=%s", lesson_id, scene_id)
+        await jobs.fail_stage(db, lesson_id, path, attempt, genver,
+                               f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
+        return await jobs.get_or_create_job(db, lesson_id)
     except VideoNarrationError as exc:
         if exc.code == "no_api_key":
             await jobs.fail_terminal(db, lesson_id, path, attempt, genver, exc.message)
@@ -817,11 +866,11 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
     if not await jobs.fence_provider(db, lesson_id, "render", attempt, genver):
         return await jobs.get_or_create_job(db, lesson_id)
 
-    try:
+    async def _do() -> None:
         lesson = await lesson_getter(lesson_id)
         if not lesson or not lesson.get("mediaRef"):
             await jobs.fail_terminal(db, lesson_id, "render", attempt, genver, "lesson has no source media")
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
 
         video_bytes, video_ct = await video_pipeline_tools.load_media_bytes(db, media_bucket, lesson["mediaRef"])
         assembly_result = claimed["assembly"]["result"]
@@ -839,7 +888,7 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
                 await jobs.fail_terminal(db, lesson_id, "render", attempt, genver, exc.message)
             else:
                 await jobs.fail_stage(db, lesson_id, "render", attempt, genver, exc.message)
-            return await jobs.get_or_create_job(db, lesson_id)
+            return
 
         key = f"video-narration/{lesson_id}/master/{attempt}.mp4"
         media_ref = await _store_video(db, rendered_bytes, key, lesson_id)
@@ -849,6 +898,13 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
             "sourceAudioTreatment": treatment, "renderedAt": _now(),
         }
         await jobs.complete_stage(db, lesson_id, "render", attempt, genver, result)
+
+    try:
+        await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("video_narration: render timed out lesson=%s", lesson_id)
+        await jobs.fail_stage(db, lesson_id, "render", attempt, genver,
+                               f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
     except Exception as exc:  # noqa: BLE001
         logger.exception("video_narration: render failed lesson=%s", lesson_id)
         await jobs.fail_unknown(db, lesson_id, "render", attempt, genver, f"{type(exc).__name__}: {exc}")
