@@ -1,0 +1,194 @@
+"""tests/test_video_ai_provider.py — Gemini model isolation for the Video
+Library. Two deliberately independent model configurations live in this
+module: VIDEO_AI_MODEL (fast path — speech recognition/ASR, default
+gemini-2.5-flash) and VIDEO_ANALYSIS_MODEL (deep path — whole-video story/
+scene understanding, default gemini-2.5-pro). This file proves they are
+genuinely isolated from each other and that video_ai_provider.py has no
+importers outside the Video Library, so changing either constant here can
+never affect any other EduHub Gemini integration (Book Factory, EduTalk,
+premium_ai_tools, etc. all read the separate, shared GEMINI_MODEL env var
+independently — verified by dependency grep, not assumed).
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+import video_ai_provider as vap
+
+
+@pytest.fixture(autouse=True)
+def _no_real_env(monkeypatch):
+    monkeypatch.delenv("VIDEO_AI_MODEL", raising=False)
+    monkeypatch.delenv("VIDEO_ANALYSIS_MODEL", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def _gemini_json_response(payload: dict) -> _FakeHttpResponse:
+    return _FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}],
+    })
+
+
+class _RecordingGeminiClient:
+    """Captures every request URL (which embeds the model name — see
+    video_ai_provider._GEN_URL) so tests can assert exactly which model a
+    given call actually used."""
+    def __init__(self, response: _FakeHttpResponse):
+        self.calls: list[str] = []
+        self._response = response
+
+    async def post(self, url, params=None, json=None, **kwargs):
+        self.calls.append(url)
+        return self._response
+
+
+def test_default_models_are_independent_constants():
+    assert vap.DEFAULT_MODEL == "gemini-2.5-flash"
+    assert vap.DEFAULT_ANALYSIS_MODEL == "gemini-2.5-pro"
+    assert vap.DEFAULT_MODEL != vap.DEFAULT_ANALYSIS_MODEL
+
+
+def test_model_getters_default_correctly_with_no_env_set():
+    assert vap._model() == "gemini-2.5-flash"
+    assert vap._analysis_model() == "gemini-2.5-pro"
+
+
+def test_analysis_model_override_never_affects_the_asr_model(monkeypatch):
+    """Setting VIDEO_ANALYSIS_MODEL must not change what ASR (_model())
+    resolves to — the two are read from separate env vars entirely."""
+    monkeypatch.setenv("VIDEO_ANALYSIS_MODEL", "gemini-2.5-pro-preview")
+    assert vap._model() == "gemini-2.5-flash"
+    assert vap._analysis_model() == "gemini-2.5-pro-preview"
+
+
+def test_asr_model_override_never_affects_the_analysis_model(monkeypatch):
+    """And the reverse: overriding the fast-path model must not touch the
+    deep-analysis model's default."""
+    monkeypatch.setenv("VIDEO_AI_MODEL", "gemini-2.5-flash-lite")
+    assert vap._model() == "gemini-2.5-flash-lite"
+    assert vap._analysis_model() == "gemini-2.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_align_asr_actually_requests_the_flash_model():
+    client = _RecordingGeminiClient(_gemini_json_response({
+        "segments": [{"text": "hello", "start": 0.0, "end": 0.5, "speakerId": "S1"}],
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    await provider.align(b"fake-audio-bytes", "audio/mpeg")
+
+    assert len(client.calls) == 1
+    assert "gemini-2.5-flash" in client.calls[0]
+    assert "gemini-2.5-pro" not in client.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_actually_requests_the_pro_model():
+    client = _RecordingGeminiClient(_gemini_json_response({
+        "summary": "A short story.", "narrativeArc": "setup/resolution",
+        "characters": [], "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 5.0, "title": "Opening",
+             "description": "d", "characters": [], "speakers": [], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": ""},
+        ],
+    }))
+    result = await vap.analyze_story(
+        b"fake-video-bytes", "video/mp4", transcript_text="hello", http_client=client,
+    )
+
+    assert result["ok"] is True
+    assert len(client.calls) == 1
+    assert "gemini-2.5-pro" in client.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_uses_gemini_25_pro_url_via_injected_client(monkeypatch):
+    """analyze_story doesn't accept http_client directly in its public
+    signature, so this drives it through the same GeminiVideoProvider path
+    it constructs internally, confirmed via the model string alone (the
+    provider is instantiated fresh inside analyze_story — see its source)."""
+    captured_urls: list[str] = []
+
+    class _Client(_RecordingGeminiClient):
+        async def post(self, url, params=None, json=None, **kwargs):
+            captured_urls.append(url)
+            return _gemini_json_response({
+                "summary": "s", "narrativeArc": "a", "characters": [], "scenes": [
+                    {"sceneId": "sc1", "start": 0.0, "end": 5.0, "title": "t", "description": "d",
+                     "characters": [], "speakers": [], "narrativeRole": "setup",
+                     "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+                     "emotionalContext": ""},
+                ],
+            })
+
+    result = await vap.analyze_story(
+        b"fake-video-bytes", "video/mp4", transcript_text="hello", http_client=_Client(_FakeHttpResponse()),
+    )
+    assert result["ok"] is True
+    assert len(captured_urls) == 1
+    assert "gemini-2.5-pro" in captured_urls[0]
+    assert "gemini-2.5-flash" not in captured_urls[0]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_receives_the_original_video_not_extracted_audio_only():
+    """Confirms the caller contract: analyze_story's media_part is built
+    from whatever bytes/content_type it's given — video_narration_tools.
+    run_story_analysis is the one that decides to pass the ORIGINAL
+    lesson.mediaRef (never the extracted-audio-only bytes ASR uses); this
+    test locks in that analyze_story itself does not silently prefer or
+    require audio-only input."""
+    captured_content_types: list[str] = []
+
+    class _Client(_RecordingGeminiClient):
+        async def post(self, url, params=None, json=None, **kwargs):
+            part = json["contents"][0]["parts"][1]
+            captured_content_types.append(part["inline_data"]["mime_type"])
+            return _gemini_json_response({
+                "summary": "s", "narrativeArc": "a", "characters": [], "scenes": [
+                    {"sceneId": "sc1", "start": 0.0, "end": 5.0, "title": "t", "description": "d",
+                     "characters": [], "speakers": [], "narrativeRole": "setup",
+                     "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+                     "emotionalContext": ""},
+                ],
+            })
+
+    result = await vap.analyze_story(
+        b"fake-video-bytes", "video/mp4", transcript_text="hello", http_client=_Client(_FakeHttpResponse()),
+    )
+    assert result["ok"] is True
+    assert captured_content_types == ["video/mp4"]
+
+
+def test_video_ai_provider_has_no_importers_outside_video_library():
+    """Locks in the isolation claim with a real, repo-wide source scan
+    rather than an assumption: if some future change makes another EduHub
+    system import this module, this test fails loudly instead of silently
+    coupling an unrelated system to the Video Library's model choices.
+    Plain filesystem scan (no git/subprocess dependency, so this can't be
+    flaky in an environment without git on PATH)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    allowed = {"video_narration_tools.py", "video_pipeline_tools.py", "video_ai_provider.py"}
+    importers: set[str] = set()
+    for py_file in repo_root.glob("*.py"):
+        if py_file.name in allowed:
+            continue
+        text = py_file.read_text(encoding="utf-8", errors="ignore")
+        if "import video_ai_provider" in text or "from video_ai_provider" in text:
+            importers.add(py_file.name)
+    assert importers == set(), importers

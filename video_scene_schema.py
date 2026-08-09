@@ -68,6 +68,31 @@ def _clean_audio_observations(v) -> dict:
 
 
 # ── StoryAnalysis (Mode A) ────────────────────────────────────────────────
+def _clean_visual_events(raw) -> list[dict]:
+    """Optional, sparse list — Gemini reports a visual event ONLY when it
+    can confidently point to one; an empty list is the correct, honest
+    output for a scene with no distinct visual beat worth calling out, not
+    a sign of missing data. Never fabricated: each entry must carry its
+    own timestamp, since a description with no timestamp isn't a usable
+    production input (see video_narration_tools.py's scene-anchoring,
+    which needs a real number to place anything against)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw[:20]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ts = float(item.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        desc = str(item.get("description") or "").strip()[:200]
+        if not desc or ts < 0:
+            continue
+        out.append({"timestamp": round(ts, 3), "description": desc})
+    return out
+
+
 def build_scene(
     *,
     scene_id: str | None = None,
@@ -81,6 +106,7 @@ def build_scene(
     confidence: float | None = None,
     audio_observations: dict | None = None,
     emotional_context: str = "",
+    visual_events: list[dict] | None = None,
 ) -> dict:
     return {
         "sceneId": scene_id or new_scene_id(),
@@ -97,6 +123,11 @@ def build_scene(
         # feeds the script-drafting prompt so performance direction is
         # grounded in real scene context rather than a generic mood label.
         "emotionalContext": str(emotional_context or "")[:400],
+        # Sparse, optional, real-timestamped visual beats within the scene
+        # (e.g. "12.4s — Daniel closes the laptop") — informational
+        # production context for Author Studio and future SFX/performance
+        # anchoring; never required, never guessed when Gemini reports none.
+        "visualEvents": _clean_visual_events(visual_events),
     }
 
 
@@ -178,6 +209,7 @@ def normalize_story_analysis(raw, *, extract_json=None) -> dict | None:
                 ),
                 audio_observations=item.get("audioObservations"),
                 emotional_context=_s(item.get("emotionalContext"), 400),
+                visual_events=item.get("visualEvents"),
             ))
 
     raw_characters = data.get("characters")

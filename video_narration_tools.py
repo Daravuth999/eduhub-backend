@@ -732,6 +732,35 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     if not ordered_results:
         raise VideoNarrationError("no_lines", "the script has no lines to assemble", 409)
 
+    # Scene-anchored timing: a scene's narration should not begin before
+    # that scene has actually started on screen. Real story-analysis scene
+    # start/end times (Gemini's own timestamps — never invented here) are
+    # used ONLY to insert REAL generated silence at a scene boundary when
+    # the track's own running cursor would otherwise place that scene's
+    # first line too early. This never stretches/trims ElevenLabs audio
+    # and never touches a line's OWN relative word timestamps (those stay
+    # exactly as ElevenLabs measured them) — only the absolute OFFSET each
+    # line is placed at changes, which is why this must be the SAME loop
+    # that builds both the real audio segments and the word timestamps:
+    # a gap inserted into one but not the other would make the sync
+    # document lie about what the assembled audio actually contains.
+    # Gracefully degrades to the prior pure back-to-back concatenation
+    # when story-analysis timing is unavailable for a scene, or when real
+    # silence generation itself is unavailable (no ffmpeg) — an honest
+    # fallback, never a fabricated gap.
+    story_scenes = (job.get("storyAnalysis", {}).get("result") or {}).get("scenes") or []
+    scene_time_map: dict[str, tuple[float, float]] = {}
+    for sc in story_scenes:
+        if not isinstance(sc, dict) or not sc.get("sceneId"):
+            continue
+        try:
+            s_start = float(sc.get("start"))
+            s_end = float(sc.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if s_end > s_start >= 0:
+            scene_time_map[sc["sceneId"]] = (s_start, s_end)
+
     # Loudness normalization runs per-line, BEFORE stitching: ElevenLabs
     # renders each line independently, so raw output loudness genuinely
     # varies line to line — normalizing the already-assembled track as one
@@ -740,19 +769,47 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     # changes clip duration, so the timestamps built below (from
     # ElevenLabs' own alignment) remain accurate against the normalized
     # audio actually stored.
-    audio_segments = []
-    for entry in ordered_results:
-        raw, _ct = await video_pipeline_tools.load_media_bytes(db, sync_studio_tools.get_media_bucket(db), entry["mediaRef"])
-        audio_segments.append(await video_render_tools.normalize_line_loudness(raw))
-    stitched = _stitch_mp3_segments(audio_segments)
-
+    audio_segments: list[bytes] = []
     sentences = []
     cursor = 0.0
     speaker_ids: list[str] = []
     scene_starts: dict[str, float] = {}
+    scene_timing_notes: list[dict] = []
+    seen_scenes: set[str] = set()
     for entry, scene_id in zip(ordered_results, ordered_scene_ids):
+        if scene_id not in seen_scenes:
+            seen_scenes.add(scene_id)
+            intended_start = scene_time_map.get(scene_id, (None, None))[0]
+            if intended_start is not None and intended_start > cursor + 0.05:
+                gap = intended_start - cursor
+                silence = await video_render_tools.generate_silence_clip(gap)
+                if silence:
+                    audio_segments.append(silence)
+                    cursor += gap
+                    scene_timing_notes.append({
+                        "sceneId": scene_id, "paddedSec": round(gap, 3),
+                        "reason": "waited for the scene's real visual start",
+                    })
+                else:
+                    scene_timing_notes.append({
+                        "sceneId": scene_id, "paddedSec": 0.0,
+                        "reason": "scene's visual start is later than the narration cursor, but real "
+                                  "silence padding was unavailable (ffmpeg missing/failed) — narration "
+                                  "starts immediately instead",
+                    })
+            elif intended_start is not None and intended_start < cursor - 0.05:
+                scene_timing_notes.append({
+                    "sceneId": scene_id, "paddedSec": 0.0,
+                    "reason": "the prior scene's narration overran into this scene's visual start — "
+                              "not corrected (would require compressing or stretching real audio)",
+                })
+
         offset = cursor
         scene_starts.setdefault(scene_id, offset)
+
+        raw, _ct = await video_pipeline_tools.load_media_bytes(db, sync_studio_tools.get_media_bucket(db), entry["mediaRef"])
+        audio_segments.append(await video_render_tools.normalize_line_loudness(raw))
+
         raw_words = _strip_bracketed_instruction_words(entry.get("wordTimestamps") or [])
         words = [
             sync_schema.build_word(
@@ -768,6 +825,8 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
             sentences.append(sync_schema.build_sentence(f"s{len(sentences) + 1}", words, speaker_id=sid or None))
         line_duration = float(entry.get("durationSec") or (words[-1]["end"] - offset if words else 0.0))
         cursor = offset + line_duration
+
+    stitched = _stitch_mp3_segments(audio_segments)
 
     # Mix any completed SFX into the stitched track BEFORE it's persisted —
     # additive overlay via video_render_tools.overlay_audio_at_offset, which
@@ -815,6 +874,11 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     assembly_result = {
         "syncId": sync_doc["syncId"], "mediaRef": media_ref, "durationSec": cursor,
         "sfxMixed": sfx_mixed, "sfxSkipped": sfx_skipped,
+        # Honest, explicit record of every scene-boundary timing decision —
+        # never silent. Empty list means every scene either had no story-
+        # analysis timing to anchor to, or landed within 0.05s of its
+        # intended start with no correction needed.
+        "sceneTiming": scene_timing_notes,
     }
     await db[jobs.COLL].update_one(
         {"_id": lesson_id},
@@ -989,6 +1053,25 @@ async def render_final_master(db, lesson_id: str, media_bucket, *, lesson_getter
     return await jobs.get_or_create_job(db, lesson_id)
 
 
+async def reset_render(db, lesson_id: str) -> dict:
+    """Explicit, admin-confirmed reset of an already-completed render —
+    the ONLY way to force a fresh final-master mux (render_final_master's
+    own cost-safe guard otherwise refuses to re-run a completed stage,
+    matching reset_line_voice's identical pattern for ElevenLabs lines).
+    Needed whenever the ASSEMBLY that feeds the render genuinely changed
+    (e.g. re-running "Assemble narration track" after a fix to how
+    narration is timed/cleaned) — the existing per-line ElevenLabs audio
+    is fully reused; this never re-triggers any provider call, only a new
+    ffmpeg mux the next time render_final_master runs. Does not un-publish
+    an already-published lesson — publish_narration must be re-run
+    afterward to expose the new master, exactly like a first render."""
+    job = await jobs.get_or_create_job(db, lesson_id)
+    if job["render"]["state"] == jobs.S_PENDING:
+        raise VideoNarrationError("nothing_to_reset", "no render has been produced yet", 409)
+    await db[jobs.COLL].update_one({"_id": lesson_id}, {"$set": {"render": jobs.new_stage(), "updatedAt": _now()}})
+    return await jobs.get_or_create_job(db, lesson_id)
+
+
 async def publish_narration(db, lesson_id: str) -> dict:
     """The explicit human-approval gate — an assembled narration track is
     NEVER surfaced to students until this is called. Distinct from the
@@ -1151,6 +1234,15 @@ def register_video_narration_routes(api, db, require_admin, *, lesson_getter, sy
             job = await render_final_master(
                 db, lesson_id, sync_studio_tools.get_media_bucket(db), lesson_getter=lesson_getter,
             )
+        except VideoNarrationError as exc:
+            _raise(exc)
+        return {"ok": True, "job": job}
+
+    @api.post("/studio/video/lessons/{lesson_id}/narration/render/reset")
+    async def reset_render_route(lesson_id: str, _admin=Depends(require_admin)):
+        _need_enabled()
+        try:
+            job = await reset_render(db, lesson_id)
         except VideoNarrationError as exc:
             _raise(exc)
         return {"ok": True, "job": job}

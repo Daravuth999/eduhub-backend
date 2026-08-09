@@ -451,3 +451,59 @@ async def test_normalize_line_loudness_returns_original_bytes_on_ffmpeg_failure(
 @pytest.mark.asyncio
 async def test_normalize_line_loudness_passthrough_on_empty_input():
     assert await vrt.normalize_line_loudness(b"") == b""
+
+
+# ── silence generation (scene-anchored narration timing) ──────────────────
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_generate_silence_clip_produces_a_clip_of_the_requested_duration():
+    clip = await vrt.generate_silence_clip(2.0)
+    assert clip is not None
+    assert len(clip) > 0
+    duration = await vrt.probe_audio_duration_seconds(clip)
+    assert duration == pytest.approx(2.0, abs=0.15)
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_generate_silence_clip_is_genuinely_silent():
+    """Real verification via ffmpeg's own volumedetect filter — not just
+    "a file came back", but that its measured mean/max volume is at (or
+    indistinguishable from) digital silence."""
+    clip = await vrt.generate_silence_clip(1.0)
+    assert clip is not None
+    path = os.path.join(tempfile.gettempdir(), f"vrt_silence_check_{uuid.uuid4().hex}.mp3")
+    with open(path, "wb") as f:
+        f.write(clip)
+    try:
+        ffmpeg = vrt._resolve_ffmpeg()
+        _code, _out, err = await vrt._run(ffmpeg, "-i", path, "-af", "volumedetect", "-f", "null", "-", timeout=30.0)
+        text = err.decode("utf-8", errors="replace")
+        assert "mean_volume" in text
+        import re as _re
+        mean = float(_re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)", text).group(1))
+        assert mean < -50.0  # dB — effectively silent
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+@pytest.mark.asyncio
+async def test_generate_silence_clip_returns_none_for_non_positive_duration():
+    assert await vrt.generate_silence_clip(0.0) is None
+    assert await vrt.generate_silence_clip(-1.0) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_silence_clip_returns_none_when_ffmpeg_unavailable(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    assert await vrt.generate_silence_clip(2.0) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_silence_clip_returns_none_on_ffmpeg_failure(monkeypatch):
+    async def _failing_run(*args, timeout):
+        return 1, b"", b"ffmpeg: invalid filter"
+
+    monkeypatch.setattr(vrt, "_run", _failing_run)
+    assert await vrt.generate_silence_clip(2.0) is None

@@ -74,6 +74,53 @@ def test_normalize_story_analysis_parses_emotional_context_from_raw_scene():
     assert result["scenes"][0]["emotionalContext"] == "Emma is relieved to see her grandfather after months apart."
 
 
+def test_build_scene_defaults_visual_events_to_empty_list():
+    sc = vss.build_scene(start=0.0, end=1.0)
+    assert sc["visualEvents"] == []
+
+
+def test_build_scene_cleans_valid_visual_events():
+    sc = vss.build_scene(start=0.0, end=10.0, visual_events=[
+        {"timestamp": 3.14159, "description": "Daniel closes the laptop"},
+        {"timestamp": 7, "description": "x" * 300},
+    ])
+    assert sc["visualEvents"] == [
+        {"timestamp": 3.142, "description": "Daniel closes the laptop"},
+        {"timestamp": 7.0, "description": "x" * 200},
+    ]
+
+
+def test_build_scene_drops_visual_events_missing_a_timestamp_or_description():
+    sc = vss.build_scene(start=0.0, end=10.0, visual_events=[
+        {"description": "no timestamp"},
+        {"timestamp": 2.0},  # no description
+        {"timestamp": -1.0, "description": "negative timestamp"},
+        "not a dict",
+        {"timestamp": 4.0, "description": "kept"},
+    ])
+    assert sc["visualEvents"] == [{"timestamp": 4.0, "description": "kept"}]
+
+
+def test_build_scene_handles_non_list_visual_events():
+    sc = vss.build_scene(start=0.0, end=1.0, visual_events="not a list")
+    assert sc["visualEvents"] == []
+
+
+def test_normalize_story_analysis_parses_visual_events_from_raw_scene():
+    raw = {"scenes": [{
+        "title": "with events", "start": 0, "end": 10,
+        "visualEvents": [{"timestamp": 4.2, "description": "Daniel freezes"}],
+    }]}
+    result = vss.normalize_story_analysis(raw)
+    assert result["scenes"][0]["visualEvents"] == [{"timestamp": 4.2, "description": "Daniel freezes"}]
+
+
+def test_normalize_story_analysis_defaults_visual_events_when_missing_from_raw_scene():
+    raw = {"scenes": [{"title": "no events field", "start": 0, "end": 5}]}
+    result = vss.normalize_story_analysis(raw)
+    assert result["scenes"][0]["visualEvents"] == []
+
+
 def test_build_script_line_allows_a_rich_performance_direction_not_just_a_word():
     line = vss.build_script_line(
         speaker="Emma", text="Are you okay?",

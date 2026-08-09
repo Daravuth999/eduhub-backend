@@ -270,6 +270,57 @@ async def normalize_line_loudness(audio_bytes: bytes, *, timeout: float = 60.0) 
                 pass
 
 
+async def generate_silence_clip(duration_sec: float, *, sample_rate: int = 44100,
+                                 timeout: float = 30.0) -> bytes | None:
+    """Real, honest digital silence — an actual MP3-encoded silent clip
+    (ffmpeg's `anullsrc` lavfi source), never a fabricated timestamp or a
+    guessed-length placeholder. Used by video_narration_tools.
+    assemble_narration_track to pad a genuine gap when a scene's real
+    visual start (from Gemini's story analysis) is later than where the
+    narration track's own cursor has naturally landed — so a scene's
+    narration doesn't start speaking before that scene has even begun on
+    screen.
+
+    Mono, 44.1kHz MP3 to match ElevenLabs' own `mp3_44100_128` output
+    format, so the existing frame-level concatenation (_stitch_mp3_
+    segments) keeps working correctly across a real line clip / silence /
+    real line clip sequence.
+
+    Best-effort, never fabricates: returns None (never raises, never
+    returns a shorter/wrong-length clip) when duration is not positive or
+    ffmpeg is unavailable or generation fails for any reason. Callers MUST
+    treat None as "padding unavailable" and skip the gap — an honest
+    degrade to sequential concatenation — never as a zero-length silence."""
+    if duration_sec is None or duration_sec <= 0:
+        return None
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    work_id = uuid.uuid4().hex
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_silence_{work_id}.mp3")
+    try:
+        args = (
+            ffmpeg, "-y", "-f", "lavfi", "-i", f"anullsrc=r={sample_rate}:cl=mono",
+            "-t", f"{duration_sec:.3f}", "-c:a", "libmp3lame", "-b:a", "128k", out_path,
+        )
+        code, _out, err = await _run(*args, timeout=timeout)
+        if code != 0:
+            logger.info("video_render: silence generation skipped (ffmpeg exit %s): %s",
+                        code, err.decode("utf-8", errors="replace")[-300:])
+            return None
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return data or None
+    except RenderError:
+        return None
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
+
+
 async def mux_narration_into_video(
     video_bytes: bytes, video_content_type: str, audio_bytes: bytes,
     *, treatment: str = DEFAULT_SOURCE_AUDIO_TREATMENT, timeout: float = 300.0,

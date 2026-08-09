@@ -89,6 +89,7 @@ def test_status_reports_provider_readiness_when_keys_present(monkeypatch):
     ("post", "/api/studio/video/lessons/vid_1/narration/voice-production/sc_1/ln_1/reset"),
     ("post", "/api/studio/video/lessons/vid_1/narration/assemble"),
     ("post", "/api/studio/video/lessons/vid_1/narration/render"),
+    ("post", "/api/studio/video/lessons/vid_1/narration/render/reset"),
     ("post", "/api/studio/video/lessons/vid_1/narration/publish"),
     ("post", "/api/studio/video/lessons/vid_1/narration/unpublish"),
 ])
@@ -107,6 +108,14 @@ def test_narration_status_route_works_once_enabled(monkeypatch):
     r = client.get("/api/studio/video/lessons/vid_1/narration")
     assert r.status_code == 200
     assert r.json()["job"]["lessonId"] == "vid_1"
+
+
+def test_reset_render_route_refuses_honestly_when_nothing_was_rendered(monkeypatch):
+    monkeypatch.setenv("VIDEO_NARRATION_ENABLED", "true")
+    client = _make_client()
+    r = client.post("/api/studio/video/lessons/vid_1/narration/render/reset")
+    assert r.status_code == 409
+    assert "nothing_to_reset" in r.json()["detail"].lower() or "no render" in r.json()["detail"].lower()
 
 
 def test_status_route_never_gated_by_enabled_itself(monkeypatch):

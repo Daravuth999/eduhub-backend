@@ -30,9 +30,26 @@ Educational analysis (`analyze_transcript`) follows the same pattern: real
 Gemini when available, deterministic bounded mock otherwise.
 
 Env:
-  GEMINI_API_KEY    — provider key (absent ⇒ mock mode)
-  VIDEO_AI_MODEL    — generateContent model (default: gemini-2.5-flash)
-  VIDEO_AI_MOCK     — "1"/"true" forces mock mode even with a key (testing)
+  GEMINI_API_KEY       — provider key (absent ⇒ mock mode)
+  VIDEO_AI_MODEL       — generateContent model for FAST paths: speech
+                         recognition (align) and text-only educational
+                         analysis (default: gemini-2.5-flash)
+  VIDEO_ANALYSIS_MODEL — generateContent model for the DEEP whole-video
+                         story/scene understanding path only (analyze_story
+                         / analyze_story_raw — default: gemini-2.5-pro)
+  VIDEO_AI_MOCK        — "1"/"true" forces mock mode even with a key (testing)
+
+Two deliberately separate model configurations (2026-08 product direction):
+speech recognition needs to be fast and cheap (it runs on every upload,
+often on long media) — Flash. Whole-story scene/character/emotion
+understanding is a single per-lesson call that directly drives narration
+performance quality, so it warrants the stronger model. This ONLY affects
+this module (video_pipeline_tools.py / video_narration_tools.py are its
+only importers — verified, not assumed) via a video-library-specific env
+var; it shares no configuration with GEMINI_MODEL, which is what every
+OTHER EduHub Gemini integration (Book Factory, EduTalk, the AI Assistant,
+premium_ai_tools, etc.) reads independently. Changing either model
+constant here cannot affect any of those other systems.
 """
 from __future__ import annotations
 
@@ -65,6 +82,10 @@ _ALIGN_TIMEOUT = httpx.Timeout(480.0, connect=15.0)
 _ANALYZE_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+# Deep whole-video story/scene analysis ONLY — never used for speech
+# recognition or any other Gemini call in this module. See the module
+# docstring's "Two deliberately separate model configurations" note.
+DEFAULT_ANALYSIS_MODEL = "gemini-2.5-pro"
 
 
 def _env(name: str) -> str:
@@ -77,6 +98,13 @@ def _api_key() -> str:
 
 def _model() -> str:
     return _env("VIDEO_AI_MODEL") or DEFAULT_MODEL
+
+
+def _analysis_model() -> str:
+    """Model for GeminiVideoProvider.analyze_story_raw ONLY — deliberately
+    independent of _model()/VIDEO_AI_MODEL (speech recognition) so a future
+    change to either never silently affects the other."""
+    return _env("VIDEO_ANALYSIS_MODEL") or DEFAULT_ANALYSIS_MODEL
 
 
 def _mock_forced() -> bool:
@@ -246,7 +274,10 @@ _STORY_PROMPT_TEMPLATE = (
     '"music": "<any music you hear, or empty>", "ambience": "<background/room tone, or empty>", '
     '"sfx": "<any sound effects, or empty>"}}, '
     '"emotionalContext": "<who feels what and why in this scene, and how the characters relate '
-    'to each other here — 1 sentence, or empty if purely factual/narration>"}}\n'
+    'to each other here — 1 sentence, or empty if purely factual/narration>", '
+    '"visualEvents": [{{"timestamp": <seconds as number, within this scene\'s start/end>, '
+    '"description": "<one short, concrete visual beat you can actually see, e.g. '
+    '\'Daniel closes the laptop\'>"}}]}}\n'
     "  ]\n"
     "}}\n"
     "Rules:\n"
@@ -255,7 +286,12 @@ _STORY_PROMPT_TEMPLATE = (
     "- A scene with no dialogue (pure narration/action) is still valid — leave speakers empty.\n"
     "- audioObservations describes what you HEAR in the ORIGINAL audio track of this scene — "
     "this is your own listening description, not a claim that those sounds can be isolated. "
-    "Leave any field \"\" if you don't notice that layer.\n\n"
+    "Leave any field \"\" if you don't notice that layer.\n"
+    "- visualEvents is OPTIONAL and SPARSE: include an entry only for a visual beat you can "
+    "confidently point to a specific moment for (a character's specific action, a clear scene-"
+    "changing event). An empty array is the correct answer for a scene with no such distinct "
+    "beat — never invent one to fill the list, and never guess a timestamp you are not confident "
+    "about.\n\n"
     "Lesson title: {title}\n\n"
     "Transcript (reference only — analyze the actual attached video, not just this text):\n{transcript}"
 )
@@ -344,7 +380,12 @@ async def analyze_story(media_bytes: bytes, content_type: str, *, transcript_tex
     if not ai_available():
         return {"ok": True, "storyAnalysis": _mock_story_analysis(transcript_text), "engine": "mock"}
     try:
-        provider = GeminiVideoProvider(http_client=http_client)
+        # Deep story/scene understanding gets its OWN model (gemini-2.5-pro
+        # by default, see _analysis_model()) — a separate GeminiVideoProvider
+        # instance from whatever get_video_ai_provider() hands the ASR path,
+        # constructed fresh right here so the override can never leak into
+        # any other call site.
+        provider = GeminiVideoProvider(http_client=http_client, model=_analysis_model())
         raw_text = await provider.analyze_story_raw(
             media_bytes, content_type, transcript_text=transcript_text, title=title,
         )

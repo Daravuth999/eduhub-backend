@@ -648,6 +648,49 @@ async def test_render_is_cost_safe_never_reruns_when_completed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reset_render_allows_a_genuinely_fresh_render_without_new_elevenlabs_calls(monkeypatch):
+    """The safe re-render path: after a fix changes what assembly produces
+    (e.g. corrected timing/clean transcript), the admin must be able to
+    force a fresh mux WITHOUT paying for ElevenLabs again — reset_render
+    only clears the render stage; every per-line audio asset is reused
+    as-is."""
+    db = _FakeDB()
+    bucket = await _assembled_job(db, monkeypatch)
+    elevenlabs_calls = []
+
+    class _CountingClient(_FakeElevenLabsClient):
+        async def post(self, url, headers=None, json=None, **kwargs):
+            elevenlabs_calls.append(1)
+            return await super().post(url, headers=headers, json=json, **kwargs)
+
+    mux_calls = []
+
+    async def _counting_mux(video_bytes, video_ct, audio_bytes, *, treatment="mute"):
+        mux_calls.append(1)
+        return await _fake_mux(video_bytes, video_ct, audio_bytes, treatment=treatment)
+
+    monkeypatch.setattr(vnt.video_render_tools, "mux_narration_into_video", _counting_mux)
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert len(mux_calls) == 1
+
+    job = await vnt.reset_render(db, "vid_1")
+    assert job["render"]["state"] == jobs.S_PENDING
+
+    await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
+    assert len(mux_calls) == 2  # a genuinely fresh mux ran
+    assert elevenlabs_calls == []  # no ElevenLabs re-spend — audio assets reused as-is
+
+
+@pytest.mark.asyncio
+async def test_reset_render_refuses_when_nothing_has_been_rendered_yet():
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    with pytest.raises(vnt.VideoNarrationError) as exc:
+        await vnt.reset_render(db, "vid_1")
+    assert exc.value.code == "nothing_to_reset"
+
+
+@pytest.mark.asyncio
 async def test_render_fails_terminal_when_ffmpeg_unavailable(monkeypatch):
     db = _FakeDB()
     bucket = await _assembled_job(db, monkeypatch)
@@ -1164,6 +1207,119 @@ async def test_real_end_to_end_production_pipeline_with_genuine_ffmpeg_media(mon
     lesson = await db.video_lessons.find_one({"lessonId": "vid_1"})
     assert lesson["aiNarrationMasterMediaRef"] == master_ref
     assert published["published"] is True
+
+
+@pytest.mark.skipif(NO_FFMPEG_E2E or NO_FFPROBE_E2E, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_real_multi_scene_narration_is_anchored_to_real_scene_start_times(monkeypatch):
+    """The production-grade correction this test exists to prove: two
+    scenes with a real visual GAP between them (scene 2 doesn't start on
+    screen until well after scene 1's narration finishes speaking) must
+    result in scene 2's narration actually landing at scene 2's real
+    start time in the assembled audio — not immediately after scene 1's
+    narration ends. Verified with genuine ffmpeg-generated audio and real
+    ffprobe duration measurement, not just asserted numbers."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+
+    # Scene 1: 0.0s-1.0s on screen. Scene 2 doesn't begin until 3.0s — a
+    # real 2s+ visual gap (e.g. a transition/pause) the narration must
+    # respect rather than just picking up immediately where scene 1 left off.
+    story_analysis = {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 1.0, "title": "Opening", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+            {"sceneId": "sc2", "start": 3.0, "end": 5.0, "title": "Later", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "development",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_analyze_story(*a, **k):
+        return {"ok": True, "storyAnalysis": story_analysis, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _fake_analyze_story)
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_COMPLETED
+
+    script_blueprint = {
+        "scenes": [
+            {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": "Scene one begins.", "emotion": ""}]},
+            {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": "Scene two begins.", "emotion": ""}]},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_draft_script(*a, **k):
+        return {"ok": True, "scriptBlueprint": script_blueprint, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _fake_draft_script)
+    job = await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["scriptBlueprint"]["state"] == jobs.S_COMPLETED
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+
+    # Both narration lines are short (0.4s) — scene 1's narration finishes
+    # at t=0.4, well before scene 2's real visual start at t=3.0. Without
+    # scene anchoring, scene 2's narration would start speaking at t=0.4.
+    clip1 = await _make_real_media(kind="audio", duration=0.4)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=_RealAudioElevenLabsClient(clip1))
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+
+    clip2 = await _make_real_media(kind="audio", duration=0.4)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc2", "ln2", http_client=_RealAudioElevenLabsClient(clip2))
+    assert job["voiceProduction"]["sc2"]["lines"]["ln2"]["state"] == jobs.S_COMPLETED
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["state"] == jobs.S_COMPLETED
+
+    # _RealAudioElevenLabsClient (see its docstring above) fabricates
+    # alignment timing from TEXT LENGTH (0.05s/char) — decoupled from the
+    # real ffmpeg clip's actual playtime, since no real ElevenLabs call is
+    # made. In real production usage the alignment always matches the real
+    # audio it was measured from; here, computing the expected cursor the
+    # SAME way durationSec is actually derived (word_timestamps[-1]["end"])
+    # keeps this assertion honest rather than guessing a number.
+    line1_duration = len("Scene one begins.") * 0.05
+    line2_duration = len("Scene two begins.") * 0.05
+
+    # Honest record of the timing decision actually made.
+    timing_notes = job["assembly"]["result"]["sceneTiming"]
+    sc2_note = next(n for n in timing_notes if n["sceneId"] == "sc2")
+    assert sc2_note["paddedSec"] == pytest.approx(3.0 - line1_duration, abs=0.2)
+
+    # Real audio proof: the assembled track's ACTUAL playable duration must
+    # be unmistakably longer than the two real clips played back-to-back —
+    # proof that genuine silence bytes were spliced in, not just numbers
+    # changed in the sync document. (The exact total isn't asserted against
+    # line1_duration/line2_duration precisely: those are the FAKE
+    # alignment's text-length-derived durations, which this fixture uses
+    # to decide the gap size — real ElevenLabs always measures duration
+    # from the real audio it generated, so this mismatch is a test-fixture
+    # artifact, never a product behavior.)
+    real_clip1_duration = await vnt.video_render_tools.probe_audio_duration_seconds(clip1)
+    real_clip2_duration = await vnt.video_render_tools.probe_audio_duration_seconds(clip2)
+    assembled_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(
+        db, bucket, job["assembly"]["result"]["mediaRef"],
+    )
+    total_duration = await vnt.video_render_tools.probe_audio_duration_seconds(assembled_bytes)
+    assert total_duration > real_clip1_duration + real_clip2_duration + 1.0
+
+    # Karaoke proof: scene 2's line's word timestamps are absolute against
+    # the REAL assembled timeline — the sync document must place them
+    # around t=3.0, not t=0.4.
+    sync_doc = await db.chapter_sync.find_one({"syncId": job["assembly"]["result"]["syncId"]})
+    sentences = sync_doc["paragraphs"][0]["sentences"]
+    scene2_sentence = sentences[1]  # sc1's line assembled first, sc2's second
+    assert scene2_sentence["words"][0]["start"] == pytest.approx(3.0, abs=0.2)
 
 
 # ── Stage watchdog — root-cause fix for a job stuck forever in "claimed"/
