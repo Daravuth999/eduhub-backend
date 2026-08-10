@@ -2366,3 +2366,165 @@ async def test_idempotent_reuse_never_fires_for_a_genuinely_different_request(mo
     final_stage = _get_dotted(job_final, path)
     assert final_stage["state"] == jobs.S_COMPLETED
     assert len(client.calls) == 2, "a genuinely different request must call ElevenLabs again, not reuse stale audio"
+
+
+# ── Bilingual (Khmer) learning layer in the AI-narrated pipeline ───────────
+# One coherent bilingual architecture regardless of which pipeline produced
+# a lesson's sync document: video_scene_schema.build_script_line's own
+# translationKm (drafted by the SAME Gemini call that writes the line's
+# English "text" — see video_ai_provider._SCRIPT_PROMPT_TEMPLATE) rides
+# through assemble_narration_track onto the exact sentence built from that
+# line, with no separate id-matching step at all.
+async def _job_with_two_scenes_and_translations(db, monkeypatch):
+    """Same shape as _job_with_two_scenes, but each script line already
+    carries a real translationKm — as if Gemini had drafted it in the same
+    response as the line's English text."""
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+
+    story_analysis = {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 5.0, "title": "Opening", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+            {"sceneId": "sc2", "start": 5.0, "end": 10.0, "title": "Later", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "development",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_analyze_story(*a, **k):
+        return {"ok": True, "storyAnalysis": story_analysis, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _fake_analyze_story)
+    await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+
+    script_blueprint = {
+        "scenes": [
+            {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": "The room went quiet.",
+                                           "emotion": "", "translationKm": "បន្ទប់នោះស្ងាត់ស្ងៀម។"}]},
+            {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": "No one moved.",
+                                           "emotion": "", "translationKm": "គ្មាននរណាម្នាក់កម្រើកឡើយ។"}]},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_draft_script(*a, **k):
+        return {"ok": True, "scriptBlueprint": script_blueprint, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _fake_draft_script)
+    await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    return bucket
+
+
+def _bypass_real_audio_concat(monkeypatch):
+    """These tests are about Khmer translation carry-through/timing-safety,
+    not audio-concatenation correctness (already covered by the dedicated
+    real-ffmpeg E2E tests) — the fake ElevenLabs client's placeholder
+    "audio-for:<text>" byte strings are not real, decodable MP3, so a
+    genuine ffmpeg concat/decode would fail on them. Stubbed to the exact
+    same honest byte-join fallback concat_audio_segments itself already
+    uses when ffmpeg is genuinely unavailable."""
+    async def _fake_concat(segments, *, timeout=180.0):
+        real = [s for s in segments if s]
+        return real[0] if len(real) <= 1 else b"".join(real)
+    monkeypatch.setattr(vnt.video_render_tools, "concat_audio_segments", _fake_concat)
+
+
+@pytest.mark.asyncio
+async def test_assemble_carries_each_lines_translation_onto_its_own_sentence(monkeypatch):
+    db = _FakeDB()
+    await _job_with_two_scenes_and_translations(db, monkeypatch)
+    _bypass_real_audio_concat(monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+    client = _FakeElevenLabsClient()
+    await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=client)
+    await vnt.generate_line_voice(db, "vid_1", "sc2", "ln2", http_client=client)
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    sync_id = job["assembly"]["result"]["syncId"]
+    sync_doc = await db.chapter_sync.find_one({"syncId": sync_id})
+    sentences = sync_doc["paragraphs"][0]["sentences"]
+
+    assert len(sentences) == 2
+    assert sentences[0]["translationKm"] == "បន្ទប់នោះស្ងាត់ស្ងៀម។"
+    assert sentences[1]["translationKm"] == "គ្មាននរណាម្នាក់កម្រើកឡើយ។"
+    # Never leaked into the actual spoken words.
+    for s in sentences:
+        for w in s["words"]:
+            assert "translationKm" not in w
+
+
+@pytest.mark.asyncio
+async def test_assemble_translation_present_or_absent_yields_identical_word_timing(monkeypatch):
+    """The exact karaoke-safety proof this directive demands: attaching a
+    translation to a line must never change the resulting audio segments,
+    word timestamps, or sentence count — only add the extra field."""
+    db_with = _FakeDB()
+    await _job_with_two_scenes_and_translations(db_with, monkeypatch)
+    _bypass_real_audio_concat(monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db_with, "vid_1", {"Narrator": "voice_1"})
+    client_with = _FakeElevenLabsClient()
+    await vnt.generate_line_voice(db_with, "vid_1", "sc1", "ln1", http_client=client_with)
+    await vnt.generate_line_voice(db_with, "vid_1", "sc2", "ln2", http_client=client_with)
+    job_with = await vnt.assemble_narration_track(db_with, "vid_1")
+    doc_with = await db_with.chapter_sync.find_one({"syncId": job_with["assembly"]["result"]["syncId"]})
+
+    db_without = _FakeDB()
+    await _job_with_two_scenes(db_without, monkeypatch)
+    await vnt.set_voice_assignments(db_without, "vid_1", {"Narrator": "voice_1"})
+    client_without = _FakeElevenLabsClient()
+    await vnt.generate_line_voice(db_without, "vid_1", "sc1", "ln1", http_client=client_without)
+    await vnt.generate_line_voice(db_without, "vid_1", "sc2", "ln2", http_client=client_without)
+    job_without = await vnt.assemble_narration_track(db_without, "vid_1")
+    doc_without = await db_without.chapter_sync.find_one({"syncId": job_without["assembly"]["result"]["syncId"]})
+
+    def _words_only(doc):
+        return [{k: v for k, v in w.items() if k != "confidence"}
+                for s in doc["paragraphs"][0]["sentences"] for w in s["words"]]
+
+    assert _words_only(doc_with) == _words_only(doc_without)
+    assert doc_with["durationSec"] == doc_without["durationSec"]
+
+
+@pytest.mark.asyncio
+async def test_edit_script_blueprint_clears_stale_translation_when_text_changes(monkeypatch):
+    db = _FakeDB()
+    await _job_with_two_scenes_and_translations(db, monkeypatch)
+
+    corrected = [
+        {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator",
+                                       "text": "The room went completely silent.",  # text changed
+                                       "emotion": "", "translationKm": "បន្ទប់នោះស្ងាត់ស្ងៀម។"}]},
+        {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": "No one moved.",  # unchanged
+                                       "emotion": "", "translationKm": "គ្មាននរណាម្នាក់កម្រើកឡើយ។"}]},
+    ]
+    job = await vnt.edit_script_blueprint(db, "vid_1", corrected)
+    lines_by_scene = {sc["sceneId"]: sc["lines"][0] for sc in job["scriptBlueprint"]["result"]["scenes"]}
+
+    assert lines_by_scene["sc1"]["text"] == "The room went completely silent."
+    assert lines_by_scene["sc1"]["translationKm"] == "", "stale translation (drafted against the OLD text) must be cleared"
+    assert lines_by_scene["sc2"]["translationKm"] == "គ្មាននរណាម្នាក់កម្រើកឡើយ។", "unchanged line keeps its real translation"
+
+
+@pytest.mark.asyncio
+async def test_edit_script_blueprint_keeps_translation_when_only_emotion_changes(monkeypatch):
+    db = _FakeDB()
+    await _job_with_two_scenes_and_translations(db, monkeypatch)
+
+    corrected = [
+        {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": "The room went quiet.",
+                                       "emotion": "More hesitant, drawn out", "translationKm": "បន្ទប់នោះស្ងាត់ស្ងៀម។"}]},
+        {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": "No one moved.",
+                                       "emotion": "", "translationKm": "គ្មាននរណាម្នាក់កម្រើកឡើយ។"}]},
+    ]
+    job = await vnt.edit_script_blueprint(db, "vid_1", corrected)
+    line = job["scriptBlueprint"]["result"]["scenes"][0]["lines"][0]
+    assert line["translationKm"] == "បន្ទប់នោះស្ងាត់ស្ងៀម។"

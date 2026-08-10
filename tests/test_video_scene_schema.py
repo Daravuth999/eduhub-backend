@@ -134,6 +134,35 @@ def test_build_script_line_bounds_emotion_at_300_chars():
     assert len(line["emotion"]) == 300
 
 
+def test_build_script_line_carries_its_own_khmer_translation():
+    line = vss.build_script_line(speaker="Emma", text="Are you okay?", translation_km="តើអ្នកសុខសប្បាយទេ?")
+    assert line["translationKm"] == "តើអ្នកសុខសប្បាយទេ?"
+
+
+def test_build_script_line_defaults_translation_to_empty_never_fabricated():
+    line = vss.build_script_line(speaker="Emma", text="Hi")
+    assert line["translationKm"] == ""
+
+
+def test_build_script_line_bounds_translation_at_500_chars():
+    line = vss.build_script_line(speaker="Emma", text="Hi", translation_km="x" * 900)
+    assert len(line["translationKm"]) == 500
+
+
+def test_normalize_script_blueprint_extracts_each_lines_own_translation():
+    raw = {"scenes": [{"sceneId": "sc_1", "lines": [
+        {"speaker": "Narrator", "text": "Once upon a time.", "translationKm": "នាពេលមួយកាលមុន។"},
+    ]}]}
+    result = vss.normalize_script_blueprint(raw, scene_ids_in_order=["sc_1"])
+    assert result["scenes"][0]["lines"][0]["translationKm"] == "នាពេលមួយកាលមុន។"
+
+
+def test_normalize_script_blueprint_defaults_missing_translation_to_empty():
+    raw = {"scenes": [{"sceneId": "sc_1", "lines": [{"speaker": "Narrator", "text": "Once upon a time."}]}]}
+    result = vss.normalize_script_blueprint(raw, scene_ids_in_order=["sc_1"])
+    assert result["scenes"][0]["lines"][0]["translationKm"] == ""
+
+
 def test_validate_story_analysis_rejects_duplicate_scene_ids():
     doc = vss.build_story_analysis(scenes=[
         vss.build_scene(scene_id="sc_1"),

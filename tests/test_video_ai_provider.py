@@ -241,6 +241,23 @@ async def test_analyze_story_actually_requests_the_pro_model():
 
 
 @pytest.mark.asyncio
+async def test_draft_script_blueprint_also_uses_the_pro_model():
+    """Script drafting is grounded in the same full-story context as Story
+    Analysis (and now also drafts each line's Khmer translation in the same
+    response) — it deliberately runs on the deep-path model, not the ASR/
+    Flash model _model() the speech-recognition path uses."""
+    client = _RecordingGeminiClient(_gemini_json_response({
+        "scenes": [{"sceneId": "sc1", "lines": [{"speaker": "Narrator", "text": "Hi.", "translationKm": "សួស្ដី។"}]}],
+    }))
+    story_analysis = {"scenes": [{"sceneId": "sc1"}]}
+    result = await vap.draft_script_blueprint(story_analysis, transcript_text="hi", http_client=client)
+
+    assert result["ok"] is True
+    assert len(client.calls) == 1
+    assert "gemini-2.5-pro" in client.calls[0]
+
+
+@pytest.mark.asyncio
 async def test_analyze_story_uses_gemini_25_pro_url_via_injected_client(monkeypatch):
     """analyze_story doesn't accept http_client directly in its public
     signature, so this drives it through the same GeminiVideoProvider path

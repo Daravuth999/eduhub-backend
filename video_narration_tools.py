@@ -606,12 +606,44 @@ async def run_script_blueprint(db, lesson_id: str, *, lesson_getter, sync_getter
 
 async def edit_script_blueprint(db, lesson_id: str, scenes_payload: list) -> dict:
     """Admin correction pass over the Gemini-drafted script — human
-    approval is never bypassed: nothing here is ever auto-published."""
+    approval is never bypassed: nothing here is ever auto-published.
+
+    Stale-translation guard: if an edit changes a line's own `text`, that
+    line's `translationKm` (drafted against the OLD text) no longer
+    describes what the line actually says. Rather than let a now-wrong
+    Khmer translation silently keep shipping to students, this drops it
+    back to "" — the same honest "no translation yet" state a line has
+    before Gemini ever drafted one — regardless of whatever translationKm
+    value the edit payload itself carried for that line."""
     job = await jobs.get_or_create_job(db, lesson_id)
     if job["scriptBlueprint"]["state"] != jobs.S_COMPLETED:
         raise VideoNarrationError("no_script_yet", "no script blueprint exists to edit", 409)
     known_ids = {sc["sceneId"] for sc in job["storyAnalysis"]["result"].get("scenes", []) if sc.get("sceneId")}
-    candidate = video_scene_schema.build_script_blueprint(scenes=scenes_payload)
+
+    old_text_by_line: dict[tuple[str, str], str] = {}
+    for sc in (job["scriptBlueprint"]["result"] or {}).get("scenes") or []:
+        for ln in sc.get("lines") or []:
+            if isinstance(ln, dict) and ln.get("lineId"):
+                old_text_by_line[(sc.get("sceneId"), ln["lineId"])] = ln.get("text") or ""
+
+    cleaned_scenes = []
+    for sc in scenes_payload or []:
+        if not isinstance(sc, dict):
+            cleaned_scenes.append(sc)
+            continue
+        scene_id = sc.get("sceneId")
+        cleaned_lines = []
+        for ln in sc.get("lines") or []:
+            if not isinstance(ln, dict):
+                cleaned_lines.append(ln)
+                continue
+            old_text = old_text_by_line.get((scene_id, ln.get("lineId")))
+            if old_text is not None and old_text != (ln.get("text") or ""):
+                ln = {**ln, "translationKm": ""}
+            cleaned_lines.append(ln)
+        cleaned_scenes.append({**sc, "lines": cleaned_lines})
+
+    candidate = video_scene_schema.build_script_blueprint(scenes=cleaned_scenes)
     ok, errors = video_scene_schema.validate_script_blueprint(candidate, known_scene_ids=known_ids)
     if not ok:
         raise VideoNarrationError("invalid_script", "; ".join(errors), 400)
@@ -932,6 +964,14 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
 
     ordered_results: list[dict] = []
     ordered_scene_ids: list[str] = []
+    # Bilingual learning layer: each line's own translationKm (drafted by
+    # the SAME Gemini call as its English text — see video_scene_schema.
+    # build_script_line's docstring) rides through this exact same
+    # iteration, indexed 1:1 with ordered_results/ordered_scene_ids, so it
+    # attaches to the sentence built from THIS line and no other — there is
+    # no separate id-matching step, so no way for a translation to attach
+    # to the wrong sentence.
+    ordered_translations: list[str] = []
     for scene in scenes:
         vp_lines = ((job.get("voiceProduction") or {}).get(scene["sceneId"], {}) or {}).get("lines") or {}
         for line in scene.get("lines") or []:
@@ -943,6 +983,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
                 )
             ordered_results.append(stage["result"])
             ordered_scene_ids.append(scene["sceneId"])
+            ordered_translations.append(str(line.get("translationKm") or ""))
 
     if not ordered_results:
         raise VideoNarrationError("no_lines", "the script has no lines to assemble", 409)
@@ -993,7 +1034,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
     scene_starts: dict[str, float] = {}
     scene_timing_notes: list[dict] = []
     seen_scenes: set[str] = set()
-    for entry, scene_id in zip(ordered_results, ordered_scene_ids):
+    for entry, scene_id, translation_km in zip(ordered_results, ordered_scene_ids, ordered_translations):
         scene_bounds = scene_time_map.get(scene_id)
         if scene_id not in seen_scenes:
             seen_scenes.add(scene_id)
@@ -1112,7 +1153,10 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
             sid = entry.get("speaker") or ""
             if sid and sid not in speaker_ids:
                 speaker_ids.append(sid)
-            sentences.append(sync_schema.build_sentence(f"s{len(sentences) + 1}", words, speaker_id=sid or None))
+            sentences.append(sync_schema.build_sentence(
+                f"s{len(sentences) + 1}", words, speaker_id=sid or None,
+                translation_km=translation_km,
+            ))
         cursor = offset + line_duration
 
     stitched = await video_render_tools.concat_audio_segments(audio_segments)

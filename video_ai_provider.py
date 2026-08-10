@@ -331,8 +331,9 @@ _STORY_PROMPT_TEMPLATE = (
 )
 
 _SCRIPT_PROMPT_TEMPLATE = (
-    "You are a professional narration/dialogue scriptwriter for an "
-    "English-learning video platform. Below is a whole-story analysis of "
+    "You are a professional narration/dialogue scriptwriter AND a professional "
+    "Khmer translator preparing bilingual materials for Cambodian English "
+    "learners. Below is a whole-story analysis of "
     "a lesson video (already understood scene-by-scene, in order) and its "
     "original transcript for reference. Draft a scene-by-scene narration/"
     "dialogue SCRIPT that a voice actor will read aloud over this video.\n"
@@ -344,7 +345,9 @@ _SCRIPT_PROMPT_TEMPLATE = (
     '"emotion": "<a short PERFORMANCE DIRECTION for the voice actor — natural language, '
     "not a single mood word. Describe pace, warmth/restraint, hesitation, and WHY the "
     "line is said given the scene's emotional/relationship context, e.g. "
-    '\'Gentle concern, natural conversational pace, a slight hesitation before asking\'>"}}\n'
+    '\'Gentle concern, natural conversational pace, a slight hesitation before asking\'>", '
+    '"translationKm": "<natural Khmer translation of THIS EXACT line\'s "text" — see the '
+    'KHMER TRANSLATION REQUIREMENTS below>"}}\n'
     "  ]}}\n"
     "]}}\n"
     "Rules:\n"
@@ -357,6 +360,17 @@ _SCRIPT_PROMPT_TEMPLATE = (
     "- Ground each line's performance direction in the scene's actual emotionalContext/"
     "relationships, not a generic label — two lines with the same one-word mood should still "
     "get different, specific direction if the context differs.\n\n"
+    "KHMER TRANSLATION REQUIREMENTS (translationKm) — read carefully:\n"
+    "- Translate the INTENDED MEANING of the line you just wrote, in its scene/story context, "
+    "never word-by-word — you have the whole story analysis below, use it.\n"
+    "- Preserve character names and important terminology as-is or with a natural Khmer "
+    "rendering — never invent or omit meaning.\n"
+    "- Use natural, everyday Cambodian Khmer, not overly formal literary Khmer, unless the "
+    "scene's own tone is formal.\n"
+    "- Keep the translation concise enough to read comfortably on one phone screen line — a "
+    "short line should stay a short Khmer sentence.\n"
+    "- translationKm must translate the exact \"text\" you wrote for that same line, never a "
+    "different or paraphrased version of it.\n\n"
     "Lesson title: {title}\n\n"
     "Story analysis (JSON):\n{story_json}\n\n"
     "Original transcript (reference only):\n{transcript}"
@@ -473,11 +487,18 @@ async def draft_script_blueprint(story_analysis: dict, *, transcript_text: str =
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"},
         }
+        # Deep-path model (gemini-2.5-pro by default, see _analysis_model),
+        # the SAME override used for the whole-video Story Analysis call
+        # above — script drafting is grounded in that same full-story
+        # context (and now also drafts the line's Khmer translation in the
+        # same response), so it gets the same model quality. This is a
+        # deliberate move OFF the ASR/Flash model (_model()) for this call
+        # specifically; the ASR speech-recognition path itself is untouched.
         if http_client is not None:
-            r = await http_client.post(_GEN_URL.format(model=_model()), params={"key": _api_key()}, json=body)
+            r = await http_client.post(_GEN_URL.format(model=_analysis_model()), params={"key": _api_key()}, json=body)
         else:
             async with httpx.AsyncClient(timeout=_ANALYZE_TIMEOUT) as cli:
-                r = await cli.post(_GEN_URL.format(model=_model()), params={"key": _api_key()}, json=body)
+                r = await cli.post(_GEN_URL.format(model=_analysis_model()), params={"key": _api_key()}, json=body)
         if r.status_code != 200:
             log.warning("video-ai: script-blueprint HTTP %s | body=%s", r.status_code, (r.text or "")[:300])
             return {"ok": False, "reason": "provider_rejected"}
