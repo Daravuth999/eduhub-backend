@@ -169,8 +169,79 @@ def _short_acting_cue(acting_note: str) -> str:
     return cue[:max_len].strip()
 
 
+# ── ElevenLabs narration model/voice isolation ──────────────────────────
+# Deliberately SEPARATE env vars from the shared ELEVENLABS_MODEL/
+# ELEVENLABS_DEFAULT_VOICE that server.py/edutalk_tools.py also read for
+# Book Factory/EduTalk — the SAME isolation discipline video_ai_provider.py
+# already applies to Gemini (VIDEO_AI_MODEL/VIDEO_ANALYSIS_MODEL vs the
+# shared GEMINI_MODEL). Without this, changing Book Factory's configured
+# model/voice would silently change Video Library narration too, and vice
+# versa — reading the shared vars here would have been exactly that bug.
+DEFAULT_NARRATION_MODEL = "eleven_multilingual_v2"
+# "Sarah" — the approved default storyteller voice, used only when the
+# admin hasn't assigned a voice to a speaker and no override env var is
+# set. Ensures a lesson never fails narration purely for lack of
+# configuration, while every speaker still gets exactly ONE voice for the
+# whole episode (voice_assignments is set once per speaker, never varied
+# per scene/line).
+DEFAULT_STORYTELLER_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+
+# Per-scene-intent ElevenLabs performance settings. Grounded in the
+# production baseline given for this feature: stability/style trade
+# emotional stability for expressiveness, speed adjusts delivery pace.
+# Every row already respects "stability >= 0.30, style <= 0.65" — no
+# runtime clamping needed as long as this table itself isn't edited into
+# an extreme.
+_SCENE_VOICE_SETTINGS: dict[str, dict[str, float]] = {
+    "reverent":    {"stability": 0.72, "similarity_boost": 0.80, "style": 0.20, "speed": 0.92},
+    "warm":        {"stability": 0.50, "similarity_boost": 0.78, "style": 0.42, "speed": 0.98},
+    "joyful":      {"stability": 0.38, "similarity_boost": 0.75, "style": 0.60, "speed": 1.05},
+    "nostalgic":   {"stability": 0.62, "similarity_boost": 0.80, "style": 0.35, "speed": 0.90},
+    "curious":     {"stability": 0.42, "similarity_boost": 0.75, "style": 0.50, "speed": 1.00},
+    "closing":     {"stability": 0.68, "similarity_boost": 0.82, "style": 0.28, "speed": 0.90},
+}
+# Keyword groups a scene's real Gemini-observed text is matched against, in
+# priority order — checked in this order so a scene that's both e.g.
+# "joyful" and mentions a "goodbye" resolution still reads as the intended
+# emotional arc position rather than whichever keyword happens first
+# alphabetically. Grounded entirely in words Gemini itself would plausibly
+# write in emotionalContext/narrativeRole/description — never inferred from
+# anything the scene doesn't actually say.
+_EMOTION_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("reverent", ("reverent", "sacred", "solemn", "prayer", "worship", "holy", "ceremony")),
+    ("closing", ("resolution", "closing", "farewell", "goodbye", "conclu", "ending", "peace")),
+    ("joyful", ("joy", "festiv", "celebrat", "excit", "laugh", "cheer", "delight")),
+    ("nostalgic", ("nostalg", "memory", "memories", "remember", "longing", "wistful", "childhood")),
+    ("curious", ("curious", "question", "wonder", "confus", "puzzle", "uncertain")),
+    ("warm", ("warm", "family", "domestic", "home", "comfort", "gentle", "tender", "love")),
+]
+
+
+def _scene_voice_settings(scene: dict | None) -> dict[str, float] | None:
+    """Classifies a story-analysis scene into one of the documented
+    emotional-intent categories using ONLY the scene's own real Gemini-
+    observed text (emotionalContext, narrativeRole, title, description) —
+    never a fabricated guess — and returns that category's ElevenLabs
+    voice_settings. Returns None when the scene is missing or its text
+    doesn't confidently match any category, so the caller can fall back to
+    the existing global default rather than force an arbitrary category
+    onto a scene Gemini gave no emotional signal for."""
+    if not isinstance(scene, dict):
+        return None
+    haystack = " ".join(str(scene.get(f) or "") for f in
+                         ("emotionalContext", "narrativeRole", "title", "description")).lower()
+    if not haystack.strip():
+        return None
+    for category, keywords in _EMOTION_KEYWORDS:
+        if any(kw in haystack for kw in keywords):
+            return dict(_SCENE_VOICE_SETTINGS[category])
+    return None
+
+
 async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str | None = None,
-                                    voice_settings: dict | None = None, http_client=None) -> dict:
+                                    voice_settings: dict | None = None,
+                                    previous_text: str | None = None, next_text: str | None = None,
+                                    http_client=None) -> dict:
     api_key = _env("ELEVENLABS_API_KEY")
     if not api_key:
         raise VideoNarrationError("no_api_key", "ELEVENLABS_API_KEY is not configured")
@@ -180,14 +251,34 @@ async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str
     use_acting = bool(acting_note) and len(text.strip()) > 10
     tts_cue = _short_acting_cue(acting_note) if use_acting else ""
     tts_text = f"[{tts_cue}] {text}" if use_acting else text
-    model = _env("ELEVENLABS_MODEL") or "eleven_v3"
+    # Isolated from the shared ELEVENLABS_MODEL other EduHub systems read
+    # (see DEFAULT_NARRATION_MODEL's own comment) — Video Library narration
+    # always defaults to the multilingual model for its stronger prosody/
+    # emotional performance, regardless of what Book Factory/EduTalk have
+    # configured for their own, unrelated ElevenLabs usage.
+    model = _env("VIDEO_NARRATION_MODEL") or DEFAULT_NARRATION_MODEL
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
     headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
-    body: dict = {"text": tts_text, "model_id": model, "output_format": "mp3_44100_128"}
+    # output_format is a QUERY parameter in ElevenLabs' documented request
+    # contract, not a JSON body field — a body-embedded copy is silently
+    # ignored by the API, so the actual output format previously depended
+    # on account/endpoint defaults rather than the mp3_44100_128 this
+    # module's own downstream ffmpeg pipeline (mono/44.1kHz MP3 splicing)
+    # actually assumes.
+    params = {"output_format": "mp3_44100_128"}
+    body: dict = {"text": tts_text, "model_id": model}
+    # Adjacent-scene context text — shapes delivery continuity across the
+    # cut but is never itself spoken (ElevenLabs' documented contract for
+    # these fields). Only included when real (never empty strings), and
+    # never contaminates the actual spoken `text`/transcript.
+    if previous_text and previous_text.strip():
+        body["previous_text"] = previous_text.strip()[:1000]
+    if next_text and next_text.strip():
+        body["next_text"] = next_text.strip()[:1000]
     if voice_settings:
         vs = {}
-        for key in ("stability", "similarity_boost", "style"):
+        for key in ("stability", "similarity_boost", "style", "speed"):
             if key in voice_settings:
                 try:
                     vs[key] = float(voice_settings[key])
@@ -198,10 +289,10 @@ async def elevenlabs_generate_line(text: str, voice_id: str, *, acting_note: str
             body["voice_settings"] = vs
 
     if http_client is not None:
-        r = await http_client.post(url, headers=headers, json=body)
+        r = await http_client.post(url, params=params, headers=headers, json=body)
     else:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0), follow_redirects=True) as cli:
-            r = await cli.post(url, headers=headers, json=body)
+            r = await cli.post(url, params=params, headers=headers, json=body)
     if r.status_code != 200:
         code = "provider_rejected" if r.status_code < 500 else "provider_unavailable"
         raise VideoNarrationError(code, f"ElevenLabs HTTP {r.status_code}: {(r.text or '')[:200]}")
@@ -420,6 +511,16 @@ async def set_voice_assignments(db, lesson_id: str, assignments: dict) -> dict:
 # which this is a backstop for, not a replacement of.
 STAGE_TIMEOUT_S = 900
 
+# See assemble_narration_track's scene-anchoring gap-padding logic: the
+# ceiling beyond which a scene's reported visual start is treated as an
+# implausible Gemini timestamp rather than a real pause to wait out. Chosen
+# generously above any real production pause a scene transition would need
+# — real videos rarely have 20+ seconds of dead air between spoken scenes —
+# while still catching the failure mode that actually caused a real
+# karaoke-freeze incident (a hallucinated scene.start minutes beyond the
+# real video's length).
+MAX_SAFE_GAP_PADDING_S = 20.0
+
 
 # ── Mode A: whole-story analysis ─────────────────────────────────────────
 async def run_story_analysis(db, lesson_id: str, media_bucket, *, lesson_getter, sync_getter) -> dict:
@@ -543,6 +644,43 @@ def _find_scene_and_line(job: dict, scene_id: str, line_id: str) -> tuple[dict, 
     return scene, line
 
 
+def _ordered_script_lines(job: dict) -> list[tuple[str, str, str]]:
+    """Flat (sceneId, lineId, text) list across the WHOLE script, in real
+    narration order — used to find a line's genuine adjacent-context text
+    for ElevenLabs' previous_text/next_text continuity fields. Deliberately
+    crosses scene boundaries: the goal is one continuous narrative
+    performance, not disconnected per-scene clips."""
+    scenes = (job.get("scriptBlueprint", {}).get("result") or {}).get("scenes") or []
+    out: list[tuple[str, str, str]] = []
+    for scene in scenes:
+        for line in scene.get("lines") or []:
+            out.append((scene.get("sceneId"), line.get("lineId"), line.get("text") or ""))
+    return out
+
+
+def _adjacent_context_text(job: dict, scene_id: str, line_id: str) -> tuple[str | None, str | None]:
+    """The real, already-drafted TEXT of the immediately preceding/
+    following line in the whole script — never fabricated, never the
+    acting-note/performance-direction field. None at either end of the
+    script, exactly as it should be — there is no adjacent line to use."""
+    ordered = _ordered_script_lines(job)
+    idx = next((i for i, (s, l, _t) in enumerate(ordered) if s == scene_id and l == line_id), None)
+    if idx is None:
+        return None, None
+    previous_text = ordered[idx - 1][2] if idx > 0 else None
+    next_text = ordered[idx + 1][2] if idx + 1 < len(ordered) else None
+    return previous_text, next_text
+
+
+def _story_scene_for(job: dict, scene_id: str) -> dict | None:
+    """The story-analysis record for a scriptBlueprint sceneId — the two
+    stages share sceneId values by construction (run_script_blueprint
+    copies the story analysis's own scene ordering/ids), so a direct
+    lookup is safe and never needs fuzzy matching."""
+    scenes = (job.get("storyAnalysis", {}).get("result") or {}).get("scenes") or []
+    return next((s for s in scenes if s.get("sceneId") == scene_id), None)
+
+
 async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *, http_client=None) -> dict:
     job = await jobs.get_or_create_job(db, lesson_id)
     if job["scriptBlueprint"]["state"] != jobs.S_COMPLETED:
@@ -560,17 +698,32 @@ async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *
     if not await jobs.fence_provider(db, lesson_id, path, attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
+    # Isolated from the shared ELEVENLABS_DEFAULT_VOICE other EduHub systems
+    # read (server.py/edutalk_tools.py) — a per-speaker assignment always
+    # wins (the admin's explicit, once-set choice, locked for the whole
+    # episode); VIDEO_NARRATION_VOICE lets ops override the default without
+    # touching Book Factory/EduTalk's own voice config; the hardcoded
+    # DEFAULT_STORYTELLER_VOICE_ID ("Sarah") is the final safety net so a
+    # lesson never fails narration purely for lack of configuration.
     voice_assignments = claimed.get("voiceAssignments") or {}
-    voice_id = voice_assignments.get(line["speaker"]) or _env("ELEVENLABS_DEFAULT_VOICE")
-    if not voice_id:
-        await jobs.fail_terminal(db, lesson_id, path, attempt, genver,
-                                  f"no voice assigned for speaker {line['speaker']!r}")
-        return await jobs.get_or_create_job(db, lesson_id)
+    voice_id = (voice_assignments.get(line["speaker"])
+                or _env("VIDEO_NARRATION_VOICE") or DEFAULT_STORYTELLER_VOICE_ID)
+
+    # Real, Gemini-observed scene emotion (never a keyword guess about text
+    # that doesn't exist) drives per-scene performance settings; real
+    # adjacent script lines (never fabricated) give ElevenLabs continuity
+    # context so the whole episode reads as one performance, not
+    # disconnected clips.
+    story_scene = _story_scene_for(claimed, scene_id)
+    voice_settings = _scene_voice_settings(story_scene)
+    previous_text, next_text = _adjacent_context_text(claimed, scene_id, line_id)
 
     try:
         raw = await asyncio.wait_for(
             elevenlabs_generate_line(
-                line["text"], voice_id, acting_note=line.get("emotion") or None, http_client=http_client,
+                line["text"], voice_id, acting_note=line.get("emotion") or None,
+                voice_settings=voice_settings, previous_text=previous_text, next_text=next_text,
+                http_client=http_client,
             ),
             timeout=STAGE_TIMEOUT_S,
         )
@@ -796,7 +949,31 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         if scene_id not in seen_scenes:
             seen_scenes.add(scene_id)
             intended_start = scene_bounds[0] if scene_bounds else None
-            if intended_start is not None and intended_start > cursor + 0.05:
+            if intended_start is not None and intended_start > cursor + 0.05 \
+                    and (intended_start - cursor) > MAX_SAFE_GAP_PADDING_S:
+                # Root-cause fix for a real karaoke-freeze incident: Gemini's
+                # scene.start is occasionally implausibly far ahead of where
+                # the narration track has actually reached (a timestamp
+                # hallucination on long/complex video, not a real pause).
+                # generate_silence_clip has no length limit of its own, so
+                # inserting that gap verbatim would push every subsequent
+                # word's ABSOLUTE offset far beyond the real audio's actual
+                # duration — and since every later word then shares that same
+                # corrupted, un-reachable offset, the student-facing karaoke
+                # engine's binary search can never advance past the last
+                # word before this scene for the rest of playback, even
+                # though the audio/video keep playing normally. Skipping the
+                # padding here (never fabricating a smaller, equally
+                # arbitrary gap instead) keeps every absolute timestamp
+                # honest and bounded, at the cost of this one scene's
+                # narration starting immediately rather than waiting.
+                scene_timing_notes.append({
+                    "sceneId": scene_id, "type": "padding_implausible", "paddedSec": 0.0,
+                    "reason": f"scene's reported visual start is {round(intended_start - cursor, 1)}s "
+                              "ahead of the narration cursor — implausibly large for real padding, "
+                              "skipped to avoid corrupting synchronization for the rest of the episode",
+                })
+            elif intended_start is not None and intended_start > cursor + 0.05:
                 gap = intended_start - cursor
                 silence = await video_render_tools.generate_silence_clip(gap)
                 if silence:

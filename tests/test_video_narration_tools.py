@@ -190,8 +190,8 @@ class _FakeElevenLabsClient:
     def __init__(self):
         self.calls = []
 
-    async def post(self, url, headers=None, json=None, **kwargs):
-        self.calls.append((url, json))
+    async def post(self, url, headers=None, json=None, params=None, **kwargs):
+        self.calls.append((url, json, params))
         text = json["text"]
         audio = f"audio-for:{text}".encode()
         chars = list(text)
@@ -210,6 +210,9 @@ def _no_real_env(monkeypatch):
     monkeypatch.delenv("VIDEO_AI_MOCK", raising=False)
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     monkeypatch.delenv("ELEVENLABS_DEFAULT_VOICE", raising=False)
+    monkeypatch.delenv("ELEVENLABS_MODEL", raising=False)
+    monkeypatch.delenv("VIDEO_NARRATION_VOICE", raising=False)
+    monkeypatch.delenv("VIDEO_NARRATION_MODEL", raising=False)
     monkeypatch.delenv("R2_ACCOUNT_ID", raising=False)
 
 
@@ -294,6 +297,126 @@ class TestElevenlabsGenerateLineActingNoteStripped:
         result = await vnt.elevenlabs_generate_line("Oh no.", "voice_1", acting_note="Startled.", http_client=client)
         assert [w["word"] for w in result["word_timestamps"]] == ["Oh", "no."]
         assert "[" not in client.calls[0][1]["text"]
+
+
+# ── ElevenLabs production request shape ────────────────────────────────
+class TestElevenlabsRequestShape:
+    @pytest.mark.asyncio
+    async def test_defaults_to_the_multilingual_model(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        await vnt.elevenlabs_generate_line("Hello there.", "voice_1", http_client=client)
+        assert client.calls[0][1]["model_id"] == "eleven_multilingual_v2"
+
+    @pytest.mark.asyncio
+    async def test_video_narration_model_overrides_the_default_without_touching_shared_var(self, monkeypatch):
+        """VIDEO_NARRATION_MODEL is isolated from the shared ELEVENLABS_MODEL
+        other EduHub systems (Book Factory/EduTalk) read — setting the
+        shared var alone must NOT change narration's model."""
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        monkeypatch.setenv("ELEVENLABS_MODEL", "eleven_v3")
+        client = _FakeElevenLabsClient()
+        await vnt.elevenlabs_generate_line("Hello there.", "voice_1", http_client=client)
+        assert client.calls[0][1]["model_id"] == "eleven_multilingual_v2"
+
+        monkeypatch.setenv("VIDEO_NARRATION_MODEL", "eleven_v3")
+        await vnt.elevenlabs_generate_line("Hello there.", "voice_1", http_client=client)
+        assert client.calls[-1][1]["model_id"] == "eleven_v3"
+
+    @pytest.mark.asyncio
+    async def test_output_format_is_a_query_param_not_a_body_field(self, monkeypatch):
+        """ElevenLabs' documented contract expects output_format as a query
+        parameter — a body-embedded copy is silently ignored by the API."""
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        await vnt.elevenlabs_generate_line("Hello there.", "voice_1", http_client=client)
+        _url, body, params = client.calls[0]
+        assert params == {"output_format": "mp3_44100_128"}
+        assert "output_format" not in body
+
+    @pytest.mark.asyncio
+    async def test_speed_is_included_in_voice_settings(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        await vnt.elevenlabs_generate_line(
+            "Hello there.", "voice_1",
+            voice_settings={"stability": 0.5, "similarity_boost": 0.78, "style": 0.42, "speed": 0.98},
+            http_client=client,
+        )
+        vs = client.calls[0][1]["voice_settings"]
+        assert vs["speed"] == 0.98
+        assert vs["use_speaker_boost"] is True
+
+    @pytest.mark.asyncio
+    async def test_previous_and_next_text_are_included_when_provided(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        await vnt.elevenlabs_generate_line(
+            "He froze.", "voice_1", previous_text="The room went quiet.", next_text="No one moved.",
+            http_client=client,
+        )
+        body = client.calls[0][1]
+        assert body["previous_text"] == "The room went quiet."
+        assert body["next_text"] == "No one moved."
+
+    @pytest.mark.asyncio
+    async def test_previous_and_next_text_are_omitted_when_empty(self, monkeypatch):
+        """Never send empty/whitespace context — an omitted field, not a
+        fabricated empty one."""
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        await vnt.elevenlabs_generate_line("He froze.", "voice_1", previous_text="  ", next_text=None, http_client=client)
+        body = client.calls[0][1]
+        assert "previous_text" not in body
+        assert "next_text" not in body
+
+    @pytest.mark.asyncio
+    async def test_context_text_is_never_spoken_only_the_real_text_is(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+        client = _FakeElevenLabsClient()
+        result = await vnt.elevenlabs_generate_line(
+            "He froze.", "voice_1", previous_text="The room went quiet.", next_text="No one moved.",
+            http_client=client,
+        )
+        spoken = " ".join(w["word"] for w in result["word_timestamps"])
+        assert "quiet" not in spoken and "moved" not in spoken
+
+
+# ── Scene-emotion voice-settings classifier ────────────────────────────
+class TestSceneVoiceSettings:
+    def test_reverent_scene_maps_to_reverent_settings(self):
+        scene = {"emotionalContext": "A solemn, reverent moment as they bow their heads."}
+        settings = vnt._scene_voice_settings(scene)
+        assert settings == {"stability": 0.72, "similarity_boost": 0.80, "style": 0.20, "speed": 0.92}
+
+    def test_joyful_scene_maps_to_joyful_settings(self):
+        scene = {"narrativeRole": "celebration", "description": "Everyone laughs and cheers together."}
+        settings = vnt._scene_voice_settings(scene)
+        assert settings == {"stability": 0.38, "similarity_boost": 0.75, "style": 0.60, "speed": 1.05}
+
+    def test_warm_family_scene_maps_to_warm_settings(self):
+        scene = {"emotionalContext": "A warm, gentle family moment at home."}
+        settings = vnt._scene_voice_settings(scene)
+        assert settings == {"stability": 0.50, "similarity_boost": 0.78, "style": 0.42, "speed": 0.98}
+
+    def test_closing_scene_maps_to_closing_settings(self):
+        scene = {"narrativeRole": "resolution", "description": "A peaceful farewell as the story concludes."}
+        settings = vnt._scene_voice_settings(scene)
+        assert settings == {"stability": 0.68, "similarity_boost": 0.82, "style": 0.28, "speed": 0.90}
+
+    def test_scene_with_no_emotional_signal_returns_none(self):
+        scene = {"emotionalContext": "", "narrativeRole": "development", "title": "Scene 4", "description": "d"}
+        assert vnt._scene_voice_settings(scene) is None
+
+    def test_missing_scene_returns_none(self):
+        assert vnt._scene_voice_settings(None) is None
+
+    def test_every_row_respects_the_safety_bounds(self):
+        """stability >= 0.30 and style <= 0.65 for every documented row —
+        the safety bound the production spec requires."""
+        for settings in vnt._SCENE_VOICE_SETTINGS.values():
+            assert settings["stability"] >= 0.30
+            assert settings["style"] <= 0.65
 
 
 LESSON = {
@@ -421,12 +544,32 @@ async def _job_with_script(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_generate_line_voice_fails_terminal_without_any_voice(monkeypatch):
+async def test_generate_line_voice_fails_terminal_without_an_api_key(monkeypatch):
+    """No ELEVENLABS_API_KEY is the one thing that must still fail
+    terminally — everything else (missing voice assignment) now has a
+    real, safe fallback (see the default-storyteller-voice test below)."""
     db = _FakeDB()
     _bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
     job = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id)
     path = f"voiceProduction.{scene_id}.lines.{line_id}"
     assert _get_dotted(job, path)["state"] == jobs.S_FAILED_TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_generate_line_voice_falls_back_to_the_default_storyteller_voice(monkeypatch):
+    """A lesson must never fail narration purely for lack of voice
+    configuration — with no per-speaker assignment and no override env
+    var, the approved default storyteller voice (Sarah) is used."""
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    monkeypatch.delenv("VIDEO_NARRATION_VOICE", raising=False)
+    client = _FakeElevenLabsClient()
+    job = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    path = f"voiceProduction.{scene_id}.lines.{line_id}"
+    stage = _get_dotted(job, path)
+    assert stage["state"] == jobs.S_COMPLETED
+    assert stage["result"]["voiceId"] == vnt.DEFAULT_STORYTELLER_VOICE_ID
 
 
 @pytest.mark.asyncio
@@ -445,6 +588,81 @@ async def test_generate_line_voice_happy_path_with_assigned_voice(monkeypatch):
     assert stage["result"]["mediaRef"].startswith("gridfs://sync_media/")
     assert stage["result"]["wordTimestamps"]
     assert client.calls, "should have called ElevenLabs"
+
+
+async def _job_with_two_scenes(db, monkeypatch, *, scene1_emotional_context=""):
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+
+    story_analysis = {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 5.0, "title": "Opening", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": scene1_emotional_context, "visualEvents": [], "confidence": None},
+            {"sceneId": "sc2", "start": 5.0, "end": 10.0, "title": "Later", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "development",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_analyze_story(*a, **k):
+        return {"ok": True, "storyAnalysis": story_analysis, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _fake_analyze_story)
+    await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+
+    script_blueprint = {
+        "scenes": [
+            {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": "The room went quiet.", "emotion": ""}]},
+            {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": "No one moved.", "emotion": ""}]},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_draft_script(*a, **k):
+        return {"ok": True, "scriptBlueprint": script_blueprint, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _fake_draft_script)
+    await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    return bucket
+
+
+@pytest.mark.asyncio
+async def test_generate_line_voice_uses_the_scenes_real_emotional_settings(monkeypatch):
+    db = _FakeDB()
+    await _job_with_two_scenes(db, monkeypatch, scene1_emotional_context="A solemn, reverent farewell.")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+
+    client = _FakeElevenLabsClient()
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=client)
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+    vs = client.calls[0][1]["voice_settings"]
+    assert vs["stability"] == 0.72 and vs["style"] == 0.20  # the "reverent" row
+
+
+@pytest.mark.asyncio
+async def test_generate_line_voice_passes_real_adjacent_line_text_as_context(monkeypatch):
+    db = _FakeDB()
+    await _job_with_two_scenes(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+
+    client = _FakeElevenLabsClient()
+    await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=client)
+    first_body = client.calls[0][1]
+    assert "previous_text" not in first_body  # first line in the whole script
+    assert first_body["next_text"] == "No one moved."
+
+    await vnt.generate_line_voice(db, "vid_1", "sc2", "ln2", http_client=client)
+    second_body = client.calls[1][1]
+    assert second_body["previous_text"] == "The room went quiet."
+    assert "next_text" not in second_body  # last line in the whole script
 
 
 @pytest.mark.asyncio
@@ -1258,8 +1476,8 @@ class _RealAudioElevenLabsClient:
         self._audio_bytes = audio_bytes
         self.calls = []
 
-    async def post(self, url, headers=None, json=None, **kwargs):
-        self.calls.append((url, json))
+    async def post(self, url, headers=None, json=None, params=None, **kwargs):
+        self.calls.append((url, json, params))
         text = json["text"]
         chars = list(text)
         starts = [i * 0.05 for i in range(len(chars))]
@@ -1465,6 +1683,107 @@ async def test_real_multi_scene_narration_is_anchored_to_real_scene_start_times(
     sentences = sync_doc["paragraphs"][0]["sentences"]
     scene2_sentence = sentences[1]  # sc1's line assembled first, sc2's second
     assert scene2_sentence["words"][0]["start"] == pytest.approx(3.0, abs=0.2)
+
+
+@pytest.mark.skipif(NO_FFMPEG_E2E or NO_FFPROBE_E2E, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_real_implausible_scene_start_never_corrupts_downstream_karaoke_timing(monkeypatch):
+    """Root-cause fix for a real karaoke-freeze incident: a hallucinated
+    Gemini scene.start far beyond the real narration cursor must NEVER be
+    inserted as real silence padding — doing so would push every
+    subsequent word's ABSOLUTE offset out to that same implausible value,
+    and since the student's karaoke engine can never advance past a word
+    whose timestamp is beyond the actual video's real length, playback
+    would freeze on the last word before this scene for the rest of the
+    episode while audio/video kept playing normally. The fix: an
+    implausibly large gap is skipped honestly (scene 2 starts immediately
+    after scene 1) rather than fabricated as real silence, keeping every
+    absolute timestamp small, real, and reachable."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+
+    # Scene 2's reported start (500s) is wildly beyond any real narration
+    # cursor position for this short test clip — exactly the Gemini
+    # timestamp-hallucination failure mode this guards against.
+    story_analysis = {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [
+            {"sceneId": "sc1", "start": 0.0, "end": 1.0, "title": "Opening", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+            {"sceneId": "sc2", "start": 500.0, "end": 505.0, "title": "Later", "description": "d",
+             "characters": [], "speakers": ["S1"], "narrativeRole": "development",
+             "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+             "emotionalContext": "", "visualEvents": [], "confidence": None},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_analyze_story(*a, **k):
+        return {"ok": True, "storyAnalysis": story_analysis, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _fake_analyze_story)
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_COMPLETED
+
+    script_blueprint = {
+        "scenes": [
+            {"sceneId": "sc1", "lines": [{"lineId": "ln1", "speaker": "Narrator", "text": "Scene one begins.", "emotion": ""}]},
+            {"sceneId": "sc2", "lines": [{"lineId": "ln2", "speaker": "Narrator", "text": "Scene two begins.", "emotion": ""}]},
+        ],
+        "generatedAt": vnt._now(), "engine": "gemini",
+    }
+
+    async def _fake_draft_script(*a, **k):
+        return {"ok": True, "scriptBlueprint": script_blueprint, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "draft_script_blueprint", _fake_draft_script)
+    job = await vnt.run_script_blueprint(db, "vid_1", lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["scriptBlueprint"]["state"] == jobs.S_COMPLETED
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    await vnt.set_voice_assignments(db, "vid_1", {"Narrator": "voice_1"})
+
+    clip1 = await _make_real_media(kind="audio", duration=0.4)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc1", "ln1", http_client=_RealAudioElevenLabsClient(clip1))
+    assert job["voiceProduction"]["sc1"]["lines"]["ln1"]["state"] == jobs.S_COMPLETED
+
+    clip2 = await _make_real_media(kind="audio", duration=0.4)
+    job = await vnt.generate_line_voice(db, "vid_1", "sc2", "ln2", http_client=_RealAudioElevenLabsClient(clip2))
+    assert job["voiceProduction"]["sc2"]["lines"]["ln2"]["state"] == jobs.S_COMPLETED
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    assert job["assembly"]["state"] == jobs.S_COMPLETED
+
+    # Honest record: the implausible gap was recognized and skipped, never
+    # fabricated as real silence.
+    timing_notes = job["assembly"]["result"]["sceneTiming"]
+    sc2_note = next(n for n in timing_notes if n["sceneId"] == "sc2")
+    assert sc2_note["type"] == "padding_implausible"
+    assert sc2_note["paddedSec"] == 0.0
+
+    # Real audio proof: the assembled track's actual playtime is just the
+    # two short real clips back-to-back — NOT hundreds of seconds of
+    # silence that would make the file impractically large and would have
+    # pushed every later timestamp out of reach.
+    real_clip1_duration = await vnt.video_render_tools.probe_audio_duration_seconds(clip1)
+    real_clip2_duration = await vnt.video_render_tools.probe_audio_duration_seconds(clip2)
+    assembled_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(
+        db, bucket, job["assembly"]["result"]["mediaRef"],
+    )
+    total_duration = await vnt.video_render_tools.probe_audio_duration_seconds(assembled_bytes)
+    assert total_duration < real_clip1_duration + real_clip2_duration + 2.0
+
+    # Karaoke proof: scene 2's word timestamps stay small and reachable —
+    # anchored to where the narration cursor actually is, never jumped out
+    # to the implausible 500s the story analysis reported.
+    sync_doc = await db.chapter_sync.find_one({"syncId": job["assembly"]["result"]["syncId"]})
+    sentences = sync_doc["paragraphs"][0]["sentences"]
+    scene2_sentence = sentences[1]
+    assert scene2_sentence["words"][0]["start"] < 5.0
 
 
 # ── Scene overrun handling: bounded, pitch-preserving time compression ────
