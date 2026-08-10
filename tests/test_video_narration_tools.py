@@ -2283,16 +2283,15 @@ async def test_crash_after_elevenlabs_succeeds_but_before_db_completion(monkeypa
     """The narrowest of the six requested crash points: the ElevenLabs HTTP
     call itself succeeds (audio genuinely generated and stored to media
     storage) but the process dies before jobs.complete_stage's Mongo write
-    lands. This is a REAL, understood, bounded-cost architectural gap in
-    the current design (documented in the final report, not silently
-    ignored): since the stage never reached provider_pending->completed,
-    self-heal (once its lease expires) demotes it to unknown_outcome, and
-    a subsequent manual retry has no way to discover the already-stored,
-    already-paid-for audio (each attempt writes to a fresh, attempt-keyed
-    storage key) — it genuinely re-calls ElevenLabs. This test proves that
-    is the CURRENT, exact behavior (so the finding is evidence-based), and
-    confirms the one thing that matters most: no data corruption, no stuck
-    job, no permanent state — it always reaches a new terminal success."""
+    lands. Root-cause fix: generate_line_voice now writes a fingerprinted
+    checkpoint (lastGeneratedAsset) immediately after the audio is stored,
+    via an unconditional (non-fenced) $set that survives even a self-heal
+    demotion. A subsequent retry — even with a brand-new attemptId/
+    generationVersion — computes the same fingerprint from the same
+    (text, voice, settings, context) and finds the checkpoint, so it
+    completes directly from the already-stored asset instead of re-calling
+    ElevenLabs. This closes the real double-spend window this test
+    originally documented as an accepted architectural gap."""
     db = _FakeDB()
     bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
     monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
@@ -2307,9 +2306,11 @@ async def test_crash_after_elevenlabs_succeeds_but_before_db_completion(monkeypa
     finally:
         jobs.complete_stage = real_complete_stage
 
-    # The stage never reached "completed" — genuinely stranded in provider_pending.
+    # The stage never reached "completed" — genuinely stranded in provider_pending —
+    # but the real asset was generated, stored, AND checkpointed before the crash.
     stage = _get_dotted(db.video_narration_jobs.docs["vid_1"], path)
     assert stage["state"] == jobs.S_PROVIDER_PENDING
+    assert stage.get("lastGeneratedAsset", {}).get("mediaRef"), "the checkpoint must survive the crash"
     files_after_first_attempt = len(bucket.files)
     assert files_after_first_attempt >= 1, "the audio genuinely was generated and stored before the crash"
 
@@ -2319,8 +2320,49 @@ async def test_crash_after_elevenlabs_succeeds_but_before_db_completion(monkeypa
     assert _get_dotted(healed, path)["state"] == jobs.S_UNKNOWN
 
     # A fresh retry with a normal client reaches a real, uncorrupted success —
-    # calling ElevenLabs again (the documented re-spend), never getting stuck.
+    # WITHOUT re-spending, by reusing the checkpointed asset from the crashed attempt.
     job_final = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
     final_stage = _get_dotted(job_final, path)
     assert final_stage["state"] == jobs.S_COMPLETED
-    assert len(client.calls) == 2, "re-spent exactly once more — the documented, bounded-cost gap"
+    assert final_stage["result"]["mediaRef"] == stage["lastGeneratedAsset"]["mediaRef"]
+    assert len(client.calls) == 1, "must NOT re-spend on ElevenLabs — the checkpointed asset was reused"
+
+
+@pytest.mark.asyncio
+async def test_idempotent_reuse_never_fires_for_a_genuinely_different_request(monkeypatch):
+    """The safety half of the same fix: a checkpoint must only ever be
+    reused for the EXACT SAME request. If the admin edits the line's text
+    (or voice/settings change) between the crash and the retry, the
+    fingerprint changes and a fresh, genuinely new ElevenLabs call must be
+    made — never silently serving stale audio for different text."""
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    path = f"voiceProduction.{scene_id}.lines.{line_id}"
+
+    client = _FakeElevenLabsClient()
+    real_complete_stage = jobs.complete_stage
+    jobs.complete_stage = None
+    try:
+        with pytest.raises(TypeError):
+            await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    finally:
+        jobs.complete_stage = real_complete_stage
+
+    stage = _get_dotted(db.video_narration_jobs.docs["vid_1"], path)
+    stage["claimExpiresAt"] = "2000-01-01T00:00:00+00:00"
+    await jobs.get_or_create_job(db, "vid_1")
+
+    # The admin edits the line's text before the retry — a genuinely
+    # different request must never reuse the old checkpoint.
+    job_doc = db.video_narration_jobs.docs["vid_1"]
+    scenes = job_doc["scriptBlueprint"]["result"]["scenes"]
+    for scene in scenes:
+        for line in scene.get("lines", []):
+            if line["lineId"] == line_id:
+                line["text"] = "This is a genuinely different line of text now."
+
+    job_final = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    final_stage = _get_dotted(job_final, path)
+    assert final_stage["state"] == jobs.S_COMPLETED
+    assert len(client.calls) == 2, "a genuinely different request must call ElevenLabs again, not reuse stale audio"

@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as _dt
+import hashlib
 import io
 import logging
 import os
@@ -706,6 +707,32 @@ async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *
     voice_settings = _scene_voice_settings(story_scene)
     previous_text, next_text = _adjacent_context_text(claimed, scene_id, line_id)
 
+    # Idempotent asset-reuse (closes a real, previously-identified crash
+    # window: the ElevenLabs call succeeds and the audio is genuinely
+    # stored, but the process dies before jobs.complete_stage's fenced
+    # Mongo write lands — every retry always minted a brand-new attemptId/
+    # generationVersion, so the fencing that protects THIS engine
+    # everywhere else could never recognize "this is the same request,
+    # already paid for" and unconditionally re-spent on ElevenLabs).
+    # fingerprint is computed from every input that actually changes the
+    # audio ElevenLabs would generate — text, voice, per-scene settings,
+    # and continuity context — so an admin edit to the line (which bumps
+    # none of these identically) is never mistaken for the same request.
+    fingerprint = hashlib.sha256(repr((
+        line["text"], voice_id, sorted((voice_settings or {}).items()), previous_text, next_text,
+    )).encode("utf-8")).hexdigest()
+    checkpoint = jobs.get_path(claimed, path).get("lastGeneratedAsset") or {}
+    if checkpoint.get("fingerprint") == fingerprint and checkpoint.get("mediaRef"):
+        logger.info("video_narration: line generation reused a checkpointed asset (crash-safe, no re-spend) "
+                    "lesson=%s scene=%s line=%s attempt=%s", lesson_id, scene_id, line_id, attempt)
+        result = {
+            "speaker": line["speaker"], "text": line["text"], "mediaRef": checkpoint["mediaRef"],
+            "wordTimestamps": checkpoint["wordTimestamps"], "durationSec": checkpoint["durationSec"],
+            "voiceId": voice_id, "voiceStale": False,
+        }
+        await jobs.complete_stage(db, lesson_id, path, attempt, genver, result)
+        return await jobs.get_or_create_job(db, lesson_id)
+
     _started = time.monotonic()
     try:
         # See run_story_analysis's identical comment on heavy_op_semaphore
@@ -749,6 +776,22 @@ async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *
 
     key = f"video-narration/{lesson_id}/{scene_id}/{line_id}/{attempt}.mp3"
     media_ref = await _store_audio(db, audio_bytes, key, lesson_id)
+
+    # Checkpoint the real, already-stored asset BEFORE the fenced
+    # complete_stage write — an unconditional, best-effort $set (not
+    # fenced on attemptId/genver) so it survives even if the process dies
+    # in the next line, or if a self-heal race (see complete_stage's own
+    # docstring) demotes this attempt moments before this point. The
+    # fingerprint check above is what makes finding it on a later retry
+    # safe: only the exact same request (same text/voice/settings/
+    # context) can ever match and reuse it.
+    await db[jobs.COLL].update_one(
+        {"_id": lesson_id},
+        {"$set": {f"{path}.lastGeneratedAsset": {
+            "fingerprint": fingerprint, "mediaRef": media_ref,
+            "wordTimestamps": raw["word_timestamps"], "durationSec": raw["duration"],
+        }}},
+    )
 
     result = {
         "speaker": line["speaker"], "text": line["text"], "mediaRef": media_ref,
