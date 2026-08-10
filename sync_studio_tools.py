@@ -191,14 +191,22 @@ def _r2_config() -> dict | None:
     return cfg if all(cfg.values()) else None
 
 
-async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata: dict) -> str | None:
+async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata: dict,
+                               *, endpoint_override: str | None = None) -> str | None:
     """R2 upload for native media uploads. NEVER raises — returns None on
     any failure (env vars absent, boto3 missing, network error) so the
     caller falls back to GridFS transparently, matching server.py's own
     `_upload_audio_to_r2` graceful-degradation pattern. Deliberately NOT
     hero_artwork_tools.py's R2-or-nothing pattern — this project's own
     architecture study (§8, Risks) flags that pattern as a real failure
-    mode for a future media pipeline without a GridFS-style fallback."""
+    mode for a future media pipeline without a GridFS-style fallback.
+
+    `endpoint_override` exists ONLY for tests — no production call site
+    ever passes it, so real behavior (the actual R2 endpoint below) is
+    unchanged. It lets tests point the exact same boto3 client construction
+    and put_object call at a local S3-compatible mock server instead of
+    mocking this function away entirely, so the real request contract
+    (signing, bucket/key, content-type, metadata) is genuinely exercised."""
     cfg = _r2_config()
     if cfg is None:
         return None
@@ -206,7 +214,7 @@ async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata:
         import boto3
         from botocore.config import Config as _BotocoreConfig
 
-        endpoint = f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+        endpoint = endpoint_override or f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
 
         def _do_upload():
             s3 = boto3.client(

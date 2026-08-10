@@ -398,34 +398,6 @@ async def elevenlabs_generate_sfx(text: str, *, duration_seconds: float | None =
     return r.content
 
 
-def _strip_id3_tags(buf: bytes) -> bytes:
-    """Same algorithm as server.py's proven _strip_id3_tags (the fix for
-    iOS AVFoundation stopping playback at the first segment's embedded
-    duration when segments are naively concatenated) — small, pure, and
-    duplicated deliberately rather than imported (see module docstring)."""
-    if not buf or len(buf) < 10:
-        return buf
-    out = buf
-    if out[:3] == b"ID3":
-        b0, b1, b2, b3 = out[6], out[7], out[8], out[9]
-        size = (b0 << 21) | (b1 << 14) | (b2 << 7) | b3
-        tag_end = 10 + size
-        if 10 < tag_end < len(out):
-            out = out[tag_end:]
-    if len(out) >= 128 and out[-128:-125] == b"TAG":
-        out = out[:-128]
-    return out
-
-
-def _stitch_mp3_segments(segments: list[bytes]) -> bytes:
-    if not segments:
-        return b""
-    parts = [segments[0]]
-    for seg in segments[1:]:
-        parts.append(_strip_id3_tags(seg))
-    return b"".join(parts)
-
-
 def _transcript_text_from_sync(sync_doc: dict | None) -> str:
     if not sync_doc:
         return ""
@@ -1100,7 +1072,7 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
             sentences.append(sync_schema.build_sentence(f"s{len(sentences) + 1}", words, speaker_id=sid or None))
         cursor = offset + line_duration
 
-    stitched = _stitch_mp3_segments(audio_segments)
+    stitched = await video_render_tools.concat_audio_segments(audio_segments)
 
     # Mix any completed SFX into the stitched track BEFORE it's persisted —
     # additive overlay via video_render_tools.overlay_audio_at_offset, which

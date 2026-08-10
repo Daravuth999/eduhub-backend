@@ -3,3 +3,4 @@
 import-linter==2.13
 pytest==9.1.1
 pytest-asyncio==1.4.0
+moto[s3]==5.2.2      # real S3-compatible mock backend for R2 uploader tests (Video Library)

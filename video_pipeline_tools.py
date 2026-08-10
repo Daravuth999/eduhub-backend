@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import logging
+import uuid
 
 import httpx
 from fastapi import Body, Depends, HTTPException
@@ -87,8 +88,9 @@ def _pipeline_is_stale(pipeline_doc: dict | None) -> bool:
     return started < _iso_in(-PIPELINE_TIMEOUT_S)
 
 
-def build_pipeline_record(provider_version: str) -> dict:
+def build_pipeline_record(provider_version: str, run_id: str | None = None) -> dict:
     return {
+        "runId": run_id or uuid.uuid4().hex[:12],
         "state": "running",
         "currentStep": PIPELINE_STEPS[0],
         "provider": provider_version,
@@ -100,7 +102,17 @@ def build_pipeline_record(provider_version: str) -> dict:
     }
 
 
-async def _set_step(db, lesson_id: str, step: str, status: str, error: str | None = None) -> None:
+async def _set_step(db, lesson_id: str, run_id: str, step: str, status: str, error: str | None = None) -> None:
+    # Fenced on runId (Directive 3 race fix): a poll-triggered self-heal in
+    # get_pipeline_status can demote a STILL-genuinely-running pipeline to
+    # "failed" purely because it observed a stale startedAt, moments before
+    # a manual retry claims a fresh run (new runId) for the same lesson —
+    # after which the ORIGINAL _run_stages() coroutine is still alive (a
+    # Mongo write doesn't kill an in-process asyncio task) and would
+    # otherwise keep writing steps into what is now a DIFFERENT run's
+    # document, corrupting it and effectively running two pipelines for one
+    # lesson at once. Filtering on the exact runId this call was started
+    # with makes a superseded run's writes silently no-op instead.
     updates = {
         f"pipeline.steps.{step}.status": status,
         f"pipeline.steps.{step}.error": error,
@@ -110,14 +122,15 @@ async def _set_step(db, lesson_id: str, step: str, status: str, error: str | Non
     entry = {"at": _now(), "step": step, "status": status,
              "message": error or f"{step.replace('_', ' ')} {status}"}
     await db[LESSONS_COLL].update_one(
-        {"lessonId": lesson_id},
+        {"lessonId": lesson_id, "pipeline.runId": run_id},
         {"$set": updates, "$push": {"pipeline.log": {"$each": [entry], "$slice": -80}}},
     )
 
 
-async def _finish(db, lesson_id: str, state: str, error: str | None = None) -> None:
+async def _finish(db, lesson_id: str, run_id: str, state: str, error: str | None = None) -> None:
+    # See _set_step's identical runId-fencing comment.
     await db[LESSONS_COLL].update_one(
-        {"lessonId": lesson_id},
+        {"lessonId": lesson_id, "pipeline.runId": run_id},
         {"$set": {"pipeline.state": state, "pipeline.error": error, "pipeline.finishedAt": _now()}},
     )
 
@@ -151,6 +164,13 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
 
     provider = video_ai_provider.get_video_ai_provider()
 
+    # A fresh runId identifies exactly this attempt — every _set_step/
+    # _finish call below is fenced on it (see their docstrings) so a
+    # superseded run (e.g. a manual retry claimed after self-heal
+    # pessimistically marked this run "failed" while it was still
+    # genuinely alive) can never corrupt a newer run's document.
+    run_id = uuid.uuid4().hex[:12]
+
     # Stale-claim override: a "running" pipeline whose startedAt is older
     # than PIPELINE_TIMEOUT_S is orphaned (see _pipeline_is_stale) — allow
     # reclaiming it instead of refusing forever, mirroring video_narration_
@@ -163,7 +183,7 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                 {"pipeline.startedAt": {"$lt": _iso_in(-PIPELINE_TIMEOUT_S)}},
             ],
         },
-        {"$set": {"pipeline": build_pipeline_record(provider.provider_version)}},
+        {"$set": {"pipeline": build_pipeline_record(provider.provider_version, run_id)}},
     )
     if claimed is None and (lesson.get("pipeline") or {}).get("state") == "running" \
             and not _pipeline_is_stale(lesson.get("pipeline")):
@@ -172,19 +192,19 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         # lesson had no pipeline field at all — seed it directly
         await db[LESSONS_COLL].update_one(
             {"lessonId": lesson_id},
-            {"$set": {"pipeline": build_pipeline_record(provider.provider_version)}},
+            {"$set": {"pipeline": build_pipeline_record(provider.provider_version, run_id)}},
         )
 
     sync_id = lesson["syncId"]
 
     async def _run_stages() -> None:
         # 1 — media check + load
-        await _set_step(db, lesson_id, "media_check", "running")
+        await _set_step(db, lesson_id, run_id, "media_check", "running")
         raw, content_type = await load_media_bytes(db, media_bucket, lesson["mediaRef"])
         if not raw or len(raw) > MAX_TRANSCRIBE_BYTES:
             raise RuntimeError("media is empty or exceeds the processing size limit")
         stored_ct = lesson.get("contentType") or content_type
-        await _set_step(db, lesson_id, "media_check", "complete")
+        await _set_step(db, lesson_id, run_id, "media_check", "complete")
 
         # 2 — audio extraction (root-cause fix: speech recognition never
         # needs video frames, but a video-typed lesson was previously sent
@@ -197,7 +217,7 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         # sending the original media, exactly the pipeline's prior
         # behavior — this step can only make things faster, never break
         # them.
-        await _set_step(db, lesson_id, "audio_extraction", "running")
+        await _set_step(db, lesson_id, run_id, "audio_extraction", "running")
         transcribe_bytes, transcribe_ct = raw, stored_ct
         # has_audio starts True (the audio-only branch below never probes,
         # and an "unknown" probe result must be treated as "might have
@@ -218,7 +238,7 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                 # ffprobe, so speech recognition is skipped outright instead.
                 has_audio = False
                 await _set_step(
-                    db, lesson_id, "audio_extraction", "complete",
+                    db, lesson_id, run_id, "audio_extraction", "complete",
                     "no audio track detected — this video is silent",
                 )
             else:
@@ -229,14 +249,14 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                     extracted = None
                 if extracted:
                     transcribe_bytes, transcribe_ct = extracted, "audio/mpeg"
-                    await _set_step(db, lesson_id, "audio_extraction", "complete")
+                    await _set_step(db, lesson_id, run_id, "audio_extraction", "complete")
                 else:
                     await _set_step(
-                        db, lesson_id, "audio_extraction", "complete",
+                        db, lesson_id, run_id, "audio_extraction", "complete",
                         "extraction unavailable or failed — sending original video to the provider",
                     )
         else:
-            await _set_step(db, lesson_id, "audio_extraction", "complete", "media is already audio-only")
+            await _set_step(db, lesson_id, run_id, "audio_extraction", "complete", "media is already audio-only")
 
         # 3 — speech recognition (Gemini / mock, provider-neutral surface).
         # Skipped entirely — never "running" then "failed" — for a
@@ -245,14 +265,14 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         # not an error condition (see Section 5/13 of the silent-video
         # production spec this satisfies).
         if has_audio:
-            await _set_step(db, lesson_id, "speech_recognition", "running")
+            await _set_step(db, lesson_id, run_id, "speech_recognition", "running")
             await sync_studio_tools.mark_alignment_processing(db, sync_id)
             result = await provider.align(transcribe_bytes, transcribe_ct)
             transcript_text = result.get("transcriptText", "")
-            await _set_step(db, lesson_id, "speech_recognition", "complete")
+            await _set_step(db, lesson_id, run_id, "speech_recognition", "complete")
 
             # 3 — synchronization generation (canonical schema, versioned)
-            await _set_step(db, lesson_id, "synchronization", "running")
+            await _set_step(db, lesson_id, run_id, "synchronization", "running")
             sync_doc = await sync_studio_tools.apply_alignment_result(db, sync_id, result["sync"])
             duration = float(sync_doc.get("durationSec") or 0.0)
             if duration > 0:
@@ -260,10 +280,10 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                     {"lessonId": lesson_id, "durationSec": {"$in": [0, 0.0, None]}},
                     {"$set": {"durationSec": round(duration, 3)}},
                 )
-            await _set_step(db, lesson_id, "synchronization", "complete")
+            await _set_step(db, lesson_id, run_id, "synchronization", "complete")
         else:
             transcript_text = ""
-            await _set_step(db, lesson_id, "speech_recognition", "skipped",
+            await _set_step(db, lesson_id, run_id, "speech_recognition", "skipped",
                              "no audio track — nothing to transcribe")
             # An empty-but-valid sync document (the SAME shape a real
             # zero-segment Gemini answer would produce via segments_to_
@@ -276,7 +296,7 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                 generated_at=_now(),
             )
             await sync_studio_tools.apply_alignment_result(db, sync_id, empty_sync)
-            await _set_step(db, lesson_id, "synchronization", "skipped",
+            await _set_step(db, lesson_id, run_id, "synchronization", "skipped",
                              "no transcript to synchronize — this video has no audio")
 
         # Real memory-pressure fix: `raw` holds the full original upload in
@@ -298,11 +318,11 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         # of this pipeline) is what understands a purely visual lesson.
         if not transcript_text.strip():
             await _set_step(
-                db, lesson_id, "educational_analysis", "skipped",
+                db, lesson_id, run_id, "educational_analysis", "skipped",
                 "no transcript to analyze — run Story Analysis for visual understanding",
             )
         else:
-            await _set_step(db, lesson_id, "educational_analysis", "running")
+            await _set_step(db, lesson_id, run_id, "educational_analysis", "running")
             analysis = await video_ai_provider.analyze_transcript(
                 transcript_text, title=lesson.get("title", ""),
             )
@@ -313,13 +333,13 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                 )
                 if learning.get("speakerLabels"):
                     await sync_studio_tools.suggest_speaker_labels(db, sync_id, learning["speakerLabels"])
-                await _set_step(db, lesson_id, "educational_analysis", "complete")
+                await _set_step(db, lesson_id, run_id, "educational_analysis", "complete")
             else:
-                await _set_step(db, lesson_id, "educational_analysis", "failed", analysis.get("reason"))
+                await _set_step(db, lesson_id, run_id, "educational_analysis", "failed", analysis.get("reason"))
 
         # 5 — review ready
-        await _set_step(db, lesson_id, "review_ready", "complete")
-        await _finish(db, lesson_id, "complete")
+        await _set_step(db, lesson_id, run_id, "review_ready", "complete")
+        await _finish(db, lesson_id, run_id, "complete")
         logger.info("video_pipeline: complete lesson=%s provider=%s", lesson_id, provider.provider_version)
 
     logger.info("video_pipeline: START lesson=%s provider=%s", lesson_id, provider.provider_version)
@@ -354,8 +374,8 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         logger.exception("video_pipeline: FAILED lesson=%s", lesson_id)
         current = await db[LESSONS_COLL].find_one({"lessonId": lesson_id}, {"_id": 0, "pipeline": 1})
         step = ((current or {}).get("pipeline") or {}).get("currentStep") or "media_check"
-        await _set_step(db, lesson_id, step, "failed", message)
-        await _finish(db, lesson_id, "failed", message)
+        await _set_step(db, lesson_id, run_id, step, "failed", message)
+        await _finish(db, lesson_id, run_id, "failed", message)
         try:
             await sync_studio_tools.mark_alignment_failed(db, sync_id)
         except Exception:  # noqa: BLE001
@@ -390,8 +410,13 @@ async def get_pipeline_status(db, lesson_id: str) -> dict:
             "(the server likely restarted mid-run). Safe to retry."
         )
         current_step = pipeline_doc.get("currentStep") or PIPELINE_STEPS[0]
-        await _set_step(db, lesson_id, current_step, "failed", message)
-        await _finish(db, lesson_id, "failed", message)
+        # Fence this self-heal write to the exact run it observed (None for
+        # a legacy pre-runId doc — Mongo's equality match on a missing/null
+        # field still matches, so old in-flight pipelines self-heal exactly
+        # as before). See _set_step's docstring for why this matters.
+        run_id = pipeline_doc.get("runId")
+        await _set_step(db, lesson_id, run_id, current_step, "failed", message)
+        await _finish(db, lesson_id, run_id, "failed", message)
         sync_id = doc.get("syncId")
         if sync_id:
             try:

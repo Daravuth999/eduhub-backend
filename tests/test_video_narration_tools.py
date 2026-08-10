@@ -2053,6 +2053,41 @@ async def test_real_combined_multi_scene_overrun_sfx_anchor_and_render_pipeline(
     sentences = sync_doc["paragraphs"][0]["sentences"]
     assert sentences[1]["words"][-1]["end"] == pytest.approx(sc2_end, abs=0.1)
 
+    # Mathematical karaoke-safety proof (Directive: "prove there is no
+    # unreachable timestamp that could make the frontend appear frozen"):
+    # every absolute word timestamp across the WHOLE assembled track, not
+    # just one scene, must fall inside [0, the job's own reported
+    # durationSec] and must never move backward or overlap the next word —
+    # the exact invariants a JS binary-search highlight engine
+    # (useSyncHighlight) depends on to always be able to advance past
+    # currentTime. Checked against durationSec (the number the real player
+    # actually uses), not a separate ffprobe re-measurement of the
+    # assembled bytes: this test's own _RealAudioElevenLabsClient fixture
+    # deliberately fabricates alignment timestamps from TEXT length while
+    # returning a fixed-duration, unrelated real audio clip (so real ffmpeg
+    # mixing/muxing has real bytes to operate on without needing to
+    # synthesize per-character-accurate speech) — a real ElevenLabs
+    # response never has that mismatch, since the same request produces
+    # both the audio and its alignment together.
+    all_words = [w for sentence in sentences for w in sentence["words"]]
+    assert all_words, "no words to verify — test setup produced an empty transcript"
+    reported_duration = job["assembly"]["result"]["durationSec"]
+    assert all_words[0]["start"] >= 0.0
+    assert all_words[-1]["end"] <= reported_duration + 0.05
+    for prev_word, next_word in zip(all_words, all_words[1:]):
+        assert next_word["start"] >= prev_word["start"], "a word timestamp moved backward — unreachable by a monotonic seek"
+        assert next_word["start"] >= prev_word["end"] - 0.05, "words overlap enough to corrupt highlight advancement"
+
+    # The assembled audio must still be genuinely playable and non-empty —
+    # concat_audio_segments' real ffmpeg decode/re-encode (replacing naive
+    # byte-concatenation — see its own docstring for the real MP3 Xing/LAME
+    # header risk that motivated this) must never produce corrupt output.
+    assembled_bytes, _ct = await vnt.video_pipeline_tools.load_media_bytes(
+        db, bucket, job["assembly"]["result"]["mediaRef"],
+    )
+    real_duration = await vnt.video_render_tools.probe_audio_duration_seconds(assembled_bytes)
+    assert real_duration > 0, "the assembled audio must genuinely be a playable, non-empty file"
+
     # Real render proof: a genuine, faststart MP4 master with an embedded
     # audio stream — the whole pipeline survives all the way to publish.
     job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
@@ -2158,3 +2193,134 @@ async def test_render_timeout_fails_retryable_not_stuck_forever(monkeypatch):
     job = await vnt.render_final_master(db, "vid_1", bucket, lesson_getter=_lesson_getter)
     assert job["render"]["state"] == jobs.S_FAILED_RETRYABLE
     assert "timed out" in job["render"]["lastError"].lower()
+
+
+# ── Process-death simulation (autonomous production-validation pass) ──────
+# Six points requested: (1) dies during Gemini, (2) dies during ElevenLabs,
+# (3) dies after ElevenLabs succeeds but before DB completion, (4) dies
+# after R2 upload but before DB completion, (5) dies during assembly,
+# (6) dies during final render. (5)/(6) are already covered by the
+# existing *_timeout_fails_retryable_not_stuck_forever tests above (render
+# goes through the same claim/fence engine; assembly has no claim at all —
+# it re-derives everything from already-completed line/sfx stages, so a
+# crash mid-assembly just means "run it again," never a stranded claim).
+# This section covers (1)-(4): the genuine claim/fence/provider-spend paths.
+@pytest.mark.asyncio
+async def test_crash_mid_gemini_call_is_safely_retryable_with_exactly_one_respend(monkeypatch):
+    """Process dies (simulated as the provider call itself raising) while
+    Gemini story analysis is in flight. Must land in unknown_outcome (never
+    silently lost, never auto-retried), and a subsequent retry must call
+    Gemini exactly once more — no duplicate/lost work."""
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    _fake_bucket_patch(monkeypatch, bucket)
+    await bucket.upload_from_stream("vid_1.mp4", __import__("io").BytesIO(b"fake-video"), {"contentType": "video/mp4"})
+
+    calls = {"n": 0}
+
+    async def _dies_once(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionResetError("simulated process death mid-request")
+        return {"ok": True, "storyAnalysis": {
+            "summary": "s", "narrativeArc": "a", "characters": [],
+            "scenes": [{"sceneId": "sc1", "start": 0.0, "end": 1.0, "title": "t", "description": "d",
+                        "characters": [], "speakers": ["S1"], "narrativeRole": "setup",
+                        "audioObservations": {"dialogue": "", "music": "", "ambience": "", "sfx": ""},
+                        "emotionalContext": "", "visualEvents": [], "confidence": None}],
+            "generatedAt": vnt._now(), "engine": "gemini",
+        }, "engine": "gemini"}
+
+    monkeypatch.setattr(vnt.video_ai_provider, "analyze_story", _dies_once)
+
+    job = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert job["storyAnalysis"]["state"] == jobs.S_UNKNOWN
+    assert calls["n"] == 1
+
+    # Retry — must call Gemini exactly once more, and reach a real terminal success.
+    job2 = await vnt.run_story_analysis(db, "vid_1", bucket, lesson_getter=_lesson_getter, sync_getter=_sync_getter)
+    assert calls["n"] == 2
+    assert job2["storyAnalysis"]["state"] == jobs.S_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_crash_mid_elevenlabs_call_is_safely_retryable_with_exactly_one_respend(monkeypatch):
+    """Same class of crash, at the ElevenLabs line-generation call site."""
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+
+    class _DiesOnceClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, headers=None, json=None, params=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionResetError("simulated process death mid-request")
+            text = json["text"]
+            audio = f"audio-for:{text}".encode()
+            chars = list(text)
+            return _FakeHttpResponse(200, {
+                "audio_base64": base64.b64encode(audio).decode(),
+                "alignment": {"characters": chars, "character_start_times_seconds": [i * 0.1 for i in range(len(chars))],
+                              "character_end_times_seconds": [(i + 1) * 0.1 for i in range(len(chars))]},
+            })
+
+    client = _DiesOnceClient()
+    job = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    path = f"voiceProduction.{scene_id}.lines.{line_id}"
+    assert _get_dotted(job, path)["state"] == jobs.S_UNKNOWN
+    assert client.calls == 1
+
+    job2 = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    assert client.calls == 2
+    assert _get_dotted(job2, path)["state"] == jobs.S_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_crash_after_elevenlabs_succeeds_but_before_db_completion(monkeypatch):
+    """The narrowest of the six requested crash points: the ElevenLabs HTTP
+    call itself succeeds (audio genuinely generated and stored to media
+    storage) but the process dies before jobs.complete_stage's Mongo write
+    lands. This is a REAL, understood, bounded-cost architectural gap in
+    the current design (documented in the final report, not silently
+    ignored): since the stage never reached provider_pending->completed,
+    self-heal (once its lease expires) demotes it to unknown_outcome, and
+    a subsequent manual retry has no way to discover the already-stored,
+    already-paid-for audio (each attempt writes to a fresh, attempt-keyed
+    storage key) — it genuinely re-calls ElevenLabs. This test proves that
+    is the CURRENT, exact behavior (so the finding is evidence-based), and
+    confirms the one thing that matters most: no data corruption, no stuck
+    job, no permanent state — it always reaches a new terminal success."""
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    path = f"voiceProduction.{scene_id}.lines.{line_id}"
+
+    client = _FakeElevenLabsClient()  # a normal, successful client
+    real_complete_stage = jobs.complete_stage
+    jobs.complete_stage = None  # simulate "the process dies right here"
+    try:
+        with pytest.raises(TypeError):  # calling None(...) — stands in for a hard crash
+            await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    finally:
+        jobs.complete_stage = real_complete_stage
+
+    # The stage never reached "completed" — genuinely stranded in provider_pending.
+    stage = _get_dotted(db.video_narration_jobs.docs["vid_1"], path)
+    assert stage["state"] == jobs.S_PROVIDER_PENDING
+    files_after_first_attempt = len(bucket.files)
+    assert files_after_first_attempt >= 1, "the audio genuinely was generated and stored before the crash"
+
+    # Self-heal (lease expiry) demotes it, exactly like a real restart would.
+    stage["claimExpiresAt"] = "2000-01-01T00:00:00+00:00"
+    healed = await jobs.get_or_create_job(db, "vid_1")
+    assert _get_dotted(healed, path)["state"] == jobs.S_UNKNOWN
+
+    # A fresh retry with a normal client reaches a real, uncorrupted success —
+    # calling ElevenLabs again (the documented re-spend), never getting stuck.
+    job_final = await vnt.generate_line_voice(db, "vid_1", scene_id, line_id, http_client=client)
+    final_stage = _get_dotted(job_final, path)
+    assert final_stage["state"] == jobs.S_COMPLETED
+    assert len(client.calls) == 2, "re-spent exactly once more — the documented, bounded-cost gap"

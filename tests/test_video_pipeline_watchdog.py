@@ -383,3 +383,69 @@ def test_route_allows_retry_once_orphaned_running_pipeline_is_stale(monkeypatch)
     r = client.post("/api/studio/video/lessons/vid_1/pipeline/run")
     assert r.status_code == 200
     assert r.json()["scheduled"] is True
+
+
+# ── runId fencing: the pipeline-level analog of video_narration_jobs'
+#    attempt/generation fencing, added in the same pass ────────────────────
+@pytest.mark.asyncio
+async def test_set_step_and_finish_are_fenced_to_the_runid_and_ignore_a_superseded_run():
+    """get_pipeline_status's self-heal can flip pipeline.state away from
+    "running" (and a subsequent manual retry then claims a brand new runId)
+    while the ORIGINAL run_pipeline() coroutine for that lesson is still
+    alive in-process — a Mongo write doesn't kill an asyncio task. Without
+    runId fencing, the old coroutine's own _set_step/_finish calls would
+    keep writing into what is now a DIFFERENT run's pipeline document,
+    corrupting it and effectively running two pipelines for one lesson at
+    once. Proven directly against _set_step/_finish, the exact functions
+    every step transition in run_pipeline goes through."""
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    old_run_id = "old_run_1"
+    new_run_id = "new_run_2"
+    await db.video_lessons.update_one(
+        {"lessonId": "vid_1"},
+        {"$set": {"pipeline": vpt.build_pipeline_record("mock", new_run_id)}},
+    )
+
+    # The OLD (superseded) coroutine keeps trying to write — must silently no-op.
+    await vpt._set_step(db, "vid_1", old_run_id, "media_check", "complete")
+    await vpt._finish(db, "vid_1", old_run_id, "complete")
+    doc = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert doc["pipeline"]["state"] == "running"  # untouched by the stale write
+    assert doc["pipeline"]["steps"]["media_check"]["status"] == "pending"
+
+    # The CURRENT run's own writes must still work exactly as before.
+    await vpt._set_step(db, "vid_1", new_run_id, "media_check", "complete")
+    await vpt._finish(db, "vid_1", new_run_id, "complete")
+    doc = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert doc["pipeline"]["state"] == "complete"
+    assert doc["pipeline"]["steps"]["media_check"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_get_pipeline_status_self_heal_write_is_fenced_to_the_run_it_observed():
+    """The self-heal write itself (get_pipeline_status) must target the
+    exact run it read — if a fresher run has already been claimed by the
+    time this write lands, it must not stamp "failed" over live progress."""
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    stale_run_id = "stale_run"
+    await db.video_lessons.update_one(
+        {"lessonId": "vid_1"},
+        {"$set": {"pipeline": {
+            **vpt.build_pipeline_record("mock", stale_run_id),
+            "startedAt": "2020-01-01T00:00:00Z",
+        }}},
+    )
+    # A fresh run has ALREADY been claimed on top of it (race won by a
+    # legitimate retry) before the stale self-heal write below lands.
+    fresh_run_id = "fresh_run"
+    await db.video_lessons.update_one(
+        {"lessonId": "vid_1"}, {"$set": {"pipeline": vpt.build_pipeline_record("mock", fresh_run_id)}},
+    )
+    await vpt._set_step(db, "vid_1", stale_run_id, "media_check", "failed", "stale self-heal")
+    await vpt._finish(db, "vid_1", stale_run_id, "failed", "stale self-heal")
+
+    doc = await db.video_lessons.find_one({"lessonId": "vid_1"})
+    assert doc["pipeline"]["runId"] == fresh_run_id
+    assert doc["pipeline"]["state"] == "running"  # the fresh run's state survives untouched

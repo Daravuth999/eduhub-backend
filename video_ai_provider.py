@@ -420,12 +420,22 @@ async def analyze_story(media_bytes: bytes, content_type: str, *, transcript_tex
         # constructed fresh right here so the override can never leak into
         # any other call site.
         provider = GeminiVideoProvider(http_client=http_client, model=_analysis_model())
-        raw_text = await provider.analyze_story_raw(
+        raw_text, raw_payload = await provider.analyze_story_raw(
             media_bytes, content_type, transcript_text=transcript_text, title=title,
         )
         analysis = normalize_story_analysis(raw_text, extract_json=_extract_json)
         if analysis is None:
-            return {"ok": False, "reason": "bad_response"}
+            # Same diagnosability as align()'s ASR path: a safety block or a
+            # MAX_TOKENS truncation must never look identical to a genuinely
+            # malformed reply — surface the REAL Gemini-reported reason
+            # (never fabricated) instead of a bare, indistinguishable
+            # "bad_response" that the Studio's Story Analysis lastError
+            # would otherwise show for every failure mode alike.
+            diag = _response_diagnostics(raw_payload)
+            log.warning("video-ai: story analysis unparsable | model=%s | %s | text_tail=%r",
+                        _analysis_model(), diag or "no diagnostic", raw_text[-300:])
+            reason = "bad_response" + (f" ({diag})" if diag else "")
+            return {"ok": False, "reason": reason}
         import datetime as _dt
         analysis["generatedAt"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         analysis["engine"] = "gemini"
@@ -610,14 +620,18 @@ class GeminiVideoProvider:
         return {"sync": sync, "transcriptText": transcript}
 
     async def analyze_story_raw(self, media_bytes: bytes, content_type: str, *,
-                                 transcript_text: str, title: str = "") -> str:
+                                 transcript_text: str, title: str = "") -> tuple[str, dict]:
         """Whole-video story understanding (Mode A): the SAME uploaded
         media Gemini already transcribed, re-sent with the already-computed
         transcript as grounding context, so scene/character detection is
         genuinely visual+narrative understanding of the full video — never
-        scene-by-scene in isolation. Returns the raw model text (the caller
-        normalizes it via video_scene_schema.normalize_story_analysis).
-        Raises VideoAiError on provider failure."""
+        scene-by-scene in isolation. Returns (raw model text, raw response
+        payload) — the caller normalizes the text via video_scene_schema.
+        normalize_story_analysis, and can compute _response_diagnostics
+        against the payload on a parse failure (a safety block or a
+        MAX_TOKENS truncation must never look like an indistinguishable
+        "bad response" — see align()'s identical pattern). Raises
+        VideoAiError on provider failure."""
         if not media_bytes:
             raise VideoAiError("empty_media", "no media bytes to analyze")
         media_part = await self._media_part(media_bytes, content_type)
@@ -636,7 +650,8 @@ class GeminiVideoProvider:
             log.warning("video-ai: story-analysis HTTP %s | model=%s | body=%s",
                         r.status_code, self._model, (r.text or "")[:400])
             raise VideoAiError("provider_rejected", f"Gemini HTTP {r.status_code}")
-        return _candidate_text(r.json())
+        raw_payload = r.json()
+        return _candidate_text(raw_payload), raw_payload
 
 
 # ── Mock provider (no key required — pipeline always exercisable) ────────

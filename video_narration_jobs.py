@@ -306,12 +306,28 @@ async def complete_stage(db, doc_id: str, path: str, attempt: str, genver: int, 
     """provider_pending → completed, fenced on attemptId + generationVersion.
     A superseded attempt or a stale generation version can never win —
     once another attempt has moved the stage on, this call is a silent
-    no-op rather than corrupting a newer result."""
+    no-op rather than corrupting a newer result.
+
+    Also accepts the SAME attempt sitting in unknown_outcome: fence_
+    provider's lease is deliberately set equal to the caller's own
+    asyncio.wait_for bound (see its docstring), so the two clocks are
+    approximately but not atomically synchronized. A poll-triggered self-
+    heal sweep (_heal_stranded_stages) can observe claimExpiresAt as just
+    expired and demote this exact attempt to unknown_outcome a moment
+    before a genuinely still-running (not dead) provider call legitimately
+    finishes and reaches this call — without this, that real, already-paid-
+    for result would be silently discarded and the stage would report
+    "stalled, safe to retry" for work that actually succeeded, and a retry
+    would re-spend on it. The attemptId + generationVersion fence is what
+    keeps this safe: a truly superseded/retried attempt has a different
+    genver (claim_stage always increments it), so it's still correctly
+    rejected here — only the exact same in-flight attempt racing its own
+    self-heal demotion is let through."""
     now = _now_iso()
     kwargs = {"return_document": ReturnDocument.AFTER} if ReturnDocument is not None else {}
     done = await db[COLL].find_one_and_update(
         {"_id": doc_id, f"{path}.attemptId": attempt, f"{path}.generationVersion": genver,
-         f"{path}.state": S_PROVIDER_PENDING},
+         f"{path}.state": {"$in": [S_PROVIDER_PENDING, S_UNKNOWN]}},
         {"$set": {
             f"{path}.state": S_COMPLETED,
             f"{path}.result": result,

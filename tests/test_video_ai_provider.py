@@ -316,3 +316,99 @@ def test_video_ai_provider_has_no_importers_outside_video_library():
         if "import video_ai_provider" in text or "from video_ai_provider" in text:
             importers.add(py_file.name)
     assert importers == set(), importers
+
+
+# ── Story Analysis (2.5 Pro) response-parsing robustness — the SAME
+#    fixture matrix already proven for the ASR (Flash) path above, now
+#    covering the deep-analysis path too (Directive: "Use realistic
+#    fixture responses for... 2.5 Pro Story Analysis... safety block,
+#    MAX_TOKENS, malformed JSON... Verify that no valid response is
+#    accidentally classified as failure"). ──────────────────────────────────
+def _valid_story_payload() -> dict:
+    return {
+        "summary": "s", "narrativeArc": "a", "characters": [],
+        "scenes": [{"start": 0.0, "end": 5.0, "title": "Opening", "description": "d",
+                    "narrativeRole": "setup", "speakers": ["S1"], "characters": []}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_accepts_a_genuinely_valid_response():
+    """The inverse of every failure-mode test below: a real, well-formed
+    answer must never be misclassified as a parsing failure."""
+    client = _RecordingGeminiClient(_gemini_json_response(_valid_story_payload()))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+    assert result["ok"] is True
+    assert result["storyAnalysis"]["scenes"][0]["title"] == "Opening"
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_surfaces_a_safety_block_reason_instead_of_a_generic_failure():
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [], "promptFeedback": {"blockReason": "SAFETY"},
+    }))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+    assert result["ok"] is False
+    assert "blockReason=SAFETY" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_surfaces_a_truncated_max_tokens_response_honestly():
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": '{"summary":"s","scenes":[{"start":0'}]},
+                         "finishReason": "MAX_TOKENS"}],
+    }))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+    assert result["ok"] is False
+    assert "finishReason=MAX_TOKENS" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_reports_no_candidates_returned_when_response_is_empty():
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {"candidates": []}))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+    assert result["ok"] is False
+    assert "no candidates returned" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_bad_response_with_no_extra_diagnostic_for_plain_garbage_text():
+    """A normal-looking response (STOP, real candidates) that just isn't
+    parsable JSON must still fail cleanly without a fabricated diagnostic."""
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": "I cannot analyze this."}]}, "finishReason": "STOP"}],
+    }))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+    assert result["ok"] is False
+    assert result["reason"] == "bad_response"
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_provider_rejected_http_error_never_silently_falls_back():
+    """A non-200 HTTP response is a real provider rejection — never
+    silently swallowed as a generic bad_response, and never triggers any
+    fallback to a different model or provider (Section 3's explicit 'no
+    silent Pro->Flash fallback' requirement — this path never touches
+    _model()/DEFAULT_MODEL at all, only _analysis_model())."""
+    client = _RecordingGeminiClient(_FakeHttpResponse(503, {}, text="upstream overloaded"))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+    assert result["ok"] is False
+    assert result["reason"] == "provider_rejected"
+    assert "gemini-2.5-pro" in client.calls[0]
+    assert "gemini-2.5-flash" not in client.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_provider_timeout_is_caught_and_reported_never_crashes():
+    """A network-level timeout raised by the http client itself (distinct
+    from a 200 response with a truncated body) must be caught and reported
+    as a clean failure, never an unhandled exception that would crash the
+    calling job-stage coroutine outside its own watchdog."""
+    class _TimesOutClient:
+        async def post(self, url, params=None, json=None, **kwargs):
+            raise TimeoutError("simulated provider timeout")
+
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi",
+                                      http_client=_TimesOutClient())
+    assert result["ok"] is False
+    assert result["reason"] == "analysis_failed"

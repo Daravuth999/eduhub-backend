@@ -638,6 +638,102 @@ async def overlay_audio_at_offset(
                 pass
 
 
+def _strip_id3_tags(buf: bytes) -> bytes:
+    """Same algorithm as video_narration_tools.py's own copy (and server.
+    py's before it) — duplicated deliberately, not imported, per this
+    codebase's established "small helpers duplicate across modules"
+    convention. Only used by concat_audio_segments' ffmpeg-unavailable
+    fallback below."""
+    if not buf or len(buf) < 10:
+        return buf
+    out = buf
+    if out[:3] == b"ID3":
+        b0, b1, b2, b3 = out[6], out[7], out[8], out[9]
+        size = (b0 << 21) | (b1 << 14) | (b2 << 7) | b3
+        tag_end = 10 + size
+        if 10 < tag_end < len(out):
+            out = out[tag_end:]
+    if len(out) >= 128 and out[-128:-125] == b"TAG":
+        out = out[:-128]
+    return out
+
+
+async def concat_audio_segments(segments: list[bytes], *, timeout: float = 180.0) -> bytes:
+    """Real, ffmpeg-decode-and-re-encode concatenation of MP3 segments into
+    ONE valid stream with an accurate total duration.
+
+    Root-cause fix for a real production defect: naive byte-level
+    concatenation of independently-encoded MP3 segments (the previous
+    implementation) is unsafe. Every segment that passes through this
+    module's own `-c:a libmp3lame` calls (normalize_line_loudness,
+    time_compress_clip) — and ElevenLabs' own returned audio — carries a
+    Xing/LAME VBR header: a special first data frame declaring that
+    SEGMENT's own frame count/duration. When segments are joined as raw
+    bytes, that header from the FIRST segment survives untouched in the
+    merged file, and both ffprobe and real media players may compute the
+    stream's reported duration from that header alone rather than
+    scanning every frame — so a multi-segment assembled narration track
+    can report (and in some players genuinely stop advancing at) only the
+    first segment's own duration, silently truncating everything after
+    it. This is exactly the class of bug _strip_id3_tags' own docstring
+    describes ("iOS AVFoundation stopping playback at the first
+    segment's embedded duration") — ID3 tag stripping alone does not fix
+    it, since a Xing header is a real MPEG audio frame, not an ID3 tag.
+
+    Decoding and re-encoding through ffmpeg's concat filter (not the
+    concat demuxer with `-c copy`, which would preserve the same
+    per-segment headers unchanged) produces one clean stream with a
+    single, correct header covering the true total duration.
+
+    Falls back to the previous naive byte-concatenation only when ffmpeg
+    is genuinely unavailable — never blocks narration assembly."""
+    real_segments = [s for s in segments if s]
+    if not real_segments:
+        return b""
+    if len(real_segments) == 1:
+        return real_segments[0]
+
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        parts = [real_segments[0]] + [_strip_id3_tags(seg) for seg in real_segments[1:]]
+        return b"".join(parts)
+
+    work_id = uuid.uuid4().hex
+    in_paths = [os.path.join(tempfile.gettempdir(), f"vnr_concat_{work_id}_{i}.mp3")
+                for i in range(len(real_segments))]
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_concat_{work_id}_out.mp3")
+    try:
+        for path, seg in zip(in_paths, real_segments):
+            with open(path, "wb") as f:
+                f.write(seg)
+
+        inputs: list[str] = []
+        for path in in_paths:
+            inputs += ["-i", path]
+        stream_refs = "".join(f"[{i}:a]" for i in range(len(in_paths)))
+        filter_complex = f"{stream_refs}concat=n={len(in_paths)}:v=0:a=1[aout]"
+        args = (
+            ffmpeg, "-y", *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[aout]",
+            "-c:a", "libmp3lame",
+            out_path,
+        )
+        code, _out, err = await _run(*args, timeout=timeout)
+        if code != 0:
+            tail = err.decode("utf-8", errors="replace")[-800:]
+            raise RenderError("ffmpeg_failed", f"ffmpeg exited {code}: {tail}", 500)
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (*in_paths, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 async def probe_audio_stream_status(video_bytes: bytes, *, content_type: str = "video/mp4",
                                      timeout: float = 30.0) -> str:
     """Tri-state media-inspection verification: `"present"`, `"absent"`, or

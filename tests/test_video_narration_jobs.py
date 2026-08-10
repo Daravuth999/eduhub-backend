@@ -402,6 +402,72 @@ async def test_get_or_create_job_heals_a_stranded_claimed_stage_for_ui_visibilit
 
 
 @pytest.mark.asyncio
+async def test_complete_stage_rescues_a_genuine_success_that_raced_past_self_heal():
+    """Real race, not hypothetical: fence_provider's lease is set equal to
+    the caller's own asyncio.wait_for bound, so a self-heal sweep triggered
+    by a concurrent poll can observe claimExpiresAt as just-expired and
+    demote a genuinely still-running (not dead) attempt to unknown_outcome
+    a moment before its real provider call legitimately succeeds. Without
+    complete_stage also accepting unknown_outcome (fenced on the SAME
+    attempt/genver), that real, already-paid-for ElevenLabs/Gemini result
+    would be silently discarded and the stage would wrongly report
+    "stalled, safe to retry" — and a retry would re-spend on already-
+    completed work."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    claimed, attempt = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    genver = claimed["storyAnalysis"]["generationVersion"]
+    await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt, genver, lease_s=900)
+
+    # Self-heal races ahead: demotes this exact still-in-flight attempt to
+    # unknown_outcome purely because a poll landed after claimExpiresAt,
+    # NOT because the process actually died.
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], "storyAnalysis.state", jobs.S_UNKNOWN)
+
+    # The real provider call then genuinely finishes successfully.
+    ok = await jobs.complete_stage(db, "vid_1", "storyAnalysis", attempt, genver, {"scenes": ["real"]})
+    assert ok is True
+
+    doc = await db.video_narration_jobs.find_one({"_id": "vid_1"})
+    assert doc["storyAnalysis"]["state"] == jobs.S_COMPLETED
+    assert doc["storyAnalysis"]["result"] == {"scenes": ["real"]}
+
+
+@pytest.mark.asyncio
+async def test_complete_stage_still_rejects_a_superseded_attempt_from_unknown_outcome():
+    """The safety half of the same fix: broadening complete_stage to accept
+    unknown_outcome must never let a genuinely STALE/superseded attempt
+    (a different attemptId/generationVersion) win just because the stage
+    happens to be sitting in unknown_outcome — only the exact same attempt
+    racing its own self-heal demotion may complete."""
+    db = _FakeDB()
+    await jobs.get_or_create_job(db, "vid_1")
+    claimed1, attempt1 = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    genver1 = claimed1["storyAnalysis"]["generationVersion"]
+    await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt1, genver1, lease_s=900)
+
+    # attempt1 is abandoned and demoted (a real crash this time), then
+    # re-claimed as attempt2 — a genuinely newer generation.
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], "storyAnalysis.state", jobs.S_UNKNOWN)
+    claimed2, attempt2 = await jobs.claim_stage(db, "vid_1", "storyAnalysis")
+    genver2 = claimed2["storyAnalysis"]["generationVersion"]
+    assert genver2 != genver1
+    await jobs.fence_provider(db, "vid_1", "storyAnalysis", attempt2, genver2, lease_s=900)
+    # Demote attempt2 as well, to land back in unknown_outcome for the assertion.
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], "storyAnalysis.state", jobs.S_UNKNOWN)
+
+    # The stale attempt1 finally responds late — must still be rejected.
+    stale_ok = await jobs.complete_stage(db, "vid_1", "storyAnalysis", attempt1, genver1, {"scenes": ["stale"]})
+    assert stale_ok is False
+
+    # attempt2 (the real current attempt) completing must still work.
+    ok2 = await jobs.complete_stage(db, "vid_1", "storyAnalysis", attempt2, genver2, {"scenes": ["fresh"]})
+    assert ok2 is True
+    doc = await db.video_narration_jobs.find_one({"_id": "vid_1"})
+    assert doc["storyAnalysis"]["result"] == {"scenes": ["fresh"]}
+
+
+@pytest.mark.asyncio
 async def test_get_or_create_job_heals_stranded_nested_scene_line_stages():
     """The sweep must walk dynamically-keyed nested stages (voiceProduction.
     <scene>.lines.<line>, sfx.<scene>) too, not just the four fixed

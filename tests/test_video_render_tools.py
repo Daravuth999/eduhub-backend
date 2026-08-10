@@ -656,6 +656,74 @@ async def test_time_compress_clip_returns_none_on_ffmpeg_failure(monkeypatch):
     assert await vrt.time_compress_clip(b"fake-mp3", 1.05) is None
 
 
+# ── concat_audio_segments — root-cause fix for naive MP3 byte-
+#    concatenation silently mis-reporting/truncating the assembled
+#    narration track's real duration (this codebase's own _strip_id3_tags
+#    docstring already names the exact failure class — "iOS AVFoundation
+#    stopping playback at the first segment's embedded duration" — as a
+#    real prior incident; ID3-tag stripping alone never fixed the deeper
+#    Xing/LAME VBR header case, since that header is a real MPEG audio
+#    frame, not an ID3 tag). ───────────────────────────────────────────────
+async def _real_mp3_clip(frequency: int, duration: float) -> bytes:
+    path = os.path.join(tempfile.gettempdir(), f"concat_seg_{uuid.uuid4().hex}.mp3")
+    args = (vrt._resolve_ffmpeg(), "-y", "-f", "lavfi", "-i", f"sine=frequency={frequency}:duration={duration}",
+            "-c:a", "libmp3lame", path)
+    await vrt._run(*args, timeout=30.0)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_concat_audio_segments_produces_the_real_correct_total_duration():
+    """The core regression proof: three independently-libmp3lame-encoded
+    segments (each carrying its OWN Xing/LAME header) must concatenate to
+    the genuine SUM of their durations, not silently report/truncate to
+    just the first segment's own duration — the exact production failure
+    mode naive byte-joining risks."""
+    seg1 = await _real_mp3_clip(440, 1.0)
+    seg2 = await _real_mp3_clip(540, 2.0)
+    seg3 = await _real_mp3_clip(640, 3.0)
+    result = await vrt.concat_audio_segments([seg1, seg2, seg3])
+    duration = await vrt.probe_audio_duration_seconds(result)
+    assert duration == pytest.approx(6.0, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_concat_audio_segments_empty_list_returns_empty_bytes():
+    assert await vrt.concat_audio_segments([]) == b""
+    assert await vrt.concat_audio_segments([b"", b"", b""]) == b""
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_concat_audio_segments_single_segment_is_returned_as_is():
+    seg = await _real_mp3_clip(440, 0.5)
+    result = await vrt.concat_audio_segments([seg])
+    assert result == seg
+
+
+@pytest.mark.asyncio
+async def test_concat_audio_segments_falls_back_to_byte_join_when_ffmpeg_unavailable(monkeypatch):
+    """Never blocks narration assembly just because ffmpeg is missing —
+    degrades to the previous (imperfect but non-fatal) behavior."""
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    result = await vrt.concat_audio_segments([b"AAA", b"BBB", b"CCC"])
+    assert result == b"AAABBBCCC"
+
+
+@pytest.mark.asyncio
+async def test_concat_audio_segments_raises_render_error_on_ffmpeg_failure(monkeypatch):
+    async def _failing_run(*args, timeout):
+        return 1, b"", b"ffmpeg: invalid input"
+
+    monkeypatch.setattr(vrt, "_run", _failing_run)
+    with pytest.raises(vrt.RenderError):
+        await vrt.concat_audio_segments([b"seg-one-bytes", b"seg-two-bytes"])
+
+
 # ── Global heavy-op concurrency cap (Directive 3 memory-pressure fix) ──────
 def test_heavy_op_semaphore_defaults_to_two_and_is_env_overridable(monkeypatch):
     assert vrt.HEAVY_OP_CONCURRENCY == 2
