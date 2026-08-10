@@ -22,6 +22,8 @@ established in test_video_pipeline_watchdog.py.
 from __future__ import annotations
 
 import asyncio
+import gc
+import sys
 
 import pytest
 
@@ -244,6 +246,83 @@ async def test_video_lesson_sends_extracted_smaller_audio_to_the_provider(monkey
     assert sent_ct == "audio/mpeg"
     assert len(sent_bytes) < len(video_bytes)  # genuinely smaller — audio only, not the whole video
     assert await vrt.probe_audio_duration_seconds(sent_bytes) == pytest.approx(3.0, abs=0.3)
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_raw_media_buffer_is_released_before_educational_analysis(monkeypatch):
+    """Real memory-pressure fix: `raw` holds the full original upload (up
+    to MAX_TRANSCRIBE_BYTES, ~300MB) in memory. Once audio extraction has
+    produced the much smaller `transcribe_bytes` and speech recognition is
+    done with it, nothing downstream (educational_analysis, review_ready)
+    ever reads raw bytes again — but as a local in run_pipeline's closure
+    it would otherwise stay alive (and un-reclaimable) for the rest of the
+    run purely because the frame still references it.
+
+    Plain `bytes` can't hold a weakref (and a subclass can't add one —
+    bytes doesn't support non-empty __slots__), so this proves the fix via
+    a genuine sys.getrefcount() delta instead: the only reference this
+    test's fake bucket holds is released the moment run_pipeline reads it
+    (a real GridFS/motor stream doesn't retain its buffer either), so if
+    `raw`/`transcribe_bytes` are properly freed after speech recognition,
+    the refcount observed mid-run (during educational_analysis) must be
+    exactly one lower than the refcount observed before the run started
+    (the bucket's transient hold, and nothing else, gone) — not the same
+    or higher, which would mean the pipeline is still holding it."""
+    _stub_downstream(monkeypatch)
+    video_bytes = await _make_video_with_audio(duration=2.0)
+
+    class _OneShotGridOut:
+        def __init__(self, data, content_type):
+            self._data = data
+            self.metadata = {"contentType": content_type}
+
+        async def read(self):
+            data = self._data
+            self._data = None  # a real GridFS/motor stream doesn't retain its buffer either
+            return data
+
+    class _OneShotBucket:
+        """Unlike the shared `_FakeBucket` (which deliberately keeps its
+        `_data` field alive for reuse across a test), this fake mirrors
+        real GridFS/motor semantics: nothing outside the single returned
+        buffer keeps the bytes alive after the read completes — so any
+        reference still standing afterward is genuinely run_pipeline's
+        own, not a test-fixture artifact."""
+        def __init__(self, data, content_type):
+            self._data = data
+            self._content_type = content_type
+
+        async def open_download_stream_by_name(self, filename):
+            data, self._data = self._data, None
+            return _OneShotGridOut(data, self._content_type)
+
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    provider = _RecordingProvider()
+    monkeypatch.setattr(vpt.video_ai_provider, "get_video_ai_provider", lambda: provider)
+    bucket = _OneShotBucket(video_bytes, "video/mp4")
+
+    seen = {}
+
+    async def _fake_analyze_transcript(transcript_text, *, title=""):
+        gc.collect()
+        seen["during"] = sys.getrefcount(video_bytes)
+        return {"ok": False, "reason": "test stub — not exercising real analysis"}
+
+    monkeypatch.setattr(vpt.video_ai_provider, "analyze_transcript", _fake_analyze_transcript)
+
+    refcount_before = sys.getrefcount(video_bytes)  # includes bucket._data's transient hold
+    pipeline = await vpt.run_pipeline(db, "vid_1", bucket)
+
+    assert pipeline["state"] == "complete"
+    assert "during" in seen, "educational_analysis was never reached — test setup is broken"
+    assert seen["during"] == refcount_before - 1, (
+        f"expected only the bucket's transient reference to have been released by the time "
+        f"educational_analysis runs (refcount {refcount_before} -> {refcount_before - 1}), "
+        f"but observed {seen['during']} — the raw media buffer is still referenced somewhere "
+        "in run_pipeline long after speech recognition finished using it"
+    )
 
 
 @pytest.mark.asyncio

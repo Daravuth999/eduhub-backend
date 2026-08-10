@@ -50,6 +50,7 @@ import io
 import logging
 import os
 import re
+import time
 import uuid
 
 import httpx
@@ -557,14 +558,23 @@ async def run_story_analysis(db, lesson_id: str, media_bucket, *, lesson_getter,
             return
         await jobs.complete_stage(db, lesson_id, "storyAnalysis", attempt, genver, result["storyAnalysis"])
 
+    _started = time.monotonic()
     try:
-        await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+        # Concurrency cap (video_render_tools.heavy_op_semaphore): bounds
+        # how many lessons' full raw media buffers + Gemini requests can be
+        # in flight across the whole process at once — claim/fence above
+        # only prevents THIS lesson's story analysis running twice.
+        async with video_render_tools.heavy_op_semaphore:
+            await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+        logger.info("video_narration: story analysis done lesson=%s attempt=%s duration=%.1fs",
+                    lesson_id, attempt, time.monotonic() - _started)
     except asyncio.TimeoutError:
-        logger.warning("video_narration: story analysis timed out lesson=%s", lesson_id)
+        logger.warning("video_narration: story analysis timed out lesson=%s attempt=%s after=%.1fs",
+                        lesson_id, attempt, time.monotonic() - _started)
         await jobs.fail_stage(db, lesson_id, "storyAnalysis", attempt, genver,
                                f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
     except Exception as exc:  # noqa: BLE001
-        logger.exception("video_narration: story analysis failed lesson=%s", lesson_id)
+        logger.exception("video_narration: story analysis failed lesson=%s attempt=%s", lesson_id, attempt)
         await jobs.fail_unknown(db, lesson_id, "storyAnalysis", attempt, genver, f"{type(exc).__name__}: {exc}")
     return await jobs.get_or_create_job(db, lesson_id)
 
@@ -603,14 +613,20 @@ async def run_script_blueprint(db, lesson_id: str, *, lesson_getter, sync_getter
             return
         await jobs.complete_stage(db, lesson_id, "scriptBlueprint", attempt, genver, result["scriptBlueprint"])
 
+    _started = time.monotonic()
     try:
-        await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+        # See run_story_analysis's identical comment on heavy_op_semaphore.
+        async with video_render_tools.heavy_op_semaphore:
+            await asyncio.wait_for(_do(), timeout=STAGE_TIMEOUT_S)
+        logger.info("video_narration: script blueprint done lesson=%s attempt=%s duration=%.1fs",
+                    lesson_id, attempt, time.monotonic() - _started)
     except asyncio.TimeoutError:
-        logger.warning("video_narration: script blueprint timed out lesson=%s", lesson_id)
+        logger.warning("video_narration: script blueprint timed out lesson=%s attempt=%s after=%.1fs",
+                        lesson_id, attempt, time.monotonic() - _started)
         await jobs.fail_stage(db, lesson_id, "scriptBlueprint", attempt, genver,
                                f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
     except Exception as exc:  # noqa: BLE001
-        logger.exception("video_narration: script blueprint failed lesson=%s", lesson_id)
+        logger.exception("video_narration: script blueprint failed lesson=%s attempt=%s", lesson_id, attempt)
         await jobs.fail_unknown(db, lesson_id, "scriptBlueprint", attempt, genver, f"{type(exc).__name__}: {exc}")
     return await jobs.get_or_create_job(db, lesson_id)
 
@@ -718,30 +734,39 @@ async def generate_line_voice(db, lesson_id: str, scene_id: str, line_id: str, *
     voice_settings = _scene_voice_settings(story_scene)
     previous_text, next_text = _adjacent_context_text(claimed, scene_id, line_id)
 
+    _started = time.monotonic()
     try:
-        raw = await asyncio.wait_for(
-            elevenlabs_generate_line(
-                line["text"], voice_id, acting_note=line.get("emotion") or None,
-                voice_settings=voice_settings, previous_text=previous_text, next_text=next_text,
-                http_client=http_client,
-            ),
-            timeout=STAGE_TIMEOUT_S,
-        )
+        # See run_story_analysis's identical comment on heavy_op_semaphore
+        # — bounds concurrent ElevenLabs requests across ALL lessons/lines
+        # at once, not just this one line's own claim/fence above.
+        async with video_render_tools.heavy_op_semaphore:
+            raw = await asyncio.wait_for(
+                elevenlabs_generate_line(
+                    line["text"], voice_id, acting_note=line.get("emotion") or None,
+                    voice_settings=voice_settings, previous_text=previous_text, next_text=next_text,
+                    http_client=http_client,
+                ),
+                timeout=STAGE_TIMEOUT_S,
+            )
+        logger.info("video_narration: line generation done lesson=%s scene=%s line=%s attempt=%s duration=%.1fs",
+                    lesson_id, scene_id, line_id, attempt, time.monotonic() - _started)
     except asyncio.TimeoutError:
-        logger.warning("video_narration: line generation timed out lesson=%s scene=%s line=%s",
-                        lesson_id, scene_id, line_id)
+        logger.warning("video_narration: line generation timed out lesson=%s scene=%s line=%s attempt=%s after=%.1fs",
+                        lesson_id, scene_id, line_id, attempt, time.monotonic() - _started)
         await jobs.fail_stage(db, lesson_id, path, attempt, genver,
                                f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
         return await jobs.get_or_create_job(db, lesson_id)
     except VideoNarrationError as exc:
+        logger.warning("video_narration: line generation rejected lesson=%s scene=%s line=%s attempt=%s code=%s",
+                        lesson_id, scene_id, line_id, attempt, exc.code)
         if exc.code == "no_api_key":
             await jobs.fail_terminal(db, lesson_id, path, attempt, genver, exc.message)
         else:
             await jobs.fail_stage(db, lesson_id, path, attempt, genver, exc.message)
         return await jobs.get_or_create_job(db, lesson_id)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("video_narration: line generation failed lesson=%s scene=%s line=%s",
-                          lesson_id, scene_id, line_id)
+        logger.exception("video_narration: line generation failed lesson=%s scene=%s line=%s attempt=%s",
+                          lesson_id, scene_id, line_id, attempt)
         await jobs.fail_unknown(db, lesson_id, path, attempt, genver, f"{type(exc).__name__}: {exc}")
         return await jobs.get_or_create_job(db, lesson_id)
 
@@ -811,23 +836,32 @@ async def generate_scene_sfx(db, lesson_id: str, scene_id: str, *, http_client=N
     if not await jobs.fence_provider(db, lesson_id, path, attempt, genver, lease_s=STAGE_TIMEOUT_S):
         return await jobs.get_or_create_job(db, lesson_id)
 
+    _started = time.monotonic()
     try:
-        audio_bytes = await asyncio.wait_for(
-            elevenlabs_generate_sfx(sfx_description, http_client=http_client), timeout=STAGE_TIMEOUT_S,
-        )
+        # See run_story_analysis's identical comment on heavy_op_semaphore.
+        async with video_render_tools.heavy_op_semaphore:
+            audio_bytes = await asyncio.wait_for(
+                elevenlabs_generate_sfx(sfx_description, http_client=http_client), timeout=STAGE_TIMEOUT_S,
+            )
+        logger.info("video_narration: sfx generation done lesson=%s scene=%s attempt=%s duration=%.1fs",
+                    lesson_id, scene_id, attempt, time.monotonic() - _started)
     except asyncio.TimeoutError:
-        logger.warning("video_narration: sfx generation timed out lesson=%s scene=%s", lesson_id, scene_id)
+        logger.warning("video_narration: sfx generation timed out lesson=%s scene=%s attempt=%s after=%.1fs",
+                        lesson_id, scene_id, attempt, time.monotonic() - _started)
         await jobs.fail_stage(db, lesson_id, path, attempt, genver,
                                f"timed out after {STAGE_TIMEOUT_S}s (stalled I/O — retry is safe)")
         return await jobs.get_or_create_job(db, lesson_id)
     except VideoNarrationError as exc:
+        logger.warning("video_narration: sfx generation rejected lesson=%s scene=%s attempt=%s code=%s",
+                        lesson_id, scene_id, attempt, exc.code)
         if exc.code == "no_api_key":
             await jobs.fail_terminal(db, lesson_id, path, attempt, genver, exc.message)
         else:
             await jobs.fail_stage(db, lesson_id, path, attempt, genver, exc.message)
         return await jobs.get_or_create_job(db, lesson_id)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("video_narration: sfx generation failed lesson=%s scene=%s", lesson_id, scene_id)
+        logger.exception("video_narration: sfx generation failed lesson=%s scene=%s attempt=%s",
+                          lesson_id, scene_id, attempt)
         await jobs.fail_unknown(db, lesson_id, path, attempt, genver, f"{type(exc).__name__}: {exc}")
         return await jobs.get_or_create_job(db, lesson_id)
 

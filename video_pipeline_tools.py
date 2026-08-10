@@ -279,6 +279,17 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
             await _set_step(db, lesson_id, "synchronization", "skipped",
                              "no transcript to synchronize — this video has no audio")
 
+        # Real memory-pressure fix: `raw` holds the full original upload in
+        # memory (up to MAX_TRANSCRIBE_BYTES, ~300MB) and `transcribe_bytes`
+        # may alias it. Neither is read again anywhere below this point —
+        # educational analysis and review_ready work off `transcript_text`/
+        # Mongo documents only — but as local variables in this closure
+        # they would otherwise stay resident for the rest of the run purely
+        # because the frame still references them. On a large video this is
+        # real, avoidable memory held during Gemini analysis + Mongo I/O,
+        # not bounded by anything else in this function.
+        del raw, transcribe_bytes
+
         # 4 — Gemini educational analysis (never sinks the pipeline). An
         # empty transcript — whether from a silent video or from real audio
         # that simply has no speech — is an EXPECTED, valid state, never a
@@ -311,11 +322,30 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         await _finish(db, lesson_id, "complete")
         logger.info("video_pipeline: complete lesson=%s provider=%s", lesson_id, provider.provider_version)
 
+    logger.info("video_pipeline: START lesson=%s provider=%s", lesson_id, provider.provider_version)
     try:
-        # Watchdog: bounds the whole run so a stalled I/O call (dead Mongo
-        # connection, hung GridFS/R2 fetch — see PIPELINE_TIMEOUT_S) becomes
-        # a truthful "failed" state instead of an eternal "running" one.
-        await asyncio.wait_for(_run_stages(), timeout=PIPELINE_TIMEOUT_S)
+        # Concurrency cap first (see video_render_tools.heavy_op_semaphore):
+        # bounds how many lessons' worth of raw media + Gemini/ffmpeg work
+        # can be resident in memory across the whole process at once — the
+        # per-lesson claim above only prevents the SAME lesson running
+        # twice, not multiple different lessons piling up simultaneously.
+        # Diagnostic instrumentation (Directive 3 §18): logging how long
+        # this run waited for a slot separates "genuinely slow processing"
+        # from "healthy but queued behind other lessons" in a future
+        # production investigation — never logged as part of the per-stage
+        # Mongo pipeline.log the Studio UI reads, since that only makes
+        # sense once processing has actually started.
+        _wait_started = _dt.datetime.now(_dt.timezone.utc)
+        async with video_render_tools.heavy_op_semaphore:
+            queued_s = (_dt.datetime.now(_dt.timezone.utc) - _wait_started).total_seconds()
+            if queued_s > 1.0:
+                logger.info("video_pipeline: lesson=%s waited %.1fs for a processing slot", lesson_id, queued_s)
+            # Watchdog inside the cap: bounds the whole run so a stalled I/O
+            # call (dead Mongo connection, hung GridFS/R2 fetch — see
+            # PIPELINE_TIMEOUT_S) becomes a truthful "failed" state instead
+            # of an eternal "running" one, measured from when processing
+            # actually starts rather than including time spent queued.
+            await asyncio.wait_for(_run_stages(), timeout=PIPELINE_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001
         message = (
             f"Processing timed out after {PIPELINE_TIMEOUT_S}s (stalled I/O — retry is safe)"

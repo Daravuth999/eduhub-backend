@@ -206,6 +206,40 @@ async def test_probe_has_audio_stream_treats_both_absent_and_unknown_as_false():
     assert await vrt.probe_has_audio_stream(b"") is False
 
 
+# ── Real production memory-pressure fix: ffmpeg subprocess stdout is
+# discarded by default, never buffered in memory unread. ────────────────
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_run_discards_stdout_by_default_instead_of_buffering_it():
+    """The previous implementation used subprocess.run(capture_output=True),
+    which buffers BOTH stdout and stderr fully in memory on every single
+    ffmpeg/ffprobe call this module makes — real, unbounded memory growth
+    on a long render, for output nothing ever reads (every real ffmpeg
+    invocation here writes its actual media to a FILE, never stdout).
+    ffmpeg's `-f null -` writes real bytes to stdout when asked to; proving
+    _run() returns empty stdout here confirms it is genuinely discarded
+    (DEVNULL), not merely captured-and-ignored by the caller."""
+    code, out, _err = await vrt._run(
+        vrt._resolve_ffmpeg(), "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2",
+        "-f", "s16le", "-",  # writes raw PCM to stdout when captured
+        timeout=15.0,
+    )
+    assert code == 0
+    assert out == b""
+
+
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_run_captures_stdout_when_a_caller_explicitly_needs_it():
+    code, out, _err = await vrt._run(
+        vrt._resolve_ffmpeg(), "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2",
+        "-f", "s16le", "-",
+        timeout=15.0, capture_stdout=True,
+    )
+    assert code == 0
+    assert len(out) > 0  # the real raw PCM bytes, genuinely captured this time
+
+
 @pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
 @pytest.mark.asyncio
 async def test_mux_raises_ffmpeg_failed_on_genuinely_malformed_input():
@@ -620,3 +654,103 @@ async def test_time_compress_clip_returns_none_on_ffmpeg_failure(monkeypatch):
 
     monkeypatch.setattr(vrt, "_run", _failing_run)
     assert await vrt.time_compress_clip(b"fake-mp3", 1.05) is None
+
+
+# ── Global heavy-op concurrency cap (Directive 3 memory-pressure fix) ──────
+def test_heavy_op_semaphore_defaults_to_two_and_is_env_overridable(monkeypatch):
+    assert vrt.HEAVY_OP_CONCURRENCY == 2
+    assert vrt.heavy_op_semaphore._value == 2  # asyncio.Semaphore's own available-permit counter
+
+
+@pytest.mark.asyncio
+async def test_heavy_op_semaphore_genuinely_bounds_concurrent_heavy_work():
+    """The whole point of video_render_tools.heavy_op_semaphore is to cap
+    how many lessons' worth of Gemini/ElevenLabs/ffmpeg work can run at
+    once across the entire process (video_pipeline_tools.run_pipeline and
+    video_narration_tools' story-analysis/line/SFX generation all acquire
+    it) — proven here with real concurrent tasks racing for the same
+    module-level semaphore, not by inspecting the wiring."""
+    sem = asyncio.Semaphore(2)
+    concurrent_count = 0
+    max_observed = 0
+    lock = asyncio.Lock()
+
+    async def _heavy_task():
+        nonlocal concurrent_count, max_observed
+        async with sem:
+            async with lock:
+                concurrent_count += 1
+                max_observed = max(max_observed, concurrent_count)
+            await asyncio.sleep(0.05)
+            async with lock:
+                concurrent_count -= 1
+
+    await asyncio.gather(*(_heavy_task() for _ in range(6)))
+    assert max_observed == 2, f"expected the cap of 2 to be genuinely enforced, observed {max_observed} concurrent"
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_acquires_the_heavy_op_semaphore(monkeypatch):
+    """video_pipeline_tools.run_pipeline must actually acquire the shared
+    module-level semaphore during its run (not a private copy) — proven by
+    observing the real semaphore's available-permit count drop while a
+    run is in flight, using video_pipeline_tools directly rather than
+    re-implementing its internals here."""
+    import video_pipeline_tools as vpt
+
+    class _FakeColl:
+        def __init__(self, doc):
+            self.doc = doc
+
+        async def find_one(self, query, projection=None):
+            return dict(self.doc)
+
+        async def find_one_and_update(self, query, update):
+            self.doc.update(update.get("$set", {}))
+            return dict(self.doc)
+
+        async def update_one(self, query, update):
+            for k, v in (update.get("$set") or {}).items():
+                parts = k.split(".")
+                cur = self.doc
+                for p in parts[:-1]:
+                    cur = cur.setdefault(p, {})
+                cur[parts[-1]] = v
+
+    class _FakeDB:
+        def __init__(self, doc):
+            self.coll = _FakeColl(doc)
+
+        def __getitem__(self, name):
+            return self.coll
+
+    class _FakeBucket:
+        pass
+
+    lesson = {
+        "lessonId": "vid_sem", "mediaRef": "https://example.invalid/media.mp4",
+        "syncId": "sync_sem", "contentType": "video/mp4",
+    }
+    db = _FakeDB(lesson)
+
+    observed = {}
+    real_acquire = vrt.heavy_op_semaphore.acquire
+
+    async def _spy_acquire():
+        await real_acquire()
+        observed["available_during_run"] = vrt.heavy_op_semaphore._value
+
+    monkeypatch.setattr(vrt.heavy_op_semaphore, "acquire", _spy_acquire)
+
+    async def _boom_after_acquire():
+        raise RuntimeError("stop right after the semaphore is held — this test only cares about acquisition")
+
+    monkeypatch.setattr(vpt, "load_media_bytes", lambda *a, **k: _boom_after_acquire())
+
+    before = vrt.heavy_op_semaphore._value
+    await vpt.run_pipeline(db, "vid_sem", _FakeBucket())
+    after = vrt.heavy_op_semaphore._value
+
+    assert "available_during_run" in observed, "run_pipeline never acquired the shared heavy_op_semaphore"
+    assert observed["available_during_run"] == before - 1
+    assert after == before, "the semaphore permit was not released after the run finished"

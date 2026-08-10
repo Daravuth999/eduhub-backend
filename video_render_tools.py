@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 logger = logging.getLogger("eduhub.video_render")
@@ -48,6 +49,22 @@ logger = logging.getLogger("eduhub.video_render")
 # process. A module-owned executor sidesteps that entirely, on every
 # platform, in tests and in the real uvicorn server alike.
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="video_render")
+
+# Global cap on simultaneous HEAVY Video Library operations — pipeline runs
+# (video_pipeline_tools.run_pipeline) and narration production steps
+# (video_narration_tools' story analysis, line/SFX generation, assemble,
+# render) — across ALL lessons at once, not per-lesson (video_pipeline_
+# tools' own atomic claim already makes same-lesson concurrency
+# structurally impossible; video_narration_jobs' claim/fence does the same
+# per-line/per-stage). Without this, an admin queuing several lessons (or
+# retrying while a stuck one is still running) had no bound at all on how
+# many full-size raw media buffers, Gemini requests, ElevenLabs requests,
+# and ffmpeg subprocesses could be in flight simultaneously — each one
+# multiplying real peak memory/CPU on top of the others. Matches the "2"
+# this module already chose for _executor's own max_workers. Overridable
+# for operators who know their instance's real headroom.
+HEAVY_OP_CONCURRENCY = max(1, int(os.environ.get("VIDEO_HEAVY_OP_CONCURRENCY", "2") or "2"))
+heavy_op_semaphore = asyncio.Semaphore(HEAVY_OP_CONCURRENCY)
 
 SOURCE_AUDIO_TREATMENTS = ("mute", "duck", "preserve")
 DEFAULT_SOURCE_AUDIO_TREATMENT = "mute"  # exact prior behavior — no regression for existing lessons
@@ -119,7 +136,17 @@ def ffprobe_available() -> bool:
     return _resolve_ffprobe() is not None
 
 
-def _run_blocking(args: tuple[str, ...], timeout: float) -> tuple[int, bytes, bytes]:
+def _run_blocking(args: tuple[str, ...], timeout: float, capture_stdout: bool = False) -> tuple[int, bytes, bytes]:
+    # Diagnostic instrumentation (Directive 3 §18): every ffmpeg/ffprobe
+    # subprocess this module ever spawns funnels through this one function,
+    # so logging start/end/exit-code/duration here — never the full args
+    # (mostly local temp-file paths and filter strings, but there's no
+    # reason to widen the surface) or any credentials, since ffmpeg/ffprobe
+    # never take any — covers the whole module for a future production
+    # investigation without needing per-call-site logging.
+    binary = os.path.basename(args[0]) if args else "?"
+    started = time.monotonic()
+    logger.debug("video_render: subprocess start bin=%s timeout=%.0fs", binary, timeout)
     try:
         # stdin=DEVNULL, not inherited (the default None): a server process
         # has no interactive terminal to read from, and ffmpeg never needs
@@ -128,13 +155,33 @@ def _run_blocking(args: tuple[str, ...], timeout: float) -> tuple[int, bytes, by
         # directly: a long-lived host shell can leave that handle invalid,
         # which surfaces as an unrelated-looking OSError from deep inside
         # subprocess's Windows handle-duplication code).
-        proc = subprocess.run(args, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        return proc.returncode, proc.stdout, proc.stderr
+        #
+        # Real-memory-pressure fix: `capture_output=True` (the previous
+        # implementation) buffers BOTH stdout and stderr fully in memory for
+        # every single ffmpeg/ffprobe call this whole module makes. Every
+        # actual media-producing ffmpeg invocation here writes its real
+        # output to a FILE (never stdout) and every caller of THIS function
+        # either discards stdout entirely or only needs it for a small,
+        # bounded ffprobe text query (duration/codec-type) — so buffering
+        # stdout by default was pure wasted memory on every call, worst on
+        # a long render where nothing was ever reading it. stdout is now
+        # discarded (DEVNULL) unless a caller explicitly needs it.
+        # stderr is still captured (real error diagnostics genuinely read
+        # its tail), but is bounded on the read side wherever it's logged —
+        # see the `[-300:]`/`[-400:]` truncation at each call site.
+        stdout_target = subprocess.PIPE if capture_stdout else subprocess.DEVNULL
+        proc = subprocess.run(args, stdout=stdout_target, stderr=subprocess.PIPE,
+                               timeout=timeout, stdin=subprocess.DEVNULL)
+        logger.info("video_render: subprocess done bin=%s exit=%s duration=%.2fs",
+                    binary, proc.returncode, time.monotonic() - started)
+        return proc.returncode, (proc.stdout or b""), proc.stderr
     except subprocess.TimeoutExpired as exc:
+        logger.warning("video_render: subprocess TIMEOUT bin=%s after=%.2fs limit=%.0fs",
+                        binary, time.monotonic() - started, timeout)
         raise RenderError("render_timeout", f"ffmpeg did not finish within {timeout}s", 500) from exc
 
 
-async def _run(*args: str, timeout: float) -> tuple[int, bytes, bytes]:
+async def _run(*args: str, timeout: float, capture_stdout: bool = False) -> tuple[int, bytes, bytes]:
     """Runs the subprocess synchronously in a worker thread rather than via
     asyncio.create_subprocess_exec. Deliberately NOT using asyncio's native
     subprocess support: it requires a Proactor-style event loop on Windows
@@ -144,7 +191,7 @@ async def _run(*args: str, timeout: float) -> tuple[int, bytes, bytes]:
     including the Linux/uvicorn environment this actually runs in on
     Render, with no platform-specific branching required."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _run_blocking, args, timeout)
+    return await loop.run_in_executor(_executor, _run_blocking, args, timeout, capture_stdout)
 
 
 async def source_has_audio_stream(video_bytes: bytes, video_content_type: str = "video/mp4",
@@ -511,7 +558,7 @@ async def probe_audio_duration_seconds(audio_bytes: bytes, *, timeout: float = 3
             f.write(audio_bytes)
         code, out, _err = await _run(
             ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
-            timeout=timeout,
+            timeout=timeout, capture_stdout=True,
         )
         if code != 0:
             return None
@@ -618,7 +665,7 @@ async def probe_audio_stream_status(video_bytes: bytes, *, content_type: str = "
             code, out, _err = await _run(
                 ffprobe, "-v", "error", "-select_streams", "a",
                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", path,
-                timeout=timeout,
+                timeout=timeout, capture_stdout=True,
             )
             if code != 0:
                 return "unknown"
