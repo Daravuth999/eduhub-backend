@@ -410,9 +410,83 @@ async def test_analyze_story_provider_rejected_http_error_never_silently_falls_b
     client = _RecordingGeminiClient(_FakeHttpResponse(503, {}, text="upstream overloaded"))
     result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
     assert result["ok"] is False
-    assert result["reason"] == "provider_rejected"
+    # The real provider detail (HTTP status + response body) must reach the
+    # caller, not be collapsed to a bare, undiagnosable "provider_rejected".
+    assert result["reason"].startswith("provider_rejected")
+    assert "upstream overloaded" in result["reason"]
+    assert "gemini-2.5-pro" in client.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_surfaces_the_real_structured_gemini_error_not_a_bare_code():
+    """Bug report: Story Analysis showed only the bare string
+    'provider_rejected' with zero diagnostic value, even though AI
+    Processing (the ASR/Flash path, a completely separate call) had
+    already succeeded on the same lesson. Gemini's REST API returns a
+    structured {"error": {"code","message","status"}} body on rejection —
+    this must reach the Studio's lastError so a real cause (model access,
+    quota, invalid media, ...) is distinguishable from any other, instead
+    of being collapsed into the same undiagnosable string for every
+    possible rejection reason."""
+    permission_denied_body = {
+        "error": {
+            "code": 403,
+            "message": "Permission denied on resource project. Model gemini-2.5-pro "
+                       "is not enabled for this project or API key.",
+            "status": "PERMISSION_DENIED",
+        },
+    }
+    client = _RecordingGeminiClient(_FakeHttpResponse(403, permission_denied_body))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+
+    assert result["ok"] is False
+    assert result["reason"].startswith("provider_rejected")
+    assert "PERMISSION_DENIED" in result["reason"]
+    assert "not enabled for this project" in result["reason"]
+    # Confirms this really was the Pro-model call, not a silent Flash fallback.
     assert "gemini-2.5-pro" in client.calls[0]
     assert "gemini-2.5-flash" not in client.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_analyze_story_quota_error_is_distinguishable_from_permission_error():
+    """Two genuinely different Gemini rejection reasons must produce two
+    genuinely different, readable messages — never the same generic string
+    for both, which is exactly what made the original bug undiagnosable."""
+    quota_body = {"error": {"code": 429, "message": "Quota exceeded for quota metric 'requests'.",
+                             "status": "RESOURCE_EXHAUSTED"}}
+    client = _RecordingGeminiClient(_FakeHttpResponse(429, quota_body))
+    result = await vap.analyze_story(b"fake-video-bytes", "video/mp4", transcript_text="hi", http_client=client)
+
+    assert result["ok"] is False
+    assert "RESOURCE_EXHAUSTED" in result["reason"]
+    assert "PERMISSION_DENIED" not in result["reason"]
+
+
+def test_gemini_http_error_detail_falls_back_to_raw_text_for_a_non_structured_body():
+    """Not every non-200 response is Gemini's own structured error shape
+    (e.g. an upstream proxy/load-balancer 502 with an HTML body, or an
+    empty body). The helper must degrade to the raw response text — never
+    raise, never fabricate a reason that wasn't actually there."""
+    class _PlainTextResponse:
+        status_code = 502
+        text = "Bad Gateway"
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    assert vap._gemini_http_error_detail(_PlainTextResponse()) == "Bad Gateway"
+
+
+def test_gemini_http_error_detail_returns_empty_string_when_nothing_extractable():
+    class _EmptyResponse:
+        status_code = 500
+        text = ""
+
+        def json(self):
+            return {}
+
+    assert vap._gemini_http_error_detail(_EmptyResponse()) == ""
 
 
 @pytest.mark.asyncio

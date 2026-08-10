@@ -83,6 +83,55 @@ def test_segments_to_sync_skips_empty_text():
     assert doc["paragraphs"][0]["sentences"] == []
 
 
+def test_segments_to_sync_sorts_out_of_order_segments_chronologically():
+    """Root cause of a real karaoke defect: the ASR prompt instructs Gemini
+    to return segments 'in chronological order', but that's a request, not
+    a guarantee. One segment returned out of order used to leave the
+    document's own LAST array entry with an early `end` timestamp, which
+    made the frontend's own 'has playback reached the end' check
+    (timeSec >= units[last].end) fire almost immediately after playback
+    started and never recover — the exact 'karaoke jumps to the end'
+    symptom. segments_to_sync must sort by each segment's own reported
+    start time regardless of the order Gemini returned them in."""
+    out_of_order = [
+        {"speaker": "S1", "start": 5.0, "end": 10.0, "text": "This is the real ending."},
+        {"speaker": "S1", "start": 0.0, "end": 2.0, "text": "This is the real beginning."},
+        {"speaker": "S1", "start": 2.0, "end": 5.0, "text": "This is the real middle."},
+    ]
+    doc = vai.segments_to_sync(
+        out_of_order, provider_category="speech_recognition",
+        provider_version="test-v1", generated_at="2026-01-01T00:00:00Z",
+    )
+    ok, errors = validate_sync_document(doc)
+    assert ok, errors
+
+    sentences = doc["paragraphs"][0]["sentences"]
+    starts = [s["start"] for s in sentences]
+    assert starts == sorted(starts), "sentences must be in real chronological order regardless of provider order"
+    # The document's own reported duration (used for "has reached the end"
+    # everywhere downstream) must reflect the REAL final segment, not
+    # whichever segment Gemini happened to list first/last.
+    assert doc["durationSec"] == 10.0
+    assert sentences[-1]["end"] == 10.0
+    first_word_text = sentences[0]["words"][0]["word"]
+    assert first_word_text == "This"  # sanity: sentence[0] really is the t=0 segment
+    assert sentences[0]["end"] == 2.0
+
+
+def test_segments_to_sync_skips_malformed_non_dict_segments_without_crashing():
+    """Untrusted provider input must never crash sync-document assembly —
+    a malformed entry is silently dropped, never fabricated into a
+    timestamp."""
+    doc = vai.segments_to_sync(
+        [None, "not a dict", {"speaker": "S1", "start": 0, "end": 1, "text": "Real segment."}],
+        provider_category="speech_recognition",
+        provider_version="test-v1", generated_at="2026-01-01T00:00:00Z",
+    )
+    ok, errors = validate_sync_document(doc)
+    assert ok, errors
+    assert len(doc["paragraphs"][0]["sentences"]) == 1
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # mock provider — the offline pipeline path
 # ═════════════════════════════════════════════════════════════════════════
@@ -316,7 +365,8 @@ def test_analyze_story_never_falls_back_to_another_provider_on_http_error(monkey
         b"fake-video-bytes", "video/mp4", transcript_text="x", http_client=client,
     ))
     assert out["ok"] is False
-    assert out["reason"] == "provider_rejected"
+    assert out["reason"].startswith("provider_rejected")
+    assert "internal error" in out["reason"]
     assert "engine" not in out or out.get("engine") != "gpt"
 
 

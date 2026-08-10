@@ -158,10 +158,31 @@ def distribute_words(text: str, start: float, end: float) -> list[dict]:
 
 def segments_to_sync(segments: list[dict], *, provider_category: str,
                      provider_version: str, generated_at: str) -> dict:
-    """Build a canonical sync document from ordered sentence segments
+    """Build a canonical sync document from sentence segments
     (`{speaker, start, end, text}`). Paragraph boundaries: a speaker change
     or a silence gap > 2.0s starts a new paragraph — an honest structural
-    grouping derived from real timing/diarization data."""
+    grouping derived from real timing/diarization data.
+
+    Root-cause fix for a real karaoke defect: the ASR prompt instructs
+    Gemini to return segments "in chronological order", but that is a
+    REQUEST, not a guarantee — a multimodal transcription of a longer/
+    complex video can genuinely come back with one segment out of order.
+    Every downstream consumer (this function's own paragraph-boundary
+    logic, and the frontend's syncConsumption.js binary search, which
+    documents "`units` must be sorted ascending by start" as a precondition
+    it does not itself enforce) silently assumes chronological order. If
+    Gemini violates it, the LAST array entry is not the chronologically
+    last sentence, so build_paragraph/build_sentence's own "last item's end
+    is the document's end" logic produces a document whose real final
+    timestamp is wrong (too early) — which is exactly what made the
+    student-facing karaoke highlight appear to "jump to the end" almost
+    immediately: the frontend's own "have we reached the end" check
+    (`timeSec >= last.end`) starts firing as soon as playback passes that
+    one out-of-place segment's small end time, and never recovers for the
+    rest of the video. Sorting by the segment's OWN reported start time
+    here — once, at the single point every sync document is built from raw
+    provider segments — makes every downstream consumer's chronological-
+    order assumption actually true, instead of merely hoped for."""
     sentences_by_para: list[list[dict]] = []
     current: list[dict] = []
     prev_speaker: object = object()
@@ -169,7 +190,12 @@ def segments_to_sync(segments: list[dict], *, provider_category: str,
     s_idx = 0
     speaker_ids: list[str] = []
 
-    for seg in segments:
+    ordered_segments = sorted(
+        (seg for seg in segments if isinstance(seg, dict)),
+        key=lambda seg: parse_time_sec(seg.get("start")),
+    )
+
+    for seg in ordered_segments:
         text = str(seg.get("text") or "").strip()
         if not text:
             continue
@@ -251,6 +277,35 @@ def _response_diagnostics(payload: Any) -> str:
     if finish_reason and finish_reason != "STOP":
         return f"finishReason={finish_reason}"
     return ""
+
+
+def _gemini_http_error_detail(response) -> str:
+    """Extracts the REAL provider-reported reason from a non-200 Gemini
+    response body — never fabricated, never guessed. Distinct from
+    _response_diagnostics above (which reads a 200-but-unusable response's
+    promptFeedback/finishReason): a non-200 HTTP status carries a
+    different body shape entirely — Gemini's REST API returns a structured
+    {"error": {"code", "message", "status"}} object on failure (e.g.
+    status=PERMISSION_DENIED for a model the API key can't access,
+    RESOURCE_EXHAUSTED for quota, INVALID_ARGUMENT for a bad/expired media
+    reference). Falls back to the raw response text (bounded) when the
+    body isn't that shape, and to "" when nothing is extractable — a
+    caller must never turn that into a fabricated explanation, only an
+    honest bare HTTP status."""
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        text = (getattr(response, "text", "") or "").strip()
+        return text[:300]
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        status = str(error.get("status") or "").strip()
+        message = str(error.get("message") or "").strip()
+        if status and message:
+            return f"{status}: {message}"
+        return status or message
+    text = (getattr(response, "text", "") or "").strip()
+    return text[:300]
 
 
 class VideoAiError(Exception):
@@ -455,7 +510,15 @@ async def analyze_story(media_bytes: bytes, content_type: str, *, transcript_tex
         analysis["engine"] = "gemini"
         return {"ok": True, "storyAnalysis": analysis, "engine": "gemini"}
     except VideoAiError as exc:
-        return {"ok": False, "reason": exc.code}
+        # exc.message carries the real, provider-reported detail (see
+        # analyze_story_raw's non-200 branch) — surfacing only exc.code
+        # here used to collapse every distinct rejection reason (quota,
+        # permission, invalid media, safety block...) down to the same
+        # bare, undiagnosable "provider_rejected" string in the Studio UI.
+        reason = exc.code
+        if exc.message and exc.message != exc.code:
+            reason = f"{exc.code}: {exc.message}"
+        return {"ok": False, "reason": reason}
     except Exception as exc:  # noqa: BLE001
         log.warning("video-ai: story analysis error %s", type(exc).__name__)
         return {"ok": False, "reason": "analysis_failed"}
@@ -500,8 +563,10 @@ async def draft_script_blueprint(story_analysis: dict, *, transcript_text: str =
             async with httpx.AsyncClient(timeout=_ANALYZE_TIMEOUT) as cli:
                 r = await cli.post(_GEN_URL.format(model=_analysis_model()), params={"key": _api_key()}, json=body)
         if r.status_code != 200:
+            detail = _gemini_http_error_detail(r)
             log.warning("video-ai: script-blueprint HTTP %s | body=%s", r.status_code, (r.text or "")[:300])
-            return {"ok": False, "reason": "provider_rejected"}
+            reason = "provider_rejected" + (f": Gemini HTTP {r.status_code} — {detail}" if detail else f": Gemini HTTP {r.status_code}")
+            return {"ok": False, "reason": reason}
         blueprint = normalize_script_blueprint(
             _candidate_text(r.json()), scene_ids, extract_json=_extract_json,
         )
@@ -668,9 +733,15 @@ class GeminiVideoProvider:
             params={"key": self._api_key}, json=body,
         )
         if r.status_code != 200:
+            detail = _gemini_http_error_detail(r)
             log.warning("video-ai: story-analysis HTTP %s | model=%s | body=%s",
                         r.status_code, self._model, (r.text or "")[:400])
-            raise VideoAiError("provider_rejected", f"Gemini HTTP {r.status_code}")
+            # The real, provider-reported reason (e.g. "PERMISSION_DENIED:
+            # ... model is not enabled for this project") reaches the
+            # Studio's lastError field via this message — never collapsed
+            # down to a bare "provider_rejected" the way it used to be.
+            message = f"Gemini HTTP {r.status_code}" + (f" — {detail}" if detail else "")
+            raise VideoAiError("provider_rejected", message)
         raw_payload = r.json()
         return _candidate_text(raw_payload), raw_payload
 
