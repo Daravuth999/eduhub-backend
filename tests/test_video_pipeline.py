@@ -129,7 +129,9 @@ def test_normalize_learning_bounds_and_validates():
     })
     assert learning["cefrLevel"] == "B1"
     assert len(learning["summary"]) == 800
-    assert learning["vocabulary"] == [{"word": "order", "definition": "ask for", "example": "I order tea."}]
+    assert learning["vocabulary"] == [
+        {"word": "order", "definition": "ask for", "example": "I order tea.", "meaningKm": "", "usageKm": ""},
+    ]
     assert learning["conversationType"] == "conversation"
     assert learning["estimatedStudyMinutes"] == 12
     assert learning["speakerLabels"] == {"S1": "Teacher"}

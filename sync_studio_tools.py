@@ -561,6 +561,53 @@ async def apply_alignment_result(db, sync_id: str, aligned: dict) -> dict:
     return merged
 
 
+async def apply_sentence_translations(db, sync_id: str, translations: list[dict]) -> dict:
+    """Video Library bilingual-learning capability: attaches a Khmer
+    translation to EXISTING, already-timed sentences by sentenceId —
+    never creates timing, never touches a word, never re-derives a
+    sentence's start/end. Purely additive to whatever is currently on
+    the sync document's top-level (production) `paragraphs`, regardless
+    of reviewStatus: unlike apply_alignment_result's candidate-staging
+    (which protects against silently overwriting a teacher-reviewed
+    re-ALIGNMENT), this never modifies the English text/timing a teacher
+    already reviewed — it only adds a new, independent display field
+    alongside it, so there is nothing to stage or protect against.
+
+    `translations` is `[{"sentenceId": str, "translationKm": str}, ...]`
+    (see video_ai_provider.normalize_sentence_translations for the
+    bounded, sanitized shape every caller should already be passing).
+    A sentenceId with no matching sentence in this document is silently
+    skipped — never an error, since Gemini's own output is untrusted
+    input and a stray/renamed id must never fail the whole lesson.
+    Returns the updated document; never raises for a partial/empty
+    match, only for a genuinely missing sync document."""
+    doc = await get_sync_document(db, sync_id)
+    if not doc:
+        raise SyncStudioError("sync_not_found", f"no sync document for syncId={sync_id!r}", 404)
+
+    by_id = {t["sentenceId"]: t["translationKm"] for t in translations
+             if isinstance(t, dict) and t.get("sentenceId") and t.get("translationKm")}
+    if not by_id:
+        return doc
+
+    paragraphs = doc.get("paragraphs") or []
+    applied = 0
+    for paragraph in paragraphs:
+        for sentence in paragraph.get("sentences") or []:
+            km = by_id.get(sentence.get("id"))
+            if km:
+                sentence["translationKm"] = km
+                applied += 1
+    if applied == 0:
+        return doc
+
+    ok, errors = validate_sync_document({**doc, "paragraphs": paragraphs})
+    if not ok:
+        raise SyncStudioError("invalid_sync_document", "; ".join(errors), 500)
+    await db[CHAPTER_SYNC_COLL].update_one({"syncId": sync_id}, {"$set": {"paragraphs": paragraphs}})
+    return {**doc, "paragraphs": paragraphs}
+
+
 async def resolve_sync_candidate(db, sync_id: str, *, action: str) -> dict:
     """Admin-explicit resolution of a pending re-processing candidate
     (see apply_alignment_result). "approve" promotes the candidate onto

@@ -697,28 +697,117 @@ def get_video_ai_provider():
 
 
 # ── Educational analysis (Gemini enrichment) ─────────────────────────────
+# Bilingual (Khmer) learning layer — a Video Library capability, additive
+# to the existing English-only `learning` contract and the shared
+# sync_schema.py document. Generated in this SAME Gemini call (never a
+# second, per-sentence request — cost-safe, per product direction) by
+# giving Gemini the REAL, already-timed sentence units (id + English text)
+# from the sync document and requiring it to return a translation keyed by
+# THAT exact id — never positional matching, which would silently
+# mismatch if Gemini's own sentence splitting differs from the ASR
+# alignment's. See normalize_sentence_translations for the sanitization
+# boundary and video_pipeline_tools.py for how a malformed/absent
+# translation can never sink the English lesson.
+MAX_TRANSLATION_SENTENCES = 200        # bounds prompt size and Gemini output on a very long lesson
+MAX_TRANSLATION_CHARS = 500            # a mobile teleprompter line, not a paragraph
+
+
+def sentences_from_sync_document(sync_doc: dict | None) -> list[dict]:
+    """Real sentence units (id + English text, reconstructed from the
+    already-aligned words — never re-derived timing) from a sync_schema.py
+    document, for handing to Gemini as translation input. Pure, no I/O."""
+    out: list[dict] = []
+    if not isinstance(sync_doc, dict):
+        return out
+    for paragraph in sync_doc.get("paragraphs") or []:
+        if not isinstance(paragraph, dict):
+            continue
+        for sentence in paragraph.get("sentences") or []:
+            if not isinstance(sentence, dict):
+                continue
+            sid = sentence.get("id")
+            text = " ".join(str(w.get("word", "")) for w in (sentence.get("words") or []) if isinstance(w, dict)).strip()
+            if sid and text:
+                out.append({"id": str(sid), "text": text})
+            if len(out) >= MAX_TRANSLATION_SENTENCES:
+                return out
+    return out
+
+
+def normalize_sentence_translations(raw: Any, valid_sentence_ids: set[str]) -> list[dict]:
+    """Sanitization boundary for Gemini's per-sentence Khmer output (Video
+    Library Directive §19's exact hazards): drops any entry whose
+    sentenceId doesn't correspond to a REAL sentence in THIS lesson's own
+    sync document (never trust an id Gemini invented or mis-copied), bounds
+    translation length so a runaway response can't blow up a mobile
+    teleprompter line, and returns [] — never raises — for anything
+    malformed, so a translation failure can never destroy the English
+    lesson (see analyze_transcript's docstring)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("sentenceId") or "").strip()
+        km = str(item.get("translationKm") or "").strip()
+        if not sid or not km or sid not in valid_sentence_ids or sid in seen:
+            continue
+        seen.add(sid)
+        out.append({"sentenceId": sid, "translationKm": km[:MAX_TRANSLATION_CHARS]})
+        if len(out) >= MAX_TRANSLATION_SENTENCES:
+            break
+    return out
+
+
 _ANALYSIS_PROMPT_TEMPLATE = (
-    "You are an expert English-language curriculum designer. Analyze the "
-    "following lesson transcript for adult English learners and output "
-    "STRICT JSON only — no markdown, with EXACTLY these keys:\n"
+    "You are an expert English-language curriculum designer AND a professional "
+    "Khmer translator preparing bilingual materials for Cambodian English "
+    "learners. Analyze the following lesson transcript for adult English "
+    "learners and output STRICT JSON only — no markdown, with EXACTLY these keys:\n"
     "{{\n"
     '  "cefrLevel": "<one of A1,A2,B1,B2,C1,C2>",\n'
     '  "summary": "<2-3 sentence learning summary>",\n'
     '  "description": "<1-2 sentence catalog description for students>",\n'
     '  "learningObjectives": ["<objective>", "..."],\n'
-    '  "vocabulary": [{{"word": "<word>", "definition": "<simple definition>", "example": "<example sentence>"}}],\n'
+    '  "vocabulary": [{{"word": "<word>", "definition": "<simple definition>", '
+    '"example": "<example sentence>", "meaningKm": "<natural Khmer meaning, not a literal '
+    'word-for-word translation of the English definition>", '
+    '"usageKm": "<short Khmer note on how/when a Cambodian learner would use this word>"}}],\n'
     '  "difficultWords": ["<word>", "..."],\n'
     '  "phrasalVerbs": [{{"phrase": "<phrasal verb>", "meaning": "<meaning>"}}],\n'
     '  "idioms": [{{"phrase": "<idiom>", "meaning": "<meaning>"}}],\n'
     '  "keyExpressions": ["<useful expression>", "..."],\n'
-    '  "grammarPoints": [{{"point": "<grammar structure>", "explanation": "<short explanation>"}}],\n'
+    '  "grammarPoints": [{{"point": "<grammar structure>", "explanation": "<short explanation>", '
+    '"explanationKm": "<the SAME grammar point explained in natural Khmer, genuinely useful to a '
+    'Cambodian learner — not a mechanical translation of the English explanation>"}}],\n'
     '  "conversationType": "<one of conversation,storytelling,monologue,interview>",\n'
     '  "estimatedStudyMinutes": <integer>,\n'
-    '  "speakerLabels": {{"S1": "<suggested role label, e.g. Teacher>", "S2": "<...>"}}\n'
+    '  "speakerLabels": {{"S1": "<suggested role label, e.g. Teacher>", "S2": "<...>"}},\n'
+    '  "sentenceTranslations": [{{"sentenceId": "<id from the sentence list below, copied exactly>", '
+    '"translationKm": "<natural Khmer translation>"}}]\n'
     "}}\n"
     "Only include items that genuinely appear in the transcript — empty "
     "lists are correct when a category is absent. Keep definitions simple "
     "enough for the estimated CEFR level.\n\n"
+    "KHMER TRANSLATION REQUIREMENTS (sentenceTranslations) — read carefully:\n"
+    "- Translate the INTENDED MEANING of each full sentence in its story context, "
+    "never word-by-word. Read the whole transcript first so context (who is "
+    "speaking, what already happened) shapes each sentence's translation.\n"
+    "- Preserve character names and important terminology as-is or with a "
+    "natural Khmer rendering — never invent or omit meaning.\n"
+    "- Use natural, everyday Cambodian Khmer, not overly formal literary Khmer, "
+    "unless the transcript's own tone is formal.\n"
+    "- Keep each translation concise enough to read comfortably on one phone "
+    "screen line — a short lesson sentence should stay a short Khmer sentence.\n"
+    "- You MUST return exactly one entry per sentence id listed below, using "
+    "the id EXACTLY as given — never invent an id, never skip one, never "
+    "reorder or merge sentences.\n"
+    "- If a 'sentence' is not real spoken content (silence, a sound effect "
+    "marker), still return your best natural short Khmer rendering rather "
+    "than an empty string.\n\n"
+    "Sentences to translate (id: English text):\n{sentences_block}\n\n"
     "Lesson title: {title}\n\nTranscript:\n{transcript}"
 )
 
@@ -741,13 +830,20 @@ def normalize_learning(raw: Any) -> dict | None:
             return []
         return [s(x, 200) for x in v if s(x, 200)][:limit]
 
-    def pair_list(v, k1, k2, limit=15):
+    def pair_list(v, k1, k2, limit=15, k3=None):
         if not isinstance(v, list):
             return []
         out = []
         for item in v:
             if isinstance(item, dict) and s(item.get(k1)):
-                out.append({k1: s(item.get(k1), 120), k2: s(item.get(k2), 300)})
+                entry = {k1: s(item.get(k1), 120), k2: s(item.get(k2), 300)}
+                if k3:
+                    # Khmer explanation is a genuinely useful learner aid, not a
+                    # required field — an empty string when Gemini omits it is
+                    # honest (the frontend must show "unavailable", never
+                    # fabricate one), never a reason to drop the whole item.
+                    entry[k3] = s(item.get(k3), 400)
+                out.append(entry)
         return out[:limit]
 
     vocab = []
@@ -758,6 +854,8 @@ def normalize_learning(raw: Any) -> dict | None:
                     "word": s(item.get("word"), 80),
                     "definition": s(item.get("definition"), 300),
                     "example": s(item.get("example"), 300),
+                    "meaningKm": s(item.get("meaningKm"), 300),
+                    "usageKm": s(item.get("usageKm"), 300),
                 })
     cefr = s(data.get("cefrLevel"), 4).upper()
     ctype = s(data.get("conversationType"), 20).lower()
@@ -780,7 +878,7 @@ def normalize_learning(raw: Any) -> dict | None:
         "phrasalVerbs": pair_list(data.get("phrasalVerbs"), "phrase", "meaning"),
         "idioms": pair_list(data.get("idioms"), "phrase", "meaning"),
         "keyExpressions": str_list(data.get("keyExpressions")),
-        "grammarPoints": pair_list(data.get("grammarPoints"), "point", "explanation"),
+        "grammarPoints": pair_list(data.get("grammarPoints"), "point", "explanation", k3="explanationKm"),
         "conversationType": ctype if ctype in CONVERSATION_TYPES else None,
         "estimatedStudyMinutes": study,
         "speakerLabels": speaker_labels,
@@ -815,19 +913,37 @@ def _mock_learning(transcript: str) -> dict:
     })
 
 
-async def analyze_transcript(transcript: str, *, title: str = "", http_client=None) -> dict:
-    """Gemini educational enrichment. Returns
-        {"ok": True, "learning": <contract>, "engine": "gemini"|"mock"}
-        {"ok": False, "reason": ...}
-    Never raises — enrichment failure must never sink the whole pipeline."""
+async def analyze_transcript(transcript: str, *, sentences: list[dict] | None = None,
+                              title: str = "", http_client=None) -> dict:
+    """Gemini educational enrichment — English learning content AND, in the
+    SAME call (cost-safe, never a second per-sentence request), a Khmer
+    translation for each real sentence unit. `sentences` is the sync
+    document's own `[{"id", "text"}, ...]` (see sentences_from_sync_
+    document) — omit it (or pass []) to skip translation generation
+    entirely (e.g. no sync document yet) while still getting the English
+    `learning` contract exactly as before this parameter existed.
+
+    Returns {"ok": True, "learning": <contract>, "sentenceTranslations":
+    [{"sentenceId", "translationKm"}, ...], "engine": "gemini"|"mock"} or
+    {"ok": False, "reason": ...}. Never raises — enrichment failure must
+    never sink the whole pipeline, and a malformed/missing translation
+    specifically must never take the English `learning` content down with
+    it (video_pipeline_tools.py only ever treats `sentenceTranslations` as
+    optional, best-effort enrichment)."""
     text = (transcript or "").strip()
     if not text:
         return {"ok": False, "reason": "empty_transcript"}
 
-    if not ai_available():
-        return {"ok": True, "learning": _mock_learning(text), "engine": "mock"}
+    valid_sentence_ids = {s["id"] for s in (sentences or []) if isinstance(s, dict) and s.get("id")}
 
-    prompt = _ANALYSIS_PROMPT_TEMPLATE.format(title=title or "Untitled lesson", transcript=text[:24000])
+    if not ai_available():
+        return {"ok": True, "learning": _mock_learning(text), "sentenceTranslations": [], "engine": "mock"}
+
+    sentences_block = "\n".join(f"{s['id']}: {s['text']}" for s in (sentences or []) if s.get("id") and s.get("text"))
+    prompt = _ANALYSIS_PROMPT_TEMPLATE.format(
+        title=title or "Untitled lesson", transcript=text[:24000],
+        sentences_block=sentences_block or "(no sentence-level translation requested for this call)",
+    )
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
@@ -841,10 +957,15 @@ async def analyze_transcript(transcript: str, *, title: str = "", http_client=No
         if r.status_code != 200:
             log.warning("video-ai: analysis HTTP %s | body=%s", r.status_code, (r.text or "")[:300])
             return {"ok": False, "reason": "provider_rejected"}
-        learning = normalize_learning(_candidate_text(r.json()))
+        raw_data = _extract_json(_candidate_text(r.json()))
+        learning = normalize_learning(raw_data)
         if learning is None:
             return {"ok": False, "reason": "bad_response"}
-        return {"ok": True, "learning": learning, "engine": "gemini"}
+        translations = normalize_sentence_translations(
+            (raw_data or {}).get("sentenceTranslations") if isinstance(raw_data, dict) else None,
+            valid_sentence_ids,
+        )
+        return {"ok": True, "learning": learning, "sentenceTranslations": translations, "engine": "gemini"}
     except Exception as exc:  # noqa: BLE001
         log.warning("video-ai: analysis error %s", type(exc).__name__)
         return {"ok": False, "reason": "analysis_failed"}

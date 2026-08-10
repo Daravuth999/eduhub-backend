@@ -323,8 +323,14 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
             )
         else:
             await _set_step(db, lesson_id, run_id, "educational_analysis", "running")
+            # Bilingual (Khmer) learning layer: the sync document's own
+            # already-timed sentence units (id + English text) are handed
+            # to the SAME Gemini call as the English learning analysis —
+            # never a second, per-sentence request — so translation is
+            # keyed by the REAL sentence id, never a positional guess.
+            sentence_list = video_ai_provider.sentences_from_sync_document(sync_doc)
             analysis = await video_ai_provider.analyze_transcript(
-                transcript_text, title=lesson.get("title", ""),
+                transcript_text, sentences=sentence_list, title=lesson.get("title", ""),
             )
             if analysis.get("ok"):
                 learning = {**analysis["learning"], "engine": analysis.get("engine"), "generatedAt": _now()}
@@ -333,6 +339,20 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                 )
                 if learning.get("speakerLabels"):
                     await sync_studio_tools.suggest_speaker_labels(db, sync_id, learning["speakerLabels"])
+                # Translation is an ADDITIONAL educational layer, never a
+                # single point of failure for the English lesson (Directive
+                # §20): applied best-effort, any failure here is logged
+                # honestly but never flips this already-succeeded stage to
+                # "failed" — the English learning content stands on its own
+                # regardless of whether Khmer translation attached cleanly.
+                translations = analysis.get("sentenceTranslations") or []
+                if translations:
+                    try:
+                        await sync_studio_tools.apply_sentence_translations(db, sync_id, translations)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "video_pipeline: sentence translation apply failed lesson=%s (%s)", lesson_id, exc,
+                        )
                 await _set_step(db, lesson_id, run_id, "educational_analysis", "complete")
             else:
                 await _set_step(db, lesson_id, run_id, "educational_analysis", "failed", analysis.get("reason"))

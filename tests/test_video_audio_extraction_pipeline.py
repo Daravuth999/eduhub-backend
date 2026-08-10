@@ -305,7 +305,7 @@ async def test_raw_media_buffer_is_released_before_educational_analysis(monkeypa
 
     seen = {}
 
-    async def _fake_analyze_transcript(transcript_text, *, title=""):
+    async def _fake_analyze_transcript(transcript_text, *, sentences=None, title=""):
         gc.collect()
         seen["during"] = sys.getrefcount(video_bytes)
         return {"ok": False, "reason": "test stub — not exercising real analysis"}

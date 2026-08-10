@@ -67,9 +67,18 @@ def build_word(word: str, start: float, end: float, *, confidence: dict | None =
 
 
 def build_sentence(sentence_id: str, words: list[dict], *, speaker_id: str | None = None,
-                    confidence: dict | None = None) -> dict:
+                    confidence: dict | None = None, translation_km: str | None = None) -> dict:
     """`start`/`end` are derived from the first/last word — words are the
-    source of truth (spec §2), never independently specified."""
+    source of truth (spec §2), never independently specified.
+
+    `translation_km` is a purely additive, optional display field (a
+    Video Library capability — see video_ai_provider.py's per-sentence
+    Khmer translation) carrying NO timing of its own: it rides on the
+    SAME sentence unit's existing start/end derived from the English
+    words above, exactly like `speakerId`. Omitted entirely (not even a
+    None-valued key) when not supplied, so every existing caller of this
+    shared builder (Books/EduTalk sync consumers included) produces a
+    byte-identical document to before this parameter existed."""
     out = {
         "id": sentence_id,
         "start": words[0]["start"] if words else 0.0,
@@ -79,6 +88,8 @@ def build_sentence(sentence_id: str, words: list[dict], *, speaker_id: str | Non
     }
     if speaker_id is not None:
         out["speakerId"] = speaker_id
+    if translation_km:
+        out["translationKm"] = translation_km
     return out
 
 
