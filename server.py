@@ -7567,6 +7567,18 @@ except Exception as _edutalk_coupon_err:  # noqa: BLE001
         "edutalk_coupon_tools: disabled (%s)", _edutalk_coupon_err
     )
 
+# ── Video Library coupon/voucher redemption (additive) ─────────────────────
+# Flag-gated (VIDEO_LIBRARY_COUPON_REDEMPTION_ENABLED, default false). Same
+# db.coupons collection + benefit_type discrimination pattern as the EduTalk
+# coupon module above; never touches book-discount or EduTalk coupon code.
+try:
+    from video_library_coupon_tools import register_video_library_coupon_routes
+    register_video_library_coupon_routes(api, db, require_admin, require_student)
+except Exception as _video_library_coupon_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "video_library_coupon_tools: disabled (%s)", _video_library_coupon_err
+    )
+
 # ── EDUTALK LIVE COACH SURPRISE REWARDS (Phase 1, corrected) ─────────────
 # Isolated, additive reward foundation for the Live Voice Coach. All reward
 # flags default OFF; pass / achievement / voucher remain unavailable. The
