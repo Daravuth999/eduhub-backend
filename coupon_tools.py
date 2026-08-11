@@ -141,9 +141,17 @@ def register_coupon_routes(api, db, require_admin, User):
         if await db.coupons.find_one({"code": code}):
             raise HTTPException(status_code=409, detail=f"Coupon code '{code}' already exists.")
 
+        # video_library_points (Video Library Voucher) is a THIRD, additive
+        # benefit_type — same flat-points-grant shape as edutalk_points, just
+        # consumed by video_library_coupon_tools.py's own isolated redemption
+        # routes instead of edutalk_coupon_tools.py's. book_discount's own
+        # branch/behavior below is completely untouched by this addition.
         benefit_type = payload.get("benefit_type") or "book_discount"
-        if benefit_type not in ("book_discount", "edutalk_points"):
-            raise HTTPException(status_code=400, detail="benefit_type must be 'book_discount' or 'edutalk_points'.")
+        if benefit_type not in ("book_discount", "edutalk_points", "video_library_points"):
+            raise HTTPException(
+                status_code=400,
+                detail="benefit_type must be 'book_discount', 'edutalk_points', or 'video_library_points'.",
+            )
 
         if benefit_type == "book_discount":
             discount_type = payload.get("type", "percent")
@@ -155,7 +163,7 @@ def register_coupon_routes(api, db, require_admin, User):
             if discount_type == "percent" and value > 100:
                 raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
             benefit_amount = None
-        else:  # edutalk_points — does NOT depend on book-discount fields at all
+        else:  # edutalk_points / video_library_points — flat points grant, no discount fields
             discount_type = None
             value = None
             benefit_amount = payload.get("benefit_amount")
@@ -164,14 +172,16 @@ def register_coupon_routes(api, db, require_admin, User):
 
         now_iso = datetime.now(timezone.utc).isoformat()
         assigned_to = payload.get("assigned_to") or []
-        if benefit_type == "edutalk_points":
+        if benefit_type in ("edutalk_points", "video_library_points"):
             # §Live Voice Coach Coupon diagnostics: assigned_to is free-typed by
             # an admin (CouponStudio's CSV field has no normalization), and
-            # _find_edutalk_coupon compares it against the student's own
+            # the redemption module compares it against the student's own
             # clean_id. Normalizing at storage time here (book_discount coupons
             # are completely unaffected — this branch never runs for them)
             # prevents a case/whitespace mismatch from ever being written in
-            # the first place.
+            # the first place. Video Library Vouchers share this exact
+            # normalization since video_library_coupon_tools.py's own
+            # _norm_sid() does the identical strip().lower().
             assigned_to = [str(x).strip().lower() for x in assigned_to if x]
         doc = {
             "code":        code,
@@ -218,20 +228,21 @@ def register_coupon_routes(api, db, require_admin, User):
         updates = {k: v for k, v in payload.items() if k in allowed}
         if not updates:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
-        if updates.get("benefit_type") == "edutalk_points":
+        if updates.get("benefit_type") in ("edutalk_points", "video_library_points"):
             amt = updates.get("benefit_amount")
             if not isinstance(amt, int) or isinstance(amt, bool) or not (1 <= amt <= 1000):
                 raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
         if "assigned_to" in updates:
-            # §Live Voice Coach Coupon diagnostics: normalize only for an
-            # edutalk_points coupon (this update payload's own benefit_type if
-            # given, else the coupon's EXISTING benefit_type) — a book_discount
-            # coupon's assigned_to is completely unaffected.
+            # §Live Voice Coach Coupon diagnostics: normalize only for a
+            # points-grant coupon (edutalk_points or video_library_points —
+            # this update payload's own benefit_type if given, else the
+            # coupon's EXISTING benefit_type) — a book_discount coupon's
+            # assigned_to is completely unaffected.
             effective_benefit_type = updates.get("benefit_type")
             if effective_benefit_type is None:
                 existing_doc = await db.coupons.find_one({"code": code.upper()}, {"_id": 0, "benefit_type": 1})
                 effective_benefit_type = (existing_doc or {}).get("benefit_type") or "book_discount"
-            if effective_benefit_type == "edutalk_points":
+            if effective_benefit_type in ("edutalk_points", "video_library_points"):
                 updates["assigned_to"] = [str(x).strip().lower() for x in (updates.get("assigned_to") or []) if x]
         res = await db.coupons.update_one({"code": code.upper()}, {"$set": updates})
         if res.matched_count == 0:

@@ -194,6 +194,87 @@ def test_unknown_benefit_type_rejected_at_creation():
     assert resp.status_code == 400
 
 
+# ── video_library_points (Video Library Voucher) — additive third benefit_type,
+# proven against the SAME generic /api/coupons creation route Author Studio's
+# CouponStudio.jsx calls, mirroring edutalk_points's own proven test coverage
+# exactly. video_library_coupon_tools.py's own isolated redemption module is
+# exercised separately in tests/test_video_library_coupon_tools.py — these
+# tests only prove the CREATION side produces a structurally compatible doc.
+def test_video_library_points_coupon_creation_validates_benefit_amount_strictly():
+    db = _FakeDB()
+    client = _make_client(db)
+    assert _create(client, {
+        "code": "VL20", "benefit_type": "video_library_points", "benefit_amount": -5,
+    }).status_code == 400
+    assert _create(client, {
+        "code": "VL20", "benefit_type": "video_library_points", "benefit_amount": "20",
+    }).status_code == 400
+    assert _create(client, {
+        "code": "VL20", "benefit_type": "video_library_points", "benefit_amount": 1001,
+    }).status_code == 400
+    resp = _create(client, {
+        "code": "VL20", "benefit_type": "video_library_points", "benefit_amount": 20,
+    })
+    assert resp.status_code == 200
+    coupon = resp.json()["coupon"]
+    assert coupon["benefit_type"] == "video_library_points"
+    assert coupon["benefit_amount"] == 20
+    # No dummy discount values — matches every other non-book benefit_type.
+    assert coupon["type"] is None
+    assert coupon["value"] is None
+    # Structural shape a video_library_coupon_tools.py redemption read needs:
+    assert coupon["enabled"] is True
+    assert coupon["uses_count"] == 0
+    assert coupon["redemptions"] == []
+    assert coupon["assigned_to"] == []
+    assert coupon["max_uses"] is None
+
+
+def test_video_library_points_assigned_to_normalized_at_creation():
+    db = _FakeDB()
+    client = _make_client(db)
+    resp = _create(client, {
+        "code": "VL20", "benefit_type": "video_library_points", "benefit_amount": 20,
+        "assigned_to": ["  StuMixedCase ", "OTHER"],
+    })
+    assert resp.status_code == 200
+    # Matches video_library_coupon_tools.py's own _norm_sid() (strip+lower)
+    # exactly, so a student's clean_id will actually match at redemption time.
+    assert resp.json()["coupon"]["assigned_to"] == ["stumixedcase", "other"]
+
+
+def test_update_rejects_invalid_benefit_amount_when_switching_to_video_library_points():
+    db = _FakeDB()
+    _seed(db)
+    client = _make_client(db)
+    resp = _update(client, "SAVE20", {"benefit_type": "video_library_points", "benefit_amount": 0})
+    assert resp.status_code == 400
+
+
+def test_update_normalizes_assigned_to_for_an_existing_video_library_points_coupon():
+    db = _FakeDB()
+    _seed(db, code="VL20", benefit_type="video_library_points", benefit_amount=20)
+    client = _make_client(db)
+    resp = _update(client, "VL20", {"assigned_to": ["  Foo ", "BAR"]})
+    assert resp.status_code == 200
+    assert db.coupons.docs["VL20"]["assigned_to"] == ["foo", "bar"]
+
+
+def test_video_library_points_coupon_cannot_be_redeemed_as_a_book_discount():
+    # Mirrors test_edutalk_live_coupon_cannot_be_redeemed_as_a_book_discount —
+    # the SAME bidirectional-isolation guard in _find_valid_coupon rejects
+    # ANY non-book_discount benefit_type, video_library_points included.
+    db = _FakeDB()
+    _seed(db, code="VLIB1", type=None, value=None, max_uses=1,
+          assigned_to=["stu1"], benefit_type="video_library_points", benefit_amount=20)
+    client = _make_client(db)
+    resp = client.post("/api/coupons/redeem", json={
+        "code": "VLIB1", "book_slug": "some-book", "original_price": 100, "student_id": "stu1",
+    })
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"].lower()
+
+
 # ── assigned_to normalization: edutalk_points only, book_discount untouched ─
 def test_book_discount_assigned_to_never_normalized_at_creation():
     db = _FakeDB()
