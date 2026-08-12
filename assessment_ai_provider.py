@@ -126,13 +126,44 @@ _ANSWER_KEY_PROMPT = (
     "Rules:\n"
     "- One item per question/row, in the order they appear.\n"
     "- \"prompt\" is what the student is shown (a word, a question, a sentence).\n"
-    "- \"answer\" is the single correct answer exactly as the key states it.\n"
+    "- \"answer\" is the SHORT classification/label a teacher would use to grade a "
+    "student's response (e.g. \"LONG\"/\"SHORT\", \"True\"/\"False\", \"A\"/\"B\"/\"C\"/\"D\") — "
+    "the single correct answer exactly as the key states it.\n"
+    "- A row may ALSO contain a pronunciation guide, phonetic transcription (e.g. IPA "
+    "symbols such as /ʃiː/), or other reference text. That reference text is NEVER "
+    "the answer — use the short classification/label column instead, even if the "
+    "reference text is positioned closer to \"answer\" in the layout.\n"
     "- Include every item. Do not summarize or skip rows.\n"
 )
 
 
 def _answer_key_prompt_for_text(raw_text: str) -> str:
     return _ANSWER_KEY_PROMPT + f"\nAnswer key text:\n\"\"\"\n{raw_text[:20000]}\n\"\"\"\n"
+
+
+def _answer_vocabulary_hint(questions: list[dict]) -> str:
+    """If this assessment's correct answers are drawn from a SMALL, fixed
+    vocabulary (a classification/multiple-choice format like LONG vs
+    SHORT, True vs False, A/B/C/D — the common case for a worksheet with
+    printed answer choices), tell Gemini that vocabulary explicitly so it
+    reports the student's marked CLASSIFICATION in the same words the
+    answer key uses, rather than transcribing the prompt word itself or
+    an unrelated column. Derived entirely from THIS assessment's own
+    already-persisted correct answers — never a hardcoded word list — so
+    it generalizes to any fixed-choice assessment, not just one specific
+    one. Returns "" for a free-response assessment (many distinct
+    answers), where no such vocabulary exists to anchor to."""
+    values = sorted({str(q.get("correctAnswer") or "").strip() for q in questions if q.get("correctAnswer")})
+    if not values or len(values) > 8:
+        return ""
+    joined = ", ".join(values)
+    return (
+        f"This assessment's answers are drawn from a fixed set of choices: {joined}. "
+        "Report each answer as EXACTLY one of these words — the classification the "
+        "student marked or circled — never the prompt word itself, never a "
+        "pronunciation guide or phonetic transcription, and never any other text on "
+        "the sheet.\n\n"
+    )
 
 
 def _submission_prompt(questions: list[dict]) -> str:
@@ -146,6 +177,7 @@ def _submission_prompt(questions: list[dict]) -> str:
         "answer and report it. If a question was left blank or is illegible, omit it "
         "from the output rather than guessing.\n\n"
         f"Questions on this sheet:\n{numbered}\n\n"
+        f"{_answer_vocabulary_hint(questions)}"
         "Output STRICT JSON only — no markdown, no commentary:\n"
         '{"answers": [\n'
         '  {"qid": "<exactly one of the qids above>", "answer": "<what the student marked/wrote>", '

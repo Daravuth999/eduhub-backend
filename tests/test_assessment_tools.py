@@ -230,6 +230,13 @@ class _Coll:
                 return type("R", (), {"matched_count": 1})()
         return type("R", (), {"matched_count": 0})()
 
+    async def delete_one(self, q):
+        for k, d in list(self.docs.items()):
+            if _match(d, q):
+                del self.docs[k]
+                return type("R", (), {"deleted_count": 1})()
+        return type("R", (), {"deleted_count": 0})()
+
     def find(self, q, p=None):
         out = []
         for d in self.docs.values():
@@ -282,6 +289,12 @@ class _Router:
     def patch(self, p):
         def d(fn):
             self.routes[("PATCH", p)] = fn
+            return fn
+        return d
+
+    def delete(self, p):
+        def d(fn):
+            self.routes[("DELETE", p)] = fn
             return fn
         return d
 
@@ -345,25 +358,15 @@ def _build(wallet=None, pushes=None):
     return db, router, push_log
 
 
-async def _fake_bucket_factory():
-    class _Bucket:
-        async def upload_from_stream(self, filename, stream, metadata=None):
-            return None
-    return _Bucket()
-
-
 def _patch_media_storage(monkeypatch):
-    """No R2 env vars are set in the test environment, so _upload_media_to_r2
-    already returns None (real code path, not mocked) — only GridFS's real
-    Motor bucket needs a fake, since the test DB isn't a real Motor client."""
-    async def fake_get_bucket(db):
-        class _Bucket:
-            async def upload_from_stream(self, filename, stream, metadata=None):
-                return None
-        return _Bucket()
-
-    async def fake_store_media(db, raw, ext, content_type, prefix):
-        return f"gridfs://assessment_media/{prefix}-{ext}"
+    """Mocks a SUCCESSFUL R2 store for tests that aren't specifically
+    about storage behavior (no real R2 credentials exist in the test
+    environment). Matches _store_media's real (media_ref, media_key)
+    return shape exactly, so every consumer of it downstream works
+    unmodified in tests."""
+    async def fake_store_media(raw, ext, content_type, prefix):
+        key = at._content_addressed_key(raw, ext, prefix)
+        return f"https://fake-r2.example/{key}", key
 
     monkeypatch.setattr(at, "_store_media", fake_store_media)
 
@@ -432,7 +435,8 @@ def test_student_submit_scores_against_real_answer_key(monkeypatch):
     assert sub["status"] == "needs_review"  # last answer low-confidence
     assert sub["score"]["correct"] == 29
     assert sub["score"]["pointsEarned"] == 14.5
-    assert sub["mediaRef"].startswith("gridfs://")
+    assert sub["mediaRef"].startswith("https://fake-r2.example/")
+    assert sub["mediaKey"]
 
     # student's own submission history reflects it
     mine = _call(router, "GET", "/student/assessments/submissions", student=_Student())
@@ -563,3 +567,361 @@ def test_award_without_wallet_configured_fails_cleanly(monkeypatch):
         _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
               submission_id=sub_id, admin=_Admin())
     assert "wallet_unavailable" in str(exc_info.value) or "502" in str(exc_info.value)
+
+
+# ── R2-only storage correction (2026-08): no GridFS/local-disk fallback ────
+def test_no_gridfs_fallback_exists_anywhere_in_the_module():
+    """The module must not even HAVE a GridFS code path any more — not
+    just "unused", genuinely removed."""
+    assert not hasattr(at, "get_media_bucket")
+    assert not hasattr(at, "MEDIA_GRIDFS_BUCKET")
+    assert "GridFSBucket" not in open(at.__file__, encoding="utf-8").read()
+
+
+def test_content_addressed_key_is_deterministic_by_bytes_and_scoped_by_prefix():
+    raw_a = b"identical worksheet photo bytes"
+    raw_b = b"a completely different photo"
+    key1 = at._content_addressed_key(raw_a, "png", "stu094")
+    key2 = at._content_addressed_key(raw_a, "png", "stu094")
+    assert key1 == key2  # same bytes, same prefix -> same key every time
+
+    key_other_student = at._content_addressed_key(raw_a, "png", "stu095")
+    assert key_other_student != key1  # scoped by prefix, not a global dedupe
+
+    key_diff_bytes = at._content_addressed_key(raw_b, "png", "stu094")
+    assert key_diff_bytes != key1  # different content -> different key
+    assert key1.startswith("assessment-media/stu094/")
+    assert key1.endswith(".png")
+
+
+def test_store_media_raises_and_never_falls_back_when_r2_unavailable(monkeypatch):
+    async def fake_upload_returns_none(raw, key, content_type):
+        return None
+    monkeypatch.setattr(at, "_upload_media_to_r2", fake_upload_returns_none)
+
+    with pytest.raises(at.SubmissionStorageError):
+        run(at._store_media(b"raw-bytes", "png", "image/png", "stu094"))
+
+
+def test_submit_route_fails_honestly_with_no_fallback_when_r2_unavailable(monkeypatch):
+    """R2 down (or unconfigured) must surface as a clean, retryable error —
+    and must NEVER create an orphaned submission doc referencing a file
+    that doesn't actually exist anywhere."""
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    async def fake_upload_returns_none(raw, key, content_type):
+        return None
+    monkeypatch.setattr(at, "_upload_media_to_r2", fake_upload_returns_none)
+
+    file = _UploadFile(b"worksheet-bytes", "image/png")
+    with pytest.raises(Exception) as exc_info:
+        _call(router, "POST", "/student/assessments/submit",
+              assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    assert "503" in str(exc_info.value) or "temporarily unavailable" in str(exc_info.value)
+    # No fallback write happened anywhere — the submission collection is
+    # exactly as empty as before the failed attempt.
+    assert db[at.COLL_SUBMISSIONS].docs == {}
+
+
+def test_upload_to_r2_skips_put_when_content_addressed_object_already_exists(monkeypatch):
+    """Proves the HEAD-before-PUT dedupe: retrying an upload of IDENTICAL
+    bytes must not re-transfer/duplicate the object."""
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setenv("R2_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "key")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("R2_BUCKET_NAME", "bucket")
+    monkeypatch.setenv("R2_PUBLIC_URL", "https://cdn.example.com")
+
+    calls = {"head": 0, "put": 0}
+
+    class _FakeClientAlreadyExists:
+        def head_object(self, **kw):
+            calls["head"] += 1
+            return {}  # exists — no ClientError raised
+
+        def put_object(self, **kw):
+            calls["put"] += 1
+
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *a, **kw: _FakeClientAlreadyExists())
+
+    url = run(at._upload_media_to_r2(b"bytes", "assessment-media/stu094/abc.png", "image/png"))
+    assert url == "https://cdn.example.com/assessment-media/stu094/abc.png"
+    assert calls["head"] == 1
+    assert calls["put"] == 0  # skipped — object already there, not duplicated
+
+
+def test_upload_to_r2_puts_when_object_does_not_yet_exist(monkeypatch):
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setenv("R2_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "key")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("R2_BUCKET_NAME", "bucket")
+    monkeypatch.setenv("R2_PUBLIC_URL", "https://cdn.example.com")
+
+    calls = {"head": 0, "put": 0}
+
+    class _FakeClientNotFound:
+        def head_object(self, **kw):
+            calls["head"] += 1
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+
+        def put_object(self, **kw):
+            calls["put"] += 1
+
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *a, **kw: _FakeClientNotFound())
+
+    url = run(at._upload_media_to_r2(b"bytes", "assessment-media/stu094/new.png", "image/png"))
+    assert url == "https://cdn.example.com/assessment-media/stu094/new.png"
+    assert calls["head"] == 1
+    assert calls["put"] == 1
+
+
+def test_delete_submission_deletes_r2_object_and_mongo_doc(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+    assert sub_id in db[at.COLL_SUBMISSIONS].docs
+
+    deleted_keys = []
+    async def fake_delete(key):
+        deleted_keys.append(key)
+        return True
+    monkeypatch.setattr(at, "_delete_media_from_r2", fake_delete)
+
+    result = _call(router, "DELETE", "/admin/assessments/submissions/{submission_id}",
+                    submission_id=sub_id, admin=_Admin())
+    assert result["ok"] is True
+    assert result["mediaDeleted"] is True
+    assert deleted_keys == [submitted["submission"]["mediaKey"]]
+    assert sub_id not in db[at.COLL_SUBMISSIONS].docs
+
+
+def test_delete_submission_blocked_once_already_awarded(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.9}
+                                          for q in questions], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+    _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+          submission_id=sub_id, admin=_Admin())
+    assert db[at.COLL_SUBMISSIONS].docs[sub_id]["status"] == "awarded"
+
+    with pytest.raises(Exception) as exc_info:
+        _call(router, "DELETE", "/admin/assessments/submissions/{submission_id}",
+              submission_id=sub_id, admin=_Admin())
+    assert "409" in str(exc_info.value) or "already been awarded" in str(exc_info.value) or "already awarded" in str(exc_info.value)
+    # The submission — the audit trail for the real point credit — must survive.
+    assert sub_id in db[at.COLL_SUBMISSIONS].docs
+
+
+# ── 2026-08 production incident regression: real 15/30 -> 7.5/15 flow ─────
+# A real student submission on the live "Long & Short Sound Listening
+# Challenge" assessment scored 0/30 despite a genuinely ~15/30-correct
+# worksheet. This suite proves the FULL lifecycle — submit -> score ->
+# Author Studio visibility -> award -> idempotent double-award -> the new
+# extraction diagnostic metadata — using a MIXED (not all-correct,
+# not all-wrong) extraction result built from the real answer key, exactly
+# matching the reported scenario's shape.
+def _mixed_extraction_15_of_30(questions):
+    """15 correct, 15 wrong — flips every SECOND question's answer to the
+    other real vocabulary value (LONG<->SHORT), never a placeholder."""
+    out = []
+    for i, q in enumerate(questions):
+        correct = q["correctAnswer"]
+        given = correct if i % 2 == 0 else ("SHORT" if correct == "LONG" else "LONG")
+        out.append({"qid": q["qid"], "answer": given, "confidence": 0.93})
+    return out
+
+
+def test_real_15_of_30_submission_flows_through_the_full_lifecycle(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes = _build(wallet=wallet)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": _mixed_extraction_15_of_30(questions), "engine": "gemini"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"real-worksheet-bytes", "image/jpeg")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub = submitted["submission"]
+    assert sub["score"]["correct"] == 15
+    assert sub["score"]["total"] == 30
+    assert sub["score"]["pointsEarned"] == 7.5
+    assert sub["status"] == "scored"
+    # New diagnostic: Gemini genuinely returned 30 answers and all 30
+    # survived the qid whitelist — distinguishes "extracted but half
+    # wrong" from "extracted nothing" for exactly this failure class.
+    assert sub["extraction"] == {"engine": "gemini", "rawAnswerCount": 30, "normalizedAnswerCount": 30}
+
+    # Visible to Author Studio via the SAME query path production uses.
+    listed = _call(router, "GET", "/admin/assessments/{assessment_id}/submissions",
+                    assessment_id=asmt["assessmentId"], status=None, admin=_Admin())
+    assert len(listed["submissions"]) == 1
+    assert listed["submissions"][0]["score"]["pointsEarned"] == 7.5
+    # Per-question breakdown is real and persisted, not fabricated —
+    # exactly what Author Studio needs to render a given-vs-correct table.
+    details = listed["submissions"][0]["score"]["details"]
+    assert len(details) == 30
+    assert sum(1 for d in details if d["correct"]) == 15
+
+    sub_id = sub["submissionId"]
+    award = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                  submission_id=sub_id, admin=_Admin())
+    assert award["points"] == 7.5
+    assert wallet.calls == 1
+    assert len(pushes) == 1
+
+    # Idempotent: a second click must NOT award a second time.
+    award2 = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                   submission_id=sub_id, admin=_Admin())
+    assert award2["duplicate"] is True
+    assert wallet.calls == 1
+    assert len(pushes) == 1
+
+
+def test_extraction_failure_never_fabricates_a_score(monkeypatch):
+    """Case: Gemini extraction itself fails (ok:false). Must land on
+    status='failed' with NO score field — never a fabricated 0 that looks
+    like a real (but wrong) grading result."""
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract_fails(media_bytes, content_type, questions):
+        return {"ok": False, "reason": "provider_rejected: Gemini HTTP 500"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract_fails)
+
+    file = _UploadFile(b"bytes", "image/png")
+    result = _call(router, "POST", "/student/assessments/submit",
+                    assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    assert result["submission"]["status"] == "failed"
+    assert result["submission"].get("score") is None
+    assert "extractionError" in result
+    assert db[at.COLL_SUBMISSIONS].docs[result["submission"]["submissionId"]]["status"] == "failed"
+
+
+def test_submitting_to_a_nonexistent_assessment_is_rejected_honestly(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    file = _UploadFile(b"bytes", "image/png")
+    with pytest.raises(Exception) as exc_info:
+        _call(router, "POST", "/student/assessments/submit",
+              assessment_id="asmt_does_not_exist", file=file, student=_Student())
+    assert "404" in str(exc_info.value) or "not found" in str(exc_info.value).lower()
+
+
+def test_duplicate_submission_is_rejected_before_creating_a_second_live_record(monkeypatch):
+    """A double-tap or retried request must never create a second
+    submission for the same (assessment, student) — the award endpoint is
+    keyed by submissionId, so two live submissions would each be
+    independently awardable, a real double-payment risk."""
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.9}
+                                          for q in questions], "engine": "gemini"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file1 = _UploadFile(b"bytes", "image/png")
+    first = _call(router, "POST", "/student/assessments/submit",
+                  assessment_id=asmt["assessmentId"], file=file1, student=_Student())
+    assert first["submission"]["status"] == "scored"
+
+    file2 = _UploadFile(b"bytes2", "image/png")
+    with pytest.raises(Exception) as exc_info:
+        _call(router, "POST", "/student/assessments/submit",
+              assessment_id=asmt["assessmentId"], file=file2, student=_Student())
+    assert "409" in str(exc_info.value) or "already submitted" in str(exc_info.value).lower()
+    # Exactly one submission exists for this (assessment, student).
+    assert len(db[at.COLL_SUBMISSIONS].docs) == 1
+
+
+def test_resubmission_after_a_failed_extraction_is_allowed(monkeypatch):
+    """A 'failed' submission is the one case resubmission must be allowed
+    — the student never got a real result the first time."""
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    call_count = {"n": 0}
+
+    async def fake_extract(media_bytes, content_type, questions):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {"ok": False, "reason": "bad_response"}
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.9}
+                                          for q in questions], "engine": "gemini"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file1 = _UploadFile(b"bytes", "image/png")
+    first = _call(router, "POST", "/student/assessments/submit",
+                  assessment_id=asmt["assessmentId"], file=file1, student=_Student())
+    assert first["submission"]["status"] == "failed"
+
+    file2 = _UploadFile(b"bytes2", "image/png")
+    second = _call(router, "POST", "/student/assessments/submit",
+                   assessment_id=asmt["assessmentId"], file=file2, student=_Student())
+    assert second["submission"]["status"] == "scored"
+    assert len(db[at.COLL_SUBMISSIONS].docs) == 2
+
+
+def test_vocabulary_mismatched_extraction_scores_zero_but_diagnostic_reveals_data_was_received(monkeypatch):
+    """The exact shape of the reported production incident: Gemini
+    confidently (high confidence, every qid present) extracts something
+    that doesn't match the answer key's vocabulary at all — must score 0
+    honestly (never inflated), but the extraction diagnostic must prove
+    data WAS received (rawAnswerCount=30), distinguishing this from "Gemini
+    returned nothing"."""
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract_wrong_vocab(media_bytes, content_type, questions):
+        # Echoes the PROMPT word instead of the LONG/SHORT classification —
+        # the exact failure mode _answer_vocabulary_hint now guards against.
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["prompt"], "confidence": 0.95}
+                                          for q in questions], "engine": "gemini"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract_wrong_vocab)
+
+    file = _UploadFile(b"bytes", "image/png")
+    result = _call(router, "POST", "/student/assessments/submit",
+                    assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub = result["submission"]
+    assert sub["score"]["correct"] == 0
+    assert sub["status"] == "scored"  # high confidence throughout -> not needs_review
+    assert sub["extraction"]["rawAnswerCount"] == 30
+    assert sub["extraction"]["normalizedAnswerCount"] == 30
+    # The per-question detail proves exactly what was wrong — visible data,
+    # not a silent zero.
+    first_detail = sub["score"]["details"][0]
+    assert first_detail["givenAnswer"] == "sheep"
+    assert first_detail["correctAnswer"] == "LONG"

@@ -16,10 +16,23 @@ Collections OWNED by this module (tools/check_collection_ownership.py):
                             twice — mirrors achievement_tools.py's claim
                             pattern.
 
-Media storage follows sync_studio_tools.py's proven R2-first, GridFS-
-fallback pattern exactly (own bucket/prefix, so the two features' media
-never collide): R2 key prefix `assessment-media/`, GridFS bucket
-`assessment_media`.
+Media storage is R2-ONLY (2026-08 explicit product direction — corrected
+from an earlier GridFS-fallback draft). Cloudflare R2 is the sole
+persistent store for every Assessment Lab binary (student submission
+photos/PDFs); MongoDB holds metadata only (assessment definitions,
+extracted answers, scoring results, review/award state, audit trail —
+see `assessment_schema.py`). There is deliberately NO fallback to GridFS
+or any local/Render filesystem: if R2 is unavailable or the upload fails,
+`_store_media` raises `SubmissionStorageError` and the route surfaces a
+plain, retryable 503 — a file is either genuinely in R2, or the request
+failed and nothing was silently stored somewhere else. R2 object keys are
+content-addressed (`sha256(bytes)`), so retrying an upload of the exact
+same bytes reuses the exact same object instead of accumulating
+duplicates, and `_upload_media_to_r2` HEAD-checks before PUT to skip a
+redundant write when the object already exists. Deletion is explicit
+too — `DELETE /admin/assessments/submissions/{id}` removes the R2 object
+and the Mongo doc together (blocked for an already-awarded submission,
+to preserve the award's audit trail).
 
 Point-awarding follows achievement_tools.py's claim/credit/finalize
 pattern exactly: WalletService.credit(...) is the ONLY thing that ever
@@ -32,14 +45,13 @@ never accepted from the client.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 from pymongo.errors import DuplicateKeyError
 
 import assessment_ai_provider as ai
@@ -66,7 +78,6 @@ log = logging.getLogger("eduhub.assessment")
 COLL_ASSESSMENTS = "assessments"
 COLL_SUBMISSIONS = "assessment_submissions"
 COLL_AWARDS = "assessment_awards"
-MEDIA_GRIDFS_BUCKET = "assessment_media"
 
 # Student submissions: photo or scanned PDF of a completed worksheet.
 SUBMISSION_CONTENT_TYPES: dict[str, str] = {
@@ -83,19 +94,15 @@ ANSWER_KEY_CONTENT_TYPES: dict[str, str] = {
 }
 HARD_MAX_MEDIA_BYTES = 25 * 1024 * 1024  # generous for a photographed worksheet page
 
-_media_bucket_cache: AsyncIOMotorGridFSBucket | None = None
 
+class SubmissionStorageError(Exception):
+    """Raised when R2 could not store an Assessment Lab binary. Routes
+    catch this and surface a plain, retryable error — there is no other
+    storage backend for this feature to fall back to."""
 
-def get_media_bucket(db) -> AsyncIOMotorGridFSBucket:
-    """Lazily constructs (and caches) this module's OWN GridFS bucket —
-    never shares sync_studio_tools.py's `sync_media` bucket. See that
-    module's identical accessor for why this must be lazy (Motor's
-    AsyncIOMotorGridFSBucket resolves the running event loop on first
-    use, which does not exist yet at import/registration time)."""
-    global _media_bucket_cache
-    if _media_bucket_cache is None:
-        _media_bucket_cache = AsyncIOMotorGridFSBucket(db, bucket_name=MEDIA_GRIDFS_BUCKET)
-    return _media_bucket_cache
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message)
+        self.message = message or "Storage is temporarily unavailable. Please try again."
 
 
 def _r2_config() -> dict | None:
@@ -104,50 +111,100 @@ def _r2_config() -> dict | None:
     return cfg if all(cfg.values()) else None
 
 
+def _r2_client(cfg: dict):
+    import boto3
+    from botocore.config import Config as _BotocoreConfig
+
+    return boto3.client(
+        "s3", endpoint_url=f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        aws_access_key_id=cfg["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+        config=_BotocoreConfig(signature_version="s3v4"),
+    )
+
+
+def _content_addressed_key(raw: bytes, ext: str, prefix: str) -> str:
+    """Deterministic R2 object key = sha256(bytes) — the SAME uploaded
+    file always maps to the SAME key, so retrying an upload (or a student
+    re-selecting the identical photo) can never create a duplicate R2
+    object; it just re-resolves to the object that's already there."""
+    digest = hashlib.sha256(raw).hexdigest()
+    return f"assessment-media/{prefix}/{digest}.{ext}"
+
+
 async def _upload_media_to_r2(raw: bytes, key: str, content_type: str) -> str | None:
-    """NEVER raises — returns None on any failure so the caller falls back
-    to GridFS transparently. Identical contract to sync_studio_tools.py's
-    `_upload_media_to_r2` (deliberately not duplicated as a shared import —
-    each module owns its own storage call exactly like hero_artwork_tools.py
-    / student_avatar.py / sync_studio_tools.py each do today)."""
+    """R2-only, NEVER falls back to any other storage. Returns None on any
+    failure (env vars absent, boto3 missing, network error) — the CALLER
+    (`_store_media`) is responsible for turning that into an honest,
+    retryable failure, never a silent write elsewhere. HEAD-checks the
+    key first and skips the PUT entirely when the (content-addressed)
+    object already exists, so a retried/duplicate upload of identical
+    bytes never re-transfers or duplicates storage."""
     cfg = _r2_config()
     if cfg is None:
         return None
     try:
-        import boto3
-        from botocore.config import Config as _BotocoreConfig
+        from botocore.exceptions import ClientError
 
-        endpoint = f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
-
-        def _do_upload():
-            s3 = boto3.client(
-                "s3", endpoint_url=endpoint,
-                aws_access_key_id=cfg["R2_ACCESS_KEY_ID"],
-                aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"],
-                region_name="auto",
-                config=_BotocoreConfig(signature_version="s3v4"),
-            )
+        def _do_upload() -> bool:
+            s3 = _r2_client(cfg)
+            try:
+                s3.head_object(Bucket=cfg["R2_BUCKET_NAME"], Key=key)
+                return True  # already stored — nothing to do
+            except ClientError as exc:
+                code = str((exc.response or {}).get("Error", {}).get("Code") or "")
+                if code not in ("404", "NoSuchKey", "NotFound"):
+                    raise
             s3.put_object(Bucket=cfg["R2_BUCKET_NAME"], Key=key, Body=raw, ContentType=content_type)
+            return False
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _do_upload)
+        already_existed = await loop.run_in_executor(None, _do_upload)
         url = f"{cfg['R2_PUBLIC_URL'].rstrip('/')}/{key}"
-        log.info("assessment_tools: uploaded %s (%d bytes) url=%s", key, len(raw), url)
+        if already_existed:
+            log.info("assessment_tools: content-addressed object already exists, skipped upload key=%s", key)
+        else:
+            log.info("assessment_tools: uploaded %s (%d bytes) url=%s", key, len(raw), url)
         return url
     except Exception:  # noqa: BLE001
-        log.exception("assessment_tools: R2 upload failed for key=%s — falling back to GridFS", key)
+        log.exception("assessment_tools: R2 upload failed for key=%s", key)
         return None
 
 
-async def _store_media(db, raw: bytes, ext: str, content_type: str, prefix: str) -> str:
-    key = f"assessment-media/{prefix}/{uuid.uuid4().hex}.{ext}"
+async def _delete_media_from_r2(key: str) -> bool:
+    """Explicit delete for retention/deletion flows — best-effort: a real
+    failure here (network/credentials) is logged CRITICAL for manual
+    follow-up rather than blocking the caller, since the Mongo doc removal
+    is the user-facing action and a lingering orphaned object is a
+    cleanup concern, not a correctness one. Returns True on confirmed
+    deletion (including "already gone")."""
+    cfg = _r2_config()
+    if cfg is None:
+        return False
+    try:
+        def _do_delete():
+            _r2_client(cfg).delete_object(Bucket=cfg["R2_BUCKET_NAME"], Key=key)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_delete)
+        log.info("assessment_tools: deleted R2 object key=%s", key)
+        return True
+    except Exception:  # noqa: BLE001
+        log.critical("assessment_tools: R2 delete FAILED for key=%s — manual cleanup needed", key)
+        return False
+
+
+async def _store_media(raw: bytes, ext: str, content_type: str, prefix: str) -> tuple[str, str]:
+    """R2-only. Raises SubmissionStorageError (never falls back to GridFS
+    or local disk) if R2 is unavailable or the upload fails. Returns
+    (media_ref_url, media_key) — the key is persisted alongside the doc
+    so deletion never has to parse it back out of the public URL."""
+    key = _content_addressed_key(raw, ext, prefix)
     media_ref = await _upload_media_to_r2(raw, key, content_type)
-    if media_ref:
-        return media_ref
-    filename = f"{uuid.uuid4().hex}.{ext}"
-    bucket = get_media_bucket(db)
-    await bucket.upload_from_stream(filename, io.BytesIO(raw), metadata={"contentType": content_type})
-    return f"gridfs://{MEDIA_GRIDFS_BUCKET}/{filename}"
+    if not media_ref:
+        raise SubmissionStorageError()
+    return media_ref, key
 
 
 def _extract_docx_text(raw: bytes) -> str:
@@ -311,6 +368,27 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
     async def admin_get_submission(submission_id: str, admin=Depends(require_admin)):
         _ = admin
         return {"ok": True, "submission": await _get_submission_or_404(submission_id)}
+
+    @api.delete("/admin/assessments/submissions/{submission_id}")
+    async def admin_delete_submission(submission_id: str, admin=Depends(require_admin)):
+        _ = admin
+        sub = await _get_submission_or_404(submission_id)
+        if sub.get("status") == "awarded":
+            # An awarded submission is the audit trail for a real point
+            # credit — deleting it would erase the reason the wallet moved.
+            raise HTTPException(409, "Cannot delete a submission whose points were already awarded.")
+        media_deleted = False
+        key = sub.get("mediaKey")
+        if key:
+            media_deleted = await _delete_media_from_r2(key)
+            if not media_deleted:
+                log.critical(
+                    "assessment: submission %s deleted from Mongo but its R2 object "
+                    "(key=%s) could NOT be confirmed deleted — manual cleanup needed",
+                    submission_id, key,
+                )
+        await submissions.delete_one({"submissionId": submission_id})
+        return {"ok": True, "submissionId": submission_id, "mediaDeleted": media_deleted}
 
     @api.post("/admin/assessments/submissions/{submission_id}/correct")
     async def admin_correct_submission(submission_id: str, payload: dict, admin=Depends(require_admin)):
@@ -480,13 +558,40 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
 
         student_id = str(getattr(student, "student_id", "") or "")
         clean_id = str(getattr(student, "clean_id", "") or "")
-        media_ref = await _store_media(db, raw, ext, content_type, clean_id or student_id or "unknown")
+
+        # Duplicate-submission guard: the award endpoint is keyed by
+        # submissionId, so two independent submission docs for the SAME
+        # (assessment, student) attempt could each be awarded separately —
+        # a real double-payment risk, not just a UX nuisance. The student
+        # PWA already hides the submit action once a non-"failed"
+        # submission exists (AssessmentsListPage.jsx's canSubmit check);
+        # this enforces the same rule server-side so a retried request or
+        # a second client can never create a second live submission.
+        existing_submission = await submissions.find_one(
+            {"assessmentId": assessment_id,
+             "$or": [{"studentId": student_id}, {"cleanId": clean_id}]},
+            {"_id": 0, "submissionId": 1, "status": 1},
+        )
+        if existing_submission and existing_submission.get("status") != "failed":
+            raise HTTPException(
+                409, "You already submitted this assessment "
+                     f"(status: {existing_submission.get('status')}).",
+            )
+
+        try:
+            media_ref, media_key = await _store_media(raw, ext, content_type, clean_id or student_id or "unknown")
+        except SubmissionStorageError as exc:
+            # R2-only, on purpose: no GridFS/local-disk fallback. A storage
+            # failure must surface as an honest, retryable error — never a
+            # silent write to a different backend, and never a submission
+            # record referencing a file that doesn't actually exist in R2.
+            raise HTTPException(503, exc.message)
 
         submission_id = new_submission_id()
         doc = build_submission_document(
             submission_id, assessment_id,
             student_id=student_id, clean_id=clean_id,
-            media_ref=media_ref, content_type=content_type,
+            media_ref=media_ref, media_key=media_key, content_type=content_type,
             status="processing", generated_at=_iso_now(),
         )
         ok, errors = validate_submission_document(doc)
@@ -502,15 +607,31 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             doc["status"] = "failed"
             return {"ok": True, "submission": doc, "extractionError": extraction.get("reason")}
 
-        answers = normalize_extracted_submission_answers(extraction.get("answers") or [], known_ids)
+        raw_answers = extraction.get("answers") or []
+        answers = normalize_extracted_submission_answers(raw_answers, known_ids)
         result = score_submission(asmt["questions"], answers)
         status = "needs_review" if result["needsReview"] else "scored"
+        # Audit metadata only (per this feature's own data-classification
+        # rule: MongoDB holds metadata, never the binary) — an at-a-glance
+        # signal for exactly the failure class this exists to catch: did
+        # Gemini return nothing (rawAnswerCount=0), did most of it get
+        # dropped by the qid whitelist (normalizedAnswerCount << raw), or
+        # did everything survive but still score 0 (a real content/
+        # vocabulary mismatch, visible per-question in score.details
+        # below). Never a second source of truth for the score itself.
+        extraction_meta = {
+            "engine": extraction.get("engine"),
+            "rawAnswerCount": len(raw_answers),
+            "normalizedAnswerCount": len(answers),
+        }
         await submissions.update_one(
             {"submissionId": submission_id},
-            {"$set": {"extractedAnswers": answers, "score": result, "status": status}},
+            {"$set": {"extractedAnswers": answers, "score": result, "status": status,
+                      "extraction": extraction_meta}},
         )
         doc.pop("_id", None)
-        doc.update({"extractedAnswers": answers, "score": result, "status": status})
+        doc.update({"extractedAnswers": answers, "score": result, "status": status,
+                    "extraction": extraction_meta})
         return {"ok": True, "submission": doc, "engine": extraction.get("engine")}
 
     @api.get("/student/assessments/submissions")
