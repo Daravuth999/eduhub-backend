@@ -8051,6 +8051,9 @@ try:
         wallet=_assessment_wallet,
         fan_out_push=_fan_out_push,
         build_target_query=_build_target_query,
+        gas_points_login_url=GAS_POINTS_LOGIN_URL,
+        gas_treasury_id=SL_TREASURY_ID,
+        gas_treasury_password=SL_TREASURY_PASSWORD,
     )
 
     @app.on_event("startup")

@@ -228,6 +228,64 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+async def _sync_award_to_gas(
+    clean_id: str, points: float, *,
+    gas_url: str, treasury_id: str, treasury_password: str,
+) -> tuple[bool, str]:
+    """Best-effort treasury->student legacy-balance sync, via the SAME
+    proven `action=sendPoints` GAS bridge already used in production by
+    Speaking Lab's /points/grant and the referral reward path (server.py) —
+    not a new mechanism.
+
+    WHY THIS EXISTS: WalletService.credit() (the caller, before this runs)
+    is this app's real, canonical points ledger — it already succeeded by
+    the time this is called, and that alone satisfies "the student's
+    points were actually credited". But most of the app's student-facing
+    UI (the header/dashboard points pill, via usePoints.ts) still polls
+    the LEGACY GAS-backed balance by default (REACT_APP_USE_RENDER_POINTS
+    is off unless explicitly flagged) — a Mongo-only credit is real but
+    invisible there until that flag flips. This call closes that
+    visibility gap for the common case; if it fails, the canonical wallet
+    credit is NOT reversed (see _award_one) — the outcome is recorded
+    honestly (gasSynced=False) instead of silently claimed as done.
+
+    GAS's legacy points ledger is integer-based (Speaking Lab's own grant
+    payload sends whole points); an assessment can award fractional points
+    (0.5/question), so the amount synced here is rounded to the nearest
+    whole point for THIS legacy-visibility leg only — the exact fractional
+    amount remains the persisted, authoritative value in points_wallets.
+
+    Never raises. Returns (ok, error_message)."""
+    if not (gas_url and treasury_id and treasury_password and clean_id):
+        return False, "gas_sync_not_configured"
+    amount = max(1, round(points))
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=6.0), follow_redirects=True,
+        ) as cli:
+            r = await cli.post(gas_url, data={
+                "action": "sendPoints",
+                "id": treasury_id,
+                "password": treasury_password,
+                "receiverId": clean_id,
+                "amount": str(amount),
+                "nonce": os.urandom(12).hex(),
+            })
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+        try:
+            j = r.json()
+        except Exception:  # noqa: BLE001
+            return False, (r.text or "")[:200]
+        if isinstance(j, dict) and j.get("success") is True:
+            return True, ""
+        return False, str((j or {}).get("message") or (j or {}).get("error") or j)[:200]
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200]
+
+
 async def ensure_assessment_indexes(db) -> None:
     await db[COLL_ASSESSMENTS].create_index("assessmentId", unique=True)
     await db[COLL_ASSESSMENTS].create_index("status")
@@ -239,7 +297,9 @@ async def ensure_assessment_indexes(db) -> None:
 
 
 def register_assessment_routes(api: APIRouter, db, require_admin, require_student, *,
-                                wallet=None, fan_out_push=None, build_target_query=None) -> None:
+                                wallet=None, fan_out_push=None, build_target_query=None,
+                                gas_points_login_url=None, gas_treasury_id=None,
+                                gas_treasury_password=None) -> None:
     assessments = db[COLL_ASSESSMENTS]
     submissions = db[COLL_SUBMISSIONS]
     awards = db[COLL_AWARDS]
@@ -425,6 +485,46 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         )
         return {"ok": True, "score": result, "correctedQids": applied}
 
+    def _award_summary(award_doc: dict) -> dict:
+        """The subset of an award document a teacher/student actually needs
+        to trust "AWARDED" means something real — NOT the whole internal
+        doc. ``gasSynced`` is explicitly None (not True/False) when no GAS
+        bridge was even configured/attempted, so the UI can distinguish
+        "not attempted" from "attempted and failed"."""
+        return {
+            "pointsCredited": award_doc.get("points"),
+            "balanceAfter": award_doc.get("balanceAfter"),
+            "creditedAt": award_doc.get("creditedAt"),
+            "notifiedAt": award_doc.get("notifiedAt"),
+            "gasSynced": award_doc.get("gasSynced"),
+            "gasSyncError": award_doc.get("gasSyncError"),
+        }
+
+    async def _attempt_gas_sync(award_id: str, submission_id: str, clean_id: str, points: float) -> None:
+        """Best-effort — see _sync_award_to_gas's docstring for why a
+        failure here never blocks or reverses the (already-real)
+        WalletService credit. Always persists an honest outcome."""
+        ok, err = await _sync_award_to_gas(
+            clean_id, points,
+            gas_url=gas_points_login_url, treasury_id=gas_treasury_id,
+            treasury_password=gas_treasury_password,
+        )
+        patch = {"gasSynced": ok, "gasSyncError": "" if ok else err, "gasSyncedAt": _iso_now()}
+        await awards.update_one({"awardId": award_id}, {"$set": patch})
+        # Merge into the submission's `award` subdocument as a single whole-
+        # object $set (not a dotted-path update) — a dotted "award.x" $set
+        # relies on MongoDB's own nested-path semantics, which the in-memory
+        # test fakes used across this codebase's route tests do not
+        # replicate (they apply $set via a flat dict.update()).
+        sub = await submissions.find_one({"submissionId": submission_id}, {"_id": 0, "award": 1})
+        merged_award = {**((sub or {}).get("award") or {}), **patch}
+        await submissions.update_one(
+            {"submissionId": submission_id},
+            {"$set": {"award": merged_award}},
+        )
+        if not ok:
+            log.warning("assessment: legacy GAS balance sync failed for award %s: %s", award_id, err)
+
     # ── Teacher: award points (individual + bulk), idempotent ───────────
     async def _award_one(submission_id: str, admin_email: str) -> dict:
         if wallet is None:
@@ -435,7 +535,8 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         if sub.get("status") == "awarded":
             existing = await awards.find_one({"submissionId": submission_id}, {"_id": 0})
             return {"submissionId": submission_id, "ok": True, "duplicate": True,
-                     "points": (existing or {}).get("points")}
+                     "points": (existing or {}).get("points"),
+                     **_award_summary(existing or {})}
 
         score = sub.get("score") or {}
         points = float(score.get("pointsEarned") or 0.0)
@@ -452,7 +553,8 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         except DuplicateKeyError:
             existing = await awards.find_one({"submissionId": submission_id}, {"_id": 0})
             return {"submissionId": submission_id, "ok": True, "duplicate": True,
-                     "points": (existing or {}).get("points")}
+                     "points": (existing or {}).get("points"),
+                     **_award_summary(existing or {})}
 
         idem_key = f"assessment_award:{submission_id}"
         try:
@@ -469,6 +571,10 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             log.error("assessment: wallet credit failed for %s: %s", submission_id, exc)
             return {"submissionId": submission_id, "ok": False, "reason": "credit_failed"}
 
+        # From this point on the REAL points_wallets credit has already
+        # happened — "AWARDED" below is truthful regardless of what
+        # follows (legacy GAS sync / push notification are downstream
+        # visibility concerns, never reversed against the wallet).
         balance_after = float((result or {}).get("balance_after") or 0)
         try:
             await awards.update_one(
@@ -477,7 +583,11 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             )
             await submissions.update_one(
                 {"submissionId": submission_id},
-                {"$set": {"status": "awarded"}},
+                {"$set": {"status": "awarded", "award": {
+                    "pointsCredited": points, "balanceAfter": balance_after,
+                    "creditedAt": _iso_now(), "notifiedAt": None,
+                    "gasSynced": None, "gasSyncError": None,
+                }}},
             )
         except Exception as exc:  # noqa: BLE001
             log.critical(
@@ -486,18 +596,33 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
                 award_id, student_id, submission_id, exc,
             )
 
+        # Legacy points-pill visibility bridge — see _sync_award_to_gas's
+        # docstring. Best-effort; a failure here is recorded honestly and
+        # never blocks or reverses the award above.
+        if points > 0 and (clean_id or student_id):
+            await _attempt_gas_sync(award_id, submission_id, clean_id or student_id, points)
+
         if callable(fan_out_push) and callable(build_target_query) and points > 0:
             try:
                 title = "Points awarded"
                 body = f"You earned {points:g} points for your assessment. Great work!"
                 query = build_target_query("students", [clean_id or student_id], None)
                 await fan_out_push(query, title, body, "/portal")
-                await awards.update_one({"awardId": award_id}, {"$set": {"notifiedAt": _iso_now()}})
+                notified_at = _iso_now()
+                await awards.update_one({"awardId": award_id}, {"$set": {"notifiedAt": notified_at}})
+                sub_now = await submissions.find_one({"submissionId": submission_id}, {"_id": 0, "award": 1})
+                merged_award = {**((sub_now or {}).get("award") or {}), "notifiedAt": notified_at}
+                await submissions.update_one(
+                    {"submissionId": submission_id},
+                    {"$set": {"award": merged_award}},
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("assessment: award notification failed for %s: %s", submission_id, exc)
 
+        final_award = await awards.find_one({"awardId": award_id}, {"_id": 0})
         return {"submissionId": submission_id, "ok": True, "duplicate": False,
-                 "points": points, "balanceAfter": balance_after}
+                 "points": points, "balanceAfter": balance_after,
+                 **_award_summary(final_award or {})}
 
     @api.post("/admin/assessments/submissions/{submission_id}/award")
     async def admin_award_submission(submission_id: str, admin=Depends(require_admin)):
@@ -506,6 +631,27 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             raise HTTPException(409 if result.get("reason") == "already_awarded" else 502,
                                  result.get("reason") or "Award failed.")
         return result
+
+    @api.post("/admin/assessments/submissions/{submission_id}/retry-gas-sync")
+    async def admin_retry_gas_sync(submission_id: str, admin=Depends(require_admin)):
+        """Retries ONLY the legacy-visibility GAS bridge for an already-
+        awarded submission — never re-credits the wallet (that would be a
+        second, real payment). Used when a teacher sees "Wallet credited"
+        but "Legacy balance sync: failed" in Author Studio."""
+        _ = admin
+        sub = await _get_submission_or_404(submission_id)
+        if sub.get("status") != "awarded":
+            raise HTTPException(409, "This submission has not been awarded yet.")
+        award = await awards.find_one({"submissionId": submission_id}, {"_id": 0})
+        if not award:
+            raise HTTPException(404, "No award record found for this submission.")
+        points = float(award.get("points") or 0)
+        clean_id = award.get("cleanId") or award.get("studentId") or ""
+        if points <= 0 or not clean_id:
+            raise HTTPException(400, "Nothing to sync for this award.")
+        await _attempt_gas_sync(award["awardId"], submission_id, clean_id, points)
+        refreshed = await awards.find_one({"submissionId": submission_id}, {"_id": 0})
+        return {"ok": True, "submissionId": submission_id, **_award_summary(refreshed or {})}
 
     @api.post("/admin/assessments/submissions/bulk-award")
     async def admin_bulk_award(payload: dict, admin=Depends(require_admin)):

@@ -925,3 +925,172 @@ def test_vocabulary_mismatched_extraction_scores_zero_but_diagnostic_reveals_dat
     first_detail = sub["score"]["details"][0]
     assert first_detail["givenAnswer"] == "sheep"
     assert first_detail["correctAnswer"] == "LONG"
+
+
+# ── production incident: "AWARDED" shown but student's visible points ─────
+# never moved (2026-08). Root cause: WalletService.credit() — the real,
+# canonical points ledger — succeeded correctly (confirmed by inspecting
+# it against achievement_tools.py's identical, proven pattern), but the
+# DEFAULT student-facing points display (usePoints.ts) polls the LEGACY
+# GAS-backed balance, not points_wallets, unless REACT_APP_USE_RENDER_POINTS
+# is explicitly flagged on. A Mongo-only credit is real but invisible
+# there. These tests cover the fix: a best-effort legacy-visibility bridge
+# (the SAME proven action=sendPoints treasury->student GAS call already
+# used in production by Speaking Lab's /points/grant), which — critically —
+# never blocks or reverses the wallet credit if it fails, and is always
+# recorded honestly rather than silently assumed to have worked.
+def _build_with_gas(monkeypatch, wallet=None, gas_ok=True, gas_error="GAS unreachable"):
+    db, router, pushes = _build(wallet=wallet)
+    calls = []
+
+    async def fake_gas_sync(clean_id, points, *, gas_url, treasury_id, treasury_password):
+        calls.append({"clean_id": clean_id, "points": points})
+        return (gas_ok, "" if gas_ok else gas_error)
+
+    monkeypatch.setattr(at, "_sync_award_to_gas", fake_gas_sync)
+    return db, router, pushes, calls
+
+
+def test_award_success_persists_wallet_proof_and_gas_sync_outcome_on_the_submission(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes, gas_calls = _build_with_gas(monkeypatch, wallet=wallet, gas_ok=True)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.9}
+                                          for q in questions], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+
+    result = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                    submission_id=sub_id, admin=_Admin())
+    assert result["ok"] is True
+    assert result["pointsCredited"] == 15.0
+    assert result["balanceAfter"] == 15.0  # _Wallet's fake balance_after == amount credited
+    assert result["gasSynced"] is True
+    assert len(gas_calls) == 1
+    assert gas_calls[0]["clean_id"] == "stu094"  # _Student()'s clean_id
+    assert gas_calls[0]["points"] == 15.0
+    assert len(pushes) == 1
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["status"] == "awarded"
+    assert stored["award"]["pointsCredited"] == 15.0
+    assert stored["award"]["balanceAfter"] == 15.0
+    assert stored["award"]["gasSynced"] is True
+    assert stored["award"]["notifiedAt"] is not None
+
+
+def test_gas_sync_failure_never_blocks_or_reverses_the_real_wallet_credit(monkeypatch):
+    """The exact reported production symptom's honest resolution: the
+    wallet credit (the real, canonical points mutation) already succeeded
+    by the time the legacy GAS bridge is even attempted — its failure
+    must never undo that, never raise, and never silently claim success."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes, gas_calls = _build_with_gas(
+        monkeypatch, wallet=wallet, gas_ok=False, gas_error="GAS unreachable",
+    )
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.9}
+                                          for q in questions], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+
+    result = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                    submission_id=sub_id, admin=_Admin())
+    # The award itself is still successful — the REAL ledger (WalletService)
+    # was credited; only the legacy-visibility bridge failed.
+    assert result["ok"] is True
+    assert wallet.calls == 1
+    assert result["balanceAfter"] == 15.0
+    assert result["gasSynced"] is False
+    assert "GAS unreachable" in result["gasSyncError"]
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["status"] == "awarded"  # never blocked by the GAS failure
+    assert stored["award"]["gasSynced"] is False
+    assert "GAS unreachable" in stored["award"]["gasSyncError"]
+    # A push notification is STILL sent — the real credit succeeded.
+    assert len(pushes) == 1
+
+
+def test_retry_gas_sync_resyncs_without_ever_recrediting_the_wallet(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes, gas_calls = _build_with_gas(monkeypatch, wallet=wallet, gas_ok=False)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.9}
+                                          for q in questions], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+
+    first = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                  submission_id=sub_id, admin=_Admin())
+    assert first["gasSynced"] is False
+    assert wallet.calls == 1
+
+    # GAS recovers — teacher clicks "Retry sync".
+    async def fake_gas_sync_now_ok(clean_id, points, *, gas_url, treasury_id, treasury_password):
+        gas_calls.append({"clean_id": clean_id, "points": points})
+        return (True, "")
+    monkeypatch.setattr(at, "_sync_award_to_gas", fake_gas_sync_now_ok)
+
+    retried = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/retry-gas-sync",
+                     submission_id=sub_id, admin=_Admin())
+    assert retried["ok"] is True
+    assert retried["gasSynced"] is True
+    # The wallet must NEVER be credited a second time by a sync retry.
+    assert wallet.calls == 1
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["award"]["gasSynced"] is True
+
+
+def test_retry_gas_sync_rejects_a_submission_that_was_never_awarded(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    db, router, pushes, gas_calls = _build_with_gas(monkeypatch, wallet=_Wallet())
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+
+    with pytest.raises(Exception) as exc_info:
+        _call(router, "POST", "/admin/assessments/submissions/{submission_id}/retry-gas-sync",
+              submission_id=sub_id, admin=_Admin())
+    assert "409" in str(exc_info.value) or "not been awarded" in str(exc_info.value)
+
+
+def test_real_gas_sync_helper_rounds_fractional_points_and_never_raises():
+    """assessment scoring supports 0.5-point increments (0.5/question);
+    GAS's legacy points ledger is integer-based (mirrors Speaking Lab's own
+    /points/grant contract) — the sync helper must round for THIS leg only
+    and never raise, even with no config at all."""
+    ok, err = run(at._sync_award_to_gas(
+        "stu094", 7.5, gas_url=None, treasury_id=None, treasury_password=None,
+    ))
+    assert ok is False
+    assert err == "gas_sync_not_configured"
