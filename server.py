@@ -8026,4 +8026,46 @@ except Exception as _achievement_err:  # noqa: BLE001
     )
 
 
+# ── AI Assessment / Quiz Submission Lab — additive, non-fatal ────────────
+# Failure is non-fatal: if the module fails to load, only assessments are
+# disabled; every existing route keeps working unchanged. Wallet crediting
+# and push notification both reuse the EXISTING platform mechanisms
+# (wallet_service.WalletService, _fan_out_push/_build_target_query) —
+# same injection pattern as attendance_tools.py/achievement_tools.py.
+try:
+    from assessment_tools import (
+        register_assessment_routes as _register_assessment_routes,
+        ensure_assessment_indexes as _ensure_assessment_indexes,
+    )
+    _assessment_wallet = None
+    if _WALLET_SERVICE_AVAILABLE and wallet_service is not None:
+        try:
+            _assessment_wallet = wallet_service.WalletService(db)
+        except Exception as _asmt_wallet_err:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "assessments: WalletService init failed (awards disabled): %s",
+                _asmt_wallet_err,
+            )
+    _register_assessment_routes(
+        api, db, require_admin, require_student,
+        wallet=_assessment_wallet,
+        fan_out_push=_fan_out_push,
+        build_target_query=_build_target_query,
+    )
+
+    @app.on_event("startup")
+    async def _assessment_startup_indexes() -> None:
+        try:
+            await _ensure_assessment_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "assessments: index ensure failed at startup (non-fatal): %s", exc,
+            )
+except Exception as _assessment_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "assessment_tools route registration failed (feature disabled): %s",
+        _assessment_err,
+    )
+
+
 app.include_router(api)
