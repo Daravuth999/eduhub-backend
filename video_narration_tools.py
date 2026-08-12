@@ -1094,6 +1094,19 @@ async def assemble_narration_track(db, lesson_id: str) -> dict:
         normalized = await video_render_tools.normalize_line_loudness(raw)
 
         raw_words = _strip_bracketed_instruction_words(entry.get("wordTimestamps") or [])
+        # Defense-in-depth against the exact incident class documented in
+        # sync_schema.validate_sync_document's own docstring: ElevenLabs'
+        # per-line alignment is expected to already be chronological within
+        # that one line, but this producer had no guard confirming it —
+        # unlike video_ai_provider.segments_to_sync's sibling ASR path,
+        # which already sorts its own raw segments for the identical
+        # reason. A stable sort on the REAL, already-measured `start`
+        # value never fabricates a timestamp; it only makes this line's
+        # own word ARRAY POSITION match the real values it already
+        # carries — done here, before `raw_words[-1]` is trusted as "the
+        # chronologically last word" for the duration fallback below, and
+        # before the words themselves are built further down.
+        raw_words = sorted(raw_words, key=lambda w: float(w.get("start", 0.0)))
         line_duration = float(entry.get("durationSec") or (raw_words[-1]["end"] if raw_words else 0.0))
 
         # Overrun handling: if THIS line's own audio would run past its

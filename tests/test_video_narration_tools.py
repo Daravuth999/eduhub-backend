@@ -13,6 +13,7 @@ import base64
 
 import pytest
 
+import sync_schema
 import sync_studio_tools
 import video_narration_jobs as jobs
 import video_narration_tools as vnt
@@ -758,6 +759,54 @@ async def test_assemble_strips_pre_existing_contaminated_word_timestamps(monkeyp
 
     assert words == ["He", "knew"]
     assert not any("[" in w or "]" in w for w in words)
+
+
+@pytest.mark.asyncio
+async def test_assemble_sorts_a_scrambled_elevenlabs_word_alignment_before_persisting(monkeypatch):
+    """Root-cause regression for the conversation-karaoke incident (2026-08):
+    ElevenLabs' own per-line alignment is EXPECTED to already be
+    chronological, but nothing previously verified that for the AI-narrated
+    (conversation/storytelling) producer path — unlike video_ai_provider.
+    segments_to_sync's sibling ASR path, which already defends itself.
+
+    This seeds a voice-production result exactly as it would look coming
+    back from a real ElevenLabs response whose word alignment is NOT sorted
+    by `start` (array position 0 has the LATEST start, matching the exact
+    "final word ends up near the front of the array" shape that made the
+    frontend's binary search resolve the wrong active word within seconds
+    of Play). Proves assemble_narration_track now produces a document whose
+    persisted word order matches the real, already-measured start times —
+    and that the resulting document passes sync_schema's own chronological
+    gate, which a naive (unsorted) assembly would fail."""
+    db = _FakeDB()
+    bucket, scene_id, line_id = await _job_with_script(db, monkeypatch)
+    path = f"voiceProduction.{scene_id}.lines.{line_id}"
+    scrambled_result = {
+        "speaker": "S1", "text": "Thanks for the deal today.", "mediaRef": "gridfs://sync_media/line.mp3",
+        "wordTimestamps": [
+            {"word": "today.", "start": 1.5, "end": 2.0},   # array position 0 — LATEST real time
+            {"word": "for", "start": 0.2, "end": 0.4},
+            {"word": "the", "start": 0.4, "end": 0.6},
+            {"word": "deal", "start": 0.6, "end": 1.5},
+            {"word": "Thanks", "start": 0.0, "end": 0.2},   # array position 4 — EARLIEST real time
+        ],
+        "durationSec": 2.0, "voiceId": "voice_1", "voiceStale": False,
+    }
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], f"{path}.state", jobs.S_COMPLETED)
+    _set_dotted(db.video_narration_jobs.docs["vid_1"], f"{path}.result", scrambled_result)
+    await bucket.upload_from_stream("line.mp3", __import__("io").BytesIO(b"fake-audio"), {"contentType": "audio/mpeg"})
+
+    job = await vnt.assemble_narration_track(db, "vid_1")
+    sync_id = job["assembly"]["result"]["syncId"]
+    sync_doc = await db.chapter_sync.find_one({"syncId": sync_id})
+
+    words = sync_doc["paragraphs"][0]["sentences"][0]["words"]
+    assert [w["word"] for w in words] == ["Thanks", "for", "the", "deal", "today."]
+    starts = [w["start"] for w in words]
+    assert starts == sorted(starts)
+
+    ok, errors = sync_schema.validate_sync_document(sync_doc)
+    assert ok, errors
 
 
 @pytest.mark.asyncio

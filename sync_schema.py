@@ -153,8 +153,37 @@ def build_sync_document(
 
 
 def validate_sync_document(doc: dict) -> tuple[bool, list[str]]:
-    """Structural validation only (shape, required fields, enum values) —
-    never re-derives or corrects data. Returns (is_valid, error_messages)."""
+    """Structural validation, PLUS the one timing invariant every consumer
+    of this document silently assumes and never itself enforces:
+    chronological order by array position.
+
+    Root-cause context (2026-08, conversation-karaoke incident): the
+    frontend's binary search (syncConsumption.js's binarySearchActiveIndex)
+    documents "`units` must be sorted ascending by start and non-overlapping"
+    as a PRECONDITION it does not itself check. video_ai_provider.segments_
+    to_sync already defends its own producer path with a sort — but that
+    fix lives at ONE producer, not at the schema boundary every producer's
+    document must pass through before persistence. A second producer
+    (video_narration_tools.assemble_narration_track, the AI-narrated
+    conversation/storytelling path) had no equivalent guard: nothing here
+    stopped a document whose sentence/word array position did not match its
+    own `start` values from being persisted and served to students, at
+    which point the frontend's lookup silently returns wrong results for
+    the entire remainder of playback (see useSyncHighlight.js's own
+    describeKaraokeDebugFrame docstring for the exact observed symptom —
+    the highlight appears to "jump to the end" within seconds of Play).
+
+    This check DETECTS the violation and rejects the document — it never
+    reorders, drops, or renumbers anything itself (per this function's own
+    "never re-derives or corrects data" contract, still honored: a caller
+    that wants a corrected document must produce one honestly, e.g. via a
+    real chronological sort at the point real timestamps are computed —
+    see assemble_narration_track's per-line word sort, added alongside
+    this check). A small tolerance (matching syncConsumption.js's own
+    TOL=0.01 boundary discipline) avoids flagging float-rounding noise
+    between two genuinely back-to-back units.
+
+    Returns (is_valid, error_messages)."""
     errors: list[str] = []
     if not isinstance(doc, dict):
         return False, ["document is not a dict"]
@@ -170,6 +199,9 @@ def validate_sync_document(doc: dict) -> tuple[bool, list[str]]:
     if doc.get("alignmentStatus") not in (*VALID_ALIGNMENT_STATUSES, None):
         errors.append(f"invalid alignmentStatus: {doc.get('alignmentStatus')!r}")
 
+    TOL = 0.01
+    prev_sentence_start = None
+
     paragraphs = doc.get("paragraphs")
     if isinstance(paragraphs, list):
         for p_idx, p in enumerate(paragraphs):
@@ -180,12 +212,31 @@ def validate_sync_document(doc: dict) -> tuple[bool, list[str]]:
                 if not isinstance(s, dict) or "words" not in s:
                     errors.append(f"paragraphs[{p_idx}].sentences[{s_idx}] missing words")
                     continue
+                s_start = s.get("start")
+                if isinstance(s_start, (int, float)):
+                    if prev_sentence_start is not None and s_start < prev_sentence_start - TOL:
+                        errors.append(
+                            f"paragraphs[{p_idx}].sentences[{s_idx}] out of chronological order: "
+                            f"start={s_start} precedes an earlier sentence's start={prev_sentence_start}"
+                        )
+                    prev_sentence_start = s_start
+                prev_word_start = None
                 for w_idx, w in enumerate(s.get("words") or []):
                     if not isinstance(w, dict) or "word" not in w or "start" not in w or "end" not in w:
                         errors.append(
                             f"paragraphs[{p_idx}].sentences[{s_idx}].words[{w_idx}] "
                             "missing word/start/end"
                         )
+                        continue
+                    w_start = w.get("start")
+                    if isinstance(w_start, (int, float)):
+                        if prev_word_start is not None and w_start < prev_word_start - TOL:
+                            errors.append(
+                                f"paragraphs[{p_idx}].sentences[{s_idx}].words[{w_idx}] out of "
+                                f"chronological order: start={w_start} precedes an earlier "
+                                f"word's start={prev_word_start}"
+                            )
+                        prev_word_start = w_start
     elif "paragraphs" in doc:
         errors.append("paragraphs must be a list")
 
