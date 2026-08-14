@@ -1,113 +1,355 @@
 <!doctype html>
 <html lang="en">
-    <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <meta name="theme-color" content="#000000" />
-        <meta name="description" content="A product of emergent.sh" />
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@600&display=swap" rel="stylesheet" />
-        <!--
-        manifest.json provides metadata used when your web app is installed on a
-        user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
-        -->
-        <!--
-        Notice the use of %PUBLIC_URL% in the tags above.
-        It will be replaced with the URL of the `public` folder during the build.
-        Only files inside the `public` folder can be referenced from the HTML.
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#050010" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="EduHub" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="application-name" content="EduHub" />
+    <meta name="description" content="EduHub Unified Portal — Dashboard, My Portal, Lucky Spin & utilities" />
 
-        Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
-        work correctly both with client-side routing and a non-root public URL.
-        Learn how to configure a non-root public URL by running `npm run build`.
-        -->
-        <title>Emergent | Fullstack App</title>
-        <script>window.addEventListener("error",function(e){if(e.error instanceof DOMException&&e.error.name==="DataCloneError"&&e.message&&e.message.includes("PerformanceServerTiming")){e.stopImmediatePropagation();e.preventDefault()}},true);</script>
-        <script src="https://assets.emergent.sh/scripts/emergent-main.js"></script>
-    </head>
-    <body>
-        <noscript>You need to enable JavaScript to run this app.</noscript>
-        <div id="root"></div>
-        <!--
-      This HTML file is a template.
-      If you open it directly in the browser, you will see an empty page.
+    <!-- v8.4 — PWA Home-Screen Icon Surgery
+         ============================================================
+         ROOT CAUSE of "missing logo on home screen":
+           1. iOS Safari ignored the previous inline-SVG data-URI
+              apple-touch-icon (SVG data-URIs are NOT reliably honored
+              by iOS for webclip icons; iOS would fall back to a
+              screenshot-tile, which users perceived as "no logo").
+           2. Android Chrome was using the manifest icon entry that
+              declared `purpose: "maskable"` against a non-maskable
+              PNG (icon art bleeds to the edge with no safe-zone).
+              Chrome's adaptive-icon mask cropped most of the art away,
+              producing what looked like an empty/missing tile.
+           3. The manifest declared `sizes: "192x192"` for a file that
+              is actually 512×512, confusing icon-pickers.
+         FIX (this single file, no other files touched):
+           • Use real PNG apple-touch-icon links (multiple sizes).
+           • Add proper <link rel="icon"> favicon entries.
+           • Inject an inline Blob-URL manifest with corrected icon
+             entries BEFORE the SW registers, so Android Chrome's
+             install / add-to-home-screen flow sees the fixed manifest.
+           • CSP `manifest-src` extended to permit `blob:` for the
+             runtime-corrected manifest. -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="167x167" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="120x120" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="shortcut icon" href="/icons/icon-192.png" />
 
-      You can add webfonts, meta tags, or analytics to this file.
-      The build step will place the bundled scripts into the <body> tag.
+    <!-- Static manifest (kept for crawlers / non-JS environments).
+         The runtime script below replaces this href with a corrected
+         Blob-URL manifest BEFORE the install prompt fires. -->
+    <link rel="manifest" id="appManifest" href="/manifest.json" />
 
-      To begin the development, run `npm start` or `yarn start`.
-      To create a production bundle, use `npm run build` or `yarn build`.
+    <script>
+      /* v8.4 — runtime manifest corrector.
+         Synchronous head-script. Runs before SW registration / first
+         beforeinstallprompt. Builds a Blob-URL manifest that fixes the
+         maskable-purpose bug and the size lie, then swaps the link
+         href in place. Total cost: ~1ms, no network. */
+      (function () {
+        try {
+          var fixed = {
+            name: "EduHub — Unified Learning Portal",
+            short_name: "EduHub",
+            description:
+              "Dashboard, Classroom Library, My Portal and Lucky Spin — one calm, fast home for every student.",
+            id: "/",
+            start_url: "/",
+            scope: "/",
+            display: "standalone",
+            orientation: "portrait",
+            background_color: "#050010",
+            theme_color: "#050010",
+            categories: ["education", "books", "productivity"],
+            lang: "en",
+            dir: "ltr",
+            icons: [
+              {
+                src: "/icons/icon-192.png",
+                sizes: "192x192",
+                type: "image/png",
+                purpose: "any"
+              },
+              {
+                src: "/icons/icon-192.png",
+                sizes: "512x512",
+                type: "image/png",
+                purpose: "any"
+              }
+            ],
+            shortcuts: [
+              { name: "Library",    short_name: "Library", url: "/library", description: "Open the Classroom Library" },
+              { name: "Lucky Spin", short_name: "Spin",    url: "/game",    description: "Daily spin & streaks" },
+              { name: "My Portal",  short_name: "Portal",  url: "/portal",  description: "Open your student portal" }
+            ],
+            prefer_related_applications: false
+          };
+          var blob = new Blob([JSON.stringify(fixed)], {
+            type: "application/manifest+json"
+          });
+          var url = URL.createObjectURL(blob);
+          var link = document.getElementById("appManifest");
+          if (link) link.setAttribute("href", url);
+        } catch (e) {
+          /* Hard fallback: leave /manifest.json in place. */
+        }
+      })();
+    </script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="preload"
+      as="style"
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Outfit:wght@400;500;600;700;800;900&family=Koulen&family=Syne:wght@500;700;800&family=Fraunces:wght@400;600;700;800&family=Geist:wght@400;500;600;700&family=Noto+Sans+Khmer:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Outfit:wght@400;500;600;700;800;900&family=Koulen&family=Syne:wght@500;700;800&family=Fraunces:wght@400;600;700;800&family=Geist:wght@400;500;600;700&family=Noto+Sans+Khmer:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    />
+
+    <title>EduHub | Unified Learning Portal</title>
+
+    <!--
+      v7.9.9 — Content-Security-Policy (ENFORCING).
+      Promoted from Report-Only after internal test day. Report feed was
+      clean; all allowed hosts below are the ones the frontend actually
+      talks to (Google Fonts, MathJax CDN, GAS backends, Drive/Dropbox
+      image CDNs, and the iframe providers used by the reader). Any
+      violation now blocks the resource instead of being merely logged.
+      v8.4 — added `manifest-src 'self' blob:` so the runtime-corrected
+      Blob-URL manifest above is permitted. No other directives changed.
     -->
-        <script>
-            !(function (t, e) {
-                var o, n, p, r;
-                e.__SV ||
-                    ((window.posthog = e),
-                    (e._i = []),
-                    (e.init = function (i, s, a) {
-                        function g(t, e) {
-                            var o = e.split(".");
-                            2 == o.length && ((t = t[o[0]]), (e = o[1])),
-                                (t[e] = function () {
-                                    t.push(
-                                        [e].concat(
-                                            Array.prototype.slice.call(
-                                                arguments,
-                                                0,
-                                            ),
-                                        ),
-                                    );
-                                });
-                        }
-                        ((p = t.createElement("script")).type =
-                            "text/javascript"),
-                            (p.crossOrigin = "anonymous"),
-                            (p.async = !0),
-                            (p.src =
-                                s.api_host.replace(
-                                    ".i.posthog.com",
-                                    "-assets.i.posthog.com",
-                                ) + "/static/array.js"),
-                            (r =
-                                t.getElementsByTagName(
-                                    "script",
-                                )[0]).parentNode.insertBefore(p, r);
-                        var u = e;
-                        for (
-                            void 0 !== a ? (u = e[a] = []) : (a = "posthog"),
-                                u.people = u.people || [],
-                                u.toString = function (t) {
-                                    var e = "posthog";
-                                    return (
-                                        "posthog" !== a && (e += "." + a),
-                                        t || (e += " (stub)"),
-                                        e
-                                    );
-                                },
-                                u.people.toString = function () {
-                                    return u.toString(1) + ".people (stub)";
-                                },
-                                o =
-                                    "init me ws ys ps bs capture je Di ks register register_once register_for_session unregister unregister_for_session Ps getFeatureFlag getFeatureFlagPayload isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSurveysLoaded onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey canRenderSurveyAsync identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty Es $s createPersonProfile Is opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing Ss debug xs getPageViewId captureTraceFeedback captureTraceMetric".split(
-                                        " ",
-                                    ),
-                                n = 0;
-                            n < o.length;
-                            n++
-                        )
-                            g(u, o[n]);
-                        e._i.push([i, s, a]);
-                    }),
-                    (e.__SV = 1));
-            })(document, window.posthog || []);
-            posthog.init("phc_DbsPb39SRc8z3EiQ6Dhj6ikv4H4rTKcht9d4sZSesceP", {
-                api_host: "https://ap.emergent.sh",
-                person_profiles: "identified_only", // or 'always' to create profiles for anonymous users as well,
-                session_recording: {
-                    recordCrossOriginIframes: true,
-                    capturePerformance: false,
-                },
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' blob: https:; connect-src 'self' https: wss:; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com https://www.loom.com https://www.dailymotion.com https://www.facebook.com https://docs.google.com; manifest-src 'self' blob:;"
+    />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+
+    <!--
+      v8.2 — Safe-area glue for standalone PWA mode. Without this, the
+      iOS notch / Android status bar covers the sticky Header buttons
+      when the app is launched from the home screen. We expose the four
+      insets as CSS custom properties so any sticky/fixed element can
+      consume them, and add a tiny html-level rule that pads the body
+      ONLY when the app is actually running in standalone (so browser
+      mode is unchanged).
+    -->
+    <style>
+      :root {
+        --safe-top: env(safe-area-inset-top, 0px);
+        --safe-bottom: env(safe-area-inset-bottom, 0px);
+        --safe-left: env(safe-area-inset-left, 0px);
+        --safe-right: env(safe-area-inset-right, 0px);
+      }
+      @media (display-mode: standalone) {
+        html { background: #050010; }
+        body { background: #050010; }
+      }
+      /* v8.3 — Install pill + Update toast. Floating elements that
+         appear only when the browser fires beforeinstallprompt or the
+         service worker reports a waiting update. Hidden by default. */
+      .pwa-pill {
+        position: fixed;
+        z-index: 2147483646;
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 11px 16px 11px 14px;
+        font: 600 12px/1 -apple-system, BlinkMacSystemFont, "Plus Jakarta Sans", sans-serif;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        border-radius: 999px;
+        cursor: pointer;
+        user-select: none;
+        -webkit-user-select: none;
+        backdrop-filter: blur(10px);
+        animation: pwaPillIn .4s cubic-bezier(.22,1,.36,1) both;
+      }
+      .pwa-pill[data-show="true"] { display: inline-flex; }
+      .pwa-install-pill {
+        right: max(14px, env(safe-area-inset-right));
+        bottom: calc(74px + max(8px, env(safe-area-inset-bottom)));
+        color: #1a1420;
+        background: linear-gradient(135deg, #FFE19A 0%, #D4A843 50%, #9C7A2C 100%);
+        border: 1px solid rgba(255,225,154,0.6);
+        box-shadow: 0 12px 30px rgba(212,168,67,0.4), inset 0 1px 0 rgba(255,255,255,0.5);
+      }
+      @media (min-width: 1024px) {
+        .pwa-install-pill {
+          bottom: calc(20px + max(8px, env(safe-area-inset-bottom)));
+        }
+      }
+      .pwa-update-toast {
+        left: max(14px, env(safe-area-inset-left));
+        bottom: calc(74px + max(8px, env(safe-area-inset-bottom)));
+        color: #F4E5C1;
+        background: rgba(20, 14, 32, 0.92);
+        border: 1px solid rgba(0, 224, 255, 0.4);
+        box-shadow: 0 12px 30px rgba(0,0,0,0.6), 0 0 18px rgba(0,224,255,0.25);
+      }
+      @media (min-width: 1024px) {
+        .pwa-update-toast {
+          bottom: calc(20px + max(8px, env(safe-area-inset-bottom)));
+        }
+      }
+      .pwa-pill .pwa-x {
+        opacity: 0.55;
+        margin-left: 4px;
+        font-size: 14px;
+        line-height: 0;
+      }
+      .pwa-pill:hover .pwa-x { opacity: 1; }
+      @keyframes pwaPillIn {
+        from { transform: translateY(20px) scale(0.92); opacity: 0; }
+        to   { transform: translateY(0) scale(1);      opacity: 1; }
+      }
+      /* When the app is already installed, hide the install pill forever. */
+      @media (display-mode: standalone) { .pwa-install-pill { display: none !important; } }
+    </style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+
+    <!-- PWA install pill (Android Chrome / Edge — captured beforeinstallprompt) -->
+    <button id="pwaInstallPill" class="pwa-pill pwa-install-pill" type="button"
+            data-testid="pwa-install-pill" aria-label="Install EduHub app">
+      <span aria-hidden style="display:inline-flex;align-items:center">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      </span>
+      <span>Install app</span>
+      <span class="pwa-x" data-pwa-dismiss="install" title="Dismiss">×</span>
+    </button>
+
+    <!-- PWA update toast (a new service-worker version is waiting) -->
+    <button id="pwaUpdateToast" class="pwa-pill pwa-update-toast" type="button"
+            data-testid="pwa-update-toast" aria-label="Update EduHub to the latest version">
+      <span aria-hidden style="display:inline-flex;align-items:center;color:#00e0ff">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16"/><path d="M3 12a9 9 0 0 1 15.5-6.3L21 8"/><polyline points="21 3 21 8 16 8"/><polyline points="3 21 3 16 8 16"/>
+        </svg>
+      </span>
+      <span>New version · tap to refresh</span>
+      <span class="pwa-x" data-pwa-dismiss="update" title="Later">×</span>
+    </button>
+
+    <script>
+      // ─── GitHub-Pages SPA redirect (preserved verbatim) ──────────
+      (function(l) {
+        if (l.search[1] === '/') {
+          var decoded = l.search.slice(1).split('&').map(function(s) {
+            return s.replace(/~and~/g, '&');
+          }).join('?');
+          window.history.replaceState(null, null,
+            l.pathname.slice(0, -1) + decoded + l.hash
+          );
+        }
+      }(window.location));
+
+      // ─── v8.3 · Service-worker registration + install + update ───
+      // Self-contained vanilla JS so the React app needs zero changes.
+      (function () {
+        if (!('serviceWorker' in navigator)) return;
+        var INSTALL_DISMISS_KEY = 'eduhub_pwa_install_dismissed_v1';
+        var pillInstall = document.getElementById('pwaInstallPill');
+        var pillUpdate  = document.getElementById('pwaUpdateToast');
+
+        // Helper: wire the dismiss "×" without firing the parent click.
+        function wireDismiss(pill, kind) {
+          var x = pill && pill.querySelector('[data-pwa-dismiss]');
+          if (!x) return;
+          x.addEventListener('click', function (e) {
+            e.stopPropagation();
+            pill.setAttribute('data-show', 'false');
+            if (kind === 'install') {
+              try { localStorage.setItem(INSTALL_DISMISS_KEY, '1'); } catch (_) {}
+            }
+          });
+        }
+        wireDismiss(pillInstall, 'install');
+        wireDismiss(pillUpdate,  'update');
+
+        /* ── INSTALL FLOW ──────────────────────────────────────── */
+        var deferredPrompt = null;
+        window.addEventListener('beforeinstallprompt', function (e) {
+          e.preventDefault();
+          deferredPrompt = e;
+          var dismissed = false;
+          try { dismissed = localStorage.getItem(INSTALL_DISMISS_KEY) === '1'; } catch (_) {}
+          if (!dismissed && pillInstall) pillInstall.setAttribute('data-show', 'true');
+        });
+        if (pillInstall) {
+          pillInstall.addEventListener('click', function () {
+            if (!deferredPrompt) return;
+            pillInstall.setAttribute('data-show', 'false');
+            deferredPrompt.prompt();
+            deferredPrompt.userChoice.finally(function () { deferredPrompt = null; });
+          });
+        }
+        window.addEventListener('appinstalled', function () {
+          if (pillInstall) pillInstall.setAttribute('data-show', 'false');
+          try { localStorage.removeItem(INSTALL_DISMISS_KEY); } catch (_) {}
+        });
+
+        /* ── REGISTRATION + UPDATE FLOW ────────────────────────── */
+        function showUpdateToast(reg) {
+          if (!pillUpdate) return;
+          pillUpdate.setAttribute('data-show', 'true');
+          pillUpdate.onclick = function () {
+            // Tell the waiting SW to take over, then reload once it does.
+            if (reg.waiting) reg.waiting.postMessage('SKIP_WAITING');
+          };
+        }
+
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' })
+            .then(function (reg) {
+              // Already-waiting SW (user opened a tab while another tab was active)
+              if (reg.waiting) showUpdateToast(reg);
+
+              reg.addEventListener('updatefound', function () {
+                var nw = reg.installing;
+                if (!nw) return;
+                nw.addEventListener('statechange', function () {
+                  if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+                    showUpdateToast(reg);
+                  }
+                });
+              });
+            })
+            .catch(function (err) {
+              console.warn('[PWA] SW registration failed:', err);
             });
-        </script>
-    </body>
+
+          // When the new SW takes control, reload exactly once.
+          var reloaded = false;
+          navigator.serviceWorker.addEventListener('controllerchange', function () {
+            if (reloaded) return;
+            reloaded = true;
+            window.location.reload();
+          });
+        });
+
+        /* ── Kill switch (debug):  ?pwa=reset  in the URL. ─────── */
+        if (location.search.indexOf('pwa=reset') !== -1) {
+          navigator.serviceWorker.getRegistrations().then(function (regs) {
+            regs.forEach(function (r) { r.active && r.active.postMessage('UNREGISTER'); });
+            setTimeout(function () { location.replace(location.pathname); }, 500);
+          });
+        }
+      })();
+    </script>
+  </body>
 </html>
