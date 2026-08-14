@@ -135,18 +135,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _coerce_amount(amount: Any, *, label: str = "amount") -> int:
+def _coerce_amount(amount: Any, *, label: str = "amount"):
+    """Whole points stay exact ints (every pre-existing caller). Half-point
+    values (e.g. 13.5 — assessment awards at 0.5/question) are preserved
+    EXACTLY rather than silently truncated: int(13.5) == 13 was a real
+    financial correctness bug for the Assessment Lab award path. Any other
+    fractional granularity is still rejected."""
     if isinstance(amount, bool):  # bool is an int subclass — reject explicitly
         raise WalletError("INVALID_AMOUNT", f"{label} must be a positive int")
     try:
-        n = int(amount)
+        n = round(float(amount), 3)
     except (TypeError, ValueError) as exc:  # noqa: BLE001
         raise WalletError("INVALID_AMOUNT", f"{label} must be an int") from exc
     if n <= 0:
         raise WalletError("INVALID_AMOUNT", f"{label} must be > 0")
     if n > 10_000_000:
         raise WalletError("INVALID_AMOUNT", f"{label} too large")
-    return n
+    if float(n).is_integer():
+        return int(n)
+    if float(n * 2).is_integer():
+        return n
+    raise WalletError("INVALID_AMOUNT", f"{label} must be a whole or half-point value")
 
 
 def _norm_id(value: Any, label: str = "student_id") -> str:

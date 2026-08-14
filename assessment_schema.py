@@ -50,6 +50,11 @@ VALID_SUBMISSION_STATUSES = (
     "failed",       # extraction or scoring could not complete
 )
 VALID_AWARD_STATUSES = ("pending", "credited", "failed")
+# Every extracted answer carries an explicit physical-evidence state — a
+# question Gemini could not read stays explicitly represented (uncertain)
+# instead of silently disappearing, so Q8 being unreadable can never shift
+# Q9's answer into Q8's slot.
+ANSWER_STATES = ("answered", "blank", "uncertain")
 
 MAX_QUESTIONS = 100
 MAX_ANSWER_LEN = 240
@@ -186,6 +191,8 @@ def build_submission_document(submission_id: str, assessment_id: str, *,
         "contentType": content_type,
         "status": status,
         "extractedAnswers": [],
+        "originalExtractedAnswers": [],
+        "extraction": None,
         "score": None,
         "teacherCorrections": [],
         "submittedAt": generated_at,
@@ -212,15 +219,24 @@ def validate_submission_document(doc: dict) -> tuple[bool, list[str]]:
 
 
 def normalize_extracted_submission_answers(raw_items, known_question_ids, *,
-                                            max_items: int = MAX_QUESTIONS) -> list[dict]:
+                                            max_items: int = MAX_QUESTIONS,
+                                            fill_missing: bool = False) -> list[dict]:
     """Bounds a Gemini submission-extraction into `{qid, answer,
-    confidence}` dicts. Any qid Gemini invents that is NOT in the
-    assessment's own known question-id set is dropped, never trusted — the
-    same "whitelist against a known-valid set" discipline video_scene_
-    schema.py's normalize_* functions use for scene/character ids."""
-    known = set(known_question_ids or [])
+    confidence, answerState, source}` dicts. Any qid Gemini invents that is
+    NOT in the assessment's own known question-id set is dropped, never
+    trusted — the same "whitelist against a known-valid set" discipline
+    video_scene_schema.py's normalize_* functions use for scene/character
+    ids. Answers are keyed by stable qid (never by list position), so one
+    unreadable question can never shift subsequent answers.
+
+    With `fill_missing=True` (the submission route's mode), every known qid
+    absent from Gemini's output is explicitly represented as an `uncertain`
+    entry instead of silently vanishing, and the result is returned in the
+    assessment's own question order."""
+    known_list = [str(k) for k in (known_question_ids or [])]
+    known = set(known_list)
     if not isinstance(raw_items, list):
-        return []
+        raw_items = []
     out: list[dict] = []
     seen: set[str] = set()
     for it in raw_items[:max_items]:
@@ -236,7 +252,18 @@ def normalize_extracted_submission_answers(raw_items, known_question_ids, *,
             confidence = max(0.0, min(1.0, confidence))
         except (TypeError, ValueError):
             confidence = None
-        out.append({"qid": qid, "answer": answer, "confidence": confidence})
+        state = str(it.get("answer_state") or it.get("answerState") or "").strip().lower()
+        if state not in ANSWER_STATES:
+            state = "answered" if answer else "blank"
+        out.append({"qid": qid, "answer": answer, "confidence": confidence,
+                    "answerState": state, "source": "gemini"})
+    if fill_missing:
+        for qid in known_list:
+            if qid not in seen:
+                out.append({"qid": qid, "answer": "", "confidence": None,
+                            "answerState": "uncertain", "source": "missing"})
+        order = {qid: i for i, qid in enumerate(known_list)}
+        out.sort(key=lambda a: order.get(a["qid"], len(order)))
     return out
 
 

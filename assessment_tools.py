@@ -414,6 +414,76 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         return {"ok": True, "assessment": existing}
 
     # ── Teacher: submissions review ───────────────────────────────────────
+    @api.post("/admin/assessments/{assessment_id}/extraction-check")
+    async def admin_extraction_check(assessment_id: str, file: UploadFile = File(...),
+                                      admin=Depends(require_admin)):
+        """Staging diagnostic switch: runs ONE real Gemini 2.5 Pro read of an
+        uploaded worksheet and compares it, per qid, against the
+        deterministic mock baseline (the answer key, which is exactly what
+        _mock_submission_answers produces). Pure read-only diagnostic —
+        nothing is persisted, no submission is created, no points move."""
+        _ = admin
+        asmt = await _get_assessment_or_404(assessment_id)
+        if not ai.ai_available():
+            raise HTTPException(
+                503, "Real Gemini extraction is not configured in this environment "
+                     "(GEMINI_API_KEY missing or mock mode enabled) — run this check on staging.")
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(400, "Uploaded file is empty.")
+        if len(raw) > HARD_MAX_MEDIA_BYTES:
+            raise HTTPException(413, f"File exceeds the {HARD_MAX_MEDIA_BYTES}-byte limit.")
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
+        if content_type not in SUBMISSION_CONTENT_TYPES:
+            raise HTTPException(415, f"Unsupported content type: {content_type!r}.")
+
+        extraction = await ai.extract_submission_answers(raw, content_type, asmt["questions"])
+        if not extraction.get("ok"):
+            raise HTTPException(502, f"Real extraction failed: {extraction.get('reason')}")
+
+        known_ids = [q["qid"] for q in asmt["questions"]]
+        real = normalize_extracted_submission_answers(
+            extraction.get("answers") or [], known_ids, fill_missing=True)
+        # Baseline = the assessment's own answer key — exactly what the
+        # deterministic mock derives its answers from.
+        base_by = {q["qid"]: str(q.get("correctAnswer") or "") for q in asmt["questions"]}
+        real_by = {a["qid"]: a for a in real}
+
+        matches = 0
+        mismatches, unreadable = [], []
+        for q in asmt["questions"]:
+            qid = q["qid"]
+            r = real_by[qid]
+            baseline_answer = base_by.get(qid, "")
+            if r["answerState"] != "answered":
+                unreadable.append({"qid": qid, "prompt": q.get("prompt"),
+                                    "answerState": r["answerState"],
+                                    "confidence": r["confidence"],
+                                    "baseline": baseline_answer})
+            elif str(r["answer"]).strip().casefold() == baseline_answer.strip().casefold():
+                matches += 1
+            else:
+                mismatches.append({"qid": qid, "prompt": q.get("prompt"),
+                                    "baseline": baseline_answer, "real": r["answer"],
+                                    "confidence": r["confidence"]})
+
+        preview = score_submission(asmt["questions"], real)
+        return {
+            "ok": True,
+            "engine": extraction.get("engine"),
+            "model": extraction.get("model"),
+            "verification": extraction.get("verification"),
+            "total": len(known_ids),
+            "matches": matches,
+            "mismatches": mismatches,
+            "unreadable": unreadable,
+            "scorePreview": {
+                "correct": preview["correct"], "total": preview["total"],
+                "scorePct": preview["scorePct"], "pointsEarned": preview["pointsEarned"],
+                "needsReview": preview["needsReview"],
+            },
+        }
+
     @api.get("/admin/assessments/{assessment_id}/submissions")
     async def admin_list_submissions(assessment_id: str, status: str | None = None,
                                       admin=Depends(require_admin)):
@@ -453,13 +523,23 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
     @api.post("/admin/assessments/submissions/{submission_id}/correct")
     async def admin_correct_submission(submission_id: str, payload: dict, admin=Depends(require_admin)):
         sub = await _get_submission_or_404(submission_id)
+        if sub.get("status") == "awarded":
+            # The credited amount was the persisted score at award time —
+            # editing answers afterwards would desync score vs. real credit.
+            raise HTTPException(409, "This submission's points were already awarded — its answers are locked.")
         corrections = payload.get("corrections") if isinstance(payload, dict) else None
         if not isinstance(corrections, list):
             raise HTTPException(400, "corrections must be a list of {qid, answer}.")
         asmt = await _get_assessment_or_404(sub["assessmentId"])
         known_ids = {q["qid"] for q in asmt["questions"]}
+        admin_email = getattr(admin, "email", "admin")
+        now = _iso_now()
 
         by_qid = {a["qid"]: dict(a) for a in sub.get("extractedAnswers") or []}
+        # Original Gemini extraction is preserved forever — backfilled here
+        # for submissions that predate the originalExtractedAnswers field.
+        original_answers = sub.get("originalExtractedAnswers") or [dict(a) for a in sub.get("extractedAnswers") or []]
+        correction_records = list(sub.get("teacherCorrections") or [])
         applied = []
         for c in corrections:
             if not isinstance(c, dict):
@@ -467,23 +547,37 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             qid = str(c.get("qid") or "")
             if qid not in known_ids:
                 continue
-            by_qid[qid] = {"qid": qid, "answer": str(c.get("answer") or "").strip()[:240], "confidence": 1.0}
+            previous = by_qid.get(qid) or {}
+            answer = str(c.get("answer") or "").strip()[:240]
+            by_qid[qid] = {"qid": qid, "answer": answer, "confidence": 1.0,
+                           "answerState": "answered" if answer else "blank",
+                           "source": "teacher"}
+            correction_records.append({
+                "qid": qid,
+                "previousAnswer": previous.get("answer"),
+                "previousState": previous.get("answerState"),
+                "answer": answer,
+                "correctedBy": admin_email,
+                "correctedAt": now,
+            })
             applied.append(qid)
 
-        new_answers = list(by_qid.values())
+        order = {q["qid"]: i for i, q in enumerate(asmt["questions"])}
+        new_answers = sorted(by_qid.values(), key=lambda a: order.get(a["qid"], len(order)))
         result = score_submission(asmt["questions"], new_answers)
         await submissions.update_one(
             {"submissionId": submission_id},
             {"$set": {
                 "extractedAnswers": new_answers,
+                "originalExtractedAnswers": original_answers,
                 "score": result,
                 "status": "reviewed",
-                "reviewedAt": _iso_now(),
-                "reviewedBy": getattr(admin, "email", "admin"),
-                "teacherCorrections": (sub.get("teacherCorrections") or []) + applied,
+                "reviewedAt": now,
+                "reviewedBy": admin_email,
+                "teacherCorrections": correction_records,
             }},
         )
-        return {"ok": True, "score": result, "correctedQids": applied}
+        return {"ok": True, "score": result, "correctedQids": applied, "status": "reviewed"}
 
     def _award_summary(award_doc: dict) -> dict:
         """The subset of an award document a teacher/student actually needs
@@ -537,6 +631,12 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             return {"submissionId": submission_id, "ok": True, "duplicate": True,
                      "points": (existing or {}).get("points"),
                      **_award_summary(existing or {})}
+        # needs_review is a "teacher should look" signal, never a dead end —
+        # any submission with a persisted deterministic score is awardable.
+        if sub.get("status") not in ("needs_review", "scored", "reviewed"):
+            return {"submissionId": submission_id, "ok": False, "reason": "not_awardable"}
+        if not isinstance(sub.get("score"), dict):
+            return {"submissionId": submission_id, "ok": False, "reason": "no_persisted_score"}
 
         score = sub.get("score") or {}
         points = float(score.get("pointsEarned") or 0.0)
@@ -628,8 +728,9 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
     async def admin_award_submission(submission_id: str, admin=Depends(require_admin)):
         result = await _award_one(submission_id, getattr(admin, "email", "admin"))
         if not result.get("ok"):
-            raise HTTPException(409 if result.get("reason") == "already_awarded" else 502,
-                                 result.get("reason") or "Award failed.")
+            reason = result.get("reason") or "Award failed."
+            conflict = reason in ("already_awarded", "not_awardable", "no_persisted_score")
+            raise HTTPException(409 if conflict else 502, reason)
         return result
 
     @api.post("/admin/assessments/submissions/{submission_id}/retry-gas-sync")
@@ -754,7 +855,7 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             return {"ok": True, "submission": doc, "extractionError": extraction.get("reason")}
 
         raw_answers = extraction.get("answers") or []
-        answers = normalize_extracted_submission_answers(raw_answers, known_ids)
+        answers = normalize_extracted_submission_answers(raw_answers, known_ids, fill_missing=True)
         result = score_submission(asmt["questions"], answers)
         status = "needs_review" if result["needsReview"] else "scored"
         # Audit metadata only (per this feature's own data-classification
@@ -767,16 +868,26 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         # below). Never a second source of truth for the score itself.
         extraction_meta = {
             "engine": extraction.get("engine"),
+            "model": extraction.get("model"),
+            "extractedAt": _iso_now(),
             "rawAnswerCount": len(raw_answers),
             "normalizedAnswerCount": len(answers),
+            "verification": extraction.get("verification"),
         }
+        # `originalExtractedAnswers` is the frozen, auditable Gemini result —
+        # teacher corrections later rewrite `extractedAnswers`, never this.
+        original_answers = [dict(a) for a in answers]
         await submissions.update_one(
             {"submissionId": submission_id},
-            {"$set": {"extractedAnswers": answers, "score": result, "status": status,
+            {"$set": {"extractedAnswers": answers,
+                      "originalExtractedAnswers": original_answers,
+                      "score": result, "status": status,
                       "extraction": extraction_meta}},
         )
         doc.pop("_id", None)
-        doc.update({"extractedAnswers": answers, "score": result, "status": status,
+        doc.update({"extractedAnswers": answers,
+                    "originalExtractedAnswers": original_answers,
+                    "score": result, "status": status,
                     "extraction": extraction_meta})
         return {"ok": True, "submission": doc, "engine": extraction.get("engine")}
 

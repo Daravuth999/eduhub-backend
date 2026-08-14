@@ -778,7 +778,11 @@ def test_real_15_of_30_submission_flows_through_the_full_lifecycle(monkeypatch):
     # New diagnostic: Gemini genuinely returned 30 answers and all 30
     # survived the qid whitelist — distinguishes "extracted but half
     # wrong" from "extracted nothing" for exactly this failure class.
-    assert sub["extraction"] == {"engine": "gemini", "rawAnswerCount": 30, "normalizedAnswerCount": 30}
+    # (Meta now also persists model/extractedAt/verification — audit trail.)
+    assert sub["extraction"]["engine"] == "gemini"
+    assert sub["extraction"]["rawAnswerCount"] == 30
+    assert sub["extraction"]["normalizedAnswerCount"] == 30
+    assert "extractedAt" in sub["extraction"]
 
     # Visible to Author Studio via the SAME query path production uses.
     listed = _call(router, "GET", "/admin/assessments/{assessment_id}/submissions",
