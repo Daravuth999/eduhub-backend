@@ -1,0 +1,48 @@
+[importlinter]
+root_packages =
+    eduhub_platform
+include_external_packages = True
+
+# Architecture Reconstruction Phase 1, item "Collection Ownership" /
+# "eduhub_platform" boundary enforcement (Phase 1e).
+#
+# eduhub_platform/ is documented (see eduhub_platform/__init__.py) as home
+# for cross-cutting infrastructure with NO business rules of its own —
+# dependencies must flow one way, domain -> platform, never the reverse.
+# This contract makes that guarantee mechanically checkable instead of
+# just a comment someone can accidentally violate. As more platform
+# primitives land here in later phases (ledger, config, events, realtime,
+# notify per the accepted migration blueprint), add their forbidden
+# domain-module imports to the same contract below.
+#
+# Deliberately scoped to eduhub_platform only for Phase 1 — a full
+# layered-architecture contract across the entire ~101-collection,
+# multi-module server.py would require the collection-ownership /ownership
+# consolidation this same phase's audit found still outstanding (see
+# check_collection_ownership.py) before it could pass without a large
+# number of pre-existing violations. Broadening this contract is future
+# work once that consolidation lands.
+[importlinter:contract:1]
+name = eduhub_platform must not import business-domain modules
+type = forbidden
+source_modules =
+    eduhub_platform
+forbidden_modules =
+    server
+    wallet_service
+    payment_bridge
+    tuition_tools
+    camrapidpay_payment_tools
+    payment_methods_config_tools
+    referral_tools
+    login_reward_tools
+    voucher_reward_tools
+    mystery_box_tools
+    login_mystery_box_tools
+    shadow_writer
+    speaking_lab_direct_join
+    speaking_lab_wallet_migration
+    lucky_draw
+    edutalk_tools
+    notification_center
+    experience_config_tools

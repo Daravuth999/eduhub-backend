@@ -1,0 +1,30 @@
+fastapi>=0.110
+uvicorn>=0.25
+python-dotenv>=1.0
+motor>=3.3
+pymongo[srv]>=4.5
+certifi>=2024.0.0
+pydantic>=2.6
+httpx>=0.27
+python-multipart>=0.0.9
+python-docx>=1.1
+markdown>=3.6
+pywebpush>=2.0
+py-vapid>=1.9
+cryptography>=42.0
+
+passlib[bcrypt]>=1.7
+boto3>=1.34         # Cloudflare R2 S3-compatible upload
+websockets>=12.0   # EduTalk Live Coach: backend↔Gemini Live WS bridge + uvicorn WS serving
+segno>=1.6.0       # v1.6.1: render CamRapidPay EMV TLV payload → PNG data URI server-side
+redis>=5.0         # eduhub_platform.events RedisTransport (Architecture Reconstruction
+                   # Phase 4, "event platform") — lazily imported, only touched when an
+                   # operator sets EVENT_BUS_TRANSPORT=redis + REDIS_URL; every other
+                   # deployment never imports it at runtime.
+reportlab>=4.2,<5  # tuition_receipt_pdf.py — pure-Python PDF invoice generation, no system libs
+pymupdf>=1.24,<2   # tuition_receipt_pdf.py — PDF->PNG rasterization (self-contained wheel, no poppler/Cairo)
+imageio-ffmpeg>=0.5,<1  # video_render_tools.py — self-contained ffmpeg binary fallback for final-
+                        # master rendering when no system ffmpeg is on PATH (e.g. Render's default
+                        # Python buildpack); same "pure-Python wheel, no system libs" pattern as
+                        # reportlab/pymupdf above. Live-verified locally to resolve and execute a
+                        # real ffmpeg 7.1 binary via pip install alone.
