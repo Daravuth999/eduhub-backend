@@ -140,7 +140,13 @@ verification passes) and the exact model used is persisted per submission in
   fractions are still rejected — widen `_coerce_amount` if future assessments need it.
 - Author Studio remains a dark-theme surface (as designed); the Day-Mode fix targets the
   student PWA Assessment surfaces which are theme-switchable.
-- Commit hashes: not applicable — no git access was provided; this ZIP **is** the patch.
+- Local git commits (against a baseline repo built from your uploaded ZIPs — your real
+  remotes are NOT accessible from this environment, so nothing was pushed):
+  - frontend `83ed62de9c8207e7b5e6cc276049282bb7b71d37`
+  - backend  `d3294221587ca5a52caf6f68eee983910bf207cb`
+  Apply them to your real repos with `git am patches/frontend-assessment-lab-repair.patch`
+  and `git am patches/backend-assessment-lab-repair.patch` (both included in this ZIP),
+  or copy the files directly.
 
 ## 8. DEPLOYMENT NOTES
 
