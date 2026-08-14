@@ -31,9 +31,17 @@ dist/
 dist
 
 # Environment files (comprehensive coverage)
+.env
+.env.*
+**/.env
+**/.env.*
 
 *token.json*
 *credentials.json*
+
+# EduHub repair workspace artifacts (never save mirrors/logs)
+eduhub/pristine/
+eduhub/*.log
 
 # Logs and debug files
 npm-debug.log*
