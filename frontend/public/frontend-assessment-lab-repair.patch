@@ -1,0 +1,982 @@
+From 83ed62de9c8207e7b5e6cc276049282bb7b71d37 Mon Sep 17 00:00:00 2001
+From: E1 <agent@e1>
+Date: Fri, 14 Aug 2026 08:41:58 +0000
+Subject: [PATCH] Assessment Lab surgical repair: Gemini 2.5 Pro physical
+ extraction (answer states + verification pass), teacher correction UI w/
+ frozen original extraction + history timeline, needs_review awardable, exact
+ fractional awards, confidence heatmap, staging extraction-check panel, staged
+ submission UX, Day Mode token remap
+
+---
+ .../pages/assessments/AssessmentsListPage.jsx |   6 +-
+ .../assessments/SubmitAssessmentModal.jsx     |  84 ++++-
+ .../__tests__/SubmitAssessmentModal.test.jsx  |  30 +-
+ src/eduhub/pages/assessments/assessments.css  |  76 +++-
+ src/studio/AssessmentReviewStudio.jsx         | 348 +++++++++++++++++-
+ .../__tests__/AssessmentReviewStudio.test.jsx | 146 +++++++-
+ src/studio/api.js                             |   7 +
+ 7 files changed, 650 insertions(+), 47 deletions(-)
+
+diff --git a/src/eduhub/pages/assessments/AssessmentsListPage.jsx b/src/eduhub/pages/assessments/AssessmentsListPage.jsx
+index 0f681e2..4c38225 100644
+--- a/src/eduhub/pages/assessments/AssessmentsListPage.jsx
++++ b/src/eduhub/pages/assessments/AssessmentsListPage.jsx
+@@ -11,14 +11,14 @@ import { listAssessments } from "./assessmentApi";
+ import SubmitAssessmentModal from "./SubmitAssessmentModal";
+ import "./assessments.css";
+ 
+-const GOLD = "#D4A843";
++const GOLD = "var(--eh-gold, #D4A843)";
+ 
+ const STATUS_META = {
+   processing: { label: "Processing", color: "#9fb0c3", Icon: Loader2, spin: true },
+   needs_review: { label: "Awaiting review", color: "#f0a850", Icon: AlertTriangle },
+   scored: { label: "Scored", color: GOLD, Icon: Check },
+   reviewed: { label: "Reviewed", color: GOLD, Icon: Check },
+-  awarded: { label: "Points awarded", color: "#7dd08a", Icon: Check },
++  awarded: { label: "🎉 Points awarded", color: "#7dd08a", Icon: Check },
+   failed: { label: "Couldn't process — try again", color: "#e08a8a", Icon: AlertTriangle },
+ };
+ 
+@@ -125,7 +125,7 @@ export default function AssessmentsListPage() {
+   const visible = buckets[tab] || [];
+ 
+   return (
+-    <div className="px-4 sm:px-6 pt-5 pb-24 max-w-2xl mx-auto" data-testid="assessments-list-page">
++    <div className="asmt-theme px-4 sm:px-6 pt-5 pb-24 max-w-2xl mx-auto" data-testid="assessments-list-page">
+       <div className="flex items-center gap-2 mb-1">
+         <ClipboardCheck size={18} style={{ color: GOLD }} />
+         <span className="text-[11px] font-bold uppercase tracking-[0.14em]" style={{ color: GOLD }}>
+diff --git a/src/eduhub/pages/assessments/SubmitAssessmentModal.jsx b/src/eduhub/pages/assessments/SubmitAssessmentModal.jsx
+index 25024a9..437a0f3 100644
+--- a/src/eduhub/pages/assessments/SubmitAssessmentModal.jsx
++++ b/src/eduhub/pages/assessments/SubmitAssessmentModal.jsx
+@@ -33,11 +33,72 @@
+  * process would mean accepting it here and failing it later — dishonest.
+  */
+ import { useEffect, useRef, useState } from "react";
+-import { X, Loader2, Check, AlertTriangle, Camera, Image as ImageIcon, FileText, FileUp } from "lucide-react";
++import {
++  X, Loader2, Check, AlertTriangle, Camera, Image as ImageIcon, FileText, FileUp,
++  ScanLine, ListChecks, Calculator,
++} from "lucide-react";
+ import { submitAssessment } from "./assessmentApi";
+ import "./assessments.css";
+ 
+-const GOLD = "#D4A843";
++const GOLD = "var(--eh-gold, #D4A843)";
++
++// The honest, real pipeline stages (the backend does upload -> Gemini
++// reading -> deterministic checking -> scoring in one request): the UI
++// advances through them on gentle timers while the request is in flight
++// and only ever claims SUBMITTED once the server actually responds.
++const PROGRESS_STAGES = [
++  { key: "uploading", label: "Uploading your worksheet", Icon: FileUp },
++  { key: "reading", label: "Reading your answers", Icon: ScanLine },
++  { key: "checking", label: "Checking against the answer key", Icon: ListChecks },
++  { key: "calculating", label: "Calculating your score", Icon: Calculator },
++];
++const STAGE_ADVANCE_MS = [1400, 3200, 3000];
++
++function SubmissionProgress() {
++  const [stage, setStage] = useState(0);
++  useEffect(() => {
++    if (stage >= PROGRESS_STAGES.length - 1) return undefined;
++    const t = setTimeout(() => setStage((s) => s + 1), STAGE_ADVANCE_MS[stage] || 2500);
++    return () => clearTimeout(t);
++  }, [stage]);
++  const pct = ((stage + 1) / (PROGRESS_STAGES.length + 1)) * 100;
++  return (
++    <div className="py-4 space-y-4" data-testid="assessment-submit-uploading" aria-live="polite">
++      <div className="asmt-progress-track">
++        <div className="asmt-progress-fill" style={{ width: `${pct}%` }} />
++      </div>
++      <div className="space-y-2.5">
++        {PROGRESS_STAGES.map((s, i) => {
++          const { Icon } = s;
++          const done = i < stage;
++          const active = i === stage;
++          return (
++            <div key={s.key}
++                 data-testid={`assessment-submit-stage-${s.key}`}
++                 className={`asmt-stage-row flex items-center gap-3 ${active ? "" : done ? "opacity-70" : "opacity-35"}`}>
++              <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${done ? "asmt-stage-done" : active ? "asmt-stage-icon-active" : ""}`}
++                   style={{
++                     background: done ? "rgba(125,208,138,0.16)" : "rgba(212,168,67,0.14)",
++                     border: `1px solid ${done ? "rgba(125,208,138,0.45)" : "rgba(212,168,67,0.35)"}`,
++                   }}>
++                {done
++                  ? <Check size={14} className="text-emerald-400" strokeWidth={3} />
++                  : <Icon size={14} style={{ color: GOLD }} className={active ? "animate-pulse" : undefined} />}
++              </div>
++              <div className={`text-[12.5px] ${active ? "font-bold text-white" : "font-semibold text-white/55"}`}>
++                {s.label}{active ? "…" : ""}
++              </div>
++              {active && <Loader2 size={13} className="animate-spin ml-auto" style={{ color: GOLD }} />}
++            </div>
++          );
++        })}
++      </div>
++      <div className="text-center text-[11px] text-white/40">
++        Gemini is reading your physical worksheet — this can take a little while.
++      </div>
++    </div>
++  );
++}
+ 
+ // Mirrors assessment_tools.py's SUBMISSION_CONTENT_TYPES exactly — the
+ // real, verified set the backend will accept and Gemini can process for a
+@@ -180,7 +241,7 @@ export default function SubmitAssessmentModal({ open, assessment, onClose, onSub
+   const closable = phase !== "uploading";
+ 
+   return (
+-    <div className="asmt-modal-overlay fixed inset-0 z-50 flex items-end sm:items-center justify-center px-0 sm:px-6"
++    <div className="asmt-theme asmt-modal-overlay fixed inset-0 z-50 flex items-end sm:items-center justify-center px-0 sm:px-6"
+          style={{ background: "rgba(0,0,0,0.72)", backdropFilter: "blur(4px)", WebkitBackdropFilter: "blur(4px)" }}
+          data-testid="assessment-submit-modal"
+          onClick={() => { if (closable) onClose?.(); }}>
+@@ -282,11 +343,7 @@ export default function SubmitAssessmentModal({ open, assessment, onClose, onSub
+           {phase === "uploading" && (
+             <>
+               <IdentityStrip assessment={assessment} />
+-              <div className="flex flex-col items-center justify-center py-10 gap-3 text-center" data-testid="assessment-submit-uploading">
+-                <Loader2 className="animate-spin" size={26} style={{ color: GOLD }} />
+-                <div className="text-[13.5px] font-semibold text-white">Reading your worksheet…</div>
+-                <div className="text-[11.5px] text-white/40">This can take a few seconds.</div>
+-              </div>
++              <SubmissionProgress />
+             </>
+           )}
+ 
+@@ -304,7 +361,7 @@ export default function SubmitAssessmentModal({ open, assessment, onClose, onSub
+               </div>
+               <div className="space-y-1">
+                 <h2 className="text-[17px] font-bold text-white">
+-                  {submission.status === "needs_review" ? "Submitted — awaiting teacher review" : "Worksheet Scored"}
++                  {submission.status === "needs_review" ? "Worksheet submitted" : "Worksheet Scored"}
+                 </h2>
+                 {submission.score && (
+                   <>
+@@ -312,12 +369,17 @@ export default function SubmitAssessmentModal({ open, assessment, onClose, onSub
+                       {submission.score.correct} / {submission.score.total} correct · {submission.score.scorePct}%
+                     </div>
+                     <div className="text-[12px] text-white/55" data-testid="assessment-submit-points-preview">
+-                      Score: {submission.score.pointsEarned}/{assessment.totalPoints ?? submission.score.total} pts
++                      {submission.score.pointsEarned} / {assessment.totalPoints ?? submission.score.total} pts calculated
+                     </div>
+                   </>
+                 )}
++                <div className="inline-flex items-center gap-1.5 mt-1 px-2.5 py-1 rounded-full border border-amber-400/35 bg-amber-400/10"
++                     data-testid="assessment-submit-teacher-review-pill">
++                  <AlertTriangle size={11} className="text-amber-300" />
++                  <span className="text-[10.5px] font-bold uppercase tracking-wide text-amber-300">Teacher review</span>
++                </div>
+                 <p className="text-[12px] text-white/50" data-testid="assessment-submit-points-awarded-note">
+-                  Points awarded: 0 — your teacher reviews and awards points after checking your worksheet.
++                  Your points are waiting for your teacher's approval — nothing has been credited yet.
+                 </p>
+               </div>
+               <button onClick={onClose} data-testid="assessment-submit-done-button"
+diff --git a/src/eduhub/pages/assessments/__tests__/SubmitAssessmentModal.test.jsx b/src/eduhub/pages/assessments/__tests__/SubmitAssessmentModal.test.jsx
+index b66f2c3..7d2e892 100644
+--- a/src/eduhub/pages/assessments/__tests__/SubmitAssessmentModal.test.jsx
++++ b/src/eduhub/pages/assessments/__tests__/SubmitAssessmentModal.test.jsx
+@@ -13,7 +13,7 @@
+  */
+ jest.mock("../assessmentApi", () => ({ submitAssessment: jest.fn() }));
+ 
+-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
++import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+ import SubmitAssessmentModal from "../SubmitAssessmentModal";
+ import { submitAssessment } from "../assessmentApi";
+ 
+@@ -141,8 +141,8 @@ test("successful submission renders the backend's own score — never a fabricat
+   // Score (what was answered correctly) and points awarded (whether the
+   // teacher has credited the wallet) are two different facts — this is a
+   // freshly-scored, not-yet-awarded submission, so points awarded is 0.
+-  expect(screen.getByTestId("assessment-submit-points-preview")).toHaveTextContent("Score: 14.5/15 pts");
+-  expect(screen.getByTestId("assessment-submit-points-awarded-note")).toHaveTextContent("Points awarded: 0");
++  expect(screen.getByTestId("assessment-submit-points-preview")).toHaveTextContent("14.5 / 15 pts calculated");
++  expect(screen.getByTestId("assessment-submit-points-awarded-note")).toHaveTextContent(/waiting for your teacher's approval/i);
+   expect(onSubmitted).toHaveBeenCalledWith(expect.objectContaining({ submissionId: "asub_1" }));
+ });
+ 
+@@ -155,7 +155,8 @@ test("a needs_review result is shown honestly, not as a final score", async () =
+   fireEvent.change(screen.getByTestId("assessment-submit-upload-file-input"), { target: { files: [pdfFile()] } });
+   fireEvent.click(screen.getByTestId("assessment-submit-confirm-button"));
+   await screen.findByTestId("assessment-submit-result");
+-  expect(screen.getByText(/awaiting teacher review/i)).toBeInTheDocument();
++  expect(screen.getByText(/worksheet submitted/i)).toBeInTheDocument();
++  expect(screen.getByTestId("assessment-submit-teacher-review-pill")).toHaveTextContent(/teacher review/i);
+ });
+ 
+ test("a failed submit shows an error state with a working retry", async () => {
+@@ -180,3 +181,24 @@ test("Escape closes the modal unless mid-upload", () => {
+   fireEvent.keyDown(window, { key: "Escape" });
+   expect(onClose).toHaveBeenCalledTimes(1);
+ });
++
++test("while the worksheet is in flight, the staged progress journey is shown (upload → read → check → calculate)", async () => {
++  let resolveSubmit;
++  submitAssessment.mockImplementation(() => new Promise((res) => { resolveSubmit = res; }));
++  renderModal();
++  fireEvent.change(screen.getByTestId("assessment-submit-upload-file-input"), { target: { files: [pngFile()] } });
++  fireEvent.click(screen.getByTestId("assessment-submit-confirm-button"));
++
++  const progress = await screen.findByTestId("assessment-submit-uploading");
++  expect(progress).toBeInTheDocument();
++  expect(screen.getByTestId("assessment-submit-stage-uploading")).toBeInTheDocument();
++  expect(screen.getByTestId("assessment-submit-stage-reading")).toBeInTheDocument();
++  expect(screen.getByTestId("assessment-submit-stage-checking")).toBeInTheDocument();
++  expect(screen.getByTestId("assessment-submit-stage-calculating")).toBeInTheDocument();
++
++  // Only the SERVER response ever ends the journey — resolve it now.
++  await act(async () => {
++    resolveSubmit({ ok: true, submission: { status: "scored", score: { correct: 30, total: 30, scorePct: 100, pointsEarned: 15 } } });
++  });
++  expect(await screen.findByTestId("assessment-submit-result")).toBeInTheDocument();
++});
+diff --git a/src/eduhub/pages/assessments/assessments.css b/src/eduhub/pages/assessments/assessments.css
+index 6a65a9e..bd0f4d6 100644
+--- a/src/eduhub/pages/assessments/assessments.css
++++ b/src/eduhub/pages/assessments/assessments.css
+@@ -1,10 +1,38 @@
+ /**
+  * assessments.css — AI Assessment / Quiz Submission Lab, student surface.
+  * Own, independent stylesheet (same one-file-per-feature convention as
+- * videoLibrary.css) — the phase-cross-fade keyframe is deliberately
+- * duplicated rather than imported, matching this codebase's established
+- * per-feature CSS isolation.
++ * videoLibrary.css).
++ *
++ * DAY MODE (v2): every Assessment Lab student surface is wrapped in
++ * `.asmt-theme`. The blanket `text-white` / `border-white/*` / `bg-white/*`
++ * utilities this feature originally shipped with are remapped here onto the
++ * app's REAL theme tokens (premium-tokens.css's --eh-ink-* / --eh-border-* /
++ * --eh-surface-* ramps), so Day Mode readability comes from the underlying
++ * theme system — not hardcoded white/black overrides. Dark mode is
++ * unchanged: these variables resolve to the same white-alpha values there.
+  */
++
++/* ── theme-token remap (Day Mode fix) ─────────────────────────────────── */
++html[data-theme="light"] .asmt-theme .text-white { color: var(--eh-ink-1); }
++html[data-theme="light"] .asmt-theme [class*="text-white/"] { color: var(--eh-ink-2); }
++html[data-theme="light"] .asmt-theme [class*="text-white/4"],
++html[data-theme="light"] .asmt-theme [class*="text-white/3"] { color: var(--eh-ink-3); }
++html[data-theme="light"] .asmt-theme [class*="border-white/"] { border-color: var(--eh-border-2); }
++html[data-theme="light"] .asmt-theme [class*="bg-white/"] { background-color: rgba(13, 10, 20, 0.04); }
++html[data-theme="light"] .asmt-theme .bg-black\/30,
++html[data-theme="light"] .asmt-theme .bg-black\/20 { background-color: var(--eh-surface-2); }
++
++html[data-theme="light"] .asmt-modal-overlay {
++  background: rgba(13, 10, 20, 0.35) !important;
++}
++html[data-theme="light"] .asmt-modal-card {
++  background: var(--eh-surface-1);
++  border-color: var(--eh-border-2);
++  color: var(--eh-ink-1);
++  box-shadow: var(--eh-shadow-3);
++}
++
++/* ── phase cross-fade ─────────────────────────────────────────────────── */
+ @keyframes asmt-phase-in {
+   from { opacity: 0; transform: translateY(10px); }
+   to   { opacity: 1; transform: translateY(0); }
+@@ -12,8 +40,48 @@
+ 
+ .asmt-phase-in { animation: asmt-phase-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+ 
++/* ── immersive submission progress (READY → … → SUBMITTED journey) ────── */
++@keyframes asmt-shimmer {
++  0%   { background-position: -200% 0; }
++  100% { background-position: 200% 0; }
++}
++@keyframes asmt-stage-pop {
++  0%   { transform: scale(0.6); opacity: 0; }
++  60%  { transform: scale(1.12); }
++  100% { transform: scale(1); opacity: 1; }
++}
++@keyframes asmt-pulse-ring {
++  0%   { box-shadow: 0 0 0 0 rgba(212, 168, 67, 0.45); }
++  100% { box-shadow: 0 0 0 10px rgba(212, 168, 67, 0); }
++}
++
++.asmt-progress-track {
++  height: 4px;
++  border-radius: 999px;
++  background: rgba(212, 168, 67, 0.16);
++  overflow: hidden;
++}
++.asmt-progress-fill {
++  height: 100%;
++  border-radius: 999px;
++  background: linear-gradient(90deg, rgba(212, 168, 67, 0.55), #d4a843, rgba(212, 168, 67, 0.55));
++  background-size: 200% 100%;
++  animation: asmt-shimmer 1.6s linear infinite;
++  transition: width 600ms cubic-bezier(0.22, 1, 0.36, 1);
++}
++.asmt-stage-icon-active {
++  animation: asmt-stage-pop 380ms cubic-bezier(0.22, 1, 0.36, 1) both,
++             asmt-pulse-ring 1.4s ease-out infinite;
++}
++.asmt-stage-done { animation: asmt-stage-pop 300ms cubic-bezier(0.22, 1, 0.36, 1) both; }
++.asmt-stage-row { transition: opacity 400ms ease, transform 400ms ease; }
++
+ @media (prefers-reduced-motion: reduce) {
+   .asmt-modal-overlay,
+   .asmt-modal-card,
+-  .asmt-phase-in { animation: none !important; }
++  .asmt-phase-in,
++  .asmt-progress-fill,
++  .asmt-stage-icon-active,
++  .asmt-stage-done,
++  .asmt-stage-row { animation: none !important; transition: none !important; }
+ }
+diff --git a/src/studio/AssessmentReviewStudio.jsx b/src/studio/AssessmentReviewStudio.jsx
+index 02189b1..bbc4e93 100644
+--- a/src/studio/AssessmentReviewStudio.jsx
++++ b/src/studio/AssessmentReviewStudio.jsx
+@@ -14,17 +14,23 @@
+  * on the backend already loops the identical _award_one function server-
+  * side — no separate bulk logic invented on either side).
+  */
+-import { useCallback, useEffect, useState } from "react";
++import { useCallback, useEffect, useRef, useState } from "react";
+ import {
+   ClipboardList, Loader2, Check, AlertTriangle, Coins, RefreshCcw,
+   Upload, Plus, ChevronDown, ChevronUp, X as XIcon, Wallet, Bell, RotateCcw,
++  Pencil, ExternalLink, Trash2, HelpCircle, History, FlaskConical,
+ } from "lucide-react";
+ import {
+   extractAssessmentAnswerKey, createAssessment, listAssessments as apiListAssessments,
+   listAssessmentSubmissions, awardAssessmentSubmission, bulkAwardAssessmentSubmissions,
+-  retryAssessmentGasSync,
++  retryAssessmentGasSync, correctAssessmentSubmission, deleteAssessmentSubmission,
++  runAssessmentExtractionCheck,
+ } from "./api";
+ 
++// needs_review means "a teacher should look" — it is still awardable with
++// its exact persisted calculated score, never a dead end.
++const AWARDABLE_STATUSES = ["needs_review", "scored", "reviewed"];
++
+ const STATUS_STYLE = {
+   processing: "text-slate-300 border-slate-400/40 bg-slate-400/10",
+   needs_review: "text-amber-300 border-amber-400/40 bg-amber-400/10",
+@@ -52,15 +58,294 @@ function StatusBadge({ status }) {
+  * text Gemini extracted per question, so a mismatched vocabulary (e.g.
+  * the prompt word instead of a LONG/SHORT classification) is visible at
+  * a glance instead of an unexplained 0. */
+-function SubmissionDetail({ submission }) {
++// Confidence heatmap: low-confidence readings must jump out BEFORE awarding.
++function confMeta(conf) {
++  if (typeof conf !== "number") return null;
++  if (conf >= 0.85) return { band: "high", cls: "text-emerald-300 bg-emerald-400/10 border-emerald-400/30" };
++  if (conf >= 0.7) return { band: "good", cls: "text-lime-300 bg-lime-400/10 border-lime-400/30" };
++  if (conf >= 0.5) return { band: "low", cls: "text-amber-300 bg-amber-400/10 border-amber-400/35" };
++  return { band: "critical", cls: "text-red-300 bg-red-400/10 border-red-400/40" };
++}
++
++const STATE_BADGE = {
++  blank: { label: "blank", cls: "text-slate-300 border-slate-400/40 bg-slate-400/10" },
++  uncertain: { label: "uncertain", cls: "text-amber-300 border-amber-400/40 bg-amber-400/10" },
++};
++
++function AnswerStateBadge({ state }) {
++  const meta = STATE_BADGE[state];
++  if (!meta) return null;
++  return (
++    <span className={`ml-1 text-[9px] font-bold uppercase px-1.5 py-px rounded-full border ${meta.cls}`}
++          data-testid="assessment-answer-state-badge">
++      {meta.label}
++    </span>
++  );
++}
++
++/** One correctable row: shows the prompt, what Gemini read (with its
++ * physical answer state + confidence) and the answer key, plus an inline
++ * teacher-correction editor. Applying a correction calls the backend's
++ * /correct endpoint, which recalculates the deterministic score and
++ * preserves the original Gemini extraction untouched. */
++function DetailRow({ d, submissionId, locked, onCorrected }) {
++  const [editing, setEditing] = useState(false);
++  const [value, setValue] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [err, setErr] = useState(null);
++
++  const apply = async () => {
++    setBusy(true);
++    setErr(null);
++    try {
++      await correctAssessmentSubmission(submissionId, [{ qid: d.qid, answer: value.trim() }]);
++      setEditing(false);
++      onCorrected?.();
++    } catch (e) {
++      setErr(e.message || "Correction failed.");
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const confPct = typeof d.confidence === "number" ? `${Math.round(d.confidence * 100)}%` : null;
++  const conf = confMeta(d.confidence);
++  return (
++    <>
++      <tr className="border-t border-white/5" data-testid="assessment-submission-detail-row">
++        <td className="pr-2 py-1 text-white/70 truncate max-w-[120px]">{d.prompt}</td>
++        <td className="pr-2 py-1 text-white/80">
++          {d.givenAnswer ?? <span className="text-white/30">—</span>}
++          <AnswerStateBadge state={d.answerState} />
++          {d.source === "teacher" && (
++            <span className="ml-1 text-[9px] font-bold uppercase px-1.5 py-px rounded-full border text-sky-300 border-sky-400/40 bg-sky-400/10">
++              teacher
++            </span>
++          )}
++        </td>
++        <td className="pr-2 py-1 text-white/50">{d.correctAnswer}</td>
++        <td className="pr-2 py-1 whitespace-nowrap">
++          {confPct ? (
++            <span className={`text-[10px] font-bold px-1.5 py-px rounded-full border ${conf.cls}`}
++                  data-testid="assessment-confidence-pill" data-confidence-band={conf.band}>
++              {confPct}
++            </span>
++          ) : (
++            <span className="text-white/25 text-[10px]">—</span>
++          )}
++        </td>
++        <td className="pr-2 py-1">
++          {d.correct
++            ? <Check size={12} className="text-emerald-400" />
++            : d.answerState === "uncertain"
++              ? <HelpCircle size={12} className="text-amber-400" />
++              : <XIcon size={12} className="text-red-400" />}
++        </td>
++        <td className="py-1">
++          {!locked && (
++            <button onClick={() => { setEditing((v) => !v); setValue(d.givenAnswer || ""); setErr(null); }}
++                    aria-label={`Correct ${d.prompt}`}
++                    data-testid="assessment-correct-toggle-button"
++                    className="p-1 text-white/35 hover:text-amber-300">
++              <Pencil size={11} />
++            </button>
++          )}
++        </td>
++      </tr>
++      {editing && (
++        <tr className="border-t border-white/5 bg-amber-400/[0.04]" data-testid="assessment-correction-editor-row">
++          <td colSpan={6} className="py-1.5 pr-2">
++            <div className="flex items-center gap-2 pl-1">
++              <span className="text-[10.5px] text-white/45">Teacher final answer:</span>
++              <input value={value} onChange={(e) => setValue(e.target.value)}
++                     data-testid="assessment-correction-input"
++                     placeholder={d.correctAnswer}
++                     className="flex-1 max-w-[160px] rounded bg-black/30 border border-amber-400/30 px-2 py-1 text-[11.5px] text-white" />
++              <button onClick={apply} disabled={busy}
++                      data-testid="assessment-apply-correction-button"
++                      className="inline-flex items-center gap-1 text-[10.5px] font-bold text-black bg-amber-400 rounded px-2 py-1 disabled:opacity-50">
++                {busy ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} />} Apply Correction
++              </button>
++              {err && <span className="text-[10.5px] text-red-300">{err}</span>}
++            </div>
++          </td>
++        </tr>
++      )}
++    </>
++  );
++}
++
++function CorrectionHistory({ corrections }) {
++  return (
++    <div className="rounded-lg border border-sky-400/20 bg-sky-400/[0.04] p-2.5 space-y-2"
++         data-testid="assessment-correction-history">
++      {corrections.map((c, i) =>
++        typeof c === "object" && c !== null ? (
++          <div key={i} className="flex items-start gap-2 text-[11px]" data-testid="assessment-correction-history-item">
++            <History size={11} className="text-sky-300 mt-0.5 flex-shrink-0" />
++            <div>
++              <span className="font-bold text-white/80">{c.qid}</span>
++              <span className="text-white/50"> · </span>
++              <span className="text-white/45">{c.previousAnswer || "—"}</span>
++              {c.previousState && c.previousState !== "answered" && (
++                <span className="text-white/35"> ({c.previousState})</span>
++              )}
++              <span className="text-sky-300 font-bold"> → {c.answer || "—"}</span>
++              <div className="text-[10px] text-white/35">
++                by {c.correctedBy || "teacher"}{c.correctedAt ? ` · ${c.correctedAt}` : ""}
++              </div>
++            </div>
++          </div>
++        ) : (
++          <div key={i} className="text-[11px] text-white/45" data-testid="assessment-correction-history-item">
++            <span className="font-bold text-white/70">{String(c)}</span> corrected (legacy record — no detail stored)
++          </div>
++        ))}
++    </div>
++  );
++}
++
++/** Staging diagnostic: one real Gemini 2.5 Pro read of a worksheet,
++ * compared per-qid against the deterministic baseline (the answer key).
++ * Read-only — creates no submission, moves no points. The backend returns
++ * 503 in environments without a real Gemini credential. */
++function ExtractionCheckPanel({ assessment }) {
++  const [open, setOpen] = useState(false);
++  const [file, setFile] = useState(null);
++  const [busy, setBusy] = useState(false);
++  const [result, setResult] = useState(null);
++  const [err, setErr] = useState(null);
++  const inputRef = useRef(null);
++
++  const run = async () => {
++    if (!file) return;
++    setBusy(true);
++    setErr(null);
++    setResult(null);
++    try {
++      setResult(await runAssessmentExtractionCheck(assessment.assessmentId, file));
++    } catch (e) {
++      setErr(e.message || "Extraction check failed.");
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4" data-testid="assessment-extraction-check-panel">
++      <button onClick={() => setOpen((v) => !v)} data-testid="assessment-extraction-check-toggle"
++              className="w-full flex items-center justify-between gap-2 text-left">
++        <span className="inline-flex items-center gap-2 text-[13px] font-bold text-white">
++          <FlaskConical size={14} className="text-purple-300" /> Real Extraction Check
++          <span className="text-[9.5px] font-bold uppercase px-1.5 py-px rounded-full border text-purple-300 border-purple-400/40 bg-purple-400/10">staging</span>
++        </span>
++        {open ? <ChevronUp size={14} className="text-white/40" /> : <ChevronDown size={14} className="text-white/40" />}
++      </button>
++      {open && (
++        <div className="mt-3 space-y-3">
++          <p className="text-[11px] text-white/45">
++            Runs ONE real Gemini 2.5 Pro read of an uploaded worksheet and compares each
++            question against the deterministic baseline (the answer key). Diagnostic only —
++            no submission is created and no points move.
++          </p>
++          <div className="flex items-center gap-2 flex-wrap">
++            <input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp,application/pdf"
++                   onChange={(e) => setFile(e.target.files?.[0] || null)}
++                   data-testid="assessment-extraction-check-file-input"
++                   className="text-[11px] text-white/60 file:mr-2 file:rounded-lg file:border-0 file:bg-white/10 file:px-2.5 file:py-1.5 file:text-[11px] file:font-semibold file:text-white" />
++            <button onClick={run} disabled={!file || busy}
++                    data-testid="assessment-extraction-check-run-button"
++                    className="inline-flex items-center gap-1.5 text-[11.5px] font-bold text-black bg-purple-300 rounded-lg px-3 py-1.5 disabled:opacity-40">
++              {busy ? <Loader2 size={12} className="animate-spin" /> : <FlaskConical size={12} />} Run check
++            </button>
++          </div>
++          {err && <div className="text-[11.5px] text-red-300" data-testid="assessment-extraction-check-error">{err}</div>}
++          {result && (
++            <div className="space-y-2" data-testid="assessment-extraction-check-result">
++              <div className="text-[11.5px] text-white/70">
++                <span className="font-bold text-white">{result.matches} / {result.total}</span> match the baseline
++                {" "}· Model: <span className="font-semibold text-purple-300">{result.model}</span>
++                {result.verification?.checkedQids?.length
++                  ? ` · verification re-checked ${result.verification.checkedQids.length}`
++                  : ""}
++              </div>
++              <div className="text-[11px] text-white/50">
++                Score preview: {result.scorePreview.correct}/{result.scorePreview.total} correct
++                {" "}· {result.scorePreview.pointsEarned} pts calculated
++                {result.scorePreview.needsReview ? " · would need review" : ""}
++              </div>
++              {result.mismatches?.length > 0 && (
++                <div className="rounded-lg border border-red-400/20 bg-red-400/[0.05] p-2 space-y-1">
++                  {result.mismatches.map((m) => (
++                    <div key={m.qid} className="text-[11px] text-white/70" data-testid="assessment-extraction-check-mismatch">
++                      <span className="font-bold">{m.prompt}</span>: baseline
++                      {" "}<span className="text-white/45">{m.baseline}</span> → real
++                      {" "}<span className="text-red-300 font-bold">{m.real}</span>
++                    </div>
++                  ))}
++                </div>
++              )}
++              {result.unreadable?.length > 0 && (
++                <div className="rounded-lg border border-amber-400/20 bg-amber-400/[0.05] p-2 space-y-1">
++                  {result.unreadable.map((u) => (
++                    <div key={u.qid} className="text-[11px] text-white/70" data-testid="assessment-extraction-check-unreadable">
++                      <span className="font-bold">{u.prompt}</span>: {u.answerState}
++                      {typeof u.confidence === "number" ? ` (${Math.round(u.confidence * 100)}%)` : ""}
++                    </div>
++                  ))}
++                </div>
++              )}
++              {result.mismatches?.length === 0 && result.unreadable?.length === 0 && (
++                <div className="text-[11px] text-emerald-300">Perfect agreement with the baseline.</div>
++              )}
++            </div>
++          )}
++        </div>
++      )}
++    </div>
++  );
++}
++
++
++function SubmissionDetail({ submission, onChanged }) {
++  const [showHistory, setShowHistory] = useState(false);
+   const details = submission?.score?.details || [];
+   const extraction = submission?.extraction;
++  const corrections = submission?.teacherCorrections || [];
++  const correctionCount = corrections.length;
++  const locked = submission?.status === "awarded";
+   return (
+     <div className="mt-2 pt-2 border-t border-white/10 space-y-2" data-testid="assessment-submission-detail">
+       {extraction && (
+         <div className="text-[10.5px] text-white/40" data-testid="assessment-submission-extraction-meta">
+-          Engine: {extraction.engine || "—"} · Gemini returned {extraction.rawAnswerCount} answer(s),
++          Engine: {extraction.engine || "—"}{extraction.model ? ` · Model: ${extraction.model}` : ""}
++          {extraction.extractedAt ? ` · Extracted: ${extraction.extractedAt}` : ""} · Gemini returned {extraction.rawAnswerCount} answer(s),
+           {" "}{extraction.normalizedAnswerCount} matched a known question.
++          {extraction.verification?.checkedQids?.length
++            ? ` Verification pass re-checked ${extraction.verification.checkedQids.length} question(s).`
++            : ""}
++        </div>
++      )}
++      {submission?.mediaRef && (
++        <a href={submission.mediaRef} target="_blank" rel="noreferrer"
++           data-testid="assessment-view-original-paper"
++           className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-sky-300 hover:text-sky-200">
++          <ExternalLink size={11} /> View original paper (R2 evidence)
++        </a>
++      )}
++      {correctionCount > 0 && (
++        <div className="space-y-1.5">
++          <div className="flex items-center gap-2">
++            <div className="text-[10.5px] text-sky-300/80" data-testid="assessment-corrections-count">
++              {correctionCount} teacher correction(s) applied — original Gemini extraction preserved.
++            </div>
++            <button onClick={() => setShowHistory((v) => !v)}
++                    data-testid="assessment-correction-history-toggle"
++                    className="inline-flex items-center gap-1 text-[10.5px] font-bold text-sky-300 hover:text-sky-200">
++              <History size={10} /> {showHistory ? "Hide history" : `History (${correctionCount})`}
++            </button>
++          </div>
++          {showHistory && <CorrectionHistory corrections={corrections} />}
+         </div>
+       )}
+       {details.length === 0 ? (
+@@ -73,21 +358,15 @@ function SubmissionDetail({ submission }) {
+                 <th className="font-medium pr-2 py-1">Prompt</th>
+                 <th className="font-medium pr-2 py-1">Given</th>
+                 <th className="font-medium pr-2 py-1">Correct</th>
++                <th className="font-medium pr-2 py-1">Conf</th>
+                 <th className="font-medium pr-2 py-1"></th>
++                <th className="font-medium py-1"></th>
+               </tr>
+             </thead>
+             <tbody>
+               {details.map((d) => (
+-                <tr key={d.qid} className="border-t border-white/5" data-testid="assessment-submission-detail-row">
+-                  <td className="pr-2 py-1 text-white/70 truncate max-w-[120px]">{d.prompt}</td>
+-                  <td className="pr-2 py-1 text-white/80">{d.givenAnswer ?? <span className="text-white/30">—</span>}</td>
+-                  <td className="pr-2 py-1 text-white/50">{d.correctAnswer}</td>
+-                  <td className="pr-2 py-1">
+-                    {d.correct
+-                      ? <Check size={12} className="text-emerald-400" />
+-                      : <XIcon size={12} className="text-red-400" />}
+-                  </td>
+-                </tr>
++                <DetailRow key={d.qid} d={d} submissionId={submission.submissionId}
++                           locked={locked} onCorrected={onChanged} />
+               ))}
+             </tbody>
+           </table>
+@@ -329,7 +608,23 @@ function SubmissionsPanel({ assessment, onChanged }) {
+     }
+   };
+ 
+-  const awardable = submissions.filter((s) => ["scored", "reviewed"].includes(s.status));
++  const removeOne = async (submissionId) => {
++    // eslint-disable-next-line no-alert
++    if (!window.confirm("Delete this submission? The original paper in R2 will also be permanently deleted.")) return;
++    setBusyId(submissionId);
++    setErr(null);
++    try {
++      await deleteAssessmentSubmission(submissionId);
++      refresh();
++      onChanged?.();
++    } catch (e) {
++      setErr(e.message || "Delete failed.");
++    } finally {
++      setBusyId(null);
++    }
++  };
++
++  const awardable = submissions.filter((s) => AWARDABLE_STATUSES.includes(s.status));
+ 
+   return (
+     <div className="space-y-3" data-testid="assessment-submissions-panel">
+@@ -368,7 +663,7 @@ function SubmissionsPanel({ assessment, onChanged }) {
+             <div className="flex items-center gap-2.5">
+               <input type="checkbox" checked={selectedIds.has(s.submissionId)}
+                      onChange={() => toggleSelect(s.submissionId)}
+-                     disabled={!["scored", "reviewed"].includes(s.status)}
++                     disabled={!AWARDABLE_STATUSES.includes(s.status)}
+                      data-testid="assessment-submission-checkbox"
+                      className="accent-amber-400" />
+               <button
+@@ -385,22 +680,31 @@ function SubmissionsPanel({ assessment, onChanged }) {
+                 )}
+               </button>
+               <StatusBadge status={s.status} />
+-              {["scored", "reviewed"].includes(s.status) && (
++              {AWARDABLE_STATUSES.includes(s.status) && s.score && (
+                 <button onClick={() => awardOne(s.submissionId)} disabled={busyId === s.submissionId}
+                         data-testid="assessment-award-button"
+                         className="inline-flex items-center gap-1 text-[11.5px] font-bold text-black bg-amber-400 rounded-lg px-2.5 py-1.5 disabled:opacity-50">
+-                  {busyId === s.submissionId ? <Loader2 size={12} className="animate-spin" /> : <Coins size={12} />} Award
++                  {busyId === s.submissionId ? <Loader2 size={12} className="animate-spin" /> : <Coins size={12} />} Award {s.score.pointsEarned} pts
+                 </button>
+               )}
+               {s.status === "awarded" && <Check size={16} className="text-emerald-400" />}
+               {s.status === "needs_review" && <AlertTriangle size={15} className="text-amber-400" />}
++              {s.status !== "awarded" && (
++                <button onClick={() => removeOne(s.submissionId)} disabled={busyId === s.submissionId}
++                        aria-label="Delete submission" data-testid="assessment-delete-submission-button"
++                        className="p-1 text-white/25 hover:text-red-400 disabled:opacity-50">
++                  <Trash2 size={13} />
++                </button>
++              )}
+               <button onClick={() => setExpandedId((id) => (id === s.submissionId ? null : s.submissionId))}
+                       aria-label="Toggle detail" className="text-white/30 hover:text-white/60">
+                 {expandedId === s.submissionId ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+               </button>
+             </div>
+             <AwardProof submission={s} onSynced={refresh} />
+-            {expandedId === s.submissionId && <SubmissionDetail submission={s} />}
++            {expandedId === s.submissionId && (
++              <SubmissionDetail submission={s} onChanged={() => { refresh(); onChanged?.(); }} />
++            )}
+           </div>
+         ))}
+         {!loading && submissions.length === 0 && (
+@@ -408,7 +712,9 @@ function SubmissionsPanel({ assessment, onChanged }) {
+         )}
+       </div>
+       {awardable.length === 0 && submissions.length > 0 && (
+-        <p className="text-[11px] text-white/35">Only "scored" or "reviewed" submissions can be awarded.</p>
++        <p className="text-[11px] text-white/35">
++          Submissions with a calculated score ("needs_review", "scored" or "reviewed") can be awarded.
++        </p>
+       )}
+     </div>
+   );
+@@ -496,6 +802,8 @@ export default function AssessmentReviewStudio() {
+         )}
+       </div>
+ 
++      {selected && <ExtractionCheckPanel assessment={selected} />}
++
+       <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+         <div className="text-[13px] font-bold text-white mb-3">Submissions</div>
+         <SubmissionsPanel assessment={selected} onChanged={refresh} />
+diff --git a/src/studio/__tests__/AssessmentReviewStudio.test.jsx b/src/studio/__tests__/AssessmentReviewStudio.test.jsx
+index 1fd48fd..7f6546a 100644
+--- a/src/studio/__tests__/AssessmentReviewStudio.test.jsx
++++ b/src/studio/__tests__/AssessmentReviewStudio.test.jsx
+@@ -9,6 +9,7 @@ import AssessmentReviewStudio from "../AssessmentReviewStudio";
+ import {
+   extractAssessmentAnswerKey, createAssessment, listAssessments, listAssessmentSubmissions,
+   awardAssessmentSubmission, bulkAwardAssessmentSubmissions, retryAssessmentGasSync,
++  correctAssessmentSubmission, deleteAssessmentSubmission, runAssessmentExtractionCheck,
+ } from "../api";
+ 
+ jest.mock("../api", () => ({
+@@ -19,6 +20,9 @@ jest.mock("../api", () => ({
+   awardAssessmentSubmission: jest.fn(),
+   bulkAwardAssessmentSubmissions: jest.fn(),
+   retryAssessmentGasSync: jest.fn(),
++  correctAssessmentSubmission: jest.fn(),
++  deleteAssessmentSubmission: jest.fn(),
++  runAssessmentExtractionCheck: jest.fn(),
+ }));
+ 
+ const ASSESSMENT = {
+@@ -31,14 +35,15 @@ const ASSESSMENT = {
+ const SUBMISSIONS = [
+   {
+     submissionId: "s1", cleanId: "stu094", status: "scored",
++    mediaRef: "https://r2.example/assessment-media/stu094/abc123.jpg",
+     score: {
+       correct: 15, total: 30, scorePct: 50, pointsEarned: 7.5,
+       details: [
+-        { qid: "q1", prompt: "sheep", givenAnswer: "LONG", correctAnswer: "LONG", correct: true },
+-        { qid: "q2", prompt: "ship", givenAnswer: "ship", correctAnswer: "SHORT", correct: false },
++        { qid: "q1", prompt: "sheep", givenAnswer: "LONG", correctAnswer: "LONG", correct: true, answerState: "answered", confidence: 0.95 },
++        { qid: "q2", prompt: "ship", givenAnswer: null, correctAnswer: "SHORT", correct: false, answerState: "uncertain", confidence: 0.31 },
+       ],
+     },
+-    extraction: { engine: "gemini", rawAnswerCount: 30, normalizedAnswerCount: 30 },
++    extraction: { engine: "gemini", model: "gemini-2.5-pro", rawAnswerCount: 30, normalizedAnswerCount: 30 },
+   },
+   { submissionId: "s2", cleanId: "stu095", status: "needs_review", score: { correct: 20, total: 30, scorePct: 66.7, pointsEarned: 10 } },
+   {
+@@ -128,9 +133,10 @@ test("bulk-select shows a 'N selected' bar and bulk-awards only the checked rows
+   await screen.findByText("stu094");
+ 
+   const checkboxes = screen.getAllByTestId("assessment-submission-checkbox");
+-  // Only "scored"/"reviewed" rows are selectable — s1 (scored) enabled, s2 (needs_review) disabled.
++  // Every submission with a persisted calculated score is selectable —
++  // including needs_review (never a dead end): s1 (scored) AND s2 (needs_review).
+   expect(checkboxes[0]).not.toBeDisabled();
+-  expect(checkboxes[1]).toBeDisabled();
++  expect(checkboxes[1]).not.toBeDisabled();
+ 
+   fireEvent.click(checkboxes[0]);
+   expect(screen.getByTestId("assessment-bulk-award-bar")).toHaveTextContent("1 selected");
+@@ -230,3 +236,133 @@ test("a failed legacy points-pill sync is shown honestly, with a working retry t
+   expect(awardAssessmentSubmission).not.toHaveBeenCalled();
+   await waitFor(() => expect(listAssessmentSubmissions).toHaveBeenCalledTimes(2));
+ });
++
++test("a needs_review submission is actionable — it has its own Award button (never a dead end)", async () => {
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByText("stu095");
++  const awardButtons = screen.getAllByTestId("assessment-award-button");
++  // s1 (scored, 7.5 pts) AND s2 (needs_review, 10 pts) both awardable.
++  expect(awardButtons).toHaveLength(2);
++  expect(awardButtons[1]).toHaveTextContent("Award 10 pts");
++});
++
++test("teacher can correct a Gemini misreading inline; the correction hits the backend and refreshes", async () => {
++  correctAssessmentSubmission.mockResolvedValue({ ok: true, score: { correct: 16 }, correctedQids: ["q2"] });
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByText("stu094");
++  fireEvent.click(screen.getAllByTestId("assessment-submission-expand-button")[0]);
++  await screen.findByTestId("assessment-submission-detail");
++
++  // q2 was read as uncertain — open its correction editor and fix it.
++  fireEvent.click(screen.getAllByTestId("assessment-correct-toggle-button")[1]);
++  const input = screen.getByTestId("assessment-correction-input");
++  fireEvent.change(input, { target: { value: "SHORT" } });
++  await act(async () => { fireEvent.click(screen.getByTestId("assessment-apply-correction-button")); });
++
++  expect(correctAssessmentSubmission).toHaveBeenCalledWith("s1", [{ qid: "q2", answer: "SHORT" }]);
++  await waitFor(() => expect(listAssessmentSubmissions).toHaveBeenCalledTimes(2));
++});
++
++test("the original R2 paper is one click away as evidence, and the model used is shown", async () => {
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByText("stu094");
++  fireEvent.click(screen.getAllByTestId("assessment-submission-expand-button")[0]);
++  const link = await screen.findByTestId("assessment-view-original-paper");
++  expect(link).toHaveAttribute("href", "https://r2.example/assessment-media/stu094/abc123.jpg");
++  expect(screen.getByTestId("assessment-submission-extraction-meta")).toHaveTextContent("gemini-2.5-pro");
++});
++
++test("deleting a non-awarded submission asks for confirmation and calls the delete endpoint; awarded rows have no delete control", async () => {
++  deleteAssessmentSubmission.mockResolvedValue({ ok: true, mediaDeleted: true });
++  const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByText("stu094");
++
++  const deleteButtons = screen.getAllByTestId("assessment-delete-submission-button");
++  expect(deleteButtons).toHaveLength(2); // s1 + s2 — never s3 (awarded, audit trail)
++  await act(async () => { fireEvent.click(deleteButtons[0]); });
++  expect(confirmSpy).toHaveBeenCalled();
++  expect(deleteAssessmentSubmission).toHaveBeenCalledWith("s1");
++  confirmSpy.mockRestore();
++});
++
++test("confidence pills are heat-colored so weak readings jump out before awarding", async () => {
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByText("stu094");
++  fireEvent.click(screen.getAllByTestId("assessment-submission-expand-button")[0]);
++  await screen.findByTestId("assessment-submission-detail");
++  const pills = screen.getAllByTestId("assessment-confidence-pill");
++  expect(pills[0]).toHaveAttribute("data-confidence-band", "high");     // 0.95
++  expect(pills[1]).toHaveAttribute("data-confidence-band", "critical"); // 0.31
++});
++
++test("teachers can open a correction-history timeline showing who changed what and when", async () => {
++  const withCorrections = SUBMISSIONS.map((s) =>
++    s.submissionId === "s1"
++      ? {
++          ...s,
++          teacherCorrections: [
++            { qid: "q2", previousAnswer: null, previousState: "uncertain", answer: "SHORT",
++              correctedBy: "teacher@eduhub.app", correctedAt: "2026-06-01T09:30:00+00:00" },
++            "q9", // legacy record shape must not crash the timeline
++          ],
++        }
++      : s);
++  listAssessmentSubmissions.mockResolvedValue({ ok: true, submissions: withCorrections });
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByText("stu094");
++  fireEvent.click(screen.getAllByTestId("assessment-submission-expand-button")[0]);
++  await screen.findByTestId("assessment-submission-detail");
++
++  fireEvent.click(screen.getByTestId("assessment-correction-history-toggle"));
++  const history = screen.getByTestId("assessment-correction-history");
++  expect(history).toHaveTextContent("q2");
++  expect(history).toHaveTextContent("→ SHORT");
++  expect(history).toHaveTextContent("teacher@eduhub.app");
++  expect(history).toHaveTextContent("2026-06-01T09:30:00+00:00");
++  const items = screen.getAllByTestId("assessment-correction-history-item");
++  expect(items).toHaveLength(2);
++  expect(items[1]).toHaveTextContent(/legacy record/i);
++});
++
++test("the staging extraction check uploads a worksheet and reports the real-vs-baseline comparison", async () => {
++  runAssessmentExtractionCheck.mockResolvedValue({
++    ok: true, engine: "gemini", model: "gemini-2.5-pro", total: 30, matches: 28,
++    verification: { checkedQids: ["q1"] },
++    mismatches: [{ qid: "q3", prompt: "cheap", baseline: "LONG", real: "SHORT", confidence: 0.8 }],
++    unreadable: [{ qid: "q1", prompt: "sheep", answerState: "uncertain", confidence: 0.31 }],
++    scorePreview: { correct: 28, total: 30, scorePct: 93.3, pointsEarned: 14, needsReview: true },
++  });
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  await screen.findByTestId("assessment-extraction-check-panel");
++
++  fireEvent.click(screen.getByTestId("assessment-extraction-check-toggle"));
++  const file = new File(["fake"], "worksheet.pdf", { type: "application/pdf" });
++  fireEvent.change(screen.getByTestId("assessment-extraction-check-file-input"), { target: { files: [file] } });
++  await act(async () => { fireEvent.click(screen.getByTestId("assessment-extraction-check-run-button")); });
++
++  expect(runAssessmentExtractionCheck).toHaveBeenCalledWith(ASSESSMENT.assessmentId, file);
++  const result = await screen.findByTestId("assessment-extraction-check-result");
++  expect(result).toHaveTextContent("28 / 30");
++  expect(result).toHaveTextContent("gemini-2.5-pro");
++  expect(screen.getByTestId("assessment-extraction-check-mismatch")).toHaveTextContent("cheap");
++  expect(screen.getByTestId("assessment-extraction-check-unreadable")).toHaveTextContent("sheep");
++});
++
++test("an unavailable real credential surfaces the backend's honest 503 message", async () => {
++  runAssessmentExtractionCheck.mockRejectedValue(new Error("Real Gemini extraction is not configured in this environment"));
++  await renderPanel();
++  fireEvent.click(screen.getByText(ASSESSMENT.title));
++  fireEvent.click(await screen.findByTestId("assessment-extraction-check-toggle"));
++  const file = new File(["fake"], "worksheet.jpg", { type: "image/jpeg" });
++  fireEvent.change(screen.getByTestId("assessment-extraction-check-file-input"), { target: { files: [file] } });
++  await act(async () => { fireEvent.click(screen.getByTestId("assessment-extraction-check-run-button")); });
++  expect(await screen.findByTestId("assessment-extraction-check-error")).toHaveTextContent(/not configured/i);
++});
+diff --git a/src/studio/api.js b/src/studio/api.js
+index 1e321ae..dafb018 100644
+--- a/src/studio/api.js
++++ b/src/studio/api.js
+@@ -783,3 +783,10 @@ export const bulkAwardAssessmentSubmissions = (submissionIds) =>
+   request("/api/admin/assessments/submissions/bulk-award", { method: "POST", body: { submissionIds } });
+ export const retryAssessmentGasSync = (submissionId) =>
+   request(`/api/admin/assessments/submissions/${encodeURIComponent(submissionId)}/retry-gas-sync`, { method: "POST" });
++export const deleteAssessmentSubmission = (submissionId) =>
++  request(`/api/admin/assessments/submissions/${encodeURIComponent(submissionId)}`, { method: "DELETE" });
++export const runAssessmentExtractionCheck = (assessmentId, file) => {
++  const fd = new FormData();
++  fd.append("file", file);
++  return request(`/api/admin/assessments/${encodeURIComponent(assessmentId)}/extraction-check`, { method: "POST", body: fd });
++};
+-- 
+2.39.5
+
