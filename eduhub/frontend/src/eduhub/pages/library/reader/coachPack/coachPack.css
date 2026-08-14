@@ -1,0 +1,372 @@
+/* coachPack.css — EduHub Coach Pack v3 design tokens.
+ * Scoped class names (`.coach-*`) so this file cannot leak into existing
+ * reader / library / studio styles. Mobile-first, respects prefers-reduced-motion,
+ * minimum 44x44 tap targets, no dark-on-dark.
+ */
+
+:root {
+  /* Coach Pack palette — additive, never overrides reader vars. */
+  --coach-bg: rgba(20, 16, 14, 0.92);
+  --coach-panel: rgba(38, 28, 22, 0.96);
+  --coach-text: #f3eadf;
+  --coach-text-muted: #c7b9a8;
+  --coach-accent: #d4a843;            /* shared with reader gold */
+  --coach-accent-soft: rgba(212, 168, 67, 0.22);
+  --coach-platinum: #e7eaf0;
+  --coach-platinum-glow: rgba(231, 234, 240, 0.45);
+  --coach-border: rgba(212, 168, 67, 0.32);
+  --coach-success: #6ec27a;
+  --coach-warn: #e3b25a;
+  --coach-error: #e07b7b;
+  --coach-radius-sm: 10px;
+  --coach-radius-md: 16px;
+  --coach-radius-lg: 22px;
+}
+
+/* ────────────────────────── overlay shell ────────────────────────── */
+.coach-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 60;
+}
+
+.coach-overlay > * { pointer-events: auto; }
+
+/* Progress chip — top-right, pinned, never overlaps existing toolbar. */
+.coach-progress-chip {
+  position: fixed;
+  top: max(8px, env(safe-area-inset-top));
+  right: max(10px, env(safe-area-inset-right));
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--coach-bg);
+  border: 1px solid var(--coach-border);
+  color: var(--coach-text);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  z-index: 65;
+  min-height: 34px;
+}
+
+.coach-progress-chip[data-tier="limited_edition"] {
+  border-color: rgba(231, 234, 240, 0.55);
+  box-shadow: 0 0 14px var(--coach-platinum-glow);
+}
+
+.coach-progress-chip__streak {
+  color: var(--coach-accent);
+}
+
+/* ────────────────────────── Briefing card ────────────────────────── */
+.coach-briefing {
+  position: fixed;
+  left: max(12px, env(safe-area-inset-left));
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(94px, calc(env(safe-area-inset-bottom) + 88px));
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 14px 16px;
+  border-radius: var(--coach-radius-md);
+  background: var(--coach-panel);
+  color: var(--coach-text);
+  border: 1px solid var(--coach-border);
+  box-shadow: 0 14px 32px rgba(0,0,0,0.42);
+  z-index: 64;
+  transition: opacity 220ms ease, transform 240ms ease;
+}
+
+.coach-briefing[data-state="hidden"] { opacity: 0; transform: translateY(12px); pointer-events: none; }
+
+.coach-briefing__title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--coach-accent);
+  margin: 0 0 4px 0;
+}
+
+.coach-briefing__body {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--coach-text);
+  margin: 0;
+}
+
+.coach-briefing__dismiss {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  background: transparent;
+  border: 0;
+  color: var(--coach-text-muted);
+  cursor: pointer;
+}
+
+.coach-briefing__dismiss:hover { color: var(--coach-text); }
+
+/* ─────────────────────────── Tools panel ─────────────────────────── */
+.coach-tools-host {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 4px 14px 4px;
+}
+
+.coach-card {
+  background: var(--coach-panel);
+  border: 1px solid var(--coach-border);
+  border-radius: var(--coach-radius-md);
+  padding: 14px 14px 12px 14px;
+  color: var(--coach-text);
+}
+
+.coach-card[data-tier="limited_edition"] {
+  border-color: rgba(231, 234, 240, 0.45);
+  box-shadow: 0 0 12px rgba(231, 234, 240, 0.18);
+}
+
+.coach-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.coach-card__title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--coach-text);
+  margin: 0;
+}
+
+.coach-card__subtitle {
+  font-size: 12px;
+  color: var(--coach-text-muted);
+  margin-left: auto;
+}
+
+.coach-card__body {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--coach-text);
+}
+
+.coach-card__cta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 16px;
+  margin-top: 10px;
+  border-radius: 999px;
+  background: var(--coach-accent);
+  color: #1c130c;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  border: 0;
+  cursor: pointer;
+  transition: transform 120ms ease, background 160ms ease;
+}
+
+.coach-card__cta:active { transform: scale(0.97); }
+.coach-card__cta:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.coach-card__cta--ghost {
+  background: transparent;
+  color: var(--coach-accent);
+  border: 1px solid var(--coach-border);
+}
+
+.coach-card__locked {
+  padding: 8px 10px;
+  border-radius: var(--coach-radius-sm);
+  background: rgba(212, 168, 67, 0.12);
+  color: var(--coach-warn);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.coach-card__error {
+  padding: 6px 8px;
+  border-radius: var(--coach-radius-sm);
+  background: rgba(224, 123, 123, 0.12);
+  color: var(--coach-error);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.coach-list { list-style: none; padding: 0; margin: 8px 0 0 0; }
+.coach-list li { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 13px; }
+.coach-list li:last-child { border-bottom: 0; }
+.coach-list__word { color: var(--coach-accent); font-weight: 600; margin-right: 8px; }
+.coach-list__kh { color: var(--coach-text-muted); font-size: 12px; }
+
+/* ─────────────────────────── Completion card ─────────────────────── */
+.coach-completion {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 6, 4, 0.74);
+  z-index: 70;
+  padding: 24px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.coach-completion__card {
+  width: min(420px, 100%);
+  background: linear-gradient(180deg, var(--coach-panel) 0%, #2a1f17 100%);
+  border: 1px solid var(--coach-border);
+  border-radius: var(--coach-radius-lg);
+  padding: 22px 22px 20px 22px;
+  color: var(--coach-text);
+  text-align: center;
+  box-shadow: 0 18px 44px rgba(0,0,0,0.55);
+}
+
+.coach-completion__card[data-tier="limited_edition"] {
+  border-color: rgba(231, 234, 240, 0.55);
+  box-shadow: 0 0 38px rgba(231, 234, 240, 0.18), 0 18px 44px rgba(0,0,0,0.55);
+}
+
+.coach-completion__title {
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--coach-accent);
+  margin: 6px 0 2px 0;
+}
+
+.coach-completion__stats {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin: 14px 0 6px 0;
+}
+
+.coach-completion__stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.coach-completion__stat-num {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--coach-text);
+}
+
+.coach-completion__stat-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--coach-text-muted);
+}
+
+/* Tools tab segmented control inside EduTalkPanel. */
+.coach-tab-strip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.32);
+  border: 1px solid var(--coach-border);
+  margin-bottom: 10px;
+}
+
+.coach-tab {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--coach-text-muted);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 0;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.coach-tab[data-active="true"] {
+  background: var(--coach-accent-soft);
+  color: var(--coach-text);
+}
+
+/* Per-block pill row extensions. */
+.coach-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(212, 168, 67, 0.16);
+  color: var(--coach-accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--coach-border);
+  cursor: pointer;
+  transition: background 160ms ease;
+}
+
+.coach-pill:hover { background: rgba(212, 168, 67, 0.26); }
+.coach-pill:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Inputs inside flip-ups. */
+.coach-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border-radius: var(--coach-radius-sm);
+  background: rgba(0,0,0,0.32);
+  border: 1px solid var(--coach-border);
+  color: var(--coach-text);
+  font-size: 14px;
+}
+
+.coach-input:focus { outline: 2px solid var(--coach-accent); outline-offset: 1px; }
+
+.coach-textarea {
+  width: 100%;
+  min-height: 88px;
+  padding: 10px 12px;
+  border-radius: var(--coach-radius-sm);
+  background: rgba(0,0,0,0.32);
+  border: 1px solid var(--coach-border);
+  color: var(--coach-text);
+  font-size: 14px;
+  resize: vertical;
+}
+
+/* Reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .coach-briefing { transition: none; }
+  .coach-card__cta { transition: none; }
+  .coach-tab { transition: none; }
+  .coach-pill { transition: none; }
+}
+
+/* Small screens: stack stats. */
+@media (max-width: 380px) {
+  .coach-completion__stats { gap: 12px; }
+  .coach-completion__stat-num { font-size: 19px; }
+}

@@ -1,0 +1,255 @@
+/* ============================================================================
+ * library-premium-v2.css — PREMIUM "Classroom Library" ivory skin (v2).
+ *
+ *  SAFE-REBUILD CONTRACT
+ *  ---------------------
+ *  • APPEND-ONLY. Imported AFTER library-theme.css, library-cinematic.css and
+ *    library-visibility.css, so it wins by source order. Deletes/replaces NOTHING.
+ *  • Every selector is scoped under
+ *      body[data-library-theme="true"] [data-testid="library-page"]
+ *    — the Library page root ONLY. The Reader (/library/read/*) shares the
+ *    body flag but has NO `library-page` node, so it is provably untouched.
+ *    Header / MobileBottomNav / BackgroundFx are outside this scope and are
+ *    NOT modified by this file.
+ *  • The `body[...]` prefix gives every rule a higher specificity than the
+ *    cinematic/visibility layers (which use `body[...] <attr>` ≈ (0,3,1)),
+ *    so these premium rules win cleanly without fighting source order.
+ *  • Pure CSS. No JS, no DOM contract changes, no data-testid changes.
+ *    VoucherBanner, LibraryTopUpButton, ArtworkCarousel/Featured/Shelf,
+ *    pointsSync, view-mode, search, shelves all keep working.
+ *  • Rollback = remove the single import line in LibraryPage.jsx + delete file.
+ *
+ *  Aesthetic: warm ivory paper, premium gold / deep navy / soft teal. Book
+ *  covers + the "Continue reading" rail intentionally keep their cinematic
+ *  dark treatment (books stay the hero); the page chrome turns ivory.
+ *  ========================================================================== */
+
+body[data-library-theme="true"] [data-testid="library-page"] {
+  --pv-paper:    #F6EFE1;
+  --pv-paper-2:  #FBF6EC;
+  --pv-card:     #FFFDF8;
+  --pv-ink:      #20303F;
+  --pv-ink-soft: #5B6B79;
+  --pv-ink-faint:#8A98A4;
+  --pv-line:     rgba(32,48,63,0.10);
+  --pv-gold:     #C9A24B;
+  --pv-gold-lt:  #E9CE8A;
+  --pv-gold-dk:  #9C7A2C;
+  --pv-teal:     #2C9C8F;
+  --pv-shadow-sm: 0 4px 14px -8px rgba(32,48,63,0.30);
+  --pv-shadow:    0 14px 34px -16px rgba(32,48,63,0.26);
+}
+
+/* ── 0. Ivory backdrop (paints only while Library page is mounted) ── */
+body[data-library-theme="true"] [data-testid="library-page"]::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-color: #F6EFE1;
+  background-image:
+    radial-gradient(ellipse 60% 45% at 12% -6%, rgba(201,162,75,0.16), transparent 60%),
+    radial-gradient(ellipse 55% 45% at 92% 4%, rgba(44,156,143,0.10), transparent 62%),
+    radial-gradient(ellipse 90% 60% at 50% 108%, rgba(30,47,69,0.06), transparent 70%),
+    linear-gradient(180deg, #FBF6EC 0%, #F6EFE1 46%, #F1E9D8 100%);
+}
+
+/* ── 1. Greeting hero → ivory welcome card + floating study-buddy mascot ── */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] {
+  position: relative;
+  gap: 1rem;
+  padding: 18px 18px 16px;
+  border-radius: 26px;
+  background: linear-gradient(135deg, #FFFFFF 0%, #FFF8E8 60%, #FBF6EC 100%) !important;
+  border: 1px solid rgba(201,162,75,0.28) !important;
+  box-shadow: 0 22px 48px -26px rgba(32,48,63,0.40), inset 0 1px 0 rgba(255,255,255,0.7) !important;
+  overflow: hidden;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] > p,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] p.text-xs { color: #9C7A2C !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-name"] { color: #20303F !important; text-shadow: none !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] .khmer { color: #5B6B79 !important; opacity: 1 !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] .text-parchment { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] .text-faded { color: #5B6B79 !important; }
+/* avatar tile → premium gold */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] > div:first-child {
+  background: linear-gradient(135deg, #E9CE8A, #C9A24B) !important;
+  border-color: rgba(201,162,75,0.5) !important;
+  color: #2a1f08 !important;
+  box-shadow: 0 10px 22px -10px rgba(201,162,75,0.7) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-greeting"] > div:first-child .text-gold { color: #2a1f08 !important; }
+
+/* pills / buttons */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-level-pill"] {
+  background: linear-gradient(135deg, rgba(201,162,75,0.18), rgba(201,162,75,0.08)) !important;
+  border-color: rgba(201,162,75,0.4) !important;
+  color: #9C7A2C !important;
+  text-shadow: none !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="wallet-pill"] {
+  background: linear-gradient(135deg, #E9CE8A, #C9A24B) !important;
+  border: none !important;
+  color: #2a1f08 !important;
+  outline: none !important;
+  box-shadow: 0 8px 16px -8px rgba(201,162,75,0.7) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-refresh-btn"] {
+  background: #FFFDF8 !important;
+  border: 1px solid rgba(32,48,63,0.10) !important;
+  color: #5B6B79 !important;
+  box-shadow: 0 4px 14px -8px rgba(32,48,63,0.30) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-refresh-btn"]:hover { color: #9C7A2C !important; border-color: rgba(201,162,75,0.5) !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-topup-btn"] {
+  background: linear-gradient(135deg, #FFF3D6, #E9CE8A 50%, #C9A24B) !important;
+  border-color: rgba(201,162,75,0.6) !important;
+  color: #2a1f08 !important;
+  box-shadow: 0 10px 22px -10px rgba(201,162,75,0.7) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-login-cta"] { color: #2a1f08 !important; }
+
+/* ── 2. Stat cards → premium white tiles, dark ink ── */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="stat-"] {
+  background: linear-gradient(160deg, #FFFFFF, #FFFDF8) !important;
+  border: 1px solid rgba(32,48,63,0.10) !important;
+  box-shadow: 0 14px 34px -16px rgba(32,48,63,0.26) !important;
+  border-radius: 20px !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="stat-"] .font-display,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="stat-"] .text-parchment { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="stat-"] .text-faded,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="stat-"] .khmer { color: #8A98A4 !important; }
+
+/* ── 3. Level bar + daily quest → ivory ── */
+body[data-library-theme="true"] [data-testid="library-page"] .level-bar {
+  background: linear-gradient(160deg, #FFFFFF, #FFFDF8) !important;
+  border: 1px solid rgba(32,48,63,0.10) !important;
+  box-shadow: 0 4px 14px -8px rgba(32,48,63,0.30) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="daily-quest-banner"] {
+  background: linear-gradient(135deg, #FFFFFF, #FFF8E8) !important;
+  border: 1px solid rgba(201,162,75,0.35) !important;
+  box-shadow: 0 4px 14px -8px rgba(32,48,63,0.30) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] .level-bar .text-parchment,
+body[data-library-theme="true"] [data-testid="library-page"] .level-bar .font-display,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="daily-quest-banner"] .text-parchment,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="daily-quest-banner"] .font-display { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] .level-bar .text-faded,
+body[data-library-theme="true"] [data-testid="library-page"] .level-bar .text-gold,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="daily-quest-banner"] .text-faded { color: #8A98A4 !important; }
+
+/* ── 4. Search → floating ivory capsule ── */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-search"] .library-search__pill {
+  background: linear-gradient(135deg, #FFFFFF, #FFFDF8) !important;
+  border: 1px solid rgba(32,48,63,0.10) !important;
+  box-shadow: 0 12px 28px -16px rgba(32,48,63,0.28) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__input { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__input::placeholder { color: rgba(32,48,63,0.42) !important; }
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__dropdown,
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__empty {
+  background: #FFFFFF !important;
+  border: 1px solid rgba(32,48,63,0.10) !important;
+  box-shadow: 0 30px 70px -24px rgba(32,48,63,0.45) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__dropdown .text-parchment,
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__dropdown .font-display { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] .library-search__dropdown .text-faded { color: #8A98A4 !important; }
+
+/* ── 5. Live data pill (single-state span) → teal on light ──
+   NOTE: filter chips + view-mode tabs are intentionally NOT restyled here.
+   They use inline styles with no active/inactive marker, and their inactive
+   state relies on light text over a dark pill; recoloring the container would
+   make inactive labels unreadable and could erase the active-gold affordance.
+   Leaving them untouched preserves full functionality (zero regression). */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-live-pill"] {
+  background: rgba(44,156,143,0.12) !important;
+  border-color: rgba(44,156,143,0.4) !important;
+  color: #1f7e73 !important;
+  text-shadow: none !important;
+}
+
+/* ── 6. Rails: New-for-you (warm) + My Books (cool) ── */
+body[data-library-theme="true"] [data-testid="library-page"] .lib-new-for-you-rail {
+  background: linear-gradient(145deg, #FFFFFF 0%, #FFF6E2 60%, #FFFDF8 100%) !important;
+  border: 1px solid rgba(201,162,75,0.30) !important;
+  box-shadow: 0 14px 34px -16px rgba(32,48,63,0.26) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] .lib-my-books-rail {
+  background: linear-gradient(145deg, #FFFFFF 0%, #EEF4FB 60%, #FFFDF8 100%) !important;
+  border: 1px solid rgba(125,168,224,0.30) !important;
+  box-shadow: 0 14px 34px -16px rgba(32,48,63,0.26) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] .lib-new-for-you-rail [data-testid^="shelf-"] h3 { color: #9C7A2C !important; text-shadow: none !important; }
+body[data-library-theme="true"] [data-testid="library-page"] .lib-my-books-rail [data-testid^="shelf-"] h3 { color: #2a4a6e !important; text-shadow: none !important; }
+
+/* ── 7. Shelf chrome ── */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="shelf-"] header h3 { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="shelf-"] header .khmer,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="shelf-"] header .text-faded { color: #8A98A4 !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="shelf-new-count-"] {
+  background: rgba(201,162,75,0.12) !important;
+  border-color: rgba(201,162,75,0.4) !important;
+  color: #9C7A2C !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="shelf-arrow-"] {
+  background: #FFFFFF !important;
+  border: 1px solid rgba(32,48,63,0.10) !important;
+  color: #5B6B79 !important;
+  box-shadow: 0 4px 14px -8px rgba(32,48,63,0.30) !important;
+  backdrop-filter: none !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid^="shelf-arrow-"]:hover { color: #9C7A2C !important; border-color: rgba(201,162,75,0.5) !important; }
+body[data-library-theme="true"] [data-testid="library-page"] .shelf-base {
+  height: 2px !important;
+  background-image: linear-gradient(90deg, transparent, rgba(201,162,75,0.6), rgba(201,162,75,0.6), transparent) !important;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.7), 0 10px 24px -10px rgba(201,162,75,0.25) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] .shelf-section[data-section="story"]        { --shelf-tint: rgba(201,162,75,0.06); }
+body[data-library-theme="true"] [data-testid="library-page"] .shelf-section[data-section="conversation"] { --shelf-tint: rgba( 44,156,143,0.06); }
+body[data-library-theme="true"] [data-testid="library-page"] .shelf-section[data-section="exercise"]     { --shelf-tint: rgba(125,168,224,0.06); }
+
+/* ── 8. Empty state + footer ── */
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-empty-state"] {
+  background: #FFFDF8 !important;
+  border: 1px dashed rgba(201,162,75,0.4) !important;
+  box-shadow: 0 4px 14px -8px rgba(32,48,63,0.30) !important;
+}
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-empty-state"] .text-parchment,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-empty-state"] .font-display { color: #20303F !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-empty-state"] .text-faded,
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-empty-state"] code { color: #5B6B79 !important; }
+body[data-library-theme="true"] [data-testid="library-page"] [data-testid="library-empty-state"] code { color: #9C7A2C !important; }
+body[data-library-theme="true"] [data-testid="library-page"] footer { color: #8A98A4 !important; }
+body[data-library-theme="true"] [data-testid="library-page"] footer .text-gold,
+body[data-library-theme="true"] [data-testid="library-page"] footer svg { color: #C9A24B !important; }
+
+/* ── 9. Book cards: KEEP cinematic dark (hero), only soften shadow ── */
+body[data-library-theme="true"] [data-testid="library-page"] .book-card--v78 {
+  box-shadow:
+    0 22px 40px -20px rgba(32,48,63,0.45),
+    0 6px 14px -10px rgba(32,48,63,0.30),
+    inset 0 1px 0 rgba(255,255,255,0.08) !important;
+}
+
+/* ── 10. Skeleton shimmer on ivory ── */
+body[data-library-theme="true"] [data-testid="library-page"] .skeleton-shimmer {
+  background: linear-gradient(100deg, #ECE3D2, #F4ECDC) !important;
+}
+
+/* ── 11. Day-mode parity (toggle on): reassert ivory premium; loaded last
+   so it also wins ties against library-visibility.css day rules. ── */
+[data-theme="day"] [data-testid="library-page"] [data-testid="library-name"] { color: #20303F !important; }
+[data-theme="day"] [data-testid="library-page"] [data-testid="wallet-pill"] {
+  background: linear-gradient(135deg, #E9CE8A, #C9A24B) !important;
+  color: #2a1f08 !important;
+  border: none !important;
+}
+[data-theme="day"] [data-testid="library-page"] [data-testid="library-topup-btn"] {
+  background: linear-gradient(135deg, #FFF3D6, #E9CE8A 50%, #C9A24B) !important;
+  color: #2a1f08 !important;
+  border-color: rgba(201,162,75,0.6) !important;
+}

@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      v20 (Native Keyboard Behaviour) — `interactive-widget=resizes-content`
+      is the actual browser-vendor fix for "the whole page translates
+      upward when the on-screen keyboard opens" (confirmed on real iPhone
+      hardware; a JS-only body-scroll-lock could not fully prevent it,
+      because WebKit's own "scroll the focused input into view" keyboard-
+      avoidance behaviour is a separate mechanism from ordinary page
+      scrolling). Without this directive, the layout viewport does NOT
+      resize when the keyboard opens, so the browser falls back to
+      scrolling the document to keep the focused input visible — which is
+      exactly the bug. With it, the layout viewport itself shrinks to fit
+      above the keyboard, so there's nothing left to scroll: `100dvh`
+      recalculates correctly and the composer's flex-column layout
+      (Assistant.jsx's `.ai-shell-v2`) just naturally gets shorter.
+      Supported iOS 17.4+ / equivalent Chrome — degrades gracefully to
+      the previous (buggy) behaviour on older engines, where the
+      useKeyboardBodyLock fallback still applies.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#050010" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!--
+      v1.3 (2026-05-23) — Global Khmer font (Noto Sans Khmer + Kantumruy Pro).
+      Loaded once at parse time so EVERY Khmer text in the PWA (Top-Up modal,
+      Push opt-in, restriction screens, etc.) renders with proper glyphs on
+      iPhone Safari and Android Chrome. display=swap keeps first paint fast.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+Khmer:wght@400;500;600;700;800&display=swap" />
+
+    <!--
+      iOS "Add to Home Screen" parse-time identity fix (Issue 2):
+      ============================================================
+      iOS Safari reads apple-mobile-web-app-title, application-name,
+      and the manifest <link> href at HTML PARSE TIME — before any JS
+      runs. The static values below ("EduHub Studio" / "/manifest.json")
+      would be captured by iOS for the AHS install identity even though
+      the runtime applyShellManifest() patcher later corrects them.
+
+      Fix: emit correct per-route values synchronously via document.write
+      at parse time. On /studio this writes "Author Studio" for the title
+      tags and "/manifest-studio.json" for the manifest link. On every
+      other route the output is byte-identical to the previous static tags
+      — main-app PWA install behaviour is completely unchanged.
+
+      The runtime applyShellManifest() patcher below is kept as defence-
+      in-depth for SPA navigations (e.g. user lands on "/" then React
+      Router pushes to "/studio" — the patcher updates manifest + title
+      without a page reload).
+    -->
+    <script>
+      (function () {
+        var isStudio = false;
+        try {
+          var p = (window.location.pathname || "/").replace(/\/+$/, "") || "/";
+          isStudio = p === "/studio" || p.indexOf("/studio/") === 0;
+        } catch (e) {}
+        var t = isStudio ? "Author Studio" : "EduHub Studio";
+        document.write(
+          '<meta name="apple-mobile-web-app-title" content="' + t + '">' +
+          '<meta name="application-name" content="' + t + '">'
+        );
+        // Expose flag so the manifest-link script below can reuse it
+        // without re-computing the pathname.
+        try { window.__STUDIO_SHELL__ = isStudio; } catch (e) {}
+      })();
+    </script>
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="description" content="EduHub Studio — Dashboard, Library, Portal, Lucky Spin & utilities in one fast, offline-capable app." />
+
+    <!-- v9.5 — Author Studio "Add to Home Screen" surgery (Safari + Chrome).
+         ============================================================
+         CHANGES FROM v9.4 (single-file, fully drop-in):
+           1. Manifest patcher refactored from a one-shot IIFE into a
+              named applyShellManifest() that re-runs on:
+                 • initial parse
+                 • popstate (back/forward)
+                 • monkey-patched history.pushState / replaceState
+              This fixes the "lands on / then SPA-navigates to /studio →
+              save still says EduHub Studio" class of bugs on both
+              Chrome (Android/Desktop) and Safari (iOS).
+           2. Manifest is now served via a STABLE `data:` URL (encoded
+              with encodeURIComponent), not a Blob URL. Chromium and
+              WebKit both honour data:application/manifest+json — and
+              unlike Blob URLs these are not GC'd or scoped to a doc
+              lifetime. Safer across SW caches and the install prompt's
+              second manifest fetch.
+           3. The studio shell's manifest `name` is now "Author Studio"
+              (was "EduHub Author Studio") so Chrome's install dialog
+              shows exactly what the home-screen tile will read.
+           4. Apple-side tile label is patched on every navigation via
+              <meta name="apple-mobile-web-app-title"> AND
+              <meta name="application-name">, plus document.title is
+              briefly set so iOS picks the right name even when Add-to-
+              Home-Screen is invoked during the very first paint.
+           5. Logo is unchanged — apple-touch-icon-* and /icons/icon-*
+              remain the same files (per the brief: "same logo").
+           6. Optional debug: append `?pwa=debug` to the URL to see
+              [PWA] console diagnostics confirming which shell + name +
+              manifest is currently active.
+    -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" sizes="167x167" href="/apple-touch-icon-167.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="/apple-touch-icon-152.png" />
+    <link rel="apple-touch-icon" sizes="120x120" href="/apple-touch-icon-120.png" />
+    <link rel="apple-touch-icon" sizes="76x76"  href="/apple-touch-icon-76.png" />
+    <link rel="apple-touch-icon" sizes="60x60"  href="/apple-touch-icon-60.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="apple-touch-icon-precomposed" href="/apple-touch-icon-precomposed.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-512.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="shortcut icon" href="/apple-touch-icon.png" />
+
+    <!-- iOS "Add to Home Screen" splash screens. Each media query maps
+         one physical device (portrait orientation). Background is the
+         brand color (#050010) and a centered logo so the launch feels
+         indistinguishable from a native app's LaunchScreen. -->
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-640-1136.png"   media="(device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-750-1334.png"   media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-828-1792.png"   media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1125-2436.png"  media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1170-2532.png"  media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1179-2556.png"  media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1242-2208.png"  media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1242-2688.png"  media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1284-2778.png"  media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1290-2796.png"  media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1488-2266.png"  media="(device-width: 744px) and (device-height: 1133px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1536-2048.png"  media="(device-width: 768px) and (device-height: 1024px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1620-2160.png"  media="(device-width: 810px) and (device-height: 1080px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1668-2224.png"  media="(device-width: 834px) and (device-height: 1112px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-1668-2388.png"  media="(device-width: 834px) and (device-height: 1194px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+    <link rel="apple-touch-startup-image" href="/splash/apple-splash-2048-2732.png"  media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" />
+
+    <!--
+      iOS "Add to Home Screen" manifest link fix (Issue 2):
+      The manifest href is emitted at parse time with the correct per-route
+      value so iOS Safari fetches the right manifest at install time.
+      On /studio this writes href="/manifest-studio.json" (id:/studio,
+      start_url:/studio?source=pwa-studio, scope:/studio).
+      On every other route it writes href="/manifest.json" — identical
+      to the previous static tag, main-app PWA identity unchanged.
+      sw.js already bypasses caching for both manifest files (v1.5).
+    -->
+    <script>
+      (function () {
+        var href = (typeof window.__STUDIO_SHELL__ !== "undefined" && window.__STUDIO_SHELL__)
+          ? "/manifest-studio.json"
+          : "/manifest.json";
+        document.write('<link rel="manifest" id="appManifest" href="' + href + '">');
+      })();
+    </script>
+
+    <script>
+      /* v9.5 — Route-aware PWA manifest (drop-in replacement for v9.4).
+         BEFORE: one-shot IIFE on parse + Blob URL — broke on SPA
+         navigation and was occasionally dropped by Chrome's install
+         re-fetch.
+         AFTER: applyShellManifest() runs on every history change,
+         emits a stable data: URL, and patches every iOS-relevant meta
+         (title + application-name) so the home-screen tile label is
+         always correct, regardless of how the user reached the route.
+         Falls back to the original EduHub manifest on every non-shell
+         route. */
+      (function () {
+        /* Per-shell overrides. Add a new entry here to opt another
+           top-level route into its own home-screen icon. The values
+           below match the brief verbatim: short_name "Author Studio",
+           same logo, unique title for each shell. */
+        var SHELLS = {
+          "/studio": {
+            name: "Author Studio",
+            short_name: "Author Studio",
+            id: "/studio",
+            start_url: "/studio?source=pwa-studio",
+            scope: "/studio",
+            ios_title: "Author Studio",
+            doc_title: "Author Studio | EduHub",
+            /* iOS "Add to Home Screen" hotfix (surgical · 2026-05):
+               iOS Safari does NOT reliably honour data:application/manifest+json
+               URLs for <link rel="manifest"> — it silently falls back to the
+               previously-fetched static /manifest.json, which has id:"/",
+               start_url:"/?source=pwa", scope:"/". That made AHS from /studio
+               install the MAIN EduHub PWA instead of Author Studio.
+               Point /studio at a REAL HTTP-served manifest so iOS picks the
+               correct id/start_url/scope. sw.js v1.5 already exempts this
+               filename from the cache and pre-caches it in SHELL_URLS.
+               Chrome desktop/Android keeps working — it follows whatever
+               href the link element points at. */
+            manifest_href: "/manifest-studio.json",
+          },
+          "/library": {
+            name: "EduHub Library",
+            short_name: "Library",
+            id: "/library",
+            start_url: "/library?source=pwa-lib",
+            scope: "/library",
+            ios_title: "Library",
+            doc_title: "Library | EduHub",
+          },
+        };
+
+        var DEFAULT_SHELL = {
+          name: "EduHub Studio — Unified Learning Portal",
+          short_name: "EduHub Studio",
+          id: "/",
+          start_url: "/?source=pwa",
+          scope: "/",
+          ios_title: "EduHub Studio",
+          doc_title: "EduHub Studio | Unified Learning Portal",
+        };
+
+        var DEBUG = false;
+        try { DEBUG = location.search.indexOf("pwa=debug") !== -1; } catch (e) {}
+        function log() {
+          if (!DEBUG) return;
+          try { console.log.apply(console, ["[PWA]"].concat([].slice.call(arguments))); } catch (e) {}
+        }
+
+        function pickShell() {
+          var path;
+          try { path = (window.location.pathname || "/").replace(/\/+$/, "") || "/"; }
+          catch (e) { return DEFAULT_SHELL; }
+          var key = Object.keys(SHELLS).find(function (k) {
+            return path === k || path.indexOf(k + "/") === 0;
+          });
+          return key ? SHELLS[key] : DEFAULT_SHELL;
+        }
+
+        function buildManifestJson(shell) {
+          return JSON.stringify({
+            name: shell.name,
+            short_name: shell.short_name,
+            description:
+              "Dashboard, Classroom Library, My Portal and Lucky Spin — one calm, fast home for every student.",
+            id: shell.id,
+            start_url: shell.start_url,
+            scope: shell.scope,
+            display: "standalone",
+            display_override: ["standalone", "minimal-ui"],
+            orientation: "portrait",
+            background_color: "#050010",
+            theme_color: "#050010",
+            categories: ["education", "books", "productivity"],
+            lang: "en",
+            dir: "ltr",
+            icons: [
+              { src: "/icons/icon-192.png",          sizes: "192x192", type: "image/png", purpose: "any" },
+              { src: "/icons/icon-512.png",          sizes: "512x512", type: "image/png", purpose: "any" },
+              { src: "/icons/icon-maskable-192.png", sizes: "192x192", type: "image/png", purpose: "maskable" },
+              { src: "/icons/icon-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
+            ],
+            shortcuts: [
+              { name: "Library",    short_name: "Library", url: "/library", description: "Open the Classroom Library" },
+              { name: "Lucky Spin", short_name: "Spin",    url: "/game",    description: "Daily spin & streaks" },
+              { name: "My Portal",  short_name: "Portal",  url: "/portal",  description: "Open your student portal" }
+            ],
+            prefer_related_applications: false
+          });
+        }
+
+        function setMeta(name, content) {
+          try {
+            var el = document.querySelector('meta[name="' + name + '"]');
+            if (el) el.setAttribute("content", content);
+          } catch (e) { /* ignore */ }
+        }
+
+        function applyShellManifest() {
+          try {
+            var shell = pickShell();
+
+            /* Prefer a REAL HTTP-served manifest URL when the shell
+               declares one (shell.manifest_href). iOS Safari ignores
+               data:application/manifest+json URLs and silently falls
+               back to the previously-fetched static /manifest.json,
+               which would install the wrong PWA identity. A real file
+               (served from /public/, exempted from the SW cache by
+               sw.js v1.5) is honoured by every browser, iOS included.
+
+               For shells WITHOUT a real file (e.g. /library) we keep
+               the existing stable data: URL — Chromium and other modern
+               WebKit builds handle it fine; the only known offender is
+               iOS Safari's "Add to Home Screen" path. */
+            var json = buildManifestJson(shell);
+            var href = shell.manifest_href
+              ? shell.manifest_href
+              : "data:application/manifest+json;charset=utf-8," +
+                encodeURIComponent(json);
+
+            var link = document.getElementById("appManifest");
+            if (link) link.setAttribute("href", href);
+
+            /* iOS Safari uses apple-mobile-web-app-title for the home-
+               screen tile label. application-name is also read on some
+               WebKit builds. Patch both so e.g. /studio shows
+               "Author Studio" under the icon — never "EduHub Studio". */
+            if (shell.ios_title) {
+              setMeta("apple-mobile-web-app-title", shell.ios_title);
+              setMeta("application-name", shell.ios_title);
+            }
+
+            /* Some iOS versions snapshot document.title at the moment
+               Share-Sheet → Add to Home Screen runs. Briefly align it
+               with the shell so first-load on /studio always offers
+               "Author Studio" as the suggested tile name. */
+            if (shell.doc_title && document.title !== shell.doc_title) {
+              try { document.title = shell.doc_title; } catch (e) {}
+            }
+
+            log("shell applied:", shell.short_name, "| name:", shell.name, "| href bytes:", href.length);
+          } catch (e) {
+            /* Hard fallback: leave /manifest.json in place. */
+            log("apply failed:", e && e.message);
+          }
+        }
+
+        /* 1) Apply on initial parse (before first paint). */
+        applyShellManifest();
+
+        /* 2) Re-apply on browser back/forward. */
+        window.addEventListener("popstate", applyShellManifest);
+
+        /* 3) Re-apply on SPA navigation. Patch History API so React
+              Router / Next-style routers trigger us automatically.
+              We DO NOT swallow exceptions — the original push/replace
+              must run normally; we only listen. */
+        try {
+          var _push = history.pushState;
+          var _replace = history.replaceState;
+          history.pushState = function () {
+            var r = _push.apply(this, arguments);
+            try { applyShellManifest(); } catch (e) {}
+            return r;
+          };
+          history.replaceState = function () {
+            var r = _replace.apply(this, arguments);
+            try { applyShellManifest(); } catch (e) {}
+            return r;
+          };
+        } catch (e) { /* ignore */ }
+      })();
+    </script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="preload"
+      as="style"
+      href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700;800&family=Geist:wght@400;500;600;700&family=Noto+Sans+Khmer:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Bricolage+Grotesque:opsz,wght@12..96,400..800&display=swap"
+    />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700;800&family=Geist:wght@400;500;600;700&family=Noto+Sans+Khmer:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Bricolage+Grotesque:opsz,wght@12..96,400..800&display=swap"
+    />
+
+    <title>EduHub Studio | Unified Learning Portal</title>
+
+    <script>
+      /* v10 (cinematic) — low-power flag for the library/reader surgery.
+         Pure feature-detect, no analytics, no fetches. CSS rules in
+         library-cinematic.css / reader-cinematic.css gate continuous
+         animations (premium halo, limited aurora) when this flag is set
+         so older phones stay smooth. */
+      (function () {
+        try {
+          var nav = window.navigator || {};
+          var lowMem = typeof nav.deviceMemory === "number" && nav.deviceMemory < 4;
+          var lowCpu = typeof nav.hardwareConcurrency === "number" && nav.hardwareConcurrency <= 4;
+          var saveData = !!(nav.connection && nav.connection.saveData);
+          if (lowMem || lowCpu || saveData) {
+            document.documentElement.setAttribute("data-low-power", "true");
+          }
+        } catch (e) { /* ignore */ }
+      })();
+    </script>
+
+    <!--
+      Content-Security-Policy (ENFORCING).
+      v9.5 — manifest-src now also permits `data:` for the route-aware
+      data-URL manifest. Blob: kept for backwards-compat with any
+      lingering caches still serving v8.x SW.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://www.googletagmanager.com https://script.google.com https://script.googleusercontent.com https://static.cloudflareinsights.com https://challenges.cloudflare.com https://lottie.host https://assets1.lottiefiles.com https://assets2.lottiefiles.com https://assets3.lottiefiles.com https://assets4.lottiefiles.com https://assets5.lottiefiles.com https://assets6.lottiefiles.com https://assets7.lottiefiles.com https://assets8.lottiefiles.com https://assets9.lottiefiles.com https://assets10.lottiefiles.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' blob: https:; connect-src 'self' https: wss: ws:; frame-src https://challenges.cloudflare.com https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com https://www.loom.com https://www.dailymotion.com https://www.facebook.com https://docs.google.com; manifest-src 'self' blob: data:;"
+    />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+
+    <!--
+      v11.0 — Cloudflare Turnstile loader (global, explicit-render mode).
+      Loaded ONCE at app boot so window.turnstile is available before any
+      login screen mounts. Centralized <TurnstileWidget> component
+      (src/eduhub/auth/TurnstileWidget.jsx) calls turnstile.render() and
+      turnstile.remove() per mount — no per-page <script> injection and
+      no race between SPA navigation and Cloudflare's auto-init.
+    -->
+    <script
+      src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+      async
+      defer
+    ></script>
+
+    <!-- v8.2 — Safe-area glue for standalone PWA mode. -->
+    <style>
+      :root {
+        --safe-top: env(safe-area-inset-top, 0px);
+        --safe-bottom: env(safe-area-inset-bottom, 0px);
+        --safe-left: env(safe-area-inset-left, 0px);
+        --safe-right: env(safe-area-inset-right, 0px);
+      }
+      @media (display-mode: standalone) {
+        html { background: #050010; }
+        body { background: #050010; }
+      }
+
+      /* v9.0 — keyframes used by the React install banner + modal.
+         Kept here so the first paint can animate even if the React
+         component's inline <style> block hasn't mounted yet. */
+      @keyframes pwaPillIn {
+        from { transform: translateY(20px) scale(0.92); opacity: 0; }
+        to   { transform: translateY(0) scale(1);      opacity: 1; }
+      }
+
+      /* v9.0 — Service-worker update toast (only UI still rendered
+         from index.html; it must work pre-hydration, when a tab is
+         re-opened after a new version is deployed). */
+      .pwa-pill {
+        position: fixed;
+        z-index: 2147483646;
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 11px 16px 11px 14px;
+        font: 600 12px/1 -apple-system, BlinkMacSystemFont, "Plus Jakarta Sans", sans-serif;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        border-radius: 999px;
+        cursor: pointer;
+        user-select: none;
+        -webkit-user-select: none;
+        backdrop-filter: blur(10px);
+        animation: pwaPillIn .4s cubic-bezier(.22,1,.36,1) both;
+      }
+      .pwa-pill[data-show="true"] { display: inline-flex; }
+      .pwa-update-toast {
+        left: max(14px, env(safe-area-inset-left));
+        bottom: calc(74px + max(8px, env(safe-area-inset-bottom)));
+        color: #F4E5C1;
+        background: rgba(20, 14, 32, 0.92);
+        border: 1px solid rgba(0, 224, 255, 0.4);
+        box-shadow: 0 12px 30px rgba(0,0,0,0.6), 0 0 18px rgba(0,224,255,0.25);
+      }
+      @media (min-width: 1024px) {
+        .pwa-update-toast { bottom: calc(20px + max(8px, env(safe-area-inset-bottom))); }
+      }
+      .pwa-pill .pwa-x {
+        opacity: 0.55;
+        margin-left: 4px;
+        font-size: 14px;
+        line-height: 0;
+      }
+      .pwa-pill:hover .pwa-x { opacity: 1; }
+    </style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+
+    <!-- PWA update toast (a new service-worker version is waiting). The
+         install UI (button + banner + iOS guide modal) is handled by
+         the React PwaInstallProvider and is no longer rendered here. -->
+    <button id="pwaUpdateToast" class="pwa-pill pwa-update-toast" type="button"
+            data-testid="pwa-update-toast" aria-label="Update EduHub Studio to the latest version">
+      <span aria-hidden style="display:inline-flex;align-items:center;color:#00e0ff">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16"/><path d="M3 12a9 9 0 0 1 15.5-6.3L21 8"/><polyline points="21 3 21 8 16 8"/><polyline points="3 21 3 16 8 16"/>
+        </svg>
+      </span>
+      <span>New version · tap to refresh</span>
+      <span class="pwa-x" data-pwa-dismiss="update" title="Later">×</span>
+    </button>
+
+    <script>
+      // ─── GitHub-Pages SPA redirect (preserved verbatim) ──────────
+      (function(l) {
+        if (l.search[1] === '/') {
+          var decoded = l.search.slice(1).split('&').map(function(s) {
+            return s.replace(/~and~/g, '&');
+          }).join('?');
+          window.history.replaceState(null, null,
+            l.pathname.slice(0, -1) + decoded + l.hash
+          );
+        }
+      }(window.location));
+
+      // ─── v9.0 · Service-worker registration + update-toast only ──
+      // (Install UI is handled by React — see PwaInstallProvider.)
+      (function () {
+        if (!('serviceWorker' in navigator)) return;
+        var pillUpdate = document.getElementById('pwaUpdateToast');
+
+        function wireDismiss(pill) {
+          var x = pill && pill.querySelector('[data-pwa-dismiss]');
+          if (!x) return;
+          x.addEventListener('click', function (e) {
+            e.stopPropagation();
+            pill.setAttribute('data-show', 'false');
+          });
+        }
+        wireDismiss(pillUpdate);
+
+        function showUpdateToast(reg) {
+          if (!pillUpdate) return;
+          pillUpdate.setAttribute('data-show', 'true');
+          pillUpdate.onclick = function () {
+            if (reg.waiting) reg.waiting.postMessage('SKIP_WAITING');
+          };
+        }
+
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' })
+            .then(function (reg) {
+              if (reg.waiting) showUpdateToast(reg);
+              reg.addEventListener('updatefound', function () {
+                var nw = reg.installing;
+                if (!nw) return;
+                nw.addEventListener('statechange', function () {
+                  if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+                    showUpdateToast(reg);
+                  }
+                });
+              });
+            })
+            .catch(function (err) {
+              console.warn('[PWA] SW registration failed:', err);
+            });
+
+          /* v1.9.0 · "reverts to old version" incident fix:
+             The controllerchange → reload handler that lived here is GONE.
+             pwaUpdateController.js (src/eduhub/lib/) is now the SINGLE
+             owner of the update reload — it keeps the iOS OAuth
+             (#session_id) deferral, adds the critical-operation guard, and
+             adds a sessionStorage single-reload latch so a controllerchange
+             storm can never reload-loop the app into a stale shell.
+             Having TWO independent reload listeners (this inline one plus
+             the controller) double-fired on every SW activation. */
+        });
+
+        /* ── Kill switch (debug):  ?pwa=reset  in the URL. ─────── */
+        if (location.search.indexOf('pwa=reset') !== -1) {
+          navigator.serviceWorker.getRegistrations().then(function (regs) {
+            regs.forEach(function (r) { r.active && r.active.postMessage('UNREGISTER'); });
+            setTimeout(function () { location.replace(location.pathname); }, 500);
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>

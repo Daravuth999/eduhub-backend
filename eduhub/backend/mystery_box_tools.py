@@ -1,0 +1,2002 @@
+# ============================================================================
+# mystery_box_tools.py — Speaking Lab Mystery Box + EduTalk Pass integration
+# (additive, isolated module)
+#
+# Registered via register_mystery_box_routes(api, db, require_admin,
+# require_student, fan_out_push, push_subscriptions, login_reward_hooks)
+# from server.py (normal import, explicit DI — matches the established
+# register_*_routes convention; Architecture Reconstruction Phase 1, item 2).
+#
+# Returns a plain dict (not a typed namespace) containing every function /
+# pydantic class that either (a) login_mystery_box_tools.py consumes as an
+# explicit parameter (``_mbt_grant_edutalk_pass``), or (b) the existing test
+# suite (tests/test_mystery_box_notifications.py) exercises directly by
+# name, mirroring the shape of the old exec()-shared-globals namespace
+# closely enough that only that test file's setup helper needed rewriting,
+# not its 19 individual test bodies. The one genuine behavioural nuance this
+# preserves: the test suite reassigns the push callable mid-test
+# (``ns["_fan_out_push"] = new_push``) and expects the NEXT
+# notify_mystery_box_prize() call to use it — the returned dict is the same
+# mutable object the internal push helper reads from at call time, so that
+# still works exactly as it did under exec().
+#
+# SCOPE
+#   * Premium Mystery Box reward system for Speaking Lab.
+#   * Admin-configurable prize templates (Author Studio) and campaigns
+#     (Speaking Lab admin) — single source of truth in MongoDB.
+#   * Backend decides the granted prize, NEVER the frontend.
+#   * Reuses the EXISTING login_reward voucher issuance pipeline so book
+#     vouchers land privately in the original PWA Voucher Hub. No public
+#     voucher code is exposed to the Speaking Lab UI.
+#   * Adds the NEW `student_feature_entitlements` collection for EduTalk
+#     Passes (private, per-student, single-use). EduTalk pass consumption
+#     is wired via hooks into edutalk_tools.py (see _et hook block below).
+#
+# SAFETY
+#   * Pure additive — does NOT modify any existing collection, route or
+#     pydantic model. All collections are created lazily.
+#   * Failure of this module is non-fatal: server.py wraps the registration
+#     call in a try/except, so a load error only disables the Mystery Box
+#     feature.
+#
+# v1.0 — initial release
+# ============================================================================
+
+import asyncio as _mbt_asyncio
+import logging as _mbt_logging
+import secrets as _mbt_secrets
+import uuid as _mbt_uuid
+from datetime import datetime, timezone, timedelta
+from typing import List, Literal, Optional
+
+from fastapi import Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+
+from eduhub_platform.identity import resolve as _mbt_norm_id
+from login_reward_tools import _lrc_voucher_discount_label
+
+# pymongo ReturnDocument enum — required for find_one_and_update to
+# return the UPDATED document (so the caller can read the entitlement
+# id of the row that was just decremented). Use a defensive import so a
+# very old pymongo install still loads the rest of the module.
+try:
+    from pymongo import ReturnDocument as _mbt_ReturnDocument
+except Exception:  # pragma: no cover
+    _mbt_ReturnDocument = None
+
+_MBT_LOG = _mbt_logging.getLogger("eduhub")
+
+
+def _mbt_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _mbt_iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    if isinstance(dt, str):
+        return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ── safe display payload helpers (pure — no db dependency) ─────────────────
+def _voucher_discount_label(dtype, dval) -> str:
+    try:
+        return _lrc_voucher_discount_label(dtype, dval)
+    except Exception:
+        pass
+    try:
+        v = float(dval or 0)
+    except Exception:
+        v = 0.0
+    if (dtype or "").lower() == "percent":
+        return f"{int(v)}% off"
+    return f"-{v:.0f} KHR"
+
+
+def _safe_display_for(prize: dict, granted: dict | None) -> dict:
+    """Build the OPAQUE payload Speaking Lab is allowed to show.
+
+    NEVER includes: coupon_code, voucher_id, raw db ids, secret keys.
+    Only includes: title, type, value/label, expiry, ownership message.
+    """
+    ptype = (prize.get("type") or "").strip().lower()
+    # Speaking Lab MUST NOT receive internal prize/template IDs. The
+    # safe display intentionally omits `prize_id`, `coupon_code`,
+    # `voucher_id`, entitlement ids, and any raw DB identifier. The
+    # caller (Speaking Lab) only needs human-facing fields below to
+    # render the reveal modal and the missed-boxes layout.
+    out = {
+        "type": ptype,
+        "title": prize.get("title") or "Mystery Prize",
+        "subtitle": prize.get("subtitle") or "",
+        "accent_color": prize.get("accent_color") or "#D4A843",
+        "icon": prize.get("icon") or "gift",
+        "rarity": prize.get("rarity") or "common",
+        "ownership_message": "Added to your EduHub account",
+    }
+    if ptype == "points":
+        out["points"] = int(prize.get("points") or 0)
+    elif ptype == "book_voucher":
+        # Show ONLY title/value/expiry, never the code.
+        out["discount_label"] = (
+            (granted or {}).get("discount_label")
+            or prize.get("discount_label")
+            or _voucher_discount_label(
+                prize.get("voucher_discount_type"),
+                prize.get("voucher_discount_value"),
+            )
+        )
+        out["expires_at"] = (granted or {}).get("expires_at")
+        out["cta_label"] = "Open My Portal → Voucher Hub"
+    elif ptype in ("edutalk_session", "edutalk_voice"):
+        out["pass_label"] = (
+            "EduTalk Session Pass" if ptype == "edutalk_session" else "EduTalk Voice Reply Pass"
+        )
+        out["quantity"] = int(prize.get("quantity") or 1)
+        out["expires_at"] = (granted or {}).get("expires_at")
+        out["cta_label"] = "Open any eligible book to use it"
+    elif ptype == "lucky_draw_entry":
+        out["entries"] = int(prize.get("entries") or 1)
+    elif ptype == "recognition":
+        out["badge_label"] = prize.get("badge_label") or prize.get("title")
+    elif ptype == "consolation":
+        out["message"] = prize.get("message") or "Almost lucky — try again!"
+        if prize.get("points"):
+            out["points"] = int(prize.get("points") or 0)
+    return out
+
+
+def _mbt_prize_notification_content(prize_type: str, prize_title: str,
+                                    safe_display: dict) -> tuple[str, str]:
+    """Truthful, prize-specific title/body built ONLY from fields already
+    present in the existing `safe_display` payload shown to Speaking Lab
+    (never a raw db id, provider error, or un-exposed entitlement code)."""
+    safe_display = safe_display or {}
+    if prize_type == "points":
+        amount = int(safe_display.get("points") or 0)
+        return ("🎁 Mystery Box Reward!",
+                f"You received {amount} points from your Mystery Box. "
+                f"Your reward was added successfully.")
+    if prize_type == "book_voucher":
+        name = prize_title or safe_display.get("title") or "a voucher"
+        return ("📚 Mystery Box Reward!",
+                f"You unlocked {name} from your Mystery Box.")
+    if prize_type in ("edutalk_session", "edutalk_voice"):
+        qty = int(safe_display.get("quantity") or 1)
+        label = safe_display.get("pass_label") or "an EduTalk pass"
+        pass_description = f"{qty} {label}" if qty > 1 else label
+        return ("🎙️ Mystery Box Reward!",
+                f"You received {pass_description} for EduTalk.")
+    return ("🎁 Mystery Box Reward!",
+            "Your Mystery Box reward was granted successfully.")
+
+
+# Reward-success push notifications: exactly-once push for a DURABLY
+# GRANTED Mystery Box prize. Mirrors the pattern already proven for
+# Speaking Lab Lucky Draw (`_send_winner_push_idempotent` in lucky_draw.py):
+# claim the notification slot atomically on the EXISTING grant record, call
+# the REAL push helper, and only ever mark `sent` on a truthful delivery
+# result. This module NEVER grants anything in this block — see
+# `notify_mystery_box_prize` docstring.
+#
+# Durable grant identity: `speaking_lab_mystery_claims.id` (the claim row
+# already created by `mbt_reveal_round`, unique per (round_id,
+# student_id_norm) via the existing `round_student_unique` index). That id
+# is the notification idempotency key (`mystery_box_grant_id`) — stable
+# across retries because a failed-grant retry reuses the SAME claim id.
+#
+# Notifiable prize types are exactly the ones with a PROVEN durable success
+# signal today:
+#   * points          → `_lrc_credit_via_treasury` result is checked by
+#                        `_mbt_grant_prize` itself (ok=False on failure).
+#   * book_voucher     → `_lrc_issue_voucher_for_claim` result is checked
+#                        (ok=False on failure / falsy payload).
+#   * edutalk_session / edutalk_voice → `_mbt_grant_edutalk_pass` inserts
+#                        an entitlement row or raises; a claim can only
+#                        reach `granted_status="granted"` if it returned.
+#
+# "consolation" is intentionally EXCLUDED: its existing grant path calls
+# the same treasury credit but swallows the result (`except Exception:
+# pass`) and unconditionally returns `ok=True` regardless of whether the
+# credit actually succeeded. There is no way to add a truthful success
+# signal for it without changing that existing return contract, which is
+# out of scope for a notification-only change — sending a push there
+# would mean faking exactly-once behavior on an unproven grant. This is
+# the one reported blocker from the inventory pass.
+#
+# "lucky_draw_entry" / "recognition" are excluded because they are
+# visual/record-only per the code's own docstring — no points, voucher,
+# or entitlement is ever durably granted for them.
+_MBT_PUSH_STALE_SECONDS = 120
+_MBT_NOTIFIABLE_PRIZE_TYPES = {"points", "book_voucher", "edutalk_session", "edutalk_voice"}
+
+
+# ── pydantic shapes (pure — no db dependency) ───────────────────────────────
+class _PrizeTemplateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: str = Field(..., min_length=1, max_length=120)
+    type: Literal[
+        "points", "book_voucher", "edutalk_session", "edutalk_voice",
+        "lucky_draw_entry", "recognition", "consolation",
+    ]
+    subtitle: Optional[str] = ""
+    accent_color: Optional[str] = "#D4A843"
+    icon: Optional[str] = "gift"
+    rarity: Optional[Literal["common", "rare", "epic", "legendary"]] = "common"
+    enabled: bool = True
+
+    # Points prize
+    points: Optional[int] = 0
+
+    # Book voucher prize (reuses login_reward issuance flow)
+    voucher_discount_type: Optional[Literal["percent", "amount"]] = "percent"
+    voucher_discount_value: Optional[float] = 0.0
+    voucher_book_slugs: Optional[List[str]] = []
+    voucher_valid_days: Optional[int] = 30
+    voucher_title: Optional[str] = ""
+    voucher_subtitle: Optional[str] = ""
+
+    # EduTalk pass prize
+    pass_template_id: Optional[str] = None
+    quantity: Optional[int] = 1
+    expires_in_days: Optional[int] = 30
+    eligible_book_slugs: Optional[List[str]] = []
+
+    # Lucky draw entry
+    entries: Optional[int] = 1
+
+    # Recognition / consolation
+    badge_label: Optional[str] = ""
+    message: Optional[str] = ""
+
+
+class _EduTalkPassTemplateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(..., min_length=1, max_length=120)
+    feature: Literal["edutalk_session", "edutalk_voice"] = "edutalk_session"
+    quantity_total: int = Field(1, ge=1, le=99)
+    eligible_book_slugs: List[str] = []
+    expires_in_days: int = Field(30, ge=1, le=730)
+    use_pass_before_points: bool = True
+    show_in_portal: bool = True
+    show_in_reader: bool = True
+    enabled: bool = True
+
+
+class _CampaignIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(..., min_length=1, max_length=120)
+    description: Optional[str] = ""
+    box_count: int = Field(7, ge=3, le=9)
+    prize_template_ids: List[str] = []
+    weighted_layout: bool = False
+    weights: Optional[List[float]] = None
+    teacher_confirm_required: bool = True
+    reveal_all_after_claim: bool = True
+    hide_voucher_code: bool = True  # ALWAYS true; flag retained for clarity
+    grant_selected_only: bool = True
+    show_missed_prizes: bool = True
+    enabled: bool = True
+
+
+class _RoundCreateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    campaign_id: str
+    session_id: Optional[str] = ""  # Speaking Lab session id, optional
+
+
+class _SelectIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    box_index: int = Field(..., ge=0, le=20)
+    student_id: str
+    student_name: Optional[str] = ""
+
+
+class _RevealIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    box_index: Optional[int] = None  # if omitted, uses last selected
+    student_id: str
+    student_name: Optional[str] = ""
+    idempotency_key: Optional[str] = ""
+
+
+class _MBTReconcileIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    claim_id: str = Field(..., min_length=1)
+    dry_run: bool = True
+
+
+class _MBTRetryPushIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    claim_id: str = Field(..., min_length=1)
+
+
+def register_mystery_box_routes(
+    api, db, require_admin, require_student,
+    fan_out_push, push_subscriptions, login_reward_hooks,
+) -> dict:
+    """Register Mystery Box + EduTalk Pass routes onto ``api``.
+
+    Explicit-DI replacement for the previous ``exec()``-into-server-namespace
+    loading. Behaviour is identical: same routes, same idempotent grant/
+    notification state machines, same safe-display stripping. Returns a
+    dict — see module docstring for why a dict rather than a typed object.
+    """
+    # ── collections (lazy, additive) ────────────────────────────────────
+    _mbt_prize_templates       = db["mystery_box_prize_templates"]
+    _mbt_edutalk_templates     = db["edutalk_pass_templates"]
+    _mbt_campaigns             = db["speaking_lab_mystery_campaigns"]
+    _mbt_rounds                = db["speaking_lab_mystery_rounds"]
+    _mbt_claims                = db["speaking_lab_mystery_claims"]
+    _mbt_reward_history        = db["speaking_lab_reward_history"]
+    _mbt_entitlements          = db["student_feature_entitlements"]
+
+    # Mutable holder so a caller can swap the push callable after
+    # registration (the existing test suite does this mid-test) and have
+    # the NEXT notify call observe the swap — mirrors the old exec()-shared
+    # -globals mutability without making the whole factory dict-indexed.
+    _ns: dict = {"_fan_out_push": fan_out_push}
+
+    async def _mbt_resolve_student(raw_id) -> dict:
+        """Return the canonical student record for any incoming identifier.
+
+        Output shape:
+            {
+                "ok":           bool,    # True only if a Mongo row was found
+                "clean_id":     str,     # USE THIS for grants + persistence
+                "student_id":   str,     # wallet form (db.students.student_id)
+                "norm":         str,     # _mbt_norm_id(clean_id)
+                "display_name": str,
+                "raw":          str,     # what the caller passed in
+            }
+
+        Safety:
+          * Read-only — never writes to db.students.
+          * Returns a fallback record when no Mongo row is found, so legacy
+            students that exist only in GAS still get a deterministic grant
+            target (their normalised raw id).
+          * Never raises.
+        """
+        raw = ("" if raw_id is None else str(raw_id)).strip()
+        if not raw:
+            return {
+                "ok": False, "clean_id": "", "student_id": "",
+                "norm": "", "display_name": "", "raw": "",
+            }
+        norm = _mbt_norm_id(raw)
+        upper = raw.upper()
+        doc = None
+        try:
+            # Try every plausible field/case combination in ONE query.
+            doc = await db.students.find_one(
+                {"$or": [
+                    {"clean_id":   norm},
+                    {"clean_id":   raw},
+                    {"clean_id":   upper},
+                    {"student_id": raw},
+                    {"student_id": norm},
+                    {"student_id": upper},
+                ]},
+                {"_id": 0, "clean_id": 1, "student_id": 1, "display_name": 1},
+            )
+        except Exception as exc:  # noqa: BLE001
+            _MBT_LOG.warning("mystery_box: resolve_student lookup failed: %s",
+                             str(exc)[:200])
+            doc = None
+
+        if doc and doc.get("clean_id"):
+            clean = str(doc.get("clean_id") or "").strip()
+            return {
+                "ok": True,
+                "clean_id": clean,
+                "student_id": str(doc.get("student_id") or ""),
+                "norm": _mbt_norm_id(clean),
+                "display_name": str(doc.get("display_name") or ""),
+                "raw": raw,
+            }
+        # Fallback: legacy students that exist only in GAS / Google Sheets.
+        # We still grant under their normalised id so a manual /admin lookup
+        # can audit the reward. The dashboard's clean-id query will only see
+        # the reward if the student is later linked to Mongo with the same
+        # clean_id (operator action).
+        return {
+            "ok": False,
+            "clean_id": raw,
+            "student_id": raw,
+            "norm": norm,
+            "display_name": "",
+            "raw": raw,
+        }
+
+    async def _mbt_mirror_points_credit(
+        *,
+        clean_id: str,
+        wallet_id: str,
+        amount: int,
+        claim_id: str,
+        source: str = "speaking_lab_mystery_box",
+    ) -> dict:
+        """Write a confirmed Speaking Lab Mystery Box points credit into the
+        Mongo points ledger + wallet. Returns a small status dict for audit.
+
+        Mirrors the GAS credit into the Mongo ledger using the claim_id as
+        the deterministic idempotency key, independent of the
+        ``USE_MONGO_POINTS_WRITE`` shadow-flag (which is "off" in
+        production) — so it is always-on for Speaking Lab Mystery Box
+        rewards. Never raises — a mirror failure does NOT revert the GAS
+        credit (the reward is still valid; the operator can re-run a
+        reconcile pass at any time).
+        """
+        out = {"ok": False, "ledger": "skipped", "wallet": "skipped",
+               "ikey": "", "error": ""}
+        try:
+            amt = int(amount or 0)
+        except Exception:
+            amt = 0
+        if amt <= 0 or not (clean_id or wallet_id):
+            out["error"] = "no-op (amount<=0 or empty id)"
+            return out
+
+        # Wallet doc key: prefer the wallet-form id (matches premium_ai /
+        # payment_bridge writes); fall back to clean_id when unknown so a
+        # later admin link will pick it up.
+        sid_for_wallet = wallet_id or clean_id
+        ikey = f"sl_mb_credit:{claim_id}"
+        out["ikey"] = ikey
+        now_iso = _mbt_iso(_mbt_now())
+
+        # 1) Append-only ledger row (idempotent on idempotency_key).
+        try:
+            r = await db.points_transactions.update_one(
+                {"idempotency_key": ikey},
+                {"$setOnInsert": {
+                    "idempotency_key": ikey,
+                    "from_id":   "treasury",
+                    "to_id":     sid_for_wallet,
+                    "to_clean_id": clean_id or "",
+                    "amount":    amt,
+                    "type":      "credit",
+                    "operation": "credit",
+                    "delta":     amt,
+                    "student_id": sid_for_wallet,
+                    "source":    source,
+                    "source_ref": claim_id,
+                    "created_at": now_iso,
+                    "status":    "confirmed",
+                }},
+                upsert=True,
+            )
+            out["ledger"] = "inserted" if r.upserted_id is not None else "duplicate"
+        except Exception as exc:  # noqa: BLE001
+            out["ledger"] = "error"
+            out["error"] = (out["error"] + f" ledger:{str(exc)[:160]}").strip()
+
+        # 2) Wallet balance bump — only on a fresh insert (avoid double-credit).
+        if out["ledger"] == "inserted":
+            try:
+                await db.points_wallets.update_one(
+                    {"student_id": sid_for_wallet},
+                    {
+                        "$inc": {"balance": amt, "version": 1},
+                        "$set": {"updated_at": now_iso,
+                                 "clean_id": clean_id or "",
+                                 "last_source": source},
+                        "$setOnInsert": {
+                            "student_id": sid_for_wallet,
+                            "created_at": now_iso,
+                        },
+                    },
+                    upsert=True,
+                )
+                out["wallet"] = "updated"
+            except Exception as exc:  # noqa: BLE001
+                out["wallet"] = "error"
+                out["error"] = (out["error"] + f" wallet:{str(exc)[:160]}").strip()
+
+        out["ok"] = out["ledger"] in ("inserted", "duplicate") and (
+            out["wallet"] in ("updated", "skipped")
+        )
+        return out
+
+    async def _mbt_ensure_indexes() -> None:
+        """Create indexes lazily on first import. Safe to call repeatedly."""
+        try:
+            await _mbt_prize_templates.create_index("id", unique=True)
+            await _mbt_edutalk_templates.create_index("id", unique=True)
+            await _mbt_campaigns.create_index("id", unique=True)
+            await _mbt_rounds.create_index("id", unique=True)
+            # One claim per round per student (idempotent reveal)
+            await _mbt_claims.create_index(
+                [("round_id", 1), ("student_id_norm", 1)],
+                unique=True,
+                name="round_student_unique",
+            )
+            await _mbt_entitlements.create_index("id", unique=True)
+            await _mbt_entitlements.create_index([("student_id_norm", 1), ("status", 1)])
+            await _mbt_reward_history.create_index([("student_id_norm", 1), ("created_at", -1)])
+        except Exception as _e:  # pragma: no cover
+            _MBT_LOG.warning("mystery_box: ensure_indexes failed: %s", _e)
+
+    # ── EduTalk Pass entitlement helpers (private, per-student) ─────────
+    async def _mbt_grant_edutalk_pass(
+        *,
+        student_clean_id: str,
+        student_id_norm: str,
+        feature: str,
+        title: str,
+        quantity: int,
+        eligible_book_slugs: List[str],
+        expires_in_days: int,
+        source: str,
+        campaign_id: Optional[str],
+        round_id: Optional[str],
+    ) -> dict:
+        """Create a new private EduTalk pass entitlement row.
+
+        Returns the inserted row (without `_id`)."""
+        now = _mbt_now()
+        expires_at = (now + timedelta(days=max(1, int(expires_in_days or 1)))).isoformat().replace("+00:00", "Z")
+        row = {
+            "id": "ent_" + _mbt_secrets.token_hex(10),
+            "student_id": student_clean_id,
+            "student_id_norm": student_id_norm,
+            "feature": feature,
+            "title": title or ("EduTalk Pass"),
+            "quantity_total": int(quantity or 1),
+            "quantity_remaining": int(quantity or 1),
+            "eligible_book_slugs": list(eligible_book_slugs or []),
+            "source": source,
+            "campaign_id": campaign_id,
+            "round_id": round_id,
+            "expires_at": expires_at,
+            "used_at": None,
+            "status": "active",
+            "created_at": _mbt_iso(now),
+            "updated_at": _mbt_iso(now),
+        }
+        await _mbt_entitlements.insert_one(dict(row))
+        return row
+
+    async def mb_reserve_pass(student_clean_id: str, feature: str, book_slug: str) -> Optional[str]:
+        """Attempt to reserve a single use of an active EduTalk pass.
+
+        Atomically decrements quantity_remaining by 1 if there is at least one
+        active, non-expired pass matching the feature and eligible book.
+        Returns the entitlement id reserved (still ACTIVE, not committed) or None.
+
+        The reserved row's `pending_reservations` is set so that on a failure
+        the commit step can be skipped (and refund() will restore the count).
+        """
+        if not student_clean_id or not feature:
+            return None
+        sid_norm = _mbt_norm_id(student_clean_id)
+        now_iso = _mbt_iso(_mbt_now())
+        book_slug = (book_slug or "").strip()
+        book_match = {"$or": [
+            {"eligible_book_slugs": {"$in": [book_slug]}},
+            {"eligible_book_slugs": {"$size": 0}},
+            {"eligible_book_slugs": {"$exists": False}},
+        ]} if book_slug else {}
+
+        query = {
+            "student_id_norm": sid_norm,
+            "feature": feature,
+            "status": "active",
+            "quantity_remaining": {"$gt": 0},
+            "$or": [
+                {"expires_at": {"$gt": now_iso}},
+                {"expires_at": None},
+            ],
+        }
+        if book_match:
+            query = {"$and": [query, book_match]}
+
+        try:
+            if _mbt_ReturnDocument is not None:
+                doc = await _mbt_entitlements.find_one_and_update(
+                    query,
+                    {"$inc": {"quantity_remaining": -1, "pending_reservations": 1},
+                     "$set": {"updated_at": now_iso}},
+                    return_document=_mbt_ReturnDocument.AFTER,
+                )
+            else:
+                # Defensive fallback: motor's default return is the document
+                # BEFORE the update, but the `id` field is immutable so it's
+                # still safe to read it from the pre-update snapshot.
+                doc = await _mbt_entitlements.find_one_and_update(
+                    query,
+                    {"$inc": {"quantity_remaining": -1, "pending_reservations": 1},
+                     "$set": {"updated_at": now_iso}},
+                )
+        except Exception as _e:
+            _MBT_LOG.warning("mb_reserve_pass query failed: %s", _e)
+            return None
+
+        if not doc:
+            return None
+        return doc.get("id")
+
+    async def mb_commit_pass(entitlement_id: str) -> bool:
+        """Finalize a previously reserved pass: clear the pending counter, and
+        if quantity_remaining == 0 also mark status='used'."""
+        if not entitlement_id:
+            return False
+        now_iso = _mbt_iso(_mbt_now())
+        try:
+            ent = await _mbt_entitlements.find_one({"id": entitlement_id}, {"_id": 0})
+            if not ent:
+                return False
+            upd = {
+                "$inc": {"pending_reservations": -1},
+                "$set": {"used_at": now_iso, "updated_at": now_iso},
+            }
+            # If this used up the last unit, mark status=used.
+            if int(ent.get("quantity_remaining") or 0) <= 0:
+                upd["$set"]["status"] = "used"
+            await _mbt_entitlements.update_one({"id": entitlement_id}, upd)
+            return True
+        except Exception as _e:
+            _MBT_LOG.warning("mb_commit_pass failed (%s): %s", entitlement_id, _e)
+            return False
+
+    async def mb_refund_pass(entitlement_id: str) -> bool:
+        """Restore a reserved-but-not-used pass (called when the edutalk
+        operation fails before consumption is final)."""
+        if not entitlement_id:
+            return False
+        now_iso = _mbt_iso(_mbt_now())
+        try:
+            await _mbt_entitlements.update_one(
+                {"id": entitlement_id},
+                {"$inc": {"quantity_remaining": 1, "pending_reservations": -1},
+                 "$set": {"updated_at": now_iso}},
+            )
+            return True
+        except Exception as _e:
+            _MBT_LOG.warning("mb_refund_pass failed (%s): %s", entitlement_id, _e)
+            return False
+
+    # Wire the helpers into edutalk_tools.py via module-level hooks so the
+    # pass is consumed BEFORE the GAS debit at each charge site. Failure to
+    # import edutalk_tools is non-fatal — EduTalk simply keeps charging
+    # points the usual way and the pass remains visible in My Portal until
+    # the next session attempt.
+    try:
+        import edutalk_tools as _et_mod
+        _et_mod._ENTITLEMENT_RESERVE = mb_reserve_pass
+        _et_mod._ENTITLEMENT_COMMIT = mb_commit_pass
+        _et_mod._ENTITLEMENT_REFUND = mb_refund_pass
+        _MBT_LOG.info("mystery_box: wired EduTalk pass hooks into edutalk_tools")
+    except Exception as _et_hook_err:
+        _MBT_LOG.warning(
+            "mystery_box: could not wire EduTalk pass hooks (passes will not be "
+            "consumed inside EduTalk yet): %s",
+            _et_hook_err,
+        )
+
+    async def _mbt_push_notify_prize(student_clean_id: str, title: str, body: str) -> dict:
+        """Reuse the EXISTING subscription normalization + fan_out_push
+        (both unchanged, shared with Lucky Draw) — never a second push
+        delivery system. Returns a TRUTHFUL structured result; never pretends
+        success on failure."""
+        norm = _mbt_norm_id(student_clean_id)
+        candidates: list[str] = []
+        for c in (student_clean_id, norm, norm.upper()):
+            if c and c not in candidates:
+                candidates.append(c)
+        query = {"studentId": {"$in": candidates}}
+        try:
+            sub_count = await push_subscriptions.count_documents(query)
+        except Exception:  # noqa: BLE001
+            sub_count = None
+        if sub_count == 0:
+            return {"attempted": False, "sent": 0, "failed": 0,
+                    "no_subscribers": True, "error": ""}
+        try:
+            sent, failed = await _ns["_fan_out_push"](
+                query, title=title, body=body, url="/portal",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"attempted": True, "sent": 0, "failed": 0,
+                    "no_subscribers": False, "error": str(exc)[:200]}
+        sent = int(sent or 0)
+        failed = int(failed or 0)
+        return {"attempted": True, "sent": sent, "failed": failed,
+                "no_subscribers": (sent == 0 and failed == 0), "error": ""}
+
+    async def notify_mystery_box_prize(
+        *,
+        student_id: str,
+        grant_id: str,
+        prize_type: str,
+        prize_payload: dict,
+        source: str = "speaking_lab_mystery_box",
+    ) -> dict:
+        """Send the Mystery Box reward-success push truthfully and EXACTLY
+        ONCE, for a prize that is ALREADY durably granted.
+
+        This function NEVER grants the prize — the caller MUST have already
+        persisted `speaking_lab_mystery_claims.{grant_id}.granted_status ==
+        "granted"` before calling this. It only atomically claims the
+        notification slot on that existing row, calls the real push helper,
+        and records a truthful outcome. Safe to call repeatedly (idempotent)
+        and safe under concurrency (exactly one caller wins the atomic claim).
+        """
+        if prize_type not in _MBT_NOTIFIABLE_PRIZE_TYPES:
+            return {"ok": True, "skipped": True, "reason": "not_notifiable_prize_type"}
+
+        now = _mbt_now()
+        now_iso = _mbt_iso(now)
+        attempt_id = _mbt_uuid.uuid4().hex
+        stale_cut = _mbt_iso(now - timedelta(seconds=_MBT_PUSH_STALE_SECONDS))
+
+        # Atomic claim: only a granted row, not already sent, and the slot is
+        # claimable (missing / pending / failed). Concurrent callers converge
+        # on exactly one winner via this conditional update.
+        claim_res = await _mbt_claims.update_one(
+            {"id": grant_id, "granted_status": "granted",
+             "notification_status": {"$in": [None, "pending", "failed"]}},
+            {"$set": {"notification_status": "sending",
+                      "notification_attempt_id": attempt_id,
+                      "notification_attempted_at": now_iso,
+                      "notification_key": grant_id,
+                      "notification_payload_version": 1}},
+        )
+        if getattr(claim_res, "modified_count", 0) != 1:
+            # Not grantable / already sent / claimed elsewhere — try the
+            # bounded stale-`sending` recovery path (mirrors Lucky Draw).
+            reclaim_res = await _mbt_claims.update_one(
+                {"id": grant_id, "granted_status": "granted",
+                 "notification_status": "sending",
+                 "notification_attempted_at": {"$lt": stale_cut}},
+                {"$set": {"notification_status": "sending",
+                          "notification_attempt_id": attempt_id,
+                          "notification_attempted_at": now_iso}},
+            )
+            if getattr(reclaim_res, "modified_count", 0) != 1:
+                return {"ok": True, "skipped": True, "reason": "not_claimable"}
+
+        prize_payload = prize_payload or {}
+        title, body = _mbt_prize_notification_content(
+            prize_type, prize_payload.get("title"), prize_payload,
+        )
+
+        try:
+            result = await _mbt_push_notify_prize(student_id, title, body)
+        except _mbt_asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — helper should not raise, but be safe
+            # Guard the terminal write on OUR attempt id so a delayed older
+            # worker can never overwrite a newer attempt's outcome.
+            await _mbt_claims.update_one(
+                {"id": grant_id, "notification_attempt_id": attempt_id},
+                {"$set": {"notification_status": "failed",
+                          "notification_error": str(exc)[:200]}},
+            )
+            _MBT_LOG.warning(
+                "mystery_box: reward push raised (grant stays successful) "
+                "grant_id=%s err=%s", grant_id, str(exc)[:200],
+            )
+            return {"ok": False, "sent": False, "error": str(exc)[:200]}
+
+        sent = int(result.get("sent") or 0)
+        if sent >= 1:
+            await _mbt_claims.update_one(
+                {"id": grant_id, "notification_attempt_id": attempt_id},
+                {"$set": {"notification_status": "sent",
+                          "notification_sent_at": _mbt_iso(_mbt_now()),
+                          "notification_error": ""}},
+            )
+            return {"ok": True, "sent": True}
+
+        no_subs = bool(result.get("no_subscribers"))
+        err = str(result.get("error") or "")
+        await _mbt_claims.update_one(
+            {"id": grant_id, "notification_attempt_id": attempt_id},
+            {"$set": {"notification_status": "failed",
+                      "notification_error": err or ("no_subscribers" if no_subs else "delivery_failed")}},
+        )
+        return {"ok": True, "sent": False,
+                "reason": "no_subscribers" if no_subs else "delivery_failed"}
+
+    # ── prize granting (server is single source of truth) ───────────────
+    async def _mbt_grant_prize(
+        *,
+        prize: dict,
+        student_clean_id: str,
+        student_id_norm: str,
+        campaign_id: str,
+        round_id: str,
+    ) -> dict:
+        """Execute the real grant for one prize. Returns a dict with:
+            {ok: bool, error?: str, granted: dict|None, safe_display: dict}
+        The voucher coupon code is NEVER included in safe_display."""
+        ptype = (prize.get("type") or "").strip().lower()
+        granted: dict = {}
+
+        credit_via_treasury = login_reward_hooks.credit_via_treasury if login_reward_hooks else None
+        issue_voucher_for_claim = login_reward_hooks.issue_voucher_for_claim if login_reward_hooks else None
+
+        if ptype == "points":
+            pts = int(prize.get("points") or 0)
+            if pts > 0:
+                if not callable(credit_via_treasury):
+                    return {"ok": False, "error": "treasury credit unavailable",
+                            "granted": None,
+                            "safe_display": _safe_display_for(prize, None)}
+                res = await credit_via_treasury(
+                    student_clean_id=student_clean_id,
+                    points=pts,
+                    campaign_id=campaign_id,
+                    campaign_name=f"Mystery Box ({prize.get('title')})",
+                )
+                if not res.get("ok"):
+                    return {"ok": False, "error": str(res.get("error") or "credit failed"),
+                            "granted": None,
+                            "safe_display": _safe_display_for(prize, None)}
+                granted = {"points_credited": pts}
+            return {"ok": True, "granted": granted,
+                    "safe_display": _safe_display_for(prize, granted)}
+
+        if ptype == "book_voucher":
+            # Reuse the EXISTING login-reward voucher issuance flow so the
+            # voucher lands in My Portal → Voucher Hub automatically (the
+            # /api/student/vouchers endpoint already lists student_vouchers).
+            if not callable(issue_voucher_for_claim):
+                return {"ok": False, "error": "voucher issuer unavailable",
+                        "granted": None,
+                        "safe_display": _safe_display_for(prize, None)}
+            # Synthesize a "campaign" envelope the issuer understands.
+            synth_camp = {
+                "id": f"mb_{round_id}_{prize.get('id')}",
+                "name": f"Mystery Box: {prize.get('title')}",
+                "reward_kind": "voucher",
+                "voucher_source": "auto",
+                "voucher_title": prize.get("voucher_title") or prize.get("title") or "Book Voucher",
+                "voucher_subtitle": prize.get("voucher_subtitle") or "",
+                "voucher_discount_type": (prize.get("voucher_discount_type") or "percent"),
+                "voucher_discount_value": float(prize.get("voucher_discount_value") or 0),
+                "voucher_valid_days": int(prize.get("voucher_valid_days") or 30),
+                "voucher_book_slugs": list(prize.get("voucher_book_slugs") or []),
+                "voucher_template": "royal_purple_gold",
+                "voucher_accent_color": prize.get("accent_color") or "#D4A843",
+                "voucher_cta_label": "Use Voucher",
+            }
+            payload = await issue_voucher_for_claim(synth_camp, student_clean_id, student_id_norm)
+            if not payload:
+                return {"ok": False, "error": "voucher issuance failed",
+                        "granted": None,
+                        "safe_display": _safe_display_for(prize, None)}
+            granted = {
+                "voucher_owned": True,
+                "discount_label": payload.get("discount_label"),
+                "expires_at": payload.get("expires_at"),
+            }
+            return {"ok": True, "granted": granted,
+                    "safe_display": _safe_display_for(prize, granted)}
+
+        if ptype in ("edutalk_session", "edutalk_voice"):
+            # Resolve title/quantity from referenced pass template if any.
+            title = prize.get("title") or "EduTalk Pass"
+            quantity = int(prize.get("quantity") or 1)
+            eligible_books = list(prize.get("eligible_book_slugs") or [])
+            expires_days = int(prize.get("expires_in_days") or 30)
+            tpl_id = prize.get("pass_template_id")
+            if tpl_id:
+                try:
+                    tpl = await _mbt_edutalk_templates.find_one({"id": tpl_id}, {"_id": 0})
+                    if tpl:
+                        title = tpl.get("name") or title
+                        quantity = int(tpl.get("quantity_total") or quantity)
+                        eligible_books = list(tpl.get("eligible_book_slugs") or eligible_books)
+                        expires_days = int(tpl.get("expires_in_days") or expires_days)
+                except Exception:
+                    pass
+            row = await _mbt_grant_edutalk_pass(
+                student_clean_id=student_clean_id,
+                student_id_norm=student_id_norm,
+                feature=ptype,
+                title=title,
+                quantity=quantity,
+                eligible_book_slugs=eligible_books,
+                expires_in_days=expires_days,
+                source="speaking_lab_mystery_box",
+                campaign_id=campaign_id,
+                round_id=round_id,
+            )
+            granted = {
+                "entitlement_id_internal": row.get("id"),  # NOT exposed to client
+                "quantity": row.get("quantity_total"),
+                "expires_at": row.get("expires_at"),
+                "feature": ptype,
+            }
+            # Strip internal id from the response we return outwards.
+            public_granted = {k: v for k, v in granted.items() if k != "entitlement_id_internal"}
+            return {"ok": True, "granted": public_granted,
+                    "safe_display": _safe_display_for(prize, public_granted)}
+
+        if ptype == "consolation":
+            pts = int(prize.get("points") or 0)
+            if pts > 0 and callable(credit_via_treasury):
+                try:
+                    await credit_via_treasury(
+                        student_clean_id=student_clean_id,
+                        points=pts,
+                        campaign_id=campaign_id,
+                        campaign_name=f"Mystery Box ({prize.get('title')})",
+                    )
+                except Exception:
+                    pass  # consolation is best-effort
+            return {"ok": True, "granted": {"points_credited": pts},
+                    "safe_display": _safe_display_for(prize, {"points_credited": pts})}
+
+        if ptype in ("lucky_draw_entry", "recognition"):
+            # These types are visual / record-only for now. We log them in
+            # reward_history but never modify the existing lucky draw or
+            # badge subsystems (per safety brief).
+            return {"ok": True, "granted": {ptype: True},
+                    "safe_display": _safe_display_for(prize, None)}
+
+        return {"ok": False, "error": f"unsupported prize type: {ptype}",
+                "granted": None,
+                "safe_display": _safe_display_for(prize, None)}
+
+    # ── ADMIN ROUTES (Author Studio + Speaking Lab admin) ────────────────
+
+    # -- EduTalk Pass templates -----------------------------------------
+    @api.get("/admin/edutalk-passes/templates")
+    async def mbt_list_pass_templates(admin=Depends(require_admin)):
+        rows = []
+        async for r in _mbt_edutalk_templates.find({}, {"_id": 0}).sort("created_at", -1).limit(200):
+            rows.append(r)
+        return {"templates": rows, "count": len(rows)}
+
+    @api.post("/admin/edutalk-passes/templates")
+    async def mbt_create_pass_template(payload: _EduTalkPassTemplateIn, admin=Depends(require_admin)):
+        now = _mbt_iso(_mbt_now())
+        doc = payload.model_dump()
+        doc.update({
+            "id": "etp_" + _mbt_secrets.token_hex(8),
+            "created_at": now,
+            "updated_at": now,
+            "created_by": getattr(admin, "email", "") or "",
+        })
+        await _mbt_edutalk_templates.insert_one(dict(doc))
+        doc.pop("_id", None)
+        return {"template": doc}
+
+    @api.put("/admin/edutalk-passes/templates/{tid}")
+    async def mbt_update_pass_template(tid: str, payload: _EduTalkPassTemplateIn, admin=Depends(require_admin)):
+        upd = payload.model_dump()
+        upd["updated_at"] = _mbt_iso(_mbt_now())
+        res = await _mbt_edutalk_templates.update_one({"id": tid}, {"$set": upd})
+        if not res.matched_count:
+            raise HTTPException(status_code=404, detail="template not found")
+        row = await _mbt_edutalk_templates.find_one({"id": tid}, {"_id": 0})
+        return {"template": row}
+
+    @api.delete("/admin/edutalk-passes/templates/{tid}")
+    async def mbt_delete_pass_template(tid: str, admin=Depends(require_admin)):
+        res = await _mbt_edutalk_templates.delete_one({"id": tid})
+        return {"deleted": int(res.deleted_count or 0)}
+
+    # -- Mystery Box prize templates -------------------------------------
+    @api.get("/admin/mystery-box/prize-templates")
+    async def mbt_list_prize_templates(admin=Depends(require_admin)):
+        rows = []
+        async for r in _mbt_prize_templates.find({}, {"_id": 0}).sort("created_at", -1).limit(500):
+            rows.append(r)
+        return {"prizes": rows, "count": len(rows)}
+
+    @api.post("/admin/mystery-box/prize-templates")
+    async def mbt_create_prize_template(payload: _PrizeTemplateIn, admin=Depends(require_admin)):
+        now = _mbt_iso(_mbt_now())
+        doc = payload.model_dump()
+        doc.update({
+            "id": "prz_" + _mbt_secrets.token_hex(8),
+            "created_at": now,
+            "updated_at": now,
+            "created_by": getattr(admin, "email", "") or "",
+        })
+        await _mbt_prize_templates.insert_one(dict(doc))
+        doc.pop("_id", None)
+        return {"prize": doc}
+
+    @api.put("/admin/mystery-box/prize-templates/{pid}")
+    async def mbt_update_prize_template(pid: str, payload: _PrizeTemplateIn, admin=Depends(require_admin)):
+        upd = payload.model_dump()
+        upd["updated_at"] = _mbt_iso(_mbt_now())
+        res = await _mbt_prize_templates.update_one({"id": pid}, {"$set": upd})
+        if not res.matched_count:
+            raise HTTPException(status_code=404, detail="prize not found")
+        row = await _mbt_prize_templates.find_one({"id": pid}, {"_id": 0})
+        return {"prize": row}
+
+    @api.delete("/admin/mystery-box/prize-templates/{pid}")
+    async def mbt_delete_prize_template(pid: str, admin=Depends(require_admin)):
+        res = await _mbt_prize_templates.delete_one({"id": pid})
+        return {"deleted": int(res.deleted_count or 0)}
+
+    # -- Campaign templates (Speaking Lab admin chooses approved prizes) --
+    @api.get("/admin/mystery-box/campaigns")
+    async def mbt_list_campaigns(admin=Depends(require_admin)):
+        rows = []
+        async for r in _mbt_campaigns.find({}, {"_id": 0}).sort("created_at", -1).limit(500):
+            rows.append(r)
+        return {"campaigns": rows, "count": len(rows)}
+
+    @api.post("/admin/mystery-box/campaigns")
+    async def mbt_create_campaign(payload: _CampaignIn, admin=Depends(require_admin)):
+        now = _mbt_iso(_mbt_now())
+        doc = payload.model_dump()
+        doc.update({
+            "id": "cmp_" + _mbt_secrets.token_hex(8),
+            "created_at": now,
+            "updated_at": now,
+            "created_by": getattr(admin, "email", "") or "",
+        })
+        await _mbt_campaigns.insert_one(dict(doc))
+        doc.pop("_id", None)
+        return {"campaign": doc}
+
+    @api.put("/admin/mystery-box/campaigns/{cid}")
+    async def mbt_update_campaign(cid: str, payload: _CampaignIn, admin=Depends(require_admin)):
+        upd = payload.model_dump()
+        upd["updated_at"] = _mbt_iso(_mbt_now())
+        res = await _mbt_campaigns.update_one({"id": cid}, {"$set": upd})
+        if not res.matched_count:
+            raise HTTPException(status_code=404, detail="campaign not found")
+        row = await _mbt_campaigns.find_one({"id": cid}, {"_id": 0})
+        return {"campaign": row}
+
+    @api.delete("/admin/mystery-box/campaigns/{cid}")
+    async def mbt_delete_campaign(cid: str, admin=Depends(require_admin)):
+        res = await _mbt_campaigns.delete_one({"id": cid})
+        return {"deleted": int(res.deleted_count or 0)}
+
+    # Admin campaign-preview endpoint. Resolves the campaign layout the SAME
+    # way the round-creation route does, but returns the prize titles/types
+    # ONLY (no codes, no internal IDs beyond what already appears in the
+    # admin Studio UI) so an operator can sanity-check "what will my
+    # classroom see when I click reveal?" without actually starting a round.
+    @api.get("/admin/mystery-box/campaigns/{cid}/preview")
+    async def mbt_preview_campaign(cid: str, admin=Depends(require_admin)):
+        camp = await _mbt_campaigns.find_one({"id": cid}, {"_id": 0})
+        if not camp:
+            raise HTTPException(status_code=404, detail="campaign not found")
+        # Resolved layout (random — call repeatedly to see variability).
+        layout = await _mbt_resolve_campaign_layout(camp)
+        # Plus the FULL pool of enabled prizes the campaign is allowed to
+        # draw from, so the operator can immediately spot "I added a
+        # voucher template but disabled it".
+        ids = list(camp.get("prize_template_ids") or [])
+        pool = []
+        if ids:
+            async for r in _mbt_prize_templates.find(
+                {"id": {"$in": ids}}, {"_id": 0},
+            ):
+                pool.append({
+                    "id": r.get("id"),
+                    "title": r.get("title"),
+                    "type": r.get("type"),
+                    "rarity": r.get("rarity"),
+                    "enabled": bool(r.get("enabled", True)),
+                })
+        return {
+            "campaign_id": cid,
+            "campaign_name": camp.get("name"),
+            "box_count": int(camp.get("box_count") or 0),
+            "enabled_pool_size": sum(1 for p in pool if p["enabled"]),
+            "pool": pool,
+            "sample_layout": [
+                {"index": i, "title": p.get("title"), "type": p.get("type"),
+                 "rarity": p.get("rarity")}
+                for i, p in enumerate(layout)
+            ],
+            "by_type_in_sample": {
+                t: sum(1 for p in layout if (p.get("type") or "") == t)
+                for t in ["points", "book_voucher", "edutalk_session",
+                          "edutalk_voice", "lucky_draw_entry",
+                          "recognition", "consolation"]
+            },
+        }
+
+    # ── SPEAKING LAB TEACHER ROUTES (rounds + reveal) ────────────────────
+
+    async def _mbt_resolve_campaign_layout(camp: dict) -> List[dict]:
+        """Resolve the prize layout for a campaign.
+
+        Returns a list of prize dicts of length camp.box_count.
+
+        * If ``box_count >= len(prizes)``: include each enabled prize at
+          least once (so a small pool still gets every template surfaced),
+          then random-sample-with-replacement for the remaining slots.
+        * If ``box_count < len(prizes)``: random-sample-WITHOUT-replacement
+          from the full pool, so every template has an equal chance per
+          round regardless of MongoDB insertion order.
+        * Optional ``weights`` array on the campaign is honoured when
+          sampling with replacement.
+
+        Final ``random.shuffle`` keeps the box positions unpredictable
+        from the client.
+        """
+        import random as _r
+
+        ids = list(camp.get("prize_template_ids") or [])
+        box_count = int(camp.get("box_count") or 7)
+        prizes: List[dict] = []
+        if ids:
+            async for r in _mbt_prize_templates.find(
+                {"id": {"$in": ids}, "enabled": True}, {"_id": 0}
+            ):
+                prizes.append(r)
+        if not prizes:
+            return []
+
+        n = len(prizes)
+        if box_count <= 0:
+            return []
+
+        # Build a weight list aligned to `prizes`. Campaign.weights is a
+        # parallel list to campaign.prize_template_ids (NOT to the
+        # filtered/enabled `prizes` order coming from Mongo). We re-align
+        # by id so a disabled prize doesn't shift the weights.
+        weight_by_id = {}
+        raw_weights = camp.get("weights") or []
+        if isinstance(raw_weights, list) and raw_weights:
+            for idx, pid in enumerate(ids):
+                if idx < len(raw_weights):
+                    try:
+                        w = float(raw_weights[idx])
+                    except Exception:
+                        w = 1.0
+                    weight_by_id[pid] = max(w, 0.0)
+        weights = [weight_by_id.get(p.get("id"), 1.0) for p in prizes]
+        # If every weight is zero, fall back to uniform.
+        if all((w == 0.0) for w in weights):
+            weights = [1.0] * n
+
+        if box_count >= n:
+            # Cover every prize at least once, then sample-with-replacement
+            # for the extra slots so larger pools still get variety.
+            out = list(prizes)
+            # Shuffle the seed copy so the "guaranteed" boxes aren't
+            # always in the same order before padding.
+            _r.shuffle(out)
+            extra_needed = box_count - n
+            if extra_needed > 0:
+                out.extend(_r.choices(prizes, weights=weights, k=extra_needed))
+        else:
+            # box_count < n  →  pick a random subset honouring weights
+            # without replacement so every template has a fair chance per
+            # round and points-templates can't crowd out vouchers/passes
+            # just because they were created first.
+            try:
+                picked = _r.sample(prizes, k=box_count)  # uniform without replacement
+            except ValueError:
+                # Defensive: sample raises if k > len, which we already
+                # guarded for, but keep a hard fallback.
+                picked = prizes[:box_count]
+            # Apply weights as a soft re-roll: with a low probability,
+            # swap a low-weight pick for a high-weight one. Keeps the
+            # behaviour intuitive without making weights mandatory.
+            if any(w != 1.0 for w in weights):
+                wmap = {p.get("id"): w for p, w in zip(prizes, weights)}
+                # Re-sort picked by weight descending so the heavier prizes
+                # tend to surface in earlier (lower-index) box slots before
+                # the final shuffle.
+                picked.sort(key=lambda p: wmap.get(p.get("id"), 1.0), reverse=True)
+            out = picked
+
+        _r.shuffle(out)
+        return out
+
+    @api.post("/speaking-lab/mystery-box/rounds")
+    async def mbt_create_round(payload: _RoundCreateIn, admin=Depends(require_admin)):
+        camp = await _mbt_campaigns.find_one({"id": payload.campaign_id, "enabled": True}, {"_id": 0})
+        if not camp:
+            raise HTTPException(status_code=404, detail="campaign not found or disabled")
+        layout = await _mbt_resolve_campaign_layout(camp)
+        if not layout:
+            raise HTTPException(status_code=400, detail="campaign has no enabled prizes")
+        rid = "rnd_" + _mbt_secrets.token_hex(10)
+        now = _mbt_iso(_mbt_now())
+        box_layout = [
+            {
+                "index": i,
+                "prize_id": p.get("id"),
+                "type": p.get("type"),
+                "rarity": p.get("rarity") or "common",
+                "accent_color": p.get("accent_color") or "#D4A843",
+            }
+            for i, p in enumerate(layout)
+        ]
+        # Internal full layout is stored separately so we can grant the right
+        # prize at reveal time; only `closed_boxes` (opaque) is returned to
+        # the teacher client.
+        closed_boxes = [
+            {
+                "index": b["index"],
+                "rarity": b["rarity"],
+                "accent_color": b["accent_color"],
+            }
+            for b in box_layout
+        ]
+        doc = {
+            "id": rid,
+            "campaign_id": camp["id"],
+            "campaign_name": camp.get("name") or "",
+            "box_count": int(camp.get("box_count") or len(layout)),
+            "session_id": (payload.session_id or "").strip(),
+            "layout": box_layout,                # contains prize_id per box
+            "closed_boxes": closed_boxes,        # safe to surface to client
+            "selected_box_index": None,
+            "selected_student_id": None,
+            "selected_student_name": "",
+            "status": "open",                    # open → revealed → done
+            "revealed_at": None,
+            "created_at": now,
+            "updated_at": now,
+            "created_by": getattr(admin, "email", "") or "",
+            "settings": {
+                "teacher_confirm_required": bool(camp.get("teacher_confirm_required", True)),
+                "reveal_all_after_claim": bool(camp.get("reveal_all_after_claim", True)),
+                "show_missed_prizes": bool(camp.get("show_missed_prizes", True)),
+            },
+        }
+        await _mbt_rounds.insert_one(dict(doc))
+        doc.pop("_id", None)
+        # Return the teacher-safe shape (no prize_id in closed_boxes).
+        safe = {k: v for k, v in doc.items() if k != "layout"}
+        return {"round": safe}
+
+    @api.get("/speaking-lab/mystery-box/rounds/{rid}")
+    async def mbt_get_round(rid: str, admin=Depends(require_admin)):
+        row = await _mbt_rounds.find_one({"id": rid}, {"_id": 0})
+        if not row:
+            raise HTTPException(status_code=404, detail="round not found")
+        # Privacy hardening: ALWAYS strip the internal ``layout`` (which
+        # contains prize_id per box). Speaking Lab must never receive raw
+        # prize identifiers — even after reveal the public reveal payload
+        # is delivered through the reveal endpoint's `revealed_layout`
+        # (titles only), not through this generic round fetch.
+        row = {k: v for k, v in row.items() if k != "layout"}
+        return {"round": row}
+
+    # Speaking Lab sanitised "active campaigns" lookup. The generic
+    # /api/admin/mystery-box/campaigns endpoint returns the full campaign
+    # record including raw prize_template_ids, weights and admin meta. The
+    # Speaking Lab teacher console only needs id / name / box_count /
+    # prize_template_count / settings, so we expose a dedicated read-only
+    # endpoint that omits anything private. The admin-only campaign list
+    # stays untouched so Author Studio keeps working.
+    @api.get("/speaking-lab/mystery-box/active-campaigns")
+    async def mbt_speaking_lab_active_campaigns(admin=Depends(require_admin)):
+        rows = []
+        async for r in _mbt_campaigns.find({"enabled": True}, {"_id": 0}).sort("created_at", -1).limit(200):
+            ids = list(r.get("prize_template_ids") or [])
+            # Compute how many of the referenced prize templates are still
+            # enabled so the teacher banner can show an accurate
+            # "X prize templates" count without exposing internal ids.
+            enabled_count = 0
+            if ids:
+                enabled_count = await _mbt_prize_templates.count_documents(
+                    {"id": {"$in": ids}, "enabled": True},
+                )
+            rows.append({
+                "id": r.get("id"),
+                "name": r.get("name") or "",
+                "description": r.get("description") or "",
+                "box_count": int(r.get("box_count") or 0),
+                "prize_template_count": int(enabled_count),
+                "teacher_confirm_required": bool(r.get("teacher_confirm_required", True)),
+                "reveal_all_after_claim": bool(r.get("reveal_all_after_claim", True)),
+                "show_missed_prizes": bool(r.get("show_missed_prizes", True)),
+                "enabled": True,
+            })
+        return {"campaigns": rows, "count": len(rows)}
+
+    @api.post("/speaking-lab/mystery-box/rounds/{rid}/select")
+    async def mbt_select_box(rid: str, payload: _SelectIn, admin=Depends(require_admin)):
+        row = await _mbt_rounds.find_one({"id": rid}, {"_id": 0})
+        if not row:
+            raise HTTPException(status_code=404, detail="round not found")
+        if row.get("status") != "open":
+            # Idempotent for "select" — if already selected, return current state.
+            return {"round": {k: v for k, v in row.items() if k != "layout"}}
+        bc = int(row.get("box_count") or 0)
+        if payload.box_index < 0 or payload.box_index >= bc:
+            raise HTTPException(status_code=400, detail="box_index out of range")
+
+        # Normalise the incoming student_id to its canonical clean_id before
+        # we store the selection. Speaking Lab historically forwarded the
+        # wallet-style id, which then leaked into mbt_reveal_round and
+        # caused rewards to be granted under the wrong student_id_norm
+        # (invisible in My Portal).
+        resolved = await _mbt_resolve_student(payload.student_id)
+        sid_clean = resolved["clean_id"] or (payload.student_id or "").strip()
+        sid_name = (
+            (payload.student_name or "").strip()
+            or resolved.get("display_name") or ""
+        )[:80]
+
+        now = _mbt_iso(_mbt_now())
+        await _mbt_rounds.update_one(
+            {"id": rid, "status": "open"},
+            {"$set": {
+                "selected_box_index": int(payload.box_index),
+                "selected_student_id": sid_clean,
+                "selected_student_id_raw": payload.student_id or "",
+                "selected_student_id_norm": resolved["norm"],
+                "selected_student_name": sid_name,
+                "selected_student_resolved": bool(resolved.get("ok")),
+                "updated_at": now,
+            }},
+        )
+        row = await _mbt_rounds.find_one({"id": rid}, {"_id": 0})
+        safe = {k: v for k, v in row.items() if k != "layout"}
+        return {"round": safe}
+
+    @api.post("/speaking-lab/mystery-box/rounds/{rid}/reveal")
+    async def mbt_reveal_round(rid: str, payload: _RevealIn, admin=Depends(require_admin)):
+        row = await _mbt_rounds.find_one({"id": rid}, {"_id": 0})
+        if not row:
+            raise HTTPException(status_code=404, detail="round not found")
+
+        # Resolve the incoming identifier to its canonical clean_id BEFORE
+        # any reward persistence. Previously this function used
+        # payload.student_id verbatim, which meant rewards were granted
+        # under the wallet-form id (e.g. ``stu_88185fad5202``) while
+        # ``/api/student/vouchers`` etc. read by clean_id (``stu094``).
+        raw_id_in = (payload.student_id or "").strip()
+        if not raw_id_in:
+            raise HTTPException(status_code=400, detail="student_id required")
+        resolved = await _mbt_resolve_student(raw_id_in)
+        sid_clean = resolved["clean_id"] or raw_id_in
+        sid_norm = resolved["norm"] or _mbt_norm_id(sid_clean)
+        sid_wallet = resolved.get("student_id") or ""
+        if not sid_clean:
+            raise HTTPException(status_code=400, detail="student_id required")
+
+        # Idempotency, three-way:
+        #   granted → return existing claim (no re-grant ever)
+        #   pending → 409 so caller waits (another reveal is in flight)
+        #   failed  → ALLOW a safe retry of the grant for the same selected box,
+        #             reusing the existing claim row so we never accumulate
+        #             duplicate failed rows for the same (round, student).
+        existing_claim = await _mbt_claims.find_one(
+            {"round_id": rid, "student_id_norm": sid_norm}, {"_id": 0}
+        )
+        retrying_failed = False
+        if existing_claim:
+            gstatus = (existing_claim.get("granted_status") or "").lower()
+            if gstatus == "granted":
+                return {
+                    "already_claimed": True,
+                    "claim": existing_claim,
+                    "revealed_layout": existing_claim.get("public_layout") or [],
+                }
+            if gstatus == "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Grant in progress for this student. Please retry shortly.",
+                )
+            # gstatus == "failed" → fall through and retry the grant. Force
+            # the retry to use the box_index recorded on the original claim
+            # so the operator can't accidentally swap the chosen box.
+            retrying_failed = True
+
+        if row.get("status") not in ("open",) and not retrying_failed:
+            # Round already closed by a different student's reveal. Return a
+            # safe layout snapshot so the teacher screen can still show the
+            # closed state without crashing.
+            public_layout = []
+            for b in (row.get("layout") or []):
+                public_layout.append({
+                    "index": b.get("index"),
+                    "type": b.get("type"),
+                    "rarity": b.get("rarity"),
+                    "is_selected": False,
+                    "is_claimed": False,
+                    "title": "Mystery Prize",
+                })
+            return {"already_claimed": True, "claim": None,
+                    "revealed_layout": public_layout}
+
+        # Resolve box_index.
+        #   - For a retry of a failed claim, ALWAYS use the original recorded
+        #     box_index (immutable choice).
+        #   - Otherwise, prefer payload, fall back to round.selected_box_index.
+        if retrying_failed:
+            box_index = existing_claim.get("selected_box_index")
+        else:
+            box_index = payload.box_index
+            if box_index is None:
+                box_index = row.get("selected_box_index")
+        if box_index is None:
+            raise HTTPException(status_code=400, detail="no box selected")
+        box_index = int(box_index)
+        layout = row.get("layout") or []
+        if box_index < 0 or box_index >= len(layout):
+            raise HTTPException(status_code=400, detail="box_index out of range")
+        chosen = layout[box_index]
+        prize = await _mbt_prize_templates.find_one({"id": chosen.get("prize_id")}, {"_id": 0})
+        if not prize:
+            raise HTTPException(status_code=500, detail="prize template missing")
+
+        # Build / refresh the claim row. On a retry we keep the original id
+        # and just flip the status back to "pending" so another concurrent
+        # retry collides on the same row instead of inserting a duplicate.
+        idem = (payload.idempotency_key or "").strip() or _mbt_uuid.uuid4().hex
+        now = _mbt_iso(_mbt_now())
+        if retrying_failed:
+            claim_id = existing_claim.get("id")
+            await _mbt_claims.update_one(
+                {"id": claim_id, "granted_status": "failed"},
+                {"$set": {
+                    "granted_status": "pending",
+                    "retry_count": int(existing_claim.get("retry_count") or 0) + 1,
+                    "idempotency_key": idem,
+                    "updated_at": now,
+                }},
+            )
+            pending_id = claim_id
+        else:
+            pending = {
+                "id": "clm_" + _mbt_secrets.token_hex(10),
+                "round_id": rid,
+                "campaign_id": row.get("campaign_id"),
+                "student_id": sid_clean,
+                "student_id_norm": sid_norm,
+                # Keep an audit trail of the raw incoming id so an
+                # operator can prove which form Speaking Lab sent.
+                "student_id_raw": raw_id_in,
+                "student_wallet_id": sid_wallet,
+                "student_resolved": bool(resolved.get("ok")),
+                "student_name": (payload.student_name or row.get("selected_student_name") or "")[:80],
+                "selected_box_index": box_index,
+                "prize_id": prize.get("id"),
+                "prize_type": prize.get("type"),
+                "prize_title": prize.get("title"),
+                "granted_status": "pending",
+                "retry_count": 0,
+                "idempotency_key": idem,
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                await _mbt_claims.insert_one(dict(pending))
+            except Exception:
+                # Unique-index race: another reveal raced in between our
+                # initial fetch and this insert. Re-fetch and apply the
+                # three-way idempotency policy.
+                other = await _mbt_claims.find_one(
+                    {"round_id": rid, "student_id_norm": sid_norm}, {"_id": 0}
+                )
+                if other:
+                    ostatus = (other.get("granted_status") or "").lower()
+                    if ostatus == "granted":
+                        return {"already_claimed": True, "claim": other,
+                                "revealed_layout": other.get("public_layout") or []}
+                    if ostatus == "pending":
+                        raise HTTPException(status_code=409, detail="Grant in progress.")
+                    # Failed → caller should retry; surface 409 so the UI
+                    # explicitly re-issues the reveal.
+                    raise HTTPException(status_code=409, detail="Previous attempt failed — retry.")
+                raise HTTPException(status_code=409, detail="claim race")
+            pending_id = pending["id"]
+
+        # Now grant the prize for real. The round is NOT marked revealed
+        # until grant succeeds — a failed grant leaves the round open for
+        # another reveal attempt.
+        result = await _mbt_grant_prize(
+            prize=prize,
+            student_clean_id=sid_clean,
+            student_id_norm=sid_norm,
+            campaign_id=row.get("campaign_id") or "",
+            round_id=rid,
+        )
+        if not result.get("ok"):
+            # Mark claim failed but keep the row (auditable retry trail).
+            await _mbt_claims.update_one(
+                {"id": pending_id},
+                {"$set": {
+                    "granted_status": "failed",
+                    "grant_error": (result.get("error") or "")[:200],
+                    "updated_at": _mbt_iso(_mbt_now()),
+                }},
+            )
+            # Important: DO NOT close the round here. A subsequent reveal
+            # call for the same student will hit the retrying_failed branch
+            # above and try the grant again with the SAME box_index.
+            raise HTTPException(status_code=502, detail=result.get("error") or "grant failed")
+
+        safe_display = result.get("safe_display") or _safe_display_for(prize, result.get("granted"))
+
+        # Build the public reveal-all layout (titles only, no codes).
+        public_layout = []
+        for b in layout:
+            p_id = b.get("prize_id")
+            is_chosen = (int(b.get("index")) == box_index)
+            # Fetch sibling prize titles lazily (single call per box, OK for 3-9 boxes)
+            sib_prize = await _mbt_prize_templates.find_one({"id": p_id}, {"_id": 0})
+            if not sib_prize:
+                sib_prize = {"title": "Mystery Prize", "type": b.get("type") or ""}
+            sib_display = _safe_display_for(sib_prize, None)
+            public_layout.append({
+                "index": int(b.get("index") or 0),
+                "type": b.get("type"),
+                "rarity": b.get("rarity") or "common",
+                "title": sib_display.get("title") or sib_prize.get("title"),
+                "display": sib_display,
+                "is_selected": is_chosen,
+                "is_claimed": is_chosen,
+                "is_missed": not is_chosen,
+            })
+
+        # Mark claim as granted with the safe display payload + public layout.
+        await _mbt_claims.update_one(
+            {"id": pending_id},
+            {"$set": {
+                "granted_status": "granted",
+                "granted_at": _mbt_iso(_mbt_now()),
+                "safe_display_payload": safe_display,
+                "public_layout": public_layout,
+                "updated_at": _mbt_iso(_mbt_now()),
+            }},
+        )
+
+        # Reward-success push — ONLY now that the grant is durably persisted
+        # as "granted" above. Best-effort: a push failure/exception must never
+        # affect the reveal response below (the prize is already granted
+        # regardless of notification outcome). Never re-grants anything —
+        # see `notify_mystery_box_prize` docstring.
+        try:
+            await notify_mystery_box_prize(
+                student_id=sid_clean,
+                grant_id=pending_id,
+                prize_type=(prize.get("type") or "").strip().lower(),
+                prize_payload=safe_display,
+                source="speaking_lab_mystery_box",
+            )
+        except Exception as _notify_exc:  # noqa: BLE001
+            _MBT_LOG.warning(
+                "mystery_box: notify_mystery_box_prize raised (grant stays "
+                "successful) claim=%s err=%s", pending_id, str(_notify_exc)[:200],
+            )
+
+        # Mirror a successful POINTS grant into the Mongo points ledger +
+        # wallet so it becomes visible in My Portal via the existing
+        # /api/student/points/latest and /transactions endpoints. The
+        # legacy credit_via_treasury writes ONLY to GAS, which the
+        # dashboard does not read. This mirror is idempotent (keyed by
+        # claim_id) and never reverts the grant on failure.
+        try:
+            ptype_g = (prize.get("type") or "").strip().lower()
+            if ptype_g in ("points", "consolation"):
+                granted_obj = result.get("granted") or {}
+                credited = int(
+                    granted_obj.get("points_credited")
+                    or prize.get("points")
+                    or 0
+                )
+                if credited > 0:
+                    mirror = await _mbt_mirror_points_credit(
+                        clean_id=sid_clean,
+                        wallet_id=sid_wallet,
+                        amount=credited,
+                        claim_id=pending_id,
+                        source="speaking_lab_mystery_box",
+                    )
+                    # Stamp the mirror result on the claim for operator audit.
+                    await _mbt_claims.update_one(
+                        {"id": pending_id},
+                        {"$set": {
+                            "points_mirror_ok": bool(mirror.get("ok")),
+                            "points_mirror_status_ledger": mirror.get("ledger"),
+                            "points_mirror_status_wallet": mirror.get("wallet"),
+                            "points_mirror_ikey": mirror.get("ikey"),
+                            "points_mirror_error": mirror.get("error") or None,
+                        }},
+                    )
+        except Exception as _mirror_exc:  # noqa: BLE001
+            _MBT_LOG.warning(
+                "mystery_box points mirror failed claim=%s err=%s",
+                pending_id, str(_mirror_exc)[:200],
+            )
+
+        # Mark round done — ONLY now that the grant succeeded. A failed
+        # grant raised above and left the round status as "open" so the
+        # teacher can retry. The conditional {status:"open"} keeps this
+        # idempotent under any race.
+        await _mbt_rounds.update_one(
+            {"id": rid, "status": "open"},
+            {"$set": {
+                "status": "revealed",
+                "selected_box_index": box_index,
+                "selected_student_id": sid_clean,
+                "selected_student_name": (payload.student_name or "")[:80],
+                "revealed_at": _mbt_iso(_mbt_now()),
+                "updated_at": _mbt_iso(_mbt_now()),
+            }},
+        )
+
+        # Reward history (for "My Portal → Activity" surface, lightweight).
+        try:
+            await _mbt_reward_history.insert_one({
+                "student_id": sid_clean,
+                "student_id_norm": sid_norm,
+                "source": "speaking_lab_mystery_box",
+                "campaign_id": row.get("campaign_id"),
+                "round_id": rid,
+                "prize_id": prize.get("id"),
+                "prize_type": prize.get("type"),
+                "prize_title": prize.get("title"),
+                "safe_display_payload": safe_display,
+                "created_at": _mbt_iso(_mbt_now()),
+            })
+        except Exception:
+            pass
+
+        return {
+            "already_claimed": False,
+            "claim": {
+                "id": pending_id,
+                "round_id": rid,
+                "prize_type": prize.get("type"),
+                "prize_title": prize.get("title"),
+                "safe_display_payload": safe_display,
+                "granted_status": "granted",
+                "granted_at": _mbt_iso(_mbt_now()),
+            },
+            "revealed_layout": public_layout,
+        }
+
+    # ── STUDENT ROUTES (My Portal) ───────────────────────────────────────
+    @api.get("/student/edutalk-passes")
+    async def mbt_list_student_passes(student=Depends(require_student)):
+        sid_clean = (getattr(student, "clean_id", "") or "").strip() or getattr(student, "student_id", "")
+        sid_norm = _mbt_norm_id(sid_clean)
+        if not sid_norm:
+            return {"passes": [], "count": 0}
+        now_iso = _mbt_iso(_mbt_now())
+        out = []
+        cur = _mbt_entitlements.find(
+            {"student_id_norm": sid_norm},
+            {"_id": 0},
+        ).sort("created_at", -1).limit(200)
+        async for r in cur:
+            # Live status: expire on the fly if past expires_at.
+            status = r.get("status") or "active"
+            if status == "active" and r.get("expires_at") and r.get("expires_at") <= now_iso:
+                status = "expired"
+                # Best-effort persist
+                try:
+                    await _mbt_entitlements.update_one(
+                        {"id": r.get("id")},
+                        {"$set": {"status": "expired", "updated_at": now_iso}},
+                    )
+                except Exception:
+                    pass
+            out.append({
+                "id": r.get("id"),
+                "feature": r.get("feature"),
+                "title": r.get("title"),
+                "quantity_total": int(r.get("quantity_total") or 0),
+                "quantity_remaining": int(r.get("quantity_remaining") or 0),
+                "eligible_book_slugs": list(r.get("eligible_book_slugs") or []),
+                "applies_to_all_books": not bool(r.get("eligible_book_slugs")),
+                "source": r.get("source"),
+                "expires_at": r.get("expires_at"),
+                "status": status,
+                "created_at": r.get("created_at"),
+            })
+        return {"passes": out, "count": len(out)}
+
+    @api.get("/student/mystery-box/history")
+    async def mbt_student_history(student=Depends(require_student)):
+        sid_clean = (getattr(student, "clean_id", "") or "").strip() or getattr(student, "student_id", "")
+        sid_norm = _mbt_norm_id(sid_clean)
+        if not sid_norm:
+            return {"items": [], "count": 0}
+        rows = []
+        cur = _mbt_reward_history.find(
+            {"student_id_norm": sid_norm},
+            {"_id": 0},
+        ).sort("created_at", -1).limit(50)
+        async for r in cur:
+            rows.append({
+                "source": r.get("source"),
+                "prize_title": r.get("prize_title"),
+                "prize_type": r.get("prize_type"),
+                "safe_display_payload": r.get("safe_display_payload"),
+                "created_at": r.get("created_at"),
+            })
+        return {"items": rows, "count": len(rows)}
+
+    # Reader EduTalk-panel "Pass Available" badge endpoint. Returns a TINY
+    # counts-only payload (no entitlement ids, no titles, no eligibility
+    # lists). The PWA Reader EduTalk panel calls this once on mount and
+    # renders a small badge if the count > 0. Optional ?book_slug=<slug>
+    # filters to passes that apply to the current book.
+    @api.get("/student/edutalk-passes/summary")
+    async def mbt_pass_summary(
+        book_slug: str = "",
+        student=Depends(require_student),
+    ):
+        sid_clean = (getattr(student, "clean_id", "") or "").strip() or getattr(student, "student_id", "")
+        sid_norm = _mbt_norm_id(sid_clean)
+        empty = {"edutalk_session": 0, "edutalk_voice": 0, "has_any": False, "book_slug": book_slug or ""}
+        if not sid_norm:
+            return empty
+        now_iso = _mbt_iso(_mbt_now())
+        book_slug = (book_slug or "").strip()
+        base_query = {
+            "student_id_norm": sid_norm,
+            "status": "active",
+            "quantity_remaining": {"$gt": 0},
+            "$or": [
+                {"expires_at": {"$gt": now_iso}},
+                {"expires_at": None},
+            ],
+        }
+        if book_slug:
+            book_clause = {"$or": [
+                {"eligible_book_slugs": {"$in": [book_slug]}},
+                {"eligible_book_slugs": {"$size": 0}},
+                {"eligible_book_slugs": {"$exists": False}},
+            ]}
+        else:
+            book_clause = None
+
+        def _q(feature: str) -> dict:
+            q = {**base_query, "feature": feature}
+            if book_clause:
+                # Combine via $and to preserve both $or branches.
+                q = {"$and": [q, book_clause]}
+            return q
+
+        try:
+            s_cnt = await _mbt_entitlements.count_documents(_q("edutalk_session"))
+            v_cnt = await _mbt_entitlements.count_documents(_q("edutalk_voice"))
+        except Exception as _e:
+            _MBT_LOG.warning("edutalk pass summary failed: %s", _e)
+            return empty
+        return {
+            "edutalk_session": int(s_cnt or 0),
+            "edutalk_voice": int(v_cnt or 0),
+            "has_any": bool((s_cnt or 0) + (v_cnt or 0) > 0),
+            "book_slug": book_slug or "",
+        }
+
+    # Admin support/smoke endpoint. Given a student id, returns a small
+    # administrative summary: active pass counts (per feature), the 5 most
+    # recent mystery-box claims (granted/failed/pending), and the 5 most
+    # recent reward-history entries. Used by operators to verify that a
+    # student's win landed correctly without exposing voucher codes
+    # anywhere. Admin-only — does NOT leak data to students.
+    @api.get("/admin/mystery-box/student-summary")
+    async def mbt_admin_student_summary(
+        student_id: str = "",
+        admin=Depends(require_admin),
+    ):
+        sid_clean = (student_id or "").strip()
+        sid_norm = _mbt_norm_id(sid_clean)
+        if not sid_norm:
+            raise HTTPException(status_code=400, detail="student_id required")
+
+        now_iso = _mbt_iso(_mbt_now())
+        # active passes
+        s_cnt = await _mbt_entitlements.count_documents({
+            "student_id_norm": sid_norm,
+            "feature": "edutalk_session",
+            "status": "active",
+            "quantity_remaining": {"$gt": 0},
+            "$or": [{"expires_at": {"$gt": now_iso}}, {"expires_at": None}],
+        })
+        v_cnt = await _mbt_entitlements.count_documents({
+            "student_id_norm": sid_norm,
+            "feature": "edutalk_voice",
+            "status": "active",
+            "quantity_remaining": {"$gt": 0},
+            "$or": [{"expires_at": {"$gt": now_iso}}, {"expires_at": None}],
+        })
+
+        # recent claims
+        claims = []
+        async for r in _mbt_claims.find(
+            {"student_id_norm": sid_norm}, {"_id": 0},
+        ).sort("created_at", -1).limit(5):
+            claims.append({
+                "id": r.get("id"),
+                "round_id": r.get("round_id"),
+                "campaign_id": r.get("campaign_id"),
+                "prize_title": r.get("prize_title"),
+                "prize_type": r.get("prize_type"),
+                "granted_status": r.get("granted_status"),
+                "retry_count": int(r.get("retry_count") or 0),
+                "grant_error": r.get("grant_error"),
+                "created_at": r.get("created_at"),
+                "granted_at": r.get("granted_at"),
+            })
+
+        # recent reward history
+        history = []
+        async for r in _mbt_reward_history.find(
+            {"student_id_norm": sid_norm}, {"_id": 0},
+        ).sort("created_at", -1).limit(5):
+            history.append({
+                "source": r.get("source"),
+                "prize_title": r.get("prize_title"),
+                "prize_type": r.get("prize_type"),
+                "safe_display_payload": r.get("safe_display_payload"),
+                "created_at": r.get("created_at"),
+            })
+
+        return {
+            "student_id_norm": sid_norm,
+            "active_passes": {
+                "edutalk_session": int(s_cnt or 0),
+                "edutalk_voice": int(v_cnt or 0),
+            },
+            "recent_claims": claims,
+            "recent_reward_history": history,
+        }
+
+    # ── admin diagnostics + reconciliation ───────────────────────────────
+    # These admin-only endpoints let an operator audit and recover affected
+    # students without opening Mongo Atlas. None of them re-grant a
+    # voucher / pass / points without a `dry_run=false` confirmation, and
+    # all of them are idempotent.
+    @api.get("/admin/mystery-box/claims/lookup")
+    async def mbt_admin_claim_lookup(
+        student_id: str = "",
+        round_id: str = "",
+        limit: int = 20,
+        admin=Depends(require_admin),
+    ):
+        """Find Mystery Box claims for a student / round (admin audit).
+        Internal ids ARE shown to the admin — but voucher codes are never
+        surfaced here (those live only in db.coupons)."""
+        q: dict = {}
+        if student_id:
+            resolved = await _mbt_resolve_student(student_id)
+            q["$or"] = [
+                {"student_id_norm": resolved["norm"]},
+                {"student_id": resolved["clean_id"]},
+                {"student_id_raw": resolved["raw"]},
+            ]
+        if round_id:
+            q["round_id"] = round_id
+        if not q:
+            raise HTTPException(status_code=400, detail="student_id or round_id required")
+        rows = []
+        async for r in _mbt_claims.find(q, {"_id": 0}).sort("created_at", -1).limit(int(limit or 20)):
+            rows.append(r)
+        return {"claims": rows, "count": len(rows)}
+
+    @api.post("/admin/mystery-box/claims/reconcile-points")
+    async def mbt_admin_reconcile_points(
+        payload: _MBTReconcileIn,
+        admin=Depends(require_admin),
+    ):
+        """Re-mirror a successful POINTS grant into the Mongo ledger if the
+        initial mirror failed (e.g. transient Mongo error during reveal).
+        Idempotent: the mirror itself is keyed by the claim_id, so calling
+        this twice will not double-credit. Voucher / pass claims are NOT
+        handled here — those write directly to the dashboard-readable
+        collections and can be re-issued via the existing issuer functions
+        (out of scope for v1.7)."""
+        claim = await _mbt_claims.find_one({"id": payload.claim_id}, {"_id": 0})
+        if not claim:
+            raise HTTPException(status_code=404, detail="claim not found")
+        if (claim.get("granted_status") or "").lower() != "granted":
+            raise HTTPException(status_code=400, detail="claim is not in granted status")
+        ptype = (claim.get("prize_type") or "").strip().lower()
+        if ptype not in ("points", "consolation"):
+            return {"ok": True, "skipped": True,
+                    "reason": f"prize_type={ptype} (not points)"}
+
+        safe = claim.get("safe_display_payload") or {}
+        pts = int(safe.get("points") or 0)
+        if pts <= 0:
+            return {"ok": True, "skipped": True, "reason": "no points to mirror"}
+
+        if payload.dry_run:
+            return {"ok": True, "dry_run": True,
+                    "would_credit_clean_id": claim.get("student_id"),
+                    "would_credit_amount": pts,
+                    "ikey": f"sl_mb_credit:{claim.get('id')}"}
+
+        resolved = await _mbt_resolve_student(claim.get("student_id") or "")
+        mirror = await _mbt_mirror_points_credit(
+            clean_id=resolved["clean_id"] or claim.get("student_id"),
+            wallet_id=resolved.get("student_id") or "",
+            amount=pts,
+            claim_id=claim.get("id"),
+            source="speaking_lab_mystery_box_reconcile",
+        )
+        await _mbt_claims.update_one(
+            {"id": claim.get("id")},
+            {"$set": {
+                "points_mirror_ok": bool(mirror.get("ok")),
+                "points_mirror_status_ledger": mirror.get("ledger"),
+                "points_mirror_status_wallet": mirror.get("wallet"),
+                "points_mirror_reconciled_at": _mbt_iso(_mbt_now()),
+                "points_mirror_reconciled_by": getattr(admin, "email", "") or "",
+            }},
+        )
+        return {"ok": True, "mirror": mirror}
+
+    @api.post("/admin/mystery-box/claims/retry-push")
+    async def mbt_admin_retry_push(
+        payload: _MBTRetryPushIn,
+        admin=Depends(require_admin),
+    ):
+        """Notification-only retry (admin-only). Re-sends the reward-success
+        push for an already-granted claim whose notification previously
+        failed / has no active subscribers. NEVER re-grants points, a
+        voucher, or an EduTalk pass, and never calls the prize provider —
+        it only re-attempts delivery via `notify_mystery_box_prize`, which is
+        idempotent and safe to call any number of times."""
+        claim = await _mbt_claims.find_one({"id": payload.claim_id}, {"_id": 0})
+        if not claim:
+            raise HTTPException(status_code=404, detail="claim not found")
+        if (claim.get("granted_status") or "").lower() != "granted":
+            raise HTTPException(
+                status_code=400, detail="claim is not in granted status")
+        resolved = await _mbt_resolve_student(claim.get("student_id") or "")
+        result = await notify_mystery_box_prize(
+            student_id=resolved["clean_id"] or claim.get("student_id"),
+            grant_id=claim.get("id"),
+            prize_type=(claim.get("prize_type") or "").strip().lower(),
+            prize_payload=claim.get("safe_display_payload") or {},
+            source="speaking_lab_mystery_box_retry",
+        )
+        return {"ok": True, "result": result}
+
+    # ── ensure indexes once at module load (best-effort) ─────────────────
+    try:
+        loop = _mbt_asyncio.get_event_loop()
+        if loop.is_running():
+            _mbt_asyncio.ensure_future(_mbt_ensure_indexes())
+        else:
+            loop.run_until_complete(_mbt_ensure_indexes())
+    except Exception as _mbt_idx_err:
+        _MBT_LOG.warning("mystery_box: deferred index creation: %s", _mbt_idx_err)
+
+    _MBT_LOG.info(
+        "mystery_box_tools: routes registered "
+        "(/api/admin/mystery-box/*, /api/admin/edutalk-passes/*, "
+        "/api/speaking-lab/mystery-box/*, /api/student/edutalk-passes, "
+        "/api/student/mystery-box/history)"
+    )
+
+    _ns.update({
+        "api": api,
+        "db": db,
+        "mbt_reveal_round": mbt_reveal_round,
+        "mbt_select_box": mbt_select_box,
+        "mbt_create_round": mbt_create_round,
+        "mbt_get_round": mbt_get_round,
+        "_mbt_grant_prize": _mbt_grant_prize,
+        "_mbt_resolve_student": _mbt_resolve_student,
+        "_mbt_resolve_campaign_layout": _mbt_resolve_campaign_layout,
+        "_mbt_grant_edutalk_pass": _mbt_grant_edutalk_pass,
+        "_mbt_mirror_points_credit": _mbt_mirror_points_credit,
+        "_mbt_ensure_indexes": _mbt_ensure_indexes,
+        "notify_mystery_box_prize": notify_mystery_box_prize,
+        "mbt_admin_retry_push": mbt_admin_retry_push,
+        "mbt_admin_reconcile_points": mbt_admin_reconcile_points,
+        "mb_reserve_pass": mb_reserve_pass,
+        "mb_commit_pass": mb_commit_pass,
+        "mb_refund_pass": mb_refund_pass,
+        "_RevealIn": _RevealIn,
+        "_SelectIn": _SelectIn,
+        "_MBTReconcileIn": _MBTReconcileIn,
+        "_MBTRetryPushIn": _MBTRetryPushIn,
+    })
+    return _ns

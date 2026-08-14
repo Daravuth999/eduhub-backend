@@ -1,0 +1,356 @@
+/* VoiceTreasure.css — Pass 2 premium visual system, scoped to the .vt-root
+ * tree only. Never leaks into other PWA routes (every selector is rooted at
+ * .vt-root). Honours iPhone safe areas + prefers-reduced-motion. The chest
+ * sequence below is a deterministic state machine: it does NOT initiate any
+ * backend claim, never replays beyond the configured one-shot keyframes.
+ */
+
+.vt-root {
+  /* Voice Treasure design tokens — original palette, original ramps. */
+  --vt-bg-0: #0a0e23;
+  --vt-bg-1: #121538;
+  --vt-bg-2: #1a1f49;
+  --vt-panel: rgba(30, 35, 80, 0.78);
+  --vt-panel-border: rgba(120, 132, 220, 0.22);
+  --vt-text: #f0eef8;
+  --vt-dim: #a4a8c6;
+  --vt-mute: rgba(240, 238, 248, 0.6);
+  --vt-accent-cyan: #6ad6ff;
+  --vt-accent-violet: #9a7bff;
+  --vt-gold-0: #ffe19a;
+  --vt-gold-1: #d4a843;
+  --vt-gold-2: #8e6a1c;
+  --vt-success: #74d68b;
+  --vt-warn: #f1c660;
+  --vt-error: #ff9aa9;
+
+  color: var(--vt-text);
+  min-height: 100dvh;
+  background:
+    radial-gradient(1100px 700px at 80% -10%, rgba(154, 123, 255, 0.18), transparent 60%),
+    radial-gradient(900px 600px at -10% 110%, rgba(106, 214, 255, 0.14), transparent 55%),
+    linear-gradient(180deg, var(--vt-bg-0) 0%, var(--vt-bg-1) 50%, var(--vt-bg-0) 100%);
+  font-family: ui-rounded, "SF Pro Rounded", system-ui, -apple-system, "Hanuman", "Khmer OS", sans-serif;
+  /* Safe-area top/bottom (notch + iOS home indicator). */
+  padding:
+    calc(env(safe-area-inset-top, 0px) + 12px)
+    env(safe-area-inset-right, 0px)
+    calc(env(safe-area-inset-bottom, 0px) + 96px)   /* bottom-nav clearance */
+    env(safe-area-inset-left, 0px);
+}
+.vt-root[lang="km"], .vt-root [lang="km"] {
+  font-family: "Hanuman", "Khmer OS", "Noto Sans Khmer", system-ui, sans-serif;
+  letter-spacing: 0;
+}
+
+.vt-wrap { max-width: 760px; margin: 0 auto; padding: 0 18px; }
+
+/* Identity header — never shows "Lucky Spin". */
+.vt-root .vt-identity {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 4px 16px; margin-bottom: 6px;
+}
+.vt-root .vt-identity .vt-brand {
+  font-size: 18px; font-weight: 800; letter-spacing: -0.2px;
+  background: linear-gradient(120deg, var(--vt-gold-0), var(--vt-accent-cyan));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.vt-root .vt-identity .vt-brand-sub { font-size: 12px; color: var(--vt-dim); }
+
+.vt-root .vt-panel {
+  background: var(--vt-panel);
+  border: 1px solid var(--vt-panel-border);
+  border-radius: 18px;
+  padding: 18px 18px 16px;
+  margin-bottom: 14px;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 18px 38px rgba(5, 7, 22, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.vt-root .vt-card-glow {
+  background:
+    radial-gradient(160% 90% at 50% -30%, rgba(154, 123, 255, 0.32) 0%, transparent 60%),
+    var(--vt-panel);
+  border-color: rgba(154, 123, 255, 0.32);
+}
+.vt-root .vt-h1 { font-size: 22px; font-weight: 800; margin: 0 0 6px; }
+.vt-root .vt-sub { font-size: 13px; color: var(--vt-dim); margin: 0 0 12px; }
+.vt-root .vt-error { color: var(--vt-error); font-size: 13px; }
+.vt-root .vt-dim { color: var(--vt-dim); font-size: 13px; }
+
+/* Buttons */
+.vt-root .vt-btn {
+  appearance: none; cursor: pointer; min-height: 48px;
+  background: linear-gradient(135deg, #5e6cff 0%, #8a5cff 100%);
+  color: #fff; border: 0; border-radius: 999px;
+  padding: 12px 22px; font-weight: 800; font-size: 14px;
+  box-shadow: 0 10px 28px rgba(94, 108, 255, 0.42);
+  transition: transform 160ms cubic-bezier(.2,.7,.2,1), box-shadow 160ms;
+}
+.vt-root .vt-btn:hover { transform: translateY(-1px); }
+.vt-root .vt-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.vt-root .vt-btn-gold {
+  background: linear-gradient(135deg, var(--vt-gold-0), var(--vt-gold-1));
+  color: #2a1d05; box-shadow: 0 10px 28px rgba(212, 168, 67, 0.45);
+}
+.vt-root .vt-btn-ghost {
+  background: transparent; color: var(--vt-text);
+  border: 1px solid rgba(255,255,255,0.18); box-shadow: none;
+}
+
+/* Dashboard */
+.vt-root .vt-dash-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.vt-root .vt-avatar {
+  width: 44px; height: 44px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--vt-accent-cyan), var(--vt-accent-violet));
+  display: grid; place-items: center; font-weight: 800; color: #0a0e23;
+}
+.vt-root .vt-balance-row {
+  display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px;
+}
+.vt-root .vt-balance-chip {
+  background: rgba(255, 225, 154, 0.12);
+  border: 1px solid rgba(255, 225, 154, 0.34);
+  color: var(--vt-gold-0);
+  padding: 8px 12px; border-radius: 999px; font-weight: 700; font-size: 13px;
+}
+.vt-root .vt-stat-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  margin-top: 8px;
+}
+.vt-root .vt-stat {
+  background: rgba(255,255,255,0.04); border-radius: 14px; padding: 10px 12px;
+}
+.vt-root .vt-stat .vt-stat-l { color: var(--vt-dim); font-size: 11px; }
+.vt-root .vt-stat .vt-stat-v { color: var(--vt-text); font-weight: 800; font-size: 18px; }
+
+/* Hero mission card */
+.vt-root .vt-hero {
+  border-radius: 22px; overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 20% 0%, rgba(106,214,255,0.30) 0%, transparent 55%),
+    radial-gradient(120% 90% at 110% 100%, rgba(255,225,154,0.20) 0%, transparent 60%),
+    linear-gradient(140deg, #1d2356 0%, #0f1430 100%);
+  padding: 18px; position: relative;
+}
+.vt-root .vt-hero-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.vt-root .vt-hero-meta .vt-tag {
+  font-size: 11px; padding: 3px 10px; border-radius: 999px;
+  background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.10);
+}
+.vt-root .vt-hero-meta .vt-tag.gold { background: rgba(255,225,154,0.16); color: var(--vt-gold-0); border-color: rgba(255,225,154,0.30); }
+
+/* Result */
+.vt-root .vt-cat-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  margin-top: 14px;
+}
+.vt-root .vt-cat {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px; padding: 10px 12px;
+}
+.vt-root .vt-cat-l { color: var(--vt-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.vt-root .vt-cat-bar { height: 6px; background: rgba(255,255,255,0.10); border-radius: 999px; margin-top: 6px; overflow: hidden; }
+.vt-root .vt-cat-bar > i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--vt-accent-cyan), var(--vt-accent-violet));
+  border-radius: 999px;
+}
+.vt-root .vt-cat-v { color: var(--vt-text); font-weight: 800; font-size: 16px; margin-top: 4px; }
+
+.vt-root .vt-coach { display: grid; gap: 10px; margin-top: 14px; }
+.vt-root .vt-coach .vt-coach-card {
+  border-radius: 14px; padding: 12px 14px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: linear-gradient(135deg, rgba(106,214,255,0.10), rgba(154,123,255,0.10));
+}
+.vt-root .vt-coach .vt-coach-l { font-size: 11px; color: var(--vt-dim); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+.vt-root .vt-coach .vt-coach-v { font-size: 14px; line-height: 1.5; color: var(--vt-text); }
+.vt-root .vt-coach .vt-coach-v[lang="km"] { font-size: 15px; line-height: 1.7; }
+
+/* CHEST — original layered SVG components below; CSS drives the animation. */
+.vt-root .vt-chest-stage {
+  position: relative; width: 220px; height: 220px; margin: 6px auto 0;
+}
+.vt-root .vt-chest-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.vt-root .vt-chest-stage .vt-rays { opacity: 0; transform: scale(0.6); transform-origin: 50% 60%; }
+.vt-root .vt-chest-stage .vt-particles { opacity: 0; }
+.vt-root .vt-chest-stage .vt-card { opacity: 0; transform: translateY(20px) scale(0.85); transform-origin: 50% 60%; }
+.vt-root .vt-chest-stage .vt-lid    { transform-origin: 50% 60%; transform: translateY(0) rotate(0deg); }
+.vt-root .vt-chest-stage .vt-latch  { transform-origin: 50% 38%; transform: rotate(0deg); }
+
+/* State: sealed (idle hover). */
+.vt-root .vt-chest-stage[data-state="sealed"]            { animation: vt-idle 4s ease-in-out infinite; }
+.vt-root .vt-chest-stage[data-state="processing"]        { animation: vt-pulse 1.4s ease-in-out infinite; }
+.vt-root .vt-chest-stage[data-state="reconciliation_required"] { animation: vt-pulse 2.2s ease-in-out infinite; }
+.vt-root .vt-chest-stage[data-state="confirmed_failed"]  { filter: saturate(0.5) brightness(0.85); }
+
+/* Opening sequence — only when state == "opening" (transient) or "completed". */
+.vt-root .vt-chest-stage[data-state="opening"] .vt-latch { animation: vt-latch 700ms ease-in 1 both; }
+.vt-root .vt-chest-stage[data-state="opening"] .vt-lid   { animation: vt-lid   900ms ease-out 700ms 1 both; }
+.vt-root .vt-chest-stage[data-state="opening"] .vt-rays  { animation: vt-rays  900ms ease-out 1300ms 1 both; }
+.vt-root .vt-chest-stage[data-state="opening"] .vt-particles { animation: vt-particles 1100ms ease-out 1400ms 1 both; }
+.vt-root .vt-chest-stage[data-state="opening"] .vt-card  { animation: vt-card  900ms cubic-bezier(.2,.7,.2,1) 1600ms 1 both; }
+
+.vt-root .vt-chest-stage[data-state="completed"] .vt-latch { transform: rotate(28deg); }
+.vt-root .vt-chest-stage[data-state="completed"] .vt-lid   { transform: translateY(-12px) rotate(-46deg); }
+.vt-root .vt-chest-stage[data-state="completed"] .vt-rays  { opacity: 0.95; transform: scale(1); animation: vt-rays-loop 6s ease-in-out infinite; }
+.vt-root .vt-chest-stage[data-state="completed"] .vt-card  { opacity: 1; transform: translateY(0) scale(1); }
+
+@keyframes vt-idle { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+@keyframes vt-pulse { 0%,100% { filter: drop-shadow(0 0 0 rgba(255,225,154,0)); } 50% { filter: drop-shadow(0 0 24px rgba(255,225,154,0.55)); } }
+@keyframes vt-latch { 0% { transform: rotate(0); } 30% { transform: rotate(-6deg); } 60% { transform: rotate(8deg); } 100% { transform: rotate(28deg); } }
+@keyframes vt-lid   { 0% { transform: translateY(0) rotate(0); } 100% { transform: translateY(-12px) rotate(-46deg); } }
+@keyframes vt-rays  { 0% { opacity: 0; transform: scale(0.5); } 100% { opacity: 0.95; transform: scale(1); } }
+@keyframes vt-rays-loop { 0%,100% { opacity: 0.8; transform: scale(0.98); } 50% { opacity: 1; transform: scale(1.04); } }
+@keyframes vt-particles { 0% { opacity: 0; } 30% { opacity: 1; } 100% { opacity: 0; transform: translateY(-30px); } }
+@keyframes vt-card { 0% { opacity: 0; transform: translateY(28px) scale(0.7); } 100% { opacity: 1; transform: translateY(0) scale(1); } }
+
+.vt-root .vt-chest-banner { text-align: center; margin-top: 14px; font-weight: 700; font-size: 15px; }
+
+/* Reduced motion — disable movement, keep clear static state changes. */
+@media (prefers-reduced-motion: reduce) {
+  .vt-root *,
+  .vt-root .vt-chest-stage * {
+    animation: none !important;
+    transition: none !important;
+  }
+  .vt-root .vt-chest-stage[data-state="opening"] .vt-lid,
+  .vt-root .vt-chest-stage[data-state="completed"] .vt-lid { transform: translateY(-12px) rotate(-46deg); }
+  .vt-root .vt-chest-stage[data-state="opening"] .vt-rays,
+  .vt-root .vt-chest-stage[data-state="completed"] .vt-rays { opacity: 0.95; transform: scale(1); }
+  .vt-root .vt-chest-stage[data-state="opening"] .vt-card,
+  .vt-root .vt-chest-stage[data-state="completed"] .vt-card { opacity: 1; transform: none; }
+}
+
+/* ── Pass 3 additions (scoped to .vt-root) ──────────────────────────────── */
+.vt-root .vt-mission-meta { display: flex; flex-wrap: wrap; gap: 8px; row-gap: 8px; align-items: center; margin: 10px 0 14px; font-size: 14px; }
+.vt-root .vt-pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  background: rgba(106,214,255,0.12); color: #cde9ff; font-size: 12px; letter-spacing: 0.02em;
+  border: 1px solid rgba(106,214,255,0.25); }
+.vt-root .vt-pill-paid { background: rgba(255,225,154,0.14); color: #ffeec6;
+  border-color: rgba(255,225,154,0.35); }
+
+.vt-root .vt-eval-orb { width: 88px; height: 88px; margin: 8px auto 18px;
+  border-radius: 50%; background: radial-gradient(circle at 30% 30%, #ffeec6, #ff9c5e 45%, #6a4cff 100%);
+  box-shadow: 0 0 36px rgba(154,123,255,0.55), inset 0 0 18px rgba(255,255,255,0.25);
+  animation: vt-orb-pulse 2.4s ease-in-out infinite; }
+.vt-root .vt-eval-checklist { list-style: none; padding: 0; margin: 18px 0 4px; display: grid; gap: 8px; text-align: left; }
+.vt-root .vt-eval-step { padding: 8px 14px; border-radius: 12px; background: rgba(255,255,255,0.05);
+  color: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.06);
+  transition: background-color 0.4s ease, color 0.4s ease, border-color 0.4s ease; }
+.vt-root .vt-eval-step-on { color: #fff; background: rgba(106,214,255,0.14); border-color: rgba(106,214,255,0.45); }
+@keyframes vt-orb-pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+
+.vt-root .vt-collectible-frame { width: 96px; height: 96px; margin: 4px auto 0; border-radius: 18px;
+  background: linear-gradient(160deg, rgba(255,225,154,0.18), rgba(154,123,255,0.18));
+  border: 1px solid rgba(255,225,154,0.35); display: grid; place-items: center; }
+.vt-root .vt-collectible-emoji { font-size: 44px; }
+.vt-root .vt-empty-state { text-align: center; padding: 18px; border-radius: 14px;
+  background: rgba(255,255,255,0.04); border: 1px dashed rgba(255,255,255,0.12); }
+.vt-root .vt-progress-grid { display: grid; gap: 6px; margin-top: 10px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vt-root .vt-eval-orb { animation: none !important; }
+}
+
+/* ── Pass B.2 additions (scoped to .vt-root) ────────────────────────────── */
+
+/* Mission scene framed inside the content card. */
+.vt-root .vt-mission-frame { position: relative; border-radius: 18px; overflow: hidden;
+  background: rgba(8,10,24,0.5); border: 1px solid rgba(255,225,154,0.18); aspect-ratio: 4/3;
+  display: grid; place-items: center; }
+.vt-root .vt-mission-frame--hero { margin-top: 4px; box-shadow: 0 14px 30px rgba(5,7,22,0.45); }
+.vt-root .vt-mission-frame--compact { aspect-ratio: 16/7; margin-bottom: 8px; }
+.vt-root .vt-mission-img { width: 100%; height: 100%; object-fit: cover; object-position: center; display: block; user-select: none; -webkit-user-drag: none; }
+.vt-root .vt-mission-frame-watch { position: absolute; left: 10px; bottom: 10px;
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  background: rgba(8,10,24,0.55); color: #ffe19a; border: 1px solid rgba(255,225,154,0.30); font-size: 11px;
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+.vt-root .vt-mission-panel { margin-top: 8px; }
+.vt-root .vt-mission-title { margin-top: 12px; }
+.vt-root .vt-mission-instructions { margin-top: 6px; }
+.vt-root .vt-mission-prompt { font-size: 15px; line-height: 1.55; color: var(--vt-text); margin: 8px 0 0; }
+.vt-root .vt-mission-prompt--km { font-size: 16px; line-height: 1.7; color: var(--vt-dim); margin-top: 6px; }
+.vt-root .vt-mission-tips { margin: 12px 0 0; padding: 0 0 0 18px; color: var(--vt-dim); font-size: 13px; line-height: 1.55; }
+.vt-root .vt-mission-tips li { margin: 2px 0; }
+.vt-root .vt-btn-cta { min-height: 52px; padding: 14px 24px; font-size: 15px; letter-spacing: 0.01em; }
+
+/* Recorder console */
+.vt-root .vt-recorder { padding: 18px; }
+.vt-root .vt-rec-console { display: grid; grid-template-columns: 88px 1fr; align-items: center;
+  gap: 14px; margin: 12px 0 6px; }
+.vt-root .vt-rec-orb { width: 88px; height: 88px; border-radius: 50%; display: grid; place-items: center;
+  background: radial-gradient(circle at 30% 30%, rgba(255,238,198,0.25), rgba(106,76,255,0.15));
+  border: 1px solid rgba(255,225,154,0.30); box-shadow: 0 0 20px rgba(154,123,255,0.25);
+  transition: box-shadow 240ms ease, transform 240ms ease; }
+.vt-root .vt-rec-orb-on { box-shadow: 0 0 32px rgba(255,156,94,0.55), 0 0 56px rgba(106,76,255,0.45);
+  animation: vt-rec-orb-pulse 1.6s ease-in-out infinite; }
+@keyframes vt-rec-orb-pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.04); } }
+.vt-root .vt-rec-wave { display: flex; align-items: end; gap: 4px; height: 60px; padding: 0 6px;
+  border-radius: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07); }
+.vt-root .vt-rec-bar { flex: 1; min-width: 3px; max-width: 8px; height: 18%;
+  background: linear-gradient(180deg, #6ad6ff 0%, #9a7bff 100%);
+  border-radius: 4px; transition: height 220ms ease; opacity: 0.55; }
+.vt-root .vt-rec-wave-on .vt-rec-bar { animation: vt-rec-bar 0.9s ease-in-out infinite alternate; opacity: 1; }
+@keyframes vt-rec-bar { 0% { height: 12%; } 100% { height: 90%; } }
+.vt-root .vt-rec-meter { margin-top: 12px; }
+.vt-root .vt-rec-meter-track { position: relative; height: 8px; border-radius: 999px;
+  background: rgba(255,255,255,0.08); overflow: hidden; }
+.vt-root .vt-rec-meter-fill { position: absolute; left: 0; top: 0; bottom: 0;
+  background: linear-gradient(90deg, var(--vt-accent-cyan), var(--vt-gold-0));
+  border-radius: 999px; transition: width 220ms ease; }
+.vt-root .vt-rec-meter-min { position: absolute; top: -3px; bottom: -3px; width: 2px;
+  background: rgba(255,225,154,0.85); box-shadow: 0 0 6px rgba(255,225,154,0.65); }
+.vt-root .vt-rec-timer { margin-top: 6px; display: flex; align-items: baseline; gap: 6px;
+  font-variant-numeric: tabular-nums; font-size: 14px; color: var(--vt-text); }
+.vt-root .vt-rec-timer .vt-rec-dot { color: #ff8a9c; animation: vt-rec-dot 1.2s ease-in-out infinite; }
+@keyframes vt-rec-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+.vt-root .vt-recorder-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.vt-root .vt-btn-stop { background: linear-gradient(135deg, #ff7676 0%, #c63838 100%);
+  color: #fff; box-shadow: 0 10px 28px rgba(198, 56, 56, 0.42); }
+
+/* Evaluation extras */
+.vt-root .vt-eval-panel { padding: 22px 18px; }
+.vt-root .vt-eval-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+
+/* Collection */
+.vt-root .vt-collection-head { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 8px; color: var(--vt-text); }
+.vt-root .vt-collection-grid { display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 12px; }
+.vt-root .vt-coll-card { appearance: none; cursor: pointer; text-align: center;
+  background: linear-gradient(160deg, rgba(255,225,154,0.10), rgba(154,123,255,0.10));
+  border: 1px solid rgba(255,225,154,0.22); border-radius: 18px; padding: 14px 10px 12px;
+  color: var(--vt-text); transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; }
+.vt-root .vt-coll-card:hover { transform: translateY(-2px); border-color: rgba(255,225,154,0.45); }
+.vt-root .vt-coll-card--owned { border-color: rgba(255,225,154,0.55); }
+.vt-root .vt-coll-card[aria-pressed="true"] { outline: 2px solid rgba(255,225,154,0.6); outline-offset: 2px; }
+.vt-root .vt-coll-art { display: block; margin: 0 auto; }
+.vt-root .vt-coll-card-title { font-weight: 800; margin-top: 8px; }
+.vt-root .vt-coll-card-state { margin-top: 6px; }
+.vt-root .vt-coll-detail { margin-top: 12px; }
+.vt-root .vt-coll-detail-title { font-weight: 800; font-size: 16px; margin-bottom: 4px; }
+.vt-root .vt-coll-detail-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 10px; }
+
+/* Progress */
+.vt-root .vt-progress { padding-bottom: 18px; }
+.vt-root .vt-stat { border-radius: 16px; padding: 12px 14px;
+  background: linear-gradient(160deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+  border: 1px solid rgba(255,255,255,0.08); }
+.vt-root .vt-stat-tone-gold { border-color: rgba(255,225,154,0.35);
+  background: linear-gradient(160deg, rgba(255,225,154,0.10), rgba(212,168,67,0.04)); }
+.vt-root .vt-stat-tone-warm { border-color: rgba(255,156,94,0.35);
+  background: linear-gradient(160deg, rgba(255,156,94,0.10), rgba(212,76,67,0.04)); }
+.vt-root .vt-progress-pair { display: grid; gap: 10px; grid-template-columns: 1fr; margin-top: 12px; }
+@media (min-width: 640px) { .vt-root .vt-progress-pair { grid-template-columns: 1fr 1fr; } }
+.vt-root .vt-progress-callout { padding: 12px 14px; }
+
+/* Score row reused on Progress + Recent */
+.vt-root .vt-recent .vt-score-row { display: flex; justify-content: space-between;
+  padding: 6px 0; border-top: 1px solid rgba(255,255,255,0.06); }
+.vt-root .vt-recent .vt-score-row:first-of-type { border-top: 0; }
+
+/* Identity header — slightly tighter when sitting inside VTStage glass */
+.vt-root .vt-identity { padding: 6px 0 10px; }

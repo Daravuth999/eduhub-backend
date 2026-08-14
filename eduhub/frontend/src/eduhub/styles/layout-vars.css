@@ -1,0 +1,14 @@
+/* layout-vars.css — shared layout CSS variables.
+ *
+ * Single source of truth for the height of MobileBottomNav so that any
+ * fixed/sticky element on a mobile authenticated page (e.g. the AI
+ * Assistant composer) can offset itself reliably without measuring at
+ * runtime.
+ *
+ * The 64px value matches MobileBottomNav.jsx visual height (icon column
+ * + 0.4rem top padding); env(safe-area-inset-bottom) is applied
+ * separately by the nav itself and by consumers via calc().
+ */
+:root {
+  --eduhub-bottom-nav-h: 64px;
+}

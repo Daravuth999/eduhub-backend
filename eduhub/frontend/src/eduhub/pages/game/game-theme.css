@@ -1,0 +1,69 @@
+/* game-theme.css — lucky-spin design tokens (Deep Violet / Royal Gold).
+   Converted from Tailwind v4 `@theme inline` syntax to plain CSS for
+   compatibility with this project's Tailwind v3 + CRA setup.
+*/
+
+body[data-game-theme="true"] {
+  background: linear-gradient(135deg, #0B0520, #1A0E4D) !important;
+  background-attachment: fixed !important;
+  color: #fff;
+  font-family: "Plus Jakarta Sans", system-ui, sans-serif;
+  min-height: 100vh;
+}
+
+body[data-game-theme="true"]::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(255, 216, 92, 0.10) 0%, transparent 50%),
+    radial-gradient(circle at 80% 70%, rgba(19, 194, 194, 0.10) 0%, transparent 50%),
+    radial-gradient(circle at 40% 80%, rgba(255, 64, 129, 0.05) 0%, transparent 50%);
+  z-index: -1;
+  pointer-events: none;
+}
+
+.glass {
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.glass-strong {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.05));
+  backdrop-filter: blur(25px) saturate(180%);
+  -webkit-backdrop-filter: blur(25px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.text-gradient-gold {
+  background: linear-gradient(135deg, #FFD85C, #13C2C2);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+.glow-gold {
+  box-shadow:
+    0 0 30px rgba(255, 216, 92, 0.4),
+    0 0 0 8px rgba(255, 216, 92, 0.25),
+    0 0 0 16px rgba(19, 194, 194, 0.15);
+}
+
+@keyframes confettiFall {
+  0%   { transform: translateY(-100vh) rotate(0deg) scale(0.5); opacity: 1; }
+  100% { transform: translateY(100vh) rotate(720deg) scale(1);  opacity: 0; }
+}
+
+.confetti-piece {
+  position: fixed;
+  top: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  z-index: 999;
+  animation: confettiFall 5s linear forwards;
+  pointer-events: none;
+}

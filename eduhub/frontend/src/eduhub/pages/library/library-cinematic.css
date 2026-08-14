@@ -1,0 +1,404 @@
+/* ============================================================================
+ * library-cinematic.css — Cinematic Dark Mode surgery for the /library page.
+ *
+ *   • Loaded AFTER library-theme.css so its rules override by source order.
+ *   • Scoped to `body[data-library-theme="true"]` so it can only ever apply
+ *     while the user is inside the /library or /library/read/* routes.
+ *   • Pure CSS: no JS, no new data, no logic changes.
+ *   • Every existing class, data-testid and DOM contract is preserved.
+ *   • Reverting this surgery = delete this file and its import.
+ *
+ *  Source-of-truth book content is unaffected: shelves are still populated
+ *  by `booksService.getAllBooks()` → real Author-Studio / Apps-Script data.
+ *  ========================================================================== */
+
+/* ─── 1. Palette tokens (additive) ─────────────────────────────────────── */
+body[data-library-theme="true"] {
+  --lib-bg-deep:     #07060D;
+  --lib-bg:          #0E0B17;
+  --lib-bg-soft:     #161220;
+  --lib-surface:     #1F1830;
+  --lib-surface-hi:  #2A2240;
+  --lib-edge:        rgba(244, 234, 208, 0.08);
+
+  --lib-ink:         #F0E6C8;
+  --lib-ink-soft:    #A99A82;
+  --lib-ink-faint:   #6F634F;
+
+  --lib-gold:        #E8B14B;
+  --lib-gold-hot:    #FFD27A;
+  --lib-teal:        #3DD0C2;
+  --lib-amethyst:    #A87CFF;
+  --lib-coral:       #FF6B8F;
+  --lib-slate:       #7DA8E0;
+
+  --lib-font-shelf:  "Bricolage Grotesque", "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --lib-font-body:   "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --lib-font-num:    "Fraunces", "Plus Jakarta Sans", serif;
+}
+
+/* ─── 2. Cinematic backdrop (overrides the dark-academia gradient) ─────── */
+body[data-library-theme="true"] {
+  background-color: var(--lib-bg) !important;
+  background-image:
+    radial-gradient(ellipse 1200px 600px at 50% -10%, rgba(168, 124, 255, 0.10), transparent 60%),
+    radial-gradient(ellipse 900px  500px at 85% 100%, rgba( 61, 208, 194, 0.08), transparent 70%),
+    linear-gradient(180deg, var(--lib-bg-deep) 0%, var(--lib-bg) 40%, var(--lib-bg-deep) 100%) !important;
+  color: var(--lib-ink);
+}
+
+/* Slightly stronger film grain — same noise SVG already in library-theme.css */
+body[data-library-theme="true"]::before {
+  opacity: 0.05 !important;
+}
+
+/* Reader root inherits the same backdrop so the transition from library →
+   reader feels continuous, not jarring. */
+body[data-library-theme="true"] .reader-shell {
+  background:
+    radial-gradient(ellipse 1100px 600px at 50% -10%, rgba(168, 124, 255, 0.08), transparent 60%),
+    linear-gradient(180deg, var(--lib-bg-deep) 0%, var(--lib-bg) 50%, var(--lib-bg-deep) 100%);
+}
+
+/* ─── 3. Section accent ────────────────────────────────────────────────── */
+body[data-library-theme="true"] .shelf-section[data-section="story"]        { --shelf-accent: var(--lib-coral);    --shelf-tint: rgba(255, 107, 143, 0.07); }
+body[data-library-theme="true"] .shelf-section[data-section="conversation"] { --shelf-accent: var(--lib-teal);     --shelf-tint: rgba( 61, 208, 194, 0.07); }
+body[data-library-theme="true"] .shelf-section[data-section="exercise"]     { --shelf-accent: var(--lib-amethyst); --shelf-tint: rgba(168, 124, 255, 0.07); }
+
+body[data-library-theme="true"] .shelf-section { position: relative; }
+body[data-library-theme="true"] .shelf-section::before {
+  content: "";
+  position: absolute;
+  inset: -14px -28px;
+  background: radial-gradient(ellipse 70% 60% at 50% 40%, var(--shelf-tint, transparent), transparent 75%);
+  pointer-events: none;
+  z-index: -1;
+  border-radius: 24px;
+}
+
+body[data-library-theme="true"] .shelf-section-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--shelf-accent, var(--lib-gold));
+  box-shadow: 0 0 12px var(--shelf-accent, var(--lib-gold));
+  flex: none;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+/* ─── 4. Shelf header typography upgrade ──────────────────────────────── */
+body[data-library-theme="true"] [data-testid^="shelf-"] header h3 {
+  font-family: var(--lib-font-shelf) !important;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-size: clamp(19px, 4.5vw, 22px);
+  color: var(--lib-ink);
+}
+
+body[data-library-theme="true"] [data-testid^="shelf-new-count-"] {
+  border-color: rgba(232, 177, 75, 0.4) !important;
+  background: rgba(232, 177, 75, 0.10) !important;
+  color: var(--lib-gold-hot) !important;
+}
+
+body[data-library-theme="true"] [data-testid^="shelf-arrow-"] {
+  background: rgba(244, 234, 208, 0.04) !important;
+  border-color: var(--lib-edge) !important;
+  color: var(--lib-ink-soft) !important;
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+}
+body[data-library-theme="true"] [data-testid^="shelf-arrow-"]:hover {
+  color: var(--shelf-accent, var(--lib-gold-hot)) !important;
+  border-color: var(--shelf-accent, rgba(232, 177, 75, 0.55)) !important;
+  transform: translateY(-1px);
+}
+
+/* ─── 5. Shelf surface (brass hairline + floor reflection) ─────────────── */
+body[data-library-theme="true"] .shelf-base {
+  height: 1px !important;
+  background-image:
+    linear-gradient(90deg, transparent, rgba(232, 177, 75, 0.55), rgba(232, 177, 75, 0.55), transparent) !important;
+  background-blend-mode: normal !important;
+  box-shadow: 0 1px 0 rgba(255, 210, 122, 0.15), 0 10px 26px -6px rgba(232, 177, 75, 0.18) !important;
+  border-radius: 0 !important;
+  margin-top: 2px;
+}
+body[data-library-theme="true"] .shelf-base + div {
+  background: rgba(7, 6, 13, 0.55) !important;
+  height: 2px !important;
+}
+
+body[data-library-theme="true"] .shelf-reflection {
+  position: relative;
+  height: 56px;
+  margin: 4px 12px 0;
+  pointer-events: none;
+  opacity: 0.45;
+  -webkit-mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent);
+          mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent);
+}
+body[data-library-theme="true"] .shelf-reflection::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 70% 90% at 50% -10%, rgba(255, 210, 122, 0.18), transparent 65%);
+}
+@media (prefers-reduced-motion: reduce),
+       (max-width: 540px) {
+  body[data-library-theme="true"] .shelf-reflection { display: none; }
+}
+
+/* ─── 6. BookCard — cinematic edge + tier-aware ladder ─────────────────── */
+body[data-library-theme="true"] .book-card--v78 {
+  box-shadow:
+    0 22px 40px -18px rgba(0, 0, 0, 0.85),
+    0 8px 14px -8px rgba(0, 0, 0, 0.6),
+    0 0 0 1px var(--lib-edge),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.5) !important;
+}
+
+body[data-library-theme="true"] .book-card--v78[data-tier="standard"] {
+  box-shadow:
+    0 22px 40px -18px rgba(0, 0, 0, 0.85),
+    0 8px 14px -8px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(125, 168, 224, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.5) !important;
+}
+
+body[data-library-theme="true"] .book-card--v78[data-tier="premium"] {
+  box-shadow:
+    0 24px 44px -18px rgba(0, 0, 0, 0.85),
+    0 8px 14px -8px rgba(0, 0, 0, 0.6),
+    0 0 0 1.5px rgba(232, 177, 75, 0.35),
+    0 0 22px -4px rgba(232, 177, 75, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
+}
+body[data-library-theme="true"] .book-card--v78[data-tier="premium"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 210, 122, 0.25), inset 0 0 22px rgba(255, 210, 122, 0.06);
+  animation: libPremiumPulse 3.4s ease-in-out infinite;
+  z-index: 1;
+}
+@keyframes libPremiumPulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
+
+body[data-library-theme="true"] .book-card--v78[data-tier="limited"] {
+  box-shadow:
+    0 26px 46px -18px rgba(0, 0, 0, 0.9),
+    0 8px 14px -8px rgba(0, 0, 0, 0.6),
+    0 0 0 2px rgba(168, 124, 255, 0.45),
+    0 0 28px -4px rgba(168, 124, 255, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
+}
+body[data-library-theme="true"] .book-card--v78[data-tier="limited"]::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.55;
+  background: conic-gradient(from var(--lib-ang, 0deg),
+    var(--lib-amethyst), var(--lib-coral), var(--lib-gold), var(--lib-teal), var(--lib-amethyst));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  padding: 2px;
+  animation: libAurora 8s linear infinite;
+}
+@property --lib-ang { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
+@keyframes libAurora { to { --lib-ang: 360deg; } }
+
+body[data-library-theme="true"] .book-card--v78 > span[aria-hidden]:first-of-type {
+  width: 10px !important;
+  background:
+    linear-gradient(90deg, rgba(0,0,0,0.65), rgba(0,0,0,0.15) 55%, rgba(0,0,0,0) 100%),
+    linear-gradient(180deg, rgba(255,210,122,0.16), transparent 26%, transparent 74%, rgba(255,210,122,0.14)) !important;
+  border-right: 1px solid rgba(232, 177, 75, 0.18);
+}
+
+body[data-library-theme="true"] .book-card--v78 .book-card__band {
+  background: linear-gradient(
+    180deg,
+    rgba(14, 11, 23, 0) 0%,
+    rgba(14, 11, 23, 0.68) 38%,
+    rgba(7, 6, 13, 0.95) 100%
+  ) !important;
+}
+
+body[data-library-theme="true"] [data-testid="card-price-badge"] {
+  letter-spacing: 0.12em !important;
+}
+
+/* ─── 7. Glass lobby (greeting + stats) ────────────────────────────────── */
+body[data-library-theme="true"] [data-testid="library-greeting"] { position: relative; }
+body[data-library-theme="true"] [data-testid="library-greeting"]::after {
+  content: "";
+  position: absolute;
+  left: -8px; right: -8px; bottom: -10px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--lib-edge), transparent);
+}
+body[data-library-theme="true"] [data-testid="library-level-pill"] {
+  border-color: rgba(232, 177, 75, 0.35) !important;
+  background: linear-gradient(135deg, rgba(232,177,75,0.18), rgba(168,124,255,0.10)) !important;
+  color: var(--lib-gold-hot) !important;
+}
+body[data-library-theme="true"] [data-testid="wallet-pill"] {
+  border-color: rgba(232, 177, 75, 0.45) !important;
+  background: linear-gradient(135deg, rgba(232,177,75,0.18), rgba( 61,208,194,0.10)) !important;
+  color: var(--lib-gold-hot) !important;
+}
+body[data-library-theme="true"] [data-testid="library-refresh-btn"] {
+  border-color: rgba(232, 177, 75, 0.30) !important;
+  background: rgba(244, 234, 208, 0.04) !important;
+  color: var(--lib-ink-soft) !important;
+}
+body[data-library-theme="true"] [data-testid="library-refresh-btn"]:hover {
+  color: var(--lib-gold-hot) !important;
+  border-color: var(--lib-gold) !important;
+}
+
+/* ─── 8. Filter chips ──────────────────────────────────────────────────── */
+body[data-library-theme="true"] [data-testid^="library-filter-"]:not([data-testid="library-filter-row"]) {
+  letter-spacing: 0.14em !important;
+}
+
+/* ─── 9. Live data pill ────────────────────────────────────────────────── */
+body[data-library-theme="true"] [data-testid="library-live-pill"] {
+  color: #BFF1EC !important;
+  background: linear-gradient(135deg, rgba(61,208,194,0.18), rgba(61,208,194,0.06)) !important;
+  border-color: rgba(61, 208, 194, 0.45) !important;
+}
+body[data-library-theme="true"] [data-testid="library-live-pill"] span:first-child {
+  animation: libLivePulse 2.2s ease-in-out infinite;
+}
+@keyframes libLivePulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--lib-teal); opacity: 1; }
+  60%      { box-shadow: 0 0 0 6px transparent;     opacity: 0.7; }
+}
+
+/* ─── 10. Continue Reading rail — promoted to cinema rail ──────────────── */
+body[data-library-theme="true"] [data-testid="continue-reading"] {
+  position: relative;
+  padding: 14px 12px 14px;
+  margin: 12px -8px 16px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--lib-surface), rgba(15, 11, 24, 0.6));
+  border: 1px solid var(--lib-edge);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 -22px 44px -22px rgba(61, 208, 194, 0.18);
+}
+body[data-library-theme="true"] [data-testid="continue-reading"] h3 {
+  font-family: var(--lib-font-shelf) !important;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--lib-ink) !important;
+}
+body[data-library-theme="true"] [data-testid^="continue-reading-card-"] {
+  background: linear-gradient(135deg, rgba(42, 34, 64, 0.85), rgba(15, 11, 24, 0.92)) !important;
+  border-color: rgba(232, 177, 75, 0.32) !important;
+}
+
+/* ─── 11. Stats / level / quest — glass treatment ──────────────────────── */
+body[data-library-theme="true"] [data-testid^="stat-"] {
+  background: linear-gradient(155deg, rgba(31, 24, 48, 0.80), rgba(15, 11, 24, 0.85)) !important;
+  border-color: var(--lib-edge) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 12px 24px -16px rgba(0, 0, 0, 0.7) !important;
+}
+body[data-library-theme="true"] [data-testid^="stat-"] .font-display {
+  font-family: var(--lib-font-num) !important;
+}
+body[data-library-theme="true"] [data-testid="daily-quest-banner"] {
+  background: linear-gradient(120deg, rgba(232, 177, 75, 0.16), rgba(61, 208, 194, 0.12)) !important;
+  border-color: rgba(232, 177, 75, 0.32) !important;
+}
+
+/* ─── 12. Empty state ──────────────────────────────────────────────────── */
+body[data-library-theme="true"] [data-testid="library-empty-state"] {
+  background: linear-gradient(160deg, rgba(31, 24, 48, 0.65), rgba(7, 6, 13, 0.65)) !important;
+  border-color: rgba(232, 177, 75, 0.32) !important;
+}
+
+/* ─── 13. Search pill ──────────────────────────────────────────────────── */
+body[data-library-theme="true"] [data-testid="library-search"] .library-search__pill {
+  background: linear-gradient(135deg, rgba(31, 24, 48, 0.88), rgba(15, 11, 24, 0.94)) !important;
+  border: 1px solid var(--lib-edge);
+}
+
+/* ─── 14. Mobile + low-power degradations ─────────────────────────────── */
+html[data-low-power="true"] body[data-library-theme="true"] .book-card--v78[data-tier="limited"]::after {
+  animation: none !important;
+  opacity: 0.35;
+}
+html[data-low-power="true"] body[data-library-theme="true"] .book-card--v78[data-tier="premium"]::after {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-library-theme="true"] .book-card--v78[data-tier="premium"]::after,
+  body[data-library-theme="true"] .book-card--v78[data-tier="limited"]::after,
+  body[data-library-theme="true"] [data-testid="library-live-pill"] span:first-child {
+    animation: none !important;
+  }
+}
+
+@media (hover: none) {
+  body[data-library-theme="true"] .book-card--v78:hover {
+    transform: none !important;
+  }
+}
+
+/* =================================================================
+ * v16 (2026-06) — Cinematic Library: day-mode token override.
+ *
+ * The cinematic palette above is dark-only. When the user picks
+ * light mode via the ThemeToggle, the Library would otherwise stay
+ * locked in `--lib-bg: #0E0B17` because library-cinematic.css loads
+ * AFTER library-theme.css and uses `!important` on the body paint.
+ *
+ * v16 ships a parallel light token block + body overrides scoped
+ * under `html[data-theme="light"]` so the Library follows the
+ * global theme without disturbing the dark-mode contract.
+ * ================================================================= */
+html[data-theme="light"] body[data-library-theme="true"] {
+  --lib-bg-deep:    #F4EEDF;
+  --lib-bg:         #FAFAFA;
+  --lib-bg-soft:    #FFFFFF;
+  --lib-surface:    #FFFFFF;
+  --lib-surface-hi: #F4EEDF;
+  --lib-edge:       rgba(15, 27, 45, 0.10);
+
+  --lib-ink:        #0F1B2D;
+  --lib-ink-soft:   rgba(15, 27, 45, 0.72);
+  --lib-ink-faint:  rgba(15, 27, 45, 0.48);
+
+  --lib-gold:       #B8862A;
+  --lib-gold-hot:   #C9952F;
+
+  background-color: var(--lib-bg) !important;
+  background-image:
+    radial-gradient(ellipse 1200px 600px at 50% -10%, rgba(184, 134, 42, 0.08), transparent 60%),
+    radial-gradient(ellipse 900px 500px at 85% 100%, rgba(61, 208, 194, 0.05), transparent 70%),
+    linear-gradient(180deg, var(--lib-bg-deep) 0%, var(--lib-bg) 40%, var(--lib-bg-deep) 100%) !important;
+  color: var(--lib-ink);
+}
+html[data-theme="light"] body[data-library-theme="true"] .reader-shell {
+  background:
+    radial-gradient(ellipse 1100px 600px at 50% -10%, rgba(184, 134, 42, 0.06), transparent 60%),
+    linear-gradient(180deg, var(--lib-bg-deep) 0%, var(--lib-bg) 50%, var(--lib-bg-deep) 100%);
+}

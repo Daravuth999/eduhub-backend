@@ -1,0 +1,164 @@
+/* ───────────────────────────────────────────────────────────────────────────
+ *  VoiceTreasureStudio.css — Pass B.2.1 visual polish (Author Studio scope).
+ *
+ *  Scoped to [data-testid="voice-treasure-studio"] and its descendants
+ *  so no styling leaks to the rest of Author Studio.
+ *
+ *  - lucide-react + framer-motion (already installed); no Lottie.
+ *  - reduced-motion respected.
+ *  - no emoji as primary artwork.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+[data-testid="voice-treasure-studio"] {
+  --vts-gold-0: #FFE19A;
+  --vts-gold-1: #D4A843;
+  --vts-text:   #F4E5C1;
+  --vts-dim:    #C9B68A;
+  --vts-deep:   rgba(45,31,62,0.55);
+  --vts-line:   rgba(212,168,67,0.22);
+  --vts-good:   #A6E29A;
+  --vts-warn:   #E5C46B;
+  --vts-bad:    #E2A0A0;
+}
+
+/* Polished Overview at the top of the studio. */
+[data-testid="voice-treasure-studio"] .vts-overview {
+  background: linear-gradient(160deg, rgba(255,225,154,0.06), rgba(45,31,62,0.65));
+  border: 1px solid var(--vts-line);
+  border-radius: 16px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-head {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-title {
+  font-size: 14px; font-weight: 700; color: var(--vts-text);
+}
+[data-testid="voice-treasure-studio"] .vts-overview-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin-top: 8px;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-stat {
+  background: rgba(15,10,22,0.55);
+  border: 1px solid rgba(212,168,67,0.18);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-stat-label {
+  font-size: 11px; color: var(--vts-dim);
+  display: inline-flex; gap: 6px; align-items: center;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-stat-value {
+  font-size: 16px; font-weight: 800; color: var(--vts-gold-0); margin-top: 2px;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-warns {
+  margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px;
+}
+[data-testid="voice-treasure-studio"] .vts-overview-warn {
+  font-size: 11px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--vts-warn); color: var(--vts-warn);
+  background: rgba(229,196,107,0.06);
+}
+[data-testid="voice-treasure-studio"] .vts-overview-warn[data-tone="error"] {
+  border-color: var(--vts-bad); color: var(--vts-bad);
+  background: rgba(226,160,160,0.06);
+}
+[data-testid="voice-treasure-studio"] .vts-overview-warn[data-tone="ok"] {
+  border-color: var(--vts-good); color: var(--vts-good);
+  background: rgba(166,226,154,0.06);
+}
+
+/* Reward integration status pill upgrades — pull the four-truth row up
+   visually so non-active rewards read as informational, not error. */
+[data-testid="voice-treasure-studio"] .vts-integration-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+[data-testid="voice-treasure-studio"] .vts-integration-row:last-of-type { border-bottom: 0; }
+[data-testid="voice-treasure-studio"] .vts-integration-pill {
+  font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid currentColor;
+}
+
+/* Bilingual preview card */
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview {
+  margin-top: 12px; padding: 12px;
+  background: rgba(15,10,22,0.6);
+  border: 1px dashed var(--vts-line);
+  border-radius: 12px;
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-head {
+  display: inline-flex; gap: 6px; align-items: center;
+  font-size: 11px; color: var(--vts-dim); margin-bottom: 8px;
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-row {
+  display: grid; gap: 10px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 720px) {
+  [data-testid="voice-treasure-studio"] .vts-bilingual-preview-row { grid-template-columns: 1fr 1fr; }
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-card {
+  background: rgba(45,31,62,0.45);
+  border: 1px solid var(--vts-line);
+  border-radius: 10px; padding: 10px 12px;
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-tag {
+  font-size: 10px; color: var(--vts-dim); margin-bottom: 4px; letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-body {
+  font-size: 13px; line-height: 1.5; color: var(--vts-text);
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-body[lang="km"] {
+  font-size: 14px; line-height: 1.75;
+}
+[data-testid="voice-treasure-studio"] .vts-bilingual-preview-count {
+  font-size: 10px; color: var(--vts-dim); margin-top: 6px;
+}
+[data-testid="voice-treasure-studio"] .vts-fallback-tag {
+  display: inline-flex; gap: 4px; align-items: center;
+  font-size: 10px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--vts-warn); color: var(--vts-warn);
+  margin-left: 6px;
+}
+
+/* Scene library polish */
+[data-testid="voice-treasure-studio"] .vts-scene-row {
+  display: grid; gap: 10px;
+  grid-template-columns: 1fr;
+}
+[data-testid="voice-treasure-studio"] .vts-scene-row-head {
+  display: flex; gap: 10px; align-items: center; justify-content: space-between;
+}
+[data-testid="voice-treasure-studio"] .vts-scene-thumb {
+  width: 64px; height: 48px; border-radius: 8px;
+  background: linear-gradient(160deg, #1d2356, #3a2c7a);
+  border: 1px solid var(--vts-line);
+  display: grid; place-items: center; color: var(--vts-gold-0);
+  flex-shrink: 0;
+}
+[data-testid="voice-treasure-studio"] .vts-scene-meta {
+  display: flex; align-items: center; gap: 10px;
+}
+[data-testid="voice-treasure-studio"] .vts-scene-status {
+  font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 999px;
+  border: 1px solid currentColor;
+}
+[data-testid="voice-treasure-studio"] .vts-scene-status[data-state="enabled"]  { color: var(--vts-good); }
+[data-testid="voice-treasure-studio"] .vts-scene-status[data-state="disabled"] { color: var(--vts-dim); }
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="voice-treasure-studio"] * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition: none !important;
+  }
+}

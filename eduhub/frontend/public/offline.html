@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#050010" />
+  <title>EduHub · Offline</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Plus Jakarta Sans", "SF Pro Text", sans-serif;
+      background: radial-gradient(circle at 30% 20%, #2D1F3E 0%, #050010 70%);
+      color: #F4E5C1;
+      display: grid;
+      place-items: center;
+      padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
+    }
+    .card {
+      max-width: 420px;
+      width: 100%;
+      text-align: center;
+      border-radius: 24px;
+      border: 1px solid rgba(212, 168, 67, 0.25);
+      padding: 36px 28px;
+      background: rgba(20, 14, 32, 0.72);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.7);
+    }
+    .icon {
+      width: 64px; height: 64px;
+      border-radius: 18px;
+      display: grid; place-items: center;
+      margin: 0 auto 16px;
+      background: linear-gradient(150deg, #2D1F3E 0%, #1A1420 100%);
+      box-shadow: inset 0 1px 0 rgba(212, 168, 67, 0.18);
+    }
+    .icon svg { width: 30px; height: 30px; color: #FFE19A; }
+    h1 {
+      font-size: 22px;
+      margin: 0 0 8px;
+      letter-spacing: -0.01em;
+      background: linear-gradient(90deg, #00e0ff 0%, #9b5cff 50%, #ff3da6 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p { color: #b8a98a; font-size: 14px; line-height: 1.55; margin: 0 0 18px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    button {
+      display: inline-flex; align-items: center; gap: 6px;
+      border-radius: 999px; padding: 11px 18px; font-size: 12px;
+      font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+      border: 1px solid rgba(212, 168, 67, 0.4); color: #1a1420;
+      background: linear-gradient(135deg, #FFE19A 0%, #D4A843 50%, #9C7A2C 100%);
+      cursor: pointer;
+    }
+    button.ghost {
+      background: transparent; color: #F4E5C1;
+      border: 1px solid rgba(244, 229, 193, 0.25);
+    }
+    .hint {
+      margin-top: 16px;
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: rgba(244, 229, 193, 0.4);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon" aria-hidden>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12a10 10 0 0 1 10-10"/><path d="M22 12a10 10 0 0 1-10 10"/><path d="m4 4 16 16"/></svg>
+    </div>
+    <h1>You're offline</h1>
+    <p>EduHub needs a connection to load fresh content. The pages you've already visited still work — head back and your last book or chapter is right where you left it.</p>
+    <div class="row">
+      <button onclick="location.reload()" data-testid="offline-retry">Try again</button>
+      <button class="ghost" onclick="history.length > 1 ? history.back() : (location.href='/')" data-testid="offline-back">Go back</button>
+    </div>
+    <p class="hint">Your saved bookmarks &amp; drafts are safe</p>
+  </div>
+  <script>
+    // Auto-retry once the device says it's online again.
+    window.addEventListener("online", () => location.reload());
+  </script>
+</body>
+</html>

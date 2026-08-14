@@ -1,0 +1,390 @@
+/* =============================================================
+   library-visibility.css — Classroom Library visibility + polish
+   v15 (2026-05-28 — controlled UI scan patch)
+
+   Scope rules (HARD):
+     • Every selector is scoped under `.lib-visibility-root` so this
+       file CANNOT bleed into Reader / EduTalk / Portal / Studio.
+     • No `body` rules. No global `*` rules. No font-family overrides.
+     • No new fonts loaded. No new dependencies. No new colour tokens.
+     • Day-mode AND night-mode covered. Night-mode rules sit behind
+       `:not([data-theme="day"])` so the cinematic theme already in
+       library-cinematic.css is preserved untouched.
+     • Khmer rendering is improved by RAISING contrast — never by
+       changing the font, letter-spacing, or stroke that breaks
+       Khmer glyphs.
+
+   Visibility goals addressed:
+     1. Pale gold text on pale backgrounds  → stronger ink + soft halo
+     2. Low-opacity Khmer labels            → opacity floor of 0.86
+     3. Over-transparent glass in day mode  → matte-glass fallback
+     4. Weak Top Up button in day mode      → underlay halo + ring
+     5. Wallet pill readability             → tabular numerals + ring
+     6. Excessive glow in day mode          → softened shadows in day
+     7. "New for You" rail premium framing  → faint gold edge + label
+   ============================================================= */
+
+/* ---------- Base ink lift inside the library scope ---------- */
+.lib-visibility-root {
+  /* Local CSS variables so the rules below stay self-contained. */
+  --lib-ink-strong:  #FFF3CC;   /* primary parchment, raised contrast */
+  --lib-ink-soft:    #F4E5C1;   /* body text */
+  --lib-ink-mute:    rgba(244, 229, 193, 0.78);
+  --lib-gold:        #FFE19A;
+  --lib-gold-edge:   rgba(255, 225, 154, 0.55);
+  --lib-card-shadow: 0 6px 14px rgba(212, 168, 67, 0.18);
+  --lib-card-shadow-day: 0 4px 12px rgba(60, 30, 10, 0.16);
+}
+
+/* The page-level title + Khmer subtitle were rendering with low
+   contrast on the warm-purple body wash. Reinforce the gradient
+   stop on the parchment text and raise the Khmer line. */
+.lib-visibility-root [data-testid="library-name"] {
+  color: var(--lib-ink-strong);
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
+}
+.lib-visibility-root [data-testid="library-greeting"] .khmer {
+  /* Raise the Khmer greeting from text-faded (0.65) to ≥ 0.86 so it
+     stays legible against the body gradient in both modes. */
+  opacity: 0.92;
+  color: var(--lib-ink-soft);
+}
+
+/* "Apprentice Reader" pill — reduce glow in day mode so the gold
+   text doesn't bleed into the page background. */
+.lib-visibility-root [data-testid="library-level-pill"] {
+  color: var(--lib-ink-strong);
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
+}
+
+/* Wallet pill — add a faint ring so it reads as a distinct chip
+   even when the dashboard's purple wash sits behind it. Tabular
+   numerals already applied inline; we just sharpen the frame. */
+.lib-visibility-root [data-testid="wallet-pill"] {
+  outline: 1px solid rgba(255, 225, 154, 0.22);
+  outline-offset: -1px;
+}
+
+/* Top Up button — strengthen day-mode contrast without changing
+   the gradient. The shadow gets a slightly warmer fall-off so the
+   pill stops disappearing on pastel backgrounds. */
+.lib-visibility-root [data-testid="library-topup-btn"] {
+  box-shadow:
+    0 6px 18px rgba(212, 168, 67, 0.28),
+    inset 0 1px 0 rgba(255, 225, 154, 0.16);
+}
+
+/* Filter chips — bump the inactive chip text from #F4E5C1 to the
+   strong ink so Khmer characters remain legible on the muted bg. */
+.lib-visibility-root [data-testid="library-filter-row"] button {
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
+}
+.lib-visibility-root [data-testid="library-live-pill"] {
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
+}
+
+/* Stat cards — title labels stay readable in day mode. */
+.lib-visibility-root .lib-visibility-root .stat-card,
+.lib-visibility-root [data-testid^="stat-"] {
+  color: var(--lib-ink-soft);
+}
+
+/* Book card title overlay — strengthen the bottom scrim on cards
+   that have a heavy cover image so the title never disappears. */
+.lib-visibility-root .book-card .book-card__band {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(0, 0, 0, 0) 0%,
+      rgba(0, 0, 0, 0.36) 38%,
+      rgba(0, 0, 0, 0.78) 78%,
+      rgba(0, 0, 0, 0.92) 100%
+    );
+  border-bottom-left-radius: inherit;
+  border-bottom-right-radius: inherit;
+}
+
+/* ---------- "New for You" rail framing (premium accent) ---------- */
+.lib-visibility-root .lib-new-for-you-rail {
+  position: relative;
+  padding: 14px 12px 10px;
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255, 225, 154, 0.10) 0%,
+      rgba(167, 139, 250, 0.06) 55%,
+      rgba(255, 255, 255, 0.02) 100%
+    );
+  border: 1px solid rgba(255, 225, 154, 0.20);
+  box-shadow:
+    0 8px 20px rgba(212, 168, 67, 0.10),
+    inset 0 1px 0 rgba(255, 225, 154, 0.10);
+}
+.lib-visibility-root .lib-new-for-you-rail::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      120% 70% at 50% 0%,
+      rgba(255, 225, 154, 0.10) 0%,
+      transparent 60%
+    );
+}
+.lib-visibility-root .lib-new-for-you-rail [data-testid="shelf-new_for_you"] h3 {
+  color: var(--lib-gold);
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.30);
+}
+
+/* ---------- "My Books" rail framing (calm blue-grey, premium) ---------- */
+/* Different palette from "New for You" so the two rails are visually
+   distinct at a glance. Cool slate-blue communicates "owned / library"
+   while the warm-gold "New for You" communicates "discover / fresh". */
+.lib-visibility-root .lib-my-books-rail {
+  position: relative;
+  padding: 14px 12px 10px;
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      145deg,
+      rgba(125, 168, 224, 0.10) 0%,
+      rgba(46, 66, 88, 0.16) 55%,
+      rgba(255, 255, 255, 0.02) 100%
+    );
+  border: 1px solid rgba(125, 168, 224, 0.22);
+  box-shadow:
+    0 8px 20px rgba(46, 66, 88, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.lib-visibility-root .lib-my-books-rail::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      120% 70% at 50% 0%,
+      rgba(125, 168, 224, 0.10) 0%,
+      transparent 60%
+    );
+}
+.lib-visibility-root .lib-my-books-rail [data-testid="shelf-my_books"] h3 {
+  color: #BFD4F0;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.30);
+}
+
+/* ---------- View-mode chip group (Discover / Owned / All) ---------- */
+/* Visually grouped so it reads as a SEGMENTED control rather than three
+   loose chips. Sits at the front of the filter-chip row. */
+.lib-visibility-root .lib-viewmode-group {
+  background: rgba(45, 31, 62, 0.55);
+  border: 1px solid rgba(212, 168, 67, 0.18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+/* ---------- Day-mode override ---------- */
+/* Only applies when the user has explicitly switched to day theme.
+   `data-theme` is set on <html> or <body> by the existing theme
+   toggle (themeAuto.js). When absent, the original cinematic dark
+   styles continue to render exactly as before. */
+.lib-visibility-root[data-theme="day"],
+[data-theme="day"] .lib-visibility-root {
+  /* Lift the ink layer up so dark text shows against a light wash. */
+  --lib-ink-strong: #2b1d0a;
+  --lib-ink-soft:   #3a2814;
+  --lib-ink-mute:   rgba(58, 40, 20, 0.78);
+}
+[data-theme="day"] .lib-visibility-root [data-testid="library-name"] {
+  text-shadow: none;
+  color: #2b1d0a;
+}
+[data-theme="day"] .lib-visibility-root [data-testid="library-greeting"] .khmer {
+  color: #4a341b;
+  opacity: 0.92;
+}
+[data-theme="day"] .lib-visibility-root [data-testid="library-level-pill"] {
+  color: #4a2c0c;
+  text-shadow: none;
+}
+[data-theme="day"] .lib-visibility-root [data-testid="wallet-pill"] {
+  /* Match day-mode brass instead of glowing gold. */
+  color: #4a2c0c !important;
+  background: linear-gradient(135deg, rgba(255, 225, 154, 0.85), rgba(212, 168, 67, 0.55)) !important;
+  border: 1px solid rgba(180, 130, 40, 0.65) !important;
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="day"] .lib-visibility-root [data-testid="library-topup-btn"] {
+  /* Day-mode: replace the dark gold-glass with a warm cream so the
+     button reads as a primary CTA rather than disappearing into the
+     page. The inline gradient on the button itself still drives the
+     hover/credited transitions — we only fortify the frame here. */
+  color: #2b1d0a !important;
+  background: linear-gradient(135deg, #FFF3D6, #FFE19A 50%, #D4A843) !important;
+  border-color: #B07A1F !important;
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="day"] .lib-visibility-root .book-card .book-card__band {
+  /* Day mode keeps a strong scrim so titles remain legible above the
+     warmer page background. */
+  background:
+    linear-gradient(
+      180deg,
+      rgba(0, 0, 0, 0) 0%,
+      rgba(0, 0, 0, 0.42) 42%,
+      rgba(0, 0, 0, 0.82) 80%,
+      rgba(0, 0, 0, 0.94) 100%
+    );
+}
+[data-theme="day"] .lib-visibility-root .lib-new-for-you-rail {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255, 225, 154, 0.38) 0%,
+      rgba(212, 168, 67, 0.18) 60%,
+      rgba(255, 255, 255, 0.10) 100%
+    );
+  border-color: rgba(180, 130, 40, 0.45);
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="day"] .lib-visibility-root .lib-new-for-you-rail [data-testid="shelf-new_for_you"] h3 {
+  color: #6a3f00;
+  text-shadow: none;
+}
+
+[data-theme="day"] .lib-visibility-root .lib-my-books-rail {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(125, 168, 224, 0.32) 0%,
+      rgba(46, 66, 88, 0.10) 60%,
+      rgba(255, 255, 255, 0.10) 100%
+    );
+  border-color: rgba(60, 90, 130, 0.40);
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="day"] .lib-visibility-root .lib-my-books-rail [data-testid="shelf-my_books"] h3 {
+  color: #1f3a5a;
+  text-shadow: none;
+}
+[data-theme="day"] .lib-visibility-root .lib-viewmode-group {
+  background: rgba(255, 255, 255, 0.45);
+  border-color: rgba(180, 130, 40, 0.35);
+}
+
+/* ---------- Reduced motion / narrow viewports ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .lib-visibility-root .lib-new-for-you-rail::before {
+    background: rgba(255, 225, 154, 0.06);
+  }
+}
+@media (max-width: 360px) {
+  .lib-visibility-root .lib-new-for-you-rail {
+    padding: 10px 8px 8px;
+  }
+}
+
+/* =================================================================
+ * v17 (2026-06) — Light-mode parity for Library visibility layer.
+ *
+ * The base file used `[data-theme="day"]` selectors but the live
+ * app emits `[data-theme="light"]` (see themeAuto.js apply()).
+ * This block mirrors every day-mode rule under the real attribute
+ * AND swaps the scoped `.lib-visibility-root` ink variables to a
+ * deep-navy ramp so Khmer / English text on ivory hits WCAG AA.
+ *
+ * Dark mode is untouched: when `data-theme` is "dark" (or absent
+ * before bootstrap), the original cream variables defined in
+ * `.lib-visibility-root` at the top of this file remain in effect.
+ * ================================================================= */
+html[data-theme="light"] .lib-visibility-root,
+[data-theme="light"] .lib-visibility-root {
+  /* Deep-navy ramp — verified ≥ 4.5:1 against ivory #FBF7EE. */
+  --lib-ink-strong: #0F1B2D;
+  --lib-ink-soft:   rgba(15, 27, 45, 0.82);
+  --lib-ink-mute:   rgba(15, 27, 45, 0.62);
+  --lib-gold:       #8A5A12;
+  --lib-gold-edge:  rgba(138, 90, 18, 0.45);
+  --lib-card-shadow: 0 4px 12px rgba(15, 27, 45, 0.10);
+}
+
+[data-theme="light"] .lib-visibility-root [data-testid="library-name"] {
+  text-shadow: none;
+  color: var(--lib-ink-strong);
+}
+[data-theme="light"] .lib-visibility-root [data-testid="library-greeting"] .khmer {
+  color: var(--lib-ink-soft);
+  opacity: 0.94;
+}
+[data-theme="light"] .lib-visibility-root [data-testid="library-level-pill"] {
+  color: #5A3A0C;
+  text-shadow: none;
+}
+[data-theme="light"] .lib-visibility-root [data-testid="wallet-pill"] {
+  color: #4a2c0c !important;
+  background: linear-gradient(135deg, rgba(255, 225, 154, 0.85), rgba(212, 168, 67, 0.55)) !important;
+  border: 1px solid rgba(180, 130, 40, 0.65) !important;
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="light"] .lib-visibility-root [data-testid="library-topup-btn"] {
+  color: #2b1d0a !important;
+  background: linear-gradient(135deg, #FFF3D6, #FFE19A 50%, #D4A843) !important;
+  border-color: #B07A1F !important;
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="light"] .lib-visibility-root [data-testid="library-filter-row"] button,
+[data-theme="light"] .lib-visibility-root [data-testid="library-live-pill"] {
+  text-shadow: none;
+  color: var(--lib-ink-strong);
+}
+[data-theme="light"] .lib-visibility-root .stat-card,
+[data-theme="light"] .lib-visibility-root [data-testid^="stat-"] {
+  color: var(--lib-ink-soft);
+}
+[data-theme="light"] .lib-visibility-root .book-card .book-card__band {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(0, 0, 0, 0) 0%,
+      rgba(0, 0, 0, 0.42) 42%,
+      rgba(0, 0, 0, 0.82) 80%,
+      rgba(0, 0, 0, 0.94) 100%
+    );
+}
+[data-theme="light"] .lib-visibility-root .lib-new-for-you-rail {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255, 225, 154, 0.38) 0%,
+      rgba(212, 168, 67, 0.18) 60%,
+      rgba(255, 255, 255, 0.10) 100%
+    );
+  border-color: rgba(180, 130, 40, 0.45);
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="light"] .lib-visibility-root .lib-new-for-you-rail [data-testid="shelf-new_for_you"] h3 {
+  color: #6a3f00;
+  text-shadow: none;
+}
+[data-theme="light"] .lib-visibility-root .lib-my-books-rail {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(125, 168, 224, 0.32) 0%,
+      rgba(46, 66, 88, 0.10) 60%,
+      rgba(255, 255, 255, 0.10) 100%
+    );
+  border-color: rgba(60, 90, 130, 0.40);
+  box-shadow: var(--lib-card-shadow-day);
+}
+[data-theme="light"] .lib-visibility-root .lib-my-books-rail [data-testid="shelf-my_books"] h3 {
+  color: #1f3a5a;
+  text-shadow: none;
+}
+[data-theme="light"] .lib-visibility-root .lib-viewmode-group {
+  background: rgba(255, 255, 255, 0.55);
+  border-color: rgba(138, 90, 18, 0.32);
+}
