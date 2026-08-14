@@ -36,6 +36,11 @@ credentials; Gemini mocked (option C), R2 stubbed (option B), local Mongo for te
 - Author Studio: inline correction UI, R2 evidence link, delete control (awarded rows
   protected), model shown, Award shows exact pts, bulk incl. needs_review.
 - Student UX: staged progress journey, honest copy, Day Mode via .asmt-theme token remap.
+- (Round 2) Real Extraction Check: POST /api/admin/assessments/{id}/extraction-check —
+  staging-only real Gemini 2.5 Pro read vs answer-key baseline, read-only diagnostic,
+  503 without credential; Studio panel with mismatches/unreadable/score preview.
+- (Round 2) Confidence heatmap pills (high/good/low/critical bands) in review table.
+- (Round 2) Correction-history timeline (who/what/when, legacy records tolerated).
 
 ## Test results
 - Backend: 2709 passed / 65 skipped / 0 failed (5 ffmpeg-env video tests excluded).

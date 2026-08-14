@@ -9,7 +9,7 @@ import AssessmentReviewStudio from "../AssessmentReviewStudio";
 import {
   extractAssessmentAnswerKey, createAssessment, listAssessments, listAssessmentSubmissions,
   awardAssessmentSubmission, bulkAwardAssessmentSubmissions, retryAssessmentGasSync,
-  correctAssessmentSubmission, deleteAssessmentSubmission,
+  correctAssessmentSubmission, deleteAssessmentSubmission, runAssessmentExtractionCheck,
 } from "../api";
 
 jest.mock("../api", () => ({
@@ -22,6 +22,7 @@ jest.mock("../api", () => ({
   retryAssessmentGasSync: jest.fn(),
   correctAssessmentSubmission: jest.fn(),
   deleteAssessmentSubmission: jest.fn(),
+  runAssessmentExtractionCheck: jest.fn(),
 }));
 
 const ASSESSMENT = {
@@ -287,4 +288,81 @@ test("deleting a non-awarded submission asks for confirmation and calls the dele
   expect(confirmSpy).toHaveBeenCalled();
   expect(deleteAssessmentSubmission).toHaveBeenCalledWith("s1");
   confirmSpy.mockRestore();
+});
+
+test("confidence pills are heat-colored so weak readings jump out before awarding", async () => {
+  await renderPanel();
+  fireEvent.click(screen.getByText(ASSESSMENT.title));
+  await screen.findByText("stu094");
+  fireEvent.click(screen.getAllByTestId("assessment-submission-expand-button")[0]);
+  await screen.findByTestId("assessment-submission-detail");
+  const pills = screen.getAllByTestId("assessment-confidence-pill");
+  expect(pills[0]).toHaveAttribute("data-confidence-band", "high");     // 0.95
+  expect(pills[1]).toHaveAttribute("data-confidence-band", "critical"); // 0.31
+});
+
+test("teachers can open a correction-history timeline showing who changed what and when", async () => {
+  const withCorrections = SUBMISSIONS.map((s) =>
+    s.submissionId === "s1"
+      ? {
+          ...s,
+          teacherCorrections: [
+            { qid: "q2", previousAnswer: null, previousState: "uncertain", answer: "SHORT",
+              correctedBy: "teacher@eduhub.app", correctedAt: "2026-06-01T09:30:00+00:00" },
+            "q9", // legacy record shape must not crash the timeline
+          ],
+        }
+      : s);
+  listAssessmentSubmissions.mockResolvedValue({ ok: true, submissions: withCorrections });
+  await renderPanel();
+  fireEvent.click(screen.getByText(ASSESSMENT.title));
+  await screen.findByText("stu094");
+  fireEvent.click(screen.getAllByTestId("assessment-submission-expand-button")[0]);
+  await screen.findByTestId("assessment-submission-detail");
+
+  fireEvent.click(screen.getByTestId("assessment-correction-history-toggle"));
+  const history = screen.getByTestId("assessment-correction-history");
+  expect(history).toHaveTextContent("q2");
+  expect(history).toHaveTextContent("→ SHORT");
+  expect(history).toHaveTextContent("teacher@eduhub.app");
+  expect(history).toHaveTextContent("2026-06-01T09:30:00+00:00");
+  const items = screen.getAllByTestId("assessment-correction-history-item");
+  expect(items).toHaveLength(2);
+  expect(items[1]).toHaveTextContent(/legacy record/i);
+});
+
+test("the staging extraction check uploads a worksheet and reports the real-vs-baseline comparison", async () => {
+  runAssessmentExtractionCheck.mockResolvedValue({
+    ok: true, engine: "gemini", model: "gemini-2.5-pro", total: 30, matches: 28,
+    verification: { checkedQids: ["q1"] },
+    mismatches: [{ qid: "q3", prompt: "cheap", baseline: "LONG", real: "SHORT", confidence: 0.8 }],
+    unreadable: [{ qid: "q1", prompt: "sheep", answerState: "uncertain", confidence: 0.31 }],
+    scorePreview: { correct: 28, total: 30, scorePct: 93.3, pointsEarned: 14, needsReview: true },
+  });
+  await renderPanel();
+  fireEvent.click(screen.getByText(ASSESSMENT.title));
+  await screen.findByTestId("assessment-extraction-check-panel");
+
+  fireEvent.click(screen.getByTestId("assessment-extraction-check-toggle"));
+  const file = new File(["fake"], "worksheet.pdf", { type: "application/pdf" });
+  fireEvent.change(screen.getByTestId("assessment-extraction-check-file-input"), { target: { files: [file] } });
+  await act(async () => { fireEvent.click(screen.getByTestId("assessment-extraction-check-run-button")); });
+
+  expect(runAssessmentExtractionCheck).toHaveBeenCalledWith(ASSESSMENT.assessmentId, file);
+  const result = await screen.findByTestId("assessment-extraction-check-result");
+  expect(result).toHaveTextContent("28 / 30");
+  expect(result).toHaveTextContent("gemini-2.5-pro");
+  expect(screen.getByTestId("assessment-extraction-check-mismatch")).toHaveTextContent("cheap");
+  expect(screen.getByTestId("assessment-extraction-check-unreadable")).toHaveTextContent("sheep");
+});
+
+test("an unavailable real credential surfaces the backend's honest 503 message", async () => {
+  runAssessmentExtractionCheck.mockRejectedValue(new Error("Real Gemini extraction is not configured in this environment"));
+  await renderPanel();
+  fireEvent.click(screen.getByText(ASSESSMENT.title));
+  fireEvent.click(await screen.findByTestId("assessment-extraction-check-toggle"));
+  const file = new File(["fake"], "worksheet.jpg", { type: "image/jpeg" });
+  fireEvent.change(screen.getByTestId("assessment-extraction-check-file-input"), { target: { files: [file] } });
+  await act(async () => { fireEvent.click(screen.getByTestId("assessment-extraction-check-run-button")); });
+  expect(await screen.findByTestId("assessment-extraction-check-error")).toHaveTextContent(/not configured/i);
 });

@@ -14,16 +14,17 @@
  * on the backend already loops the identical _award_one function server-
  * side — no separate bulk logic invented on either side).
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ClipboardList, Loader2, Check, AlertTriangle, Coins, RefreshCcw,
   Upload, Plus, ChevronDown, ChevronUp, X as XIcon, Wallet, Bell, RotateCcw,
-  Pencil, ExternalLink, Trash2, HelpCircle,
+  Pencil, ExternalLink, Trash2, HelpCircle, History, FlaskConical,
 } from "lucide-react";
 import {
   extractAssessmentAnswerKey, createAssessment, listAssessments as apiListAssessments,
   listAssessmentSubmissions, awardAssessmentSubmission, bulkAwardAssessmentSubmissions,
   retryAssessmentGasSync, correctAssessmentSubmission, deleteAssessmentSubmission,
+  runAssessmentExtractionCheck,
 } from "./api";
 
 // needs_review means "a teacher should look" — it is still awardable with
@@ -57,6 +58,15 @@ function StatusBadge({ status }) {
  * text Gemini extracted per question, so a mismatched vocabulary (e.g.
  * the prompt word instead of a LONG/SHORT classification) is visible at
  * a glance instead of an unexplained 0. */
+// Confidence heatmap: low-confidence readings must jump out BEFORE awarding.
+function confMeta(conf) {
+  if (typeof conf !== "number") return null;
+  if (conf >= 0.85) return { band: "high", cls: "text-emerald-300 bg-emerald-400/10 border-emerald-400/30" };
+  if (conf >= 0.7) return { band: "good", cls: "text-lime-300 bg-lime-400/10 border-lime-400/30" };
+  if (conf >= 0.5) return { band: "low", cls: "text-amber-300 bg-amber-400/10 border-amber-400/35" };
+  return { band: "critical", cls: "text-red-300 bg-red-400/10 border-red-400/40" };
+}
+
 const STATE_BADGE = {
   blank: { label: "blank", cls: "text-slate-300 border-slate-400/40 bg-slate-400/10" },
   uncertain: { label: "uncertain", cls: "text-amber-300 border-amber-400/40 bg-amber-400/10" },
@@ -99,6 +109,7 @@ function DetailRow({ d, submissionId, locked, onCorrected }) {
   };
 
   const confPct = typeof d.confidence === "number" ? `${Math.round(d.confidence * 100)}%` : null;
+  const conf = confMeta(d.confidence);
   return (
     <>
       <tr className="border-t border-white/5" data-testid="assessment-submission-detail-row">
@@ -113,7 +124,16 @@ function DetailRow({ d, submissionId, locked, onCorrected }) {
           )}
         </td>
         <td className="pr-2 py-1 text-white/50">{d.correctAnswer}</td>
-        <td className="pr-2 py-1 text-white/40 whitespace-nowrap">{confPct || ""}</td>
+        <td className="pr-2 py-1 whitespace-nowrap">
+          {confPct ? (
+            <span className={`text-[10px] font-bold px-1.5 py-px rounded-full border ${conf.cls}`}
+                  data-testid="assessment-confidence-pill" data-confidence-band={conf.band}>
+              {confPct}
+            </span>
+          ) : (
+            <span className="text-white/25 text-[10px]">—</span>
+          )}
+        </td>
         <td className="pr-2 py-1">
           {d.correct
             ? <Check size={12} className="text-emerald-400" />
@@ -155,11 +175,144 @@ function DetailRow({ d, submissionId, locked, onCorrected }) {
   );
 }
 
+function CorrectionHistory({ corrections }) {
+  return (
+    <div className="rounded-lg border border-sky-400/20 bg-sky-400/[0.04] p-2.5 space-y-2"
+         data-testid="assessment-correction-history">
+      {corrections.map((c, i) =>
+        typeof c === "object" && c !== null ? (
+          <div key={i} className="flex items-start gap-2 text-[11px]" data-testid="assessment-correction-history-item">
+            <History size={11} className="text-sky-300 mt-0.5 flex-shrink-0" />
+            <div>
+              <span className="font-bold text-white/80">{c.qid}</span>
+              <span className="text-white/50"> · </span>
+              <span className="text-white/45">{c.previousAnswer || "—"}</span>
+              {c.previousState && c.previousState !== "answered" && (
+                <span className="text-white/35"> ({c.previousState})</span>
+              )}
+              <span className="text-sky-300 font-bold"> → {c.answer || "—"}</span>
+              <div className="text-[10px] text-white/35">
+                by {c.correctedBy || "teacher"}{c.correctedAt ? ` · ${c.correctedAt}` : ""}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div key={i} className="text-[11px] text-white/45" data-testid="assessment-correction-history-item">
+            <span className="font-bold text-white/70">{String(c)}</span> corrected (legacy record — no detail stored)
+          </div>
+        ))}
+    </div>
+  );
+}
+
+/** Staging diagnostic: one real Gemini 2.5 Pro read of a worksheet,
+ * compared per-qid against the deterministic baseline (the answer key).
+ * Read-only — creates no submission, moves no points. The backend returns
+ * 503 in environments without a real Gemini credential. */
+function ExtractionCheckPanel({ assessment }) {
+  const [open, setOpen] = useState(false);
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState(null);
+  const inputRef = useRef(null);
+
+  const run = async () => {
+    if (!file) return;
+    setBusy(true);
+    setErr(null);
+    setResult(null);
+    try {
+      setResult(await runAssessmentExtractionCheck(assessment.assessmentId, file));
+    } catch (e) {
+      setErr(e.message || "Extraction check failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4" data-testid="assessment-extraction-check-panel">
+      <button onClick={() => setOpen((v) => !v)} data-testid="assessment-extraction-check-toggle"
+              className="w-full flex items-center justify-between gap-2 text-left">
+        <span className="inline-flex items-center gap-2 text-[13px] font-bold text-white">
+          <FlaskConical size={14} className="text-purple-300" /> Real Extraction Check
+          <span className="text-[9.5px] font-bold uppercase px-1.5 py-px rounded-full border text-purple-300 border-purple-400/40 bg-purple-400/10">staging</span>
+        </span>
+        {open ? <ChevronUp size={14} className="text-white/40" /> : <ChevronDown size={14} className="text-white/40" />}
+      </button>
+      {open && (
+        <div className="mt-3 space-y-3">
+          <p className="text-[11px] text-white/45">
+            Runs ONE real Gemini 2.5 Pro read of an uploaded worksheet and compares each
+            question against the deterministic baseline (the answer key). Diagnostic only —
+            no submission is created and no points move.
+          </p>
+          <div className="flex items-center gap-2 flex-wrap">
+            <input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp,application/pdf"
+                   onChange={(e) => setFile(e.target.files?.[0] || null)}
+                   data-testid="assessment-extraction-check-file-input"
+                   className="text-[11px] text-white/60 file:mr-2 file:rounded-lg file:border-0 file:bg-white/10 file:px-2.5 file:py-1.5 file:text-[11px] file:font-semibold file:text-white" />
+            <button onClick={run} disabled={!file || busy}
+                    data-testid="assessment-extraction-check-run-button"
+                    className="inline-flex items-center gap-1.5 text-[11.5px] font-bold text-black bg-purple-300 rounded-lg px-3 py-1.5 disabled:opacity-40">
+              {busy ? <Loader2 size={12} className="animate-spin" /> : <FlaskConical size={12} />} Run check
+            </button>
+          </div>
+          {err && <div className="text-[11.5px] text-red-300" data-testid="assessment-extraction-check-error">{err}</div>}
+          {result && (
+            <div className="space-y-2" data-testid="assessment-extraction-check-result">
+              <div className="text-[11.5px] text-white/70">
+                <span className="font-bold text-white">{result.matches} / {result.total}</span> match the baseline
+                {" "}· Model: <span className="font-semibold text-purple-300">{result.model}</span>
+                {result.verification?.checkedQids?.length
+                  ? ` · verification re-checked ${result.verification.checkedQids.length}`
+                  : ""}
+              </div>
+              <div className="text-[11px] text-white/50">
+                Score preview: {result.scorePreview.correct}/{result.scorePreview.total} correct
+                {" "}· {result.scorePreview.pointsEarned} pts calculated
+                {result.scorePreview.needsReview ? " · would need review" : ""}
+              </div>
+              {result.mismatches?.length > 0 && (
+                <div className="rounded-lg border border-red-400/20 bg-red-400/[0.05] p-2 space-y-1">
+                  {result.mismatches.map((m) => (
+                    <div key={m.qid} className="text-[11px] text-white/70" data-testid="assessment-extraction-check-mismatch">
+                      <span className="font-bold">{m.prompt}</span>: baseline
+                      {" "}<span className="text-white/45">{m.baseline}</span> → real
+                      {" "}<span className="text-red-300 font-bold">{m.real}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {result.unreadable?.length > 0 && (
+                <div className="rounded-lg border border-amber-400/20 bg-amber-400/[0.05] p-2 space-y-1">
+                  {result.unreadable.map((u) => (
+                    <div key={u.qid} className="text-[11px] text-white/70" data-testid="assessment-extraction-check-unreadable">
+                      <span className="font-bold">{u.prompt}</span>: {u.answerState}
+                      {typeof u.confidence === "number" ? ` (${Math.round(u.confidence * 100)}%)` : ""}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {result.mismatches?.length === 0 && result.unreadable?.length === 0 && (
+                <div className="text-[11px] text-emerald-300">Perfect agreement with the baseline.</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 function SubmissionDetail({ submission, onChanged }) {
+  const [showHistory, setShowHistory] = useState(false);
   const details = submission?.score?.details || [];
   const extraction = submission?.extraction;
   const corrections = submission?.teacherCorrections || [];
-  const correctionCount = corrections.filter((c) => typeof c === "object").length || corrections.length;
+  const correctionCount = corrections.length;
   const locked = submission?.status === "awarded";
   return (
     <div className="mt-2 pt-2 border-t border-white/10 space-y-2" data-testid="assessment-submission-detail">
@@ -181,8 +334,18 @@ function SubmissionDetail({ submission, onChanged }) {
         </a>
       )}
       {correctionCount > 0 && (
-        <div className="text-[10.5px] text-sky-300/80" data-testid="assessment-corrections-count">
-          {correctionCount} teacher correction(s) applied — original Gemini extraction preserved.
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2">
+            <div className="text-[10.5px] text-sky-300/80" data-testid="assessment-corrections-count">
+              {correctionCount} teacher correction(s) applied — original Gemini extraction preserved.
+            </div>
+            <button onClick={() => setShowHistory((v) => !v)}
+                    data-testid="assessment-correction-history-toggle"
+                    className="inline-flex items-center gap-1 text-[10.5px] font-bold text-sky-300 hover:text-sky-200">
+              <History size={10} /> {showHistory ? "Hide history" : `History (${correctionCount})`}
+            </button>
+          </div>
+          {showHistory && <CorrectionHistory corrections={corrections} />}
         </div>
       )}
       {details.length === 0 ? (
@@ -638,6 +801,8 @@ export default function AssessmentReviewStudio() {
           </div>
         )}
       </div>
+
+      {selected && <ExtractionCheckPanel assessment={selected} />}
 
       <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
         <div className="text-[13px] font-bold text-white mb-3">Submissions</div>

@@ -58,8 +58,8 @@ deterministic scoring separate from Gemini.
 ### frontend/ (apply to frontend/PWA repo root)
 | File | Change |
 |---|---|
-| `src/studio/AssessmentReviewStudio.jsx` | Per-question review table now shows given answer + physical `answer_state` badge + confidence % + teacher-source badge; **inline "Apply Correction" editor** per row (calls `/correct`, auto-refreshes with the recalculated score); "View original paper (R2 evidence)" link; delete control (confirm dialog; hidden for awarded rows); Award button now on `needs_review` too and shows the exact amount ("Award 13.5 pts"); bulk-award checkbox enabled for `needs_review`; extraction meta line shows engine + model + timestamp + verification info. |
-| `src/studio/api.js` | Added `deleteAssessmentSubmission`. |
+| `src/studio/AssessmentReviewStudio.jsx` | Per-question review table now shows given answer + physical `answer_state` badge + heat-colored confidence pill (`data-confidence-band` high/good/low/critical — weak readings jump out before awarding) + teacher-source badge; **inline "Apply Correction" editor** per row (calls `/correct`, auto-refreshes with the recalculated score); **correction-history timeline** (who changed what and when, legacy records tolerated); "View original paper (R2 evidence)" link; delete control (confirm dialog; hidden for awarded rows); Award button now on `needs_review` too and shows the exact amount ("Award 13.5 pts"); bulk-award checkbox enabled for `needs_review`; extraction meta line shows engine + model + timestamp + verification info; **"Real Extraction Check" staging panel** (upload a worksheet → one real Gemini 2.5 Pro read → real-vs-baseline comparison with mismatches/unreadable lists and score preview). |
+| `src/studio/api.js` | Added `deleteAssessmentSubmission` and `runAssessmentExtractionCheck`. |
 | `src/eduhub/pages/assessments/SubmitAssessmentModal.jsx` | Immersive staged submission journey (Uploading → Reading your answers → Checking → Calculating) with animated icons, shimmer progress, pulse rings — only the real server response ever ends the journey; honest result copy ("pts **calculated**", "Teacher review" pill, "waiting for your teacher's approval — nothing has been credited yet"); theme-token gold. |
 | `src/eduhub/pages/assessments/AssessmentsListPage.jsx` | `asmt-theme` Day-Mode wrapper; token-based gold; "🎉 Points awarded" state label. |
 | `src/eduhub/pages/assessments/assessments.css` | Day Mode fixed at the theme-system level: `.asmt-theme` remaps the feature's white-alpha utilities onto the app's real `--eh-ink-*` / `--eh-border-*` / `--eh-surface-*` tokens under `html[data-theme="light"]` (dark mode byte-identical); progress/shimmer/pop animations; full `prefers-reduced-motion` support. |
@@ -105,16 +105,19 @@ None destructive. Existing submissions keep working:
 
 ## 5. TEST RESULTS (verified locally — NOT against production)
 
-- Backend full regression: **2709 passed, 65 skipped, 0 failed**
+- Backend full regression: **2711 passed, 65 skipped, 0 failed**
   (5 `test_video_render_tools.py` tests excluded — they require ffmpeg/ffprobe binaries
   absent in the sandbox; unrelated to this patch and unmodified).
-- Backend assessment suites (`test_assessment_lab_repair.py` + `test_assessment_tools.py`
-  + `test_assessment_ai_provider_prompts.py`): **54 passed**.
+- Backend assessment suites (`test_assessment_lab_repair.py` — now 17 tests incl. the
+  extraction-check diagnostic — + `test_assessment_tools.py`
+  + `test_assessment_ai_provider_prompts.py`): **56 passed**.
 - Real-wallet integration (`test_assessment_award_real_wallet.py`): **1 passed** against a
   live local MongoDB — exact 13.5 credit + idempotent duplicate.
-- Frontend Assessment + Author Studio suites: **45 passed, 0 failed**
+- Frontend Assessment + Author Studio suites: **49 passed, 0 failed**
   (`AssessmentsListPage`, `SubmitAssessmentModal`, `useAssessmentBadge`, `assessmentApi`,
-  `AssessmentReviewStudio`).
+  `AssessmentReviewStudio` — incl. confidence heatmap, correction-history timeline and
+  extraction-check panel tests).
+- Frontend full regression: **2529 tests / 188 suites passed**.
 - Frontend production build: `yarn build` — compiled successfully (see report).
 
 ## 6. GEMINI TESTING MODE

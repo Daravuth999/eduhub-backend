@@ -414,6 +414,76 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         return {"ok": True, "assessment": existing}
 
     # ── Teacher: submissions review ───────────────────────────────────────
+    @api.post("/admin/assessments/{assessment_id}/extraction-check")
+    async def admin_extraction_check(assessment_id: str, file: UploadFile = File(...),
+                                      admin=Depends(require_admin)):
+        """Staging diagnostic switch: runs ONE real Gemini 2.5 Pro read of an
+        uploaded worksheet and compares it, per qid, against the
+        deterministic mock baseline (the answer key, which is exactly what
+        _mock_submission_answers produces). Pure read-only diagnostic —
+        nothing is persisted, no submission is created, no points move."""
+        _ = admin
+        asmt = await _get_assessment_or_404(assessment_id)
+        if not ai.ai_available():
+            raise HTTPException(
+                503, "Real Gemini extraction is not configured in this environment "
+                     "(GEMINI_API_KEY missing or mock mode enabled) — run this check on staging.")
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(400, "Uploaded file is empty.")
+        if len(raw) > HARD_MAX_MEDIA_BYTES:
+            raise HTTPException(413, f"File exceeds the {HARD_MAX_MEDIA_BYTES}-byte limit.")
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
+        if content_type not in SUBMISSION_CONTENT_TYPES:
+            raise HTTPException(415, f"Unsupported content type: {content_type!r}.")
+
+        extraction = await ai.extract_submission_answers(raw, content_type, asmt["questions"])
+        if not extraction.get("ok"):
+            raise HTTPException(502, f"Real extraction failed: {extraction.get('reason')}")
+
+        known_ids = [q["qid"] for q in asmt["questions"]]
+        real = normalize_extracted_submission_answers(
+            extraction.get("answers") or [], known_ids, fill_missing=True)
+        # Baseline = the assessment's own answer key — exactly what the
+        # deterministic mock derives its answers from.
+        base_by = {q["qid"]: str(q.get("correctAnswer") or "") for q in asmt["questions"]}
+        real_by = {a["qid"]: a for a in real}
+
+        matches = 0
+        mismatches, unreadable = [], []
+        for q in asmt["questions"]:
+            qid = q["qid"]
+            r = real_by[qid]
+            baseline_answer = base_by.get(qid, "")
+            if r["answerState"] != "answered":
+                unreadable.append({"qid": qid, "prompt": q.get("prompt"),
+                                    "answerState": r["answerState"],
+                                    "confidence": r["confidence"],
+                                    "baseline": baseline_answer})
+            elif str(r["answer"]).strip().casefold() == baseline_answer.strip().casefold():
+                matches += 1
+            else:
+                mismatches.append({"qid": qid, "prompt": q.get("prompt"),
+                                    "baseline": baseline_answer, "real": r["answer"],
+                                    "confidence": r["confidence"]})
+
+        preview = score_submission(asmt["questions"], real)
+        return {
+            "ok": True,
+            "engine": extraction.get("engine"),
+            "model": extraction.get("model"),
+            "verification": extraction.get("verification"),
+            "total": len(known_ids),
+            "matches": matches,
+            "mismatches": mismatches,
+            "unreadable": unreadable,
+            "scorePreview": {
+                "correct": preview["correct"], "total": preview["total"],
+                "scorePct": preview["scorePct"], "pointsEarned": preview["pointsEarned"],
+                "needsReview": preview["needsReview"],
+            },
+        }
+
     @api.get("/admin/assessments/{assessment_id}/submissions")
     async def admin_list_submissions(assessment_id: str, status: str | None = None,
                                       admin=Depends(require_admin)):

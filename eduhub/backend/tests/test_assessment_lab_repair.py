@@ -404,3 +404,43 @@ def test_bulk_award_mixed_statuses_credits_exact_amounts(monkeypatch):
     assert wallet.seen[f"assessment_award:{s1['submissionId']}"] == 13.5
     assert wallet.seen[f"assessment_award:{s2['submissionId']}"] == 15.0
     assert wallet.seen[f"assessment_award:{s3['submissionId']}"] == 12.0
+
+
+# ── 16. staging switch: real-extraction check vs. mock baseline ────────────
+def test_extraction_check_returns_503_when_real_gemini_is_not_configured(monkeypatch):
+    db, router, _ = _build()
+    _seed_published_assessment(db)
+    monkeypatch.setattr(ai, "ai_available", lambda: False)
+    with pytest.raises(Exception) as exc_info:
+        _call(router, "POST", "/admin/assessments/{assessment_id}/extraction-check",
+              assessment_id="asmt_fixed", file=_UploadFile(b"paper", "image/jpeg"), admin=_Admin())
+    assert "503" in str(exc_info.value) or "not configured" in str(exc_info.value)
+
+
+def test_extraction_check_compares_real_read_against_mock_baseline(monkeypatch):
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+    monkeypatch.setattr(ai, "ai_available", lambda: True)
+
+    real_answers = [{"qid": q["qid"], "answer": q["correctAnswer"],
+                     "answer_state": "answered", "confidence": 0.95}
+                    for q in asmt["questions"]]
+    real_answers[0] = {"qid": "q1", "answer": "", "answer_state": "uncertain", "confidence": 0.31}
+    real_answers[2] = {"qid": "q3", "answer": "SHORT", "answer_state": "answered", "confidence": 0.8}
+    monkeypatch.setattr(ai, "extract_submission_answers", _extract_stub(real_answers))
+
+    result = _call(router, "POST", "/admin/assessments/{assessment_id}/extraction-check",
+                   assessment_id="asmt_fixed", file=_UploadFile(b"paper", "image/jpeg"), admin=_Admin())
+    assert result["ok"] is True
+    assert result["model"] == "gemini-2.5-pro"
+    assert result["total"] == 30
+    assert result["matches"] == 28
+    assert [m["qid"] for m in result["mismatches"]] == ["q3"]
+    assert result["mismatches"][0]["real"] == "SHORT"
+    assert [u["qid"] for u in result["unreadable"]] == ["q1"]
+    assert result["unreadable"][0]["answerState"] == "uncertain"
+    assert result["scorePreview"]["correct"] == 28
+    assert result["scorePreview"]["pointsEarned"] == 14.0
+    assert result["scorePreview"]["needsReview"] is True
+    # Pure diagnostic — no submission was persisted.
+    assert len(db[at.COLL_SUBMISSIONS].docs) == 0

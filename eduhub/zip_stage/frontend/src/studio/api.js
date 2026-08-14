@@ -785,3 +785,8 @@ export const retryAssessmentGasSync = (submissionId) =>
   request(`/api/admin/assessments/submissions/${encodeURIComponent(submissionId)}/retry-gas-sync`, { method: "POST" });
 export const deleteAssessmentSubmission = (submissionId) =>
   request(`/api/admin/assessments/submissions/${encodeURIComponent(submissionId)}`, { method: "DELETE" });
+export const runAssessmentExtractionCheck = (assessmentId, file) => {
+  const fd = new FormData();
+  fd.append("file", file);
+  return request(`/api/admin/assessments/${encodeURIComponent(assessmentId)}/extraction-check`, { method: "POST", body: fd });
+};
