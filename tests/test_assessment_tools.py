@@ -1088,6 +1088,55 @@ def test_retry_gas_sync_rejects_a_submission_that_was_never_awarded(monkeypatch)
     assert "409" in str(exc_info.value) or "not been awarded" in str(exc_info.value)
 
 
+def test_admin_submission_list_resolves_real_student_display_name(monkeypatch):
+    """Author Studio's submission list must show WHO a worksheet belongs
+    to — a raw studentId/cleanId code is not enough for a teacher to
+    recognize a student. Resolved from db.students (the same collection
+    attendance_tools.py/tuition_tools.py already join against), batched
+    for the whole page — never a fabricated or guessed name."""
+    _patch_media_storage(monkeypatch)
+    db, router, pushes = _build(wallet=_Wallet())
+    asmt = _seed_published_assessment(db)
+    db["students"].docs["s1"] = {
+        "student_id": "stu_alice", "clean_id": "stu094", "display_name": "Alice Chan",
+    }
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    _call(router, "POST", "/student/assessments/submit",
+          assessment_id=asmt["assessmentId"], file=file, student=_Student())
+
+    listed = _call(router, "GET", "/admin/assessments/{assessment_id}/submissions",
+                    assessment_id=asmt["assessmentId"], status=None, admin=_Admin())
+    assert len(listed["submissions"]) == 1
+    assert listed["submissions"][0]["studentName"] == "Alice Chan"
+
+
+def test_admin_submission_list_never_fabricates_a_name_for_an_unknown_student(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    db, router, pushes = _build(wallet=_Wallet())
+    asmt = _seed_published_assessment(db)
+    # No matching row in db.students at all — the submission's studentId/
+    # cleanId genuinely has no resolvable name.
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+
+    file = _UploadFile(b"bytes", "image/png")
+    _call(router, "POST", "/student/assessments/submit",
+          assessment_id=asmt["assessmentId"], file=file, student=_Student())
+
+    listed = _call(router, "GET", "/admin/assessments/{assessment_id}/submissions",
+                    assessment_id=asmt["assessmentId"], status=None, admin=_Admin())
+    assert not listed["submissions"][0].get("studentName")
+    # The raw identity codes must still be present as the honest fallback.
+    assert listed["submissions"][0]["cleanId"] == "stu094"
+
+
 def test_real_gas_sync_helper_rounds_fractional_points_and_never_raises():
     """assessment scoring supports 0.5-point increments (0.5/question);
     GAS's legacy points ledger is integer-based (mirrors Speaking Lab's own

@@ -316,6 +316,34 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             raise HTTPException(404, "Submission not found.")
         return doc
 
+    async def _attach_student_names(docs: list[dict]) -> list[dict]:
+        """Batch-resolve each submission's real student display name from
+        db.students (the same collection/field shape attendance_tools.py
+        and tuition_tools.py already join against — clean_id/student_id ->
+        display_name), one query for the whole page instead of N+1.
+        Without this, Author Studio only ever showed the raw studentId/
+        cleanId code, leaving a teacher with no way to tell whose worksheet
+        a submission actually was."""
+        ids = {v for d in docs for v in (d.get("cleanId"), d.get("studentId")) if v}
+        if not ids:
+            return docs
+        rows = await db["students"].find(
+            {"$or": [{"clean_id": {"$in": list(ids)}}, {"student_id": {"$in": list(ids)}}]},
+            {"_id": 0, "student_id": 1, "clean_id": 1, "display_name": 1},
+        ).to_list(len(ids) * 2 + 10)
+        by_id: dict[str, str] = {}
+        for r in rows:
+            name = r.get("display_name")
+            if not name:
+                continue
+            if r.get("clean_id"):
+                by_id[r["clean_id"]] = name
+            if r.get("student_id"):
+                by_id[r["student_id"]] = name
+        for d in docs:
+            d["studentName"] = by_id.get(d.get("cleanId") or "") or by_id.get(d.get("studentId") or "")
+        return docs
+
     # ── Teacher: answer-key extraction (review-before-save, nothing persisted here) ──
     @api.post("/admin/assessments/extract-key")
     async def admin_extract_key(file: UploadFile = File(...), admin=Depends(require_admin)):
@@ -492,6 +520,7 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         if status:
             q["status"] = status
         docs = await submissions.find(q, {"_id": 0}).sort("submittedAt", -1).to_list(500)
+        docs = await _attach_student_names(docs)
         return {"ok": True, "submissions": docs}
 
     @api.get("/admin/assessments/submissions/{submission_id}")
