@@ -878,10 +878,25 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         extraction = await ai.extract_submission_answers(raw, content_type, asmt["questions"])
         known_ids = [q["qid"] for q in asmt["questions"]]
         if not extraction.get("ok"):
-            await submissions.update_one({"submissionId": submission_id}, {"$set": {"status": "failed"}})
+            # The real reason (e.g. "provider_rejected", "bad_response: ...",
+            # "files_upload_failed") was previously computed and handed back
+            # in this one response, then thrown away — status:"failed" was
+            # all that ever reached Mongo. That left no way for the student
+            # on a later visit, or a teacher/admin looking at the same row
+            # in Author Studio, to tell "AI genuinely couldn't read this
+            # photo" apart from "Gemini/network had a transient problem" —
+            # or to distinguish either from a fabricated/nonexistent anti-
+            # cheat rejection (this pipeline has no such mechanism at all).
+            # Persisting the honest reason closes that gap.
+            reason = extraction.get("reason")
+            await submissions.update_one(
+                {"submissionId": submission_id},
+                {"$set": {"status": "failed", "extractionError": reason}},
+            )
             doc.pop("_id", None)
             doc["status"] = "failed"
-            return {"ok": True, "submission": doc, "extractionError": extraction.get("reason")}
+            doc["extractionError"] = reason
+            return {"ok": True, "submission": doc, "extractionError": reason}
 
         raw_answers = extraction.get("answers") or []
         answers = normalize_extracted_submission_answers(raw_answers, known_ids, fill_missing=True)

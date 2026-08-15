@@ -828,7 +828,20 @@ def test_extraction_failure_never_fabricates_a_score(monkeypatch):
     assert result["submission"]["status"] == "failed"
     assert result["submission"].get("score") is None
     assert "extractionError" in result
-    assert db[at.COLL_SUBMISSIONS].docs[result["submission"]["submissionId"]]["status"] == "failed"
+    stored = db[at.COLL_SUBMISSIONS].docs[result["submission"]["submissionId"]]
+    assert stored["status"] == "failed"
+    # The real reason must survive past this one response — persisted on
+    # the document itself, so a later visit (student re-opening the
+    # assessment, or a teacher/admin looking at the row in Author Studio)
+    # can see WHY it failed instead of a bare, undiagnosable "failed".
+    assert stored["extractionError"] == "provider_rejected: Gemini HTTP 500"
+    assert result["submission"]["extractionError"] == "provider_rejected: Gemini HTTP 500"
+
+    # Author Studio's own list route must surface it too — not just the
+    # one-shot submit response.
+    listed = _call(router, "GET", "/admin/assessments/{assessment_id}/submissions",
+                    assessment_id=asmt["assessmentId"], status=None, admin=_Admin())
+    assert listed["submissions"][0]["extractionError"] == "provider_rejected: Gemini HTTP 500"
 
 
 def test_submitting_to_a_nonexistent_assessment_is_rejected_honestly(monkeypatch):
