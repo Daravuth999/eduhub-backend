@@ -879,9 +879,31 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         # Mirrors wallet_service.py's own guarded find_one_and_update
         # idiom (e.g. WalletService._mutation_body's balance-guarded
         # update) rather than inventing a new concurrency pattern.
+        #
+        # 2026-08-16 false-stale-conflict bug: a submission created BEFORE
+        # `correctionVersion` was added to build_submission_document() has
+        # no such field in Mongo at all — genuinely absent, not present-
+        # and-zero. A plain equality filter {"correctionVersion": 0} does
+        # NOT match a missing field (real, well-known Mongo semantics:
+        # missing != 0 for equality, unlike a null-vs-missing query) — so
+        # every legitimate FIRST correction attempt on such a submission
+        # lost this reservation and was rejected with the exact "corrected
+        # since you opened it" 409 shown here, even though current_version
+        # (computed in Python via `.get(...) or 0`, which DOES treat
+        # missing as 0) and the frontend's own default both correctly
+        # agreed on 0 — the mismatch was purely in this one Mongo query.
+        # Treat "field missing" as version 0 for this one comparison only;
+        # the $set below always writes a real int, so the field exists on
+        # every document after its first successful correction and this
+        # branch never needs to fire again for it.
         new_version = current_version + 1
+        version_match = (
+            {"$or": [{"correctionVersion": 0}, {"correctionVersion": {"$exists": False}}]}
+            if current_version == 0
+            else {"correctionVersion": current_version}
+        )
         reserved = await submissions.find_one_and_update(
-            {"submissionId": submission_id, "correctionVersion": current_version},
+            {"submissionId": submission_id, **version_match},
             {"$set": {"correctionVersion": new_version}},
             return_document=ReturnDocument.AFTER,
         )
