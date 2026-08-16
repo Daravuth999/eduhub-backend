@@ -176,6 +176,10 @@ def _match(doc, q):
             if not any(_match(doc, sub) for sub in v):
                 return False
             continue
+        if isinstance(v, dict) and "$exists" in v:
+            if (k in doc) != bool(v["$exists"]):
+                return False
+            continue
         dv = doc.get(k)
         if isinstance(v, dict) and "$in" in v:
             if dv not in v["$in"]:
@@ -1717,6 +1721,48 @@ def test_stale_correction_version_is_rejected_not_overwritten(monkeypatch):
                         reason="teacher_grading_mistake", client_token="teacher-b-v2", expected_version=1)
     assert retried["correctionVersion"] == 2
     assert wallet.debit_calls == 2
+
+
+def test_first_correction_on_a_legacy_submission_missing_correctionVersion_succeeds(monkeypatch):
+    """2026-08-16 false-stale-conflict bug: a submission created before
+    `correctionVersion` was added to build_submission_document() has NO
+    such field in Mongo at all (genuinely absent, not present-and-zero).
+    A freshly-opened Correction Workspace's first-ever Apply on such a
+    submission must succeed — not be rejected with a false "corrected
+    since you opened it" 409, which is what happened when the atomic
+    reservation's plain equality filter {"correctionVersion": 0} failed
+    to match a field that was simply missing (real, well-known Mongo
+    semantics — missing != 0 for equality)."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    q1 = questions[0]["qid"]
+
+    # Simulate a pre-existing production document that predates the
+    # correctionVersion field entirely — delete it outright rather than
+    # setting it to 0, which is the whole point of this regression.
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert "correctionVersion" in stored  # sanity: schema does set it normally
+    del stored["correctionVersion"]
+
+    # Fresh workspace, first legitimate Apply, expectedVersion computed
+    # the same way the frontend does (submission.correctionVersion ?? 0)
+    # — must succeed on the FIRST attempt, no retry, no manual refresh.
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="teacher_grading_mistake", client_token="legacy-fresh", expected_version=0)
+    assert result["correctionVersion"] == 1
+    assert wallet.debit_calls == 1
+
+    # The document is now healed — correctionVersion is a real, present
+    # int from here on, so the normal (non-legacy) path is exercised for
+    # every subsequent correction on this same submission.
+    healed = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert healed["correctionVersion"] == 1
+
+    second = _correct(router, sub_id, corrections=[{"qid": q1, "correct": True, "points": 0.5}],
+                       reason="teacher_grading_mistake", client_token="legacy-second", expected_version=1)
+    assert second["correctionVersion"] == 2
 
 
 def test_multiple_sequential_corrections_each_move_only_their_own_net_diff(monkeypatch):
