@@ -52,6 +52,7 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 import assessment_ai_provider as ai
@@ -860,7 +861,40 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         asmt = await _get_assessment_or_404(sub["assessmentId"])
         known_ids = {q["qid"] for q in asmt["questions"]}
         by_qid_q = {q["qid"]: q for q in asmt["questions"]}
-        base_score = sub.get("score") or {}
+
+        # ── Atomic version reservation — the ACTUAL concurrency guard ────
+        # The `current_version` check above is only a fast, friendly
+        # rejection for the common sequential case (its read and this
+        # write are not atomic with each other, so it cannot by itself
+        # stop two truly-simultaneous requests from both reading the same
+        # version). This find_one_and_update is what really serializes
+        # concurrent corrections on the SAME submission: only one request
+        # can win the compare-and-swap from `current_version` to
+        # `current_version + 1`. The loser gets None back and is rejected
+        # here — BEFORE it has computed a wallet adjustment or touched the
+        # wallet — so two concurrent corrections can never both diff
+        # against the same stale `award.pointsCredited` baseline (the bug
+        # a plain read-then-write-later version check would allow).
+        # Mirrors wallet_service.py's own guarded find_one_and_update
+        # idiom (e.g. WalletService._mutation_body's balance-guarded
+        # update) rather than inventing a new concurrency pattern.
+        new_version = current_version + 1
+        reserved = await submissions.find_one_and_update(
+            {"submissionId": submission_id, "correctionVersion": current_version},
+            {"$set": {"correctionVersion": new_version}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if reserved is None:
+            raise HTTPException(
+                409, "This submission was corrected since you opened it — "
+                     "refresh and review the latest state before correcting again.",
+            )
+        # From here on, `reserved` (NOT the earlier `sub`) is the source of
+        # truth for score/award — it is the exact document state at the
+        # moment we atomically won the version slot, so a concurrent
+        # correction that raced us can never be silently based on stale data.
+        award = reserved.get("award") or {}
+        base_score = reserved.get("score") or {}
         base_by_qid = {str(d.get("qid")): d for d in (base_score.get("details") or [])}
 
         clean_overrides: list[dict] = []
@@ -890,6 +924,13 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
                 "note": note,
             })
         if not clean_overrides:
+            # Roll back the version reservation — nothing is actually
+            # being corrected, so this must not consume a version slot
+            # or leave a phantom bump behind.
+            await submissions.update_one(
+                {"submissionId": submission_id},
+                {"$set": {"correctionVersion": current_version}},
+            )
             raise HTTPException(400, "None of the supplied corrections matched a known question.")
 
         admin_email = getattr(admin, "email", "admin")
@@ -941,6 +982,14 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
                 )
             except BaseException as exc:
                 await corrections.delete_one({"correctionId": correction_id, "status": "pending"})
+                # Release the version reservation too — no correction was
+                # actually applied, so it must not permanently consume a
+                # version slot (would otherwise make every subsequent
+                # expectedVersion check off-by-one for no real reason).
+                await submissions.update_one(
+                    {"submissionId": submission_id, "correctionVersion": new_version},
+                    {"$set": {"correctionVersion": current_version}},
+                )
                 if not isinstance(exc, Exception):
                     raise
                 log.error("assessment: correction credit failed for %s: %s", submission_id, exc)
@@ -970,6 +1019,10 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
                 )
             except BaseException as exc:
                 await corrections.delete_one({"correctionId": correction_id, "status": "pending"})
+                await submissions.update_one(
+                    {"submissionId": submission_id, "correctionVersion": new_version},
+                    {"$set": {"correctionVersion": current_version}},
+                )
                 if not isinstance(exc, Exception):
                     raise
                 log.error("assessment: correction debit failed for %s: %s", submission_id, exc)
@@ -978,7 +1031,7 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             wallet_txn_id = idem_key
         # wallet_adjustment == 0 -> intentionally NO wallet call at all.
 
-        original_award_snapshot = sub.get("originalAward")
+        original_award_snapshot = reserved.get("originalAward")
         if original_award_snapshot is None:
             # Captured ONCE, on the FIRST correction ever applied to this
             # submission — immutable from this point on. Uses the values
@@ -993,7 +1046,11 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         new_award["pointsCredited"] = corrected_points
         if balance_after is not None:
             new_award["balanceAfter"] = balance_after
-        new_version = current_version + 1
+        # `correctionVersion` is NOT re-set here — the CAS above already
+        # committed it to `new_version`; a second, unguarded write to the
+        # same field here would be redundant at best and would reintroduce
+        # exactly the lost-update risk this whole restructure exists to
+        # close if this update_one's filter is ever loosened later.
 
         try:
             await submissions.update_one(
@@ -1003,7 +1060,6 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
                     "award": new_award,
                     "originalAward": original_award_snapshot,
                     "correctionState": "applied",
-                    "correctionVersion": new_version,
                 }},
             )
             await awards.update_one(
