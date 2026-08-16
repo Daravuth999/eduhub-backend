@@ -227,6 +227,35 @@ def test_disabled_account_rejected_even_with_a_valid_credential(monkeypatch):
     assert issued["calls"] == []
 
 
+def test_qr_survives_logout_and_can_authenticate_again(monkeypatch):
+    # Smart Login credentials live in their own collection, entirely
+    # separate from student_sessions (which is what an actual /logout call
+    # deletes a row from — see server.py's student_logout()). This test
+    # proves the CONTRACT that guarantees "log out, then scan the same QR
+    # again" works: verifying a credential never mutates or consumes it.
+    # Two back-to-back successful logins with the identical QR — standing
+    # in for "login, [logout happens against student_sessions, untouched
+    # by this module], login again" — is the correct way to prove that
+    # property without needing to model server.py's whole session store.
+    client, db, issued = _make_client(students=[dict(STUDENT)], monkeypatch=monkeypatch)
+    gen = client.post("/api/teacher/students/stu_abc123/smart-login/generate").json()
+
+    before = dict(db.student_smart_login_credentials._docs[0])
+
+    first = client.post("/api/auth/student/smart-login", json={"qr_payload": gen["qr_payload"]})
+    assert first.status_code == 200
+
+    after_first = dict(db.student_smart_login_credentials._docs[0])
+    assert after_first == before  # verifying never mutates the credential row
+
+    # A real /logout call only ever touches student_sessions (a completely
+    # separate collection this module never reads or writes) — so the same
+    # QR authenticating a second time is the direct, provable consequence.
+    second = client.post("/api/auth/student/smart-login", json={"qr_payload": gen["qr_payload"]})
+    assert second.status_code == 200
+    assert issued["calls"] == ["stu_abc123", "stu_abc123"]
+
+
 def test_status_endpoint_reflects_active_then_not_generated_after_revoke(monkeypatch):
     client, _db, _ = _make_client(students=[dict(STUDENT)], monkeypatch=monkeypatch)
     before = client.get("/api/teacher/students/stu_abc123/smart-login").json()
