@@ -51,10 +51,26 @@ _INLINE_MAX_BYTES = 15 * 1024 * 1024
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
-# Physical-worksheet answer recognition REQUIRES Gemini 2.5 Pro (2026-08
-# product direction) — never silently downgraded; the model actually used
-# is persisted in the submission's extraction metadata.
-DEFAULT_SUBMISSION_MODEL = "gemini-2.5-pro"
+# Physical-worksheet answer recognition REQUIRES a Pro-tier vision model
+# (2026-08 product direction) — never silently downgraded; the model
+# actually used is persisted in the submission's extraction metadata.
+#
+# 2026-08-16 incident: "gemini-2.5-pro" started returning a real, logged
+# Gemini error — {"code": 404, "status": "NOT_FOUND", "message": "This
+# model models/gemini-2.5-pro is no longer available to new users..."} —
+# confirming Google retired it (production Render log, not a guess).
+# Replaced with "gemini-3.1-pro", confirmed via the account's own Google
+# AI Studio quota/rate-limit list as a real, currently quota-tracked
+# "Text-out models" entry named exactly "Gemini 3.1 Pro" — no "Preview"
+# qualifier, unlike genuine previews in that same list ("Deep Research
+# Pro Preview", "Computer Use Preview"). Matches this codebase's own
+# display-name -> model-id convention confirmed elsewhere (book_factory_
+# image.py's "Nano Banana 2 (Gemini 3.1 Flash Image)" -> "gemini-3.1-
+# flash-image"). Override via ASSESSMENT_AI_SUBMISSION_MODEL without a
+# redeploy if Google renames/retires this one too — the improved
+# provider_rejected error (see _gemini_http_error_detail) will say so
+# explicitly instead of a bare "Gemini HTTP 404".
+DEFAULT_SUBMISSION_MODEL = "gemini-3.1-pro"
 VERIFY_CONFIDENCE_THRESHOLD = 0.6
 MAX_VERIFY_QIDS = 50
 
@@ -118,6 +134,34 @@ def _response_diagnostics(payload) -> str:
     if finish_reason and finish_reason != "STOP":
         return f"finishReason={finish_reason}"
     return ""
+
+
+def _gemini_http_error_detail(response) -> str:
+    """Extracts the REAL provider-reported reason from a non-200 Gemini
+    response body — never fabricated, never guessed. Gemini's REST API
+    returns a structured {"error": {"code", "message", "status"}} object
+    on failure (e.g. status=NOT_FOUND for a model id that doesn't exist
+    or isn't enabled for this key, PERMISSION_DENIED, RESOURCE_EXHAUSTED
+    for quota). Falls back to the raw response text (bounded) when the
+    body isn't that shape, and to "" when nothing is extractable — a
+    caller must never turn that into a fabricated explanation, only an
+    honest bare HTTP status. Same isolated helper as video_ai_provider.
+    py's _gemini_http_error_detail (duplicated, not imported, per this
+    module's own no-shared-state convention)."""
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        text = (getattr(response, "text", "") or "").strip()
+        return text[:300]
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        status = str(error.get("status") or "").strip()
+        message = str(error.get("message") or "").strip()
+        if status and message:
+            return f"{status}: {message}"
+        return status or message
+    text = (getattr(response, "text", "") or "").strip()
+    return text[:300]
 
 
 class AssessmentAiError(Exception):
@@ -301,8 +345,15 @@ async def _call_gemini_json(prompt: str, *, media_part: dict | None = None,
     }
     r = await _post(_GEN_URL.format(model=model or _model()), params={"key": api_key}, json=body)
     if r.status_code != 200:
-        log.warning("assessment-ai: HTTP %s | body=%s", r.status_code, (r.text or "")[:400])
-        raise AssessmentAiError("provider_rejected", f"Gemini HTTP {r.status_code}")
+        detail = _gemini_http_error_detail(r)
+        log.warning("assessment-ai: HTTP %s | model=%s | body=%s",
+                    r.status_code, model or _model(), (r.text or "")[:400])
+        # The real, provider-reported reason (e.g. "NOT_FOUND: models/foo is
+        # not found" or "PERMISSION_DENIED: ... not enabled for this
+        # project") must reach the caller — never collapsed down to a bare,
+        # undiagnosable "Gemini HTTP 404" the way it used to be.
+        message = f"Gemini HTTP {r.status_code}" + (f" — {detail}" if detail else "")
+        raise AssessmentAiError("provider_rejected", message)
     raw_payload = r.json()
     text = _candidate_text(raw_payload)
     data = _extract_json(text)

@@ -50,7 +50,7 @@ def _questions():
 def _extract_stub(answers):
     async def fake_extract(media_bytes, content_type, questions):
         return {"ok": True, "answers": answers, "engine": "gemini",
-                "model": "gemini-2.5-pro", "verification": None}
+                "model": "gemini-3.1-pro", "verification": None}
     return fake_extract
 
 
@@ -308,7 +308,7 @@ def test_extraction_metadata_persists_engine_model_and_timestamp(monkeypatch):
     sub = _submit(router, db, monkeypatch, _all_correct(asmt["questions"]))["submission"]
     meta = sub["extraction"]
     assert meta["engine"] == "gemini"
-    assert meta["model"] == "gemini-2.5-pro"
+    assert meta["model"] == "gemini-3.1-pro"
     assert meta["extractedAt"]
     assert meta["rawAnswerCount"] == 30
     assert meta["normalizedAnswerCount"] == 30
@@ -316,8 +316,8 @@ def test_extraction_metadata_persists_engine_model_and_timestamp(monkeypatch):
 
 def test_default_submission_model_is_gemini_2_5_pro_and_not_downgraded(monkeypatch):
     monkeypatch.delenv("ASSESSMENT_AI_SUBMISSION_MODEL", raising=False)
-    assert ai._submission_model() == "gemini-2.5-pro"
-    assert ai.DEFAULT_SUBMISSION_MODEL == "gemini-2.5-pro"
+    assert ai._submission_model() == "gemini-3.1-pro"
+    assert ai.DEFAULT_SUBMISSION_MODEL == "gemini-3.1-pro"
 
 
 # ── 13. extraction prompt: physical evidence only, question-safe ──────────
@@ -360,7 +360,7 @@ def test_verification_pass_rechecks_only_suspect_qids(monkeypatch):
 
     result = run(ai.extract_submission_answers(b"bytes", "image/jpeg", questions))
     assert result["ok"] is True
-    assert result["model"] == "gemini-2.5-pro"
+    assert result["model"] == "gemini-3.1-pro"
     assert len(calls) == 2
     # second call re-checked exactly the suspect qids (q4 uncertain, q5 missing)
     assert 'qid="q4"' in calls[1]["prompt"] and 'qid="q5"' in calls[1]["prompt"]
@@ -432,7 +432,7 @@ def test_extraction_check_compares_real_read_against_mock_baseline(monkeypatch):
     result = _call(router, "POST", "/admin/assessments/{assessment_id}/extraction-check",
                    assessment_id="asmt_fixed", file=_UploadFile(b"paper", "image/jpeg"), admin=_Admin())
     assert result["ok"] is True
-    assert result["model"] == "gemini-2.5-pro"
+    assert result["model"] == "gemini-3.1-pro"
     assert result["total"] == 30
     assert result["matches"] == 28
     assert [m["qid"] for m in result["mismatches"]] == ["q3"]
