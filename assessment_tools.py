@@ -56,14 +56,17 @@ from pymongo.errors import DuplicateKeyError
 
 import assessment_ai_provider as ai
 from assessment_schema import (
+    CORRECTION_REASONS,
     VALID_ASSESSMENT_STATUSES,
     VALID_SUBMISSION_STATUSES,
     build_assessment_document,
     build_award_document,
+    build_correction_document,
     build_question,
     build_submission_document,
     new_assessment_id,
     new_award_id,
+    new_correction_id,
     new_submission_id,
     normalize_extracted_answer_key,
     normalize_extracted_submission_answers,
@@ -71,13 +74,14 @@ from assessment_schema import (
     validate_assessment_document,
     validate_submission_document,
 )
-from assessment_scoring import score_submission
+from assessment_scoring import apply_teacher_overrides, score_submission
 
 log = logging.getLogger("eduhub.assessment")
 
 COLL_ASSESSMENTS = "assessments"
 COLL_SUBMISSIONS = "assessment_submissions"
 COLL_AWARDS = "assessment_awards"
+COLL_CORRECTIONS = "assessment_corrections"
 
 # Student submissions: photo or scanned PDF of a completed worksheet.
 SUBMISSION_CONTENT_TYPES: dict[str, str] = {
@@ -293,6 +297,14 @@ async def ensure_assessment_indexes(db) -> None:
     await db[COLL_SUBMISSIONS].create_index([("assessmentId", 1), ("studentId", 1)])
     await db[COLL_SUBMISSIONS].create_index("status")
     await db[COLL_AWARDS].create_index("submissionId", unique=True)
+    await db[COLL_CORRECTIONS].create_index("correctionId", unique=True)
+    # Sparse unique on clientToken is the idempotency backbone for the
+    # post-award correction flow — a retried/duplicate "Apply Correction"
+    # request (double-click, refresh-and-resubmit, network retry with the
+    # same client-generated token) can never create a second audit record
+    # or a second wallet adjustment. See admin_apply_correction.
+    await db[COLL_CORRECTIONS].create_index("clientToken", unique=True, sparse=True)
+    await db[COLL_CORRECTIONS].create_index([("submissionId", 1), ("createdAt", 1)])
     log.info("assessment_tools: indexes ready")
 
 
@@ -303,6 +315,7 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
     assessments = db[COLL_ASSESSMENTS]
     submissions = db[COLL_SUBMISSIONS]
     awards = db[COLL_AWARDS]
+    corrections = db[COLL_CORRECTIONS]
 
     async def _get_assessment_or_404(assessment_id: str) -> dict:
         doc = await assessments.find_one({"assessmentId": assessment_id}, {"_id": 0})
@@ -752,6 +765,300 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         return {"submissionId": submission_id, "ok": True, "duplicate": False,
                  "points": points, "balanceAfter": balance_after,
                  **_award_summary(final_award or {})}
+
+    # ── Teacher/admin: post-award correction (reverse review) ────────────
+    def _correction_summary(doc: dict) -> dict:
+        """The subset of a correction audit record a teacher/student view
+        actually needs — mirrors _award_summary's "proof, not internals"
+        principle. `idempotencyKey` is deliberately omitted (internal)."""
+        return {
+            "correctionId": doc.get("correctionId"),
+            "reason": doc.get("reason"),
+            "reasonNote": doc.get("reasonNote"),
+            "questionChanges": doc.get("questionChanges"),
+            "originalPoints": doc.get("originalPoints"),
+            "correctedPoints": doc.get("correctedPoints"),
+            "walletAdjustment": doc.get("walletAdjustment"),
+            "walletTransactionId": doc.get("walletTransactionId"),
+            "teacherEmail": doc.get("teacherEmail"),
+            "createdAt": doc.get("createdAt"),
+            "appliedAt": doc.get("appliedAt"),
+            "notifiedAt": doc.get("notifiedAt"),
+        }
+
+    @api.post("/admin/assessments/submissions/{submission_id}/correction")
+    async def admin_apply_correction(submission_id: str, payload: dict, admin=Depends(require_admin)):
+        """Reopen an ALREADY-AWARDED submission and apply one or more
+        per-question corrections in a single transaction-like sequence.
+
+        Safety properties (all required, none inherited automatically —
+        see the walkthrough comments below):
+          1. Idempotent on `clientToken` — a retried Apply can never
+             double-credit/double-debit or create a second audit record.
+          2. Optimistic concurrency on `correctionVersion` — a stale
+             correction (opened before someone else's correction landed)
+             is rejected with a clear "refresh and try again", never
+             silently overwritten.
+          3. Exactly ONE wallet call, for the NET point difference only
+             (corrected - current), via the SAME WalletService.credit/
+             debit used everywhere else in this module — never a second
+             wallet mechanism. Zero net difference makes ZERO wallet calls.
+          4. The original award (score + points, as of the moment BEFORE
+             the FIRST correction) is snapshotted once, immutably, into
+             `submission.originalAward` — never overwritten by later
+             corrections. The full history of every correction (this one
+             and any prior ones) lives in the `assessment_corrections`
+             collection, which is append-only.
+        """
+        if wallet is None:
+            raise HTTPException(502, "wallet_unavailable")
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "Body must be JSON.")
+        client_token = str(payload.get("clientToken") or "").strip()
+        if not client_token:
+            raise HTTPException(400, "clientToken is required (idempotency key for this correction attempt).")
+
+        # ── idempotency, checked FIRST, before any other validation ──────
+        # A replay of the exact same Apply action (double-click, refresh
+        # mid-request, network retry) must short-circuit here and return
+        # the already-applied result — never re-validate, re-score, or
+        # re-touch the wallet.
+        existing = await corrections.find_one({"clientToken": client_token}, {"_id": 0})
+        if existing:
+            sub_now = await _get_submission_or_404(submission_id)
+            return {"ok": True, "duplicate": True, "submissionId": submission_id,
+                    "score": sub_now.get("score"), "award": sub_now.get("award"),
+                    "correctionVersion": sub_now.get("correctionVersion"),
+                    "correction": _correction_summary(existing)}
+
+        sub = await _get_submission_or_404(submission_id)
+        if sub.get("status") != "awarded":
+            raise HTTPException(409, "Only an already-awarded submission can be reopened for correction.")
+        award = sub.get("award") or {}
+        if not award:
+            raise HTTPException(409, "No award record found for this submission.")
+
+        current_version = int(sub.get("correctionVersion") or 0)
+        expected_version = payload.get("expectedVersion")
+        if expected_version is not None and int(expected_version) != current_version:
+            raise HTTPException(
+                409, f"This submission was corrected since you opened it "
+                     f"(you have version {expected_version}, current is {current_version}). "
+                     f"Refresh and review the latest state before correcting again.",
+            )
+
+        raw_overrides = payload.get("corrections")
+        if not isinstance(raw_overrides, list) or not raw_overrides:
+            raise HTTPException(400, "corrections must be a non-empty list of {qid, correct, points}.")
+        reason = str(payload.get("reason") or "").strip()
+        if reason not in CORRECTION_REASONS:
+            raise HTTPException(400, f"reason must be one of {CORRECTION_REASONS}.")
+        reason_note = str(payload.get("reasonNote") or "").strip()
+        if reason == "other" and not reason_note:
+            raise HTTPException(400, "reasonNote is required when reason is 'other'.")
+
+        asmt = await _get_assessment_or_404(sub["assessmentId"])
+        known_ids = {q["qid"] for q in asmt["questions"]}
+        by_qid_q = {q["qid"]: q for q in asmt["questions"]}
+        base_score = sub.get("score") or {}
+        base_by_qid = {str(d.get("qid")): d for d in (base_score.get("details") or [])}
+
+        clean_overrides: list[dict] = []
+        question_changes: list[dict] = []
+        for o in raw_overrides:
+            if not isinstance(o, dict):
+                continue
+            qid = str(o.get("qid") or "")
+            if qid not in known_ids:
+                continue
+            clean_overrides.append(o)
+            prev = base_by_qid.get(qid) or {}
+            max_points = float(by_qid_q[qid].get("points") or 0.0)
+            try:
+                new_pts = float(o.get("points"))
+            except (TypeError, ValueError):
+                new_pts = max_points if o.get("correct") else 0.0
+            new_pts = max(0.0, min(max_points, round(new_pts, 3)))
+            note = str(o.get("note") or "").strip()[:240] or None
+            question_changes.append({
+                "qid": qid,
+                "prompt": by_qid_q[qid].get("prompt"),
+                "prevCorrect": bool(prev.get("correct")),
+                "newCorrect": bool(o.get("correct")) if "correct" in o else new_pts > 0,
+                "prevPoints": float(prev.get("pointsEarned") or 0.0),
+                "newPoints": new_pts,
+                "note": note,
+            })
+        if not clean_overrides:
+            raise HTTPException(400, "None of the supplied corrections matched a known question.")
+
+        admin_email = getattr(admin, "email", "admin")
+        now = _iso_now()
+        corrected_score = apply_teacher_overrides(base_score, clean_overrides, asmt["questions"])
+        corrected_points = float(corrected_score.get("pointsEarned") or 0.0)
+        current_points = float(award.get("pointsCredited") or 0.0)
+        wallet_adjustment = round(corrected_points - current_points, 3)
+
+        student_id = sub.get("studentId") or ""
+        clean_id = sub.get("cleanId") or ""
+        correction_id = new_correction_id()
+        idem_key = f"assessment_correction:{correction_id}"
+
+        correction_doc = build_correction_document(
+            correction_id, submission_id, sub["assessmentId"],
+            student_id=student_id, clean_id=clean_id, teacher_email=admin_email,
+            reason=reason, reason_note=reason_note,
+            question_changes=question_changes,
+            original_score=base_score, corrected_score=corrected_score,
+            original_points=current_points, corrected_points=corrected_points,
+            wallet_adjustment=wallet_adjustment, wallet_transaction_id=None,
+            idempotency_key=idem_key, client_token=client_token,
+            status="pending", generated_at=now,
+        )
+        try:
+            await corrections.insert_one(dict(correction_doc))
+        except DuplicateKeyError:
+            # A genuinely concurrent duplicate submit (same token) raced us
+            # here between the pre-check above and this insert — resolve
+            # identically to the pre-check.
+            raced = await corrections.find_one({"clientToken": client_token}, {"_id": 0})
+            sub_now = await _get_submission_or_404(submission_id)
+            return {"ok": True, "duplicate": True, "submissionId": submission_id,
+                    "score": sub_now.get("score"), "award": sub_now.get("award"),
+                    "correctionVersion": sub_now.get("correctionVersion"),
+                    "correction": _correction_summary(raced or correction_doc)}
+
+        balance_after = None
+        wallet_txn_id = None
+        if wallet_adjustment > 0:
+            try:
+                result = await wallet.credit(
+                    student_id, wallet_adjustment,
+                    source="assessment_correction", source_ref=submission_id,
+                    idempotency_key=idem_key, clean_id=clean_id or None,
+                    payload={"assessment_id": sub["assessmentId"], "submission_id": submission_id,
+                             "correction_id": correction_id, "reason": reason},
+                )
+            except BaseException as exc:
+                await corrections.delete_one({"correctionId": correction_id, "status": "pending"})
+                if not isinstance(exc, Exception):
+                    raise
+                log.error("assessment: correction credit failed for %s: %s", submission_id, exc)
+                raise HTTPException(502, "credit_failed")
+            balance_after = float((result or {}).get("balance_after") or 0)
+            wallet_txn_id = idem_key
+        elif wallet_adjustment < 0:
+            try:
+                # allow_negative=True is an existing, documented
+                # WalletService capability (wallet_service.py's debit())
+                # — not a workaround invented here. It is required for
+                # edge case: the student may have already spent the
+                # originally-awarded points before the teacher discovered
+                # the mistake. A correction reversal must never be
+                # silently dropped or blocked by the insufficient-funds
+                # guard that exists to protect VOLUNTARY spends; the
+                # wallet is allowed to go negative exactly as the
+                # architecture already supports, and that is disclosed
+                # (not hidden) in the response/report.
+                result = await wallet.debit(
+                    student_id, abs(wallet_adjustment),
+                    source="assessment_correction", source_ref=submission_id,
+                    idempotency_key=idem_key, clean_id=clean_id or None,
+                    allow_negative=True,
+                    payload={"assessment_id": sub["assessmentId"], "submission_id": submission_id,
+                             "correction_id": correction_id, "reason": reason},
+                )
+            except BaseException as exc:
+                await corrections.delete_one({"correctionId": correction_id, "status": "pending"})
+                if not isinstance(exc, Exception):
+                    raise
+                log.error("assessment: correction debit failed for %s: %s", submission_id, exc)
+                raise HTTPException(502, "debit_failed")
+            balance_after = float((result or {}).get("balance_after") or 0)
+            wallet_txn_id = idem_key
+        # wallet_adjustment == 0 -> intentionally NO wallet call at all.
+
+        original_award_snapshot = sub.get("originalAward")
+        if original_award_snapshot is None:
+            # Captured ONCE, on the FIRST correction ever applied to this
+            # submission — immutable from this point on. Uses the values
+            # as they stood BEFORE this correction (base_score/award),
+            # exactly what "ORIGINAL AWARD" must mean.
+            original_award_snapshot = {
+                "score": base_score, "pointsCredited": current_points,
+                "balanceAfter": award.get("balanceAfter"), "creditedAt": award.get("creditedAt"),
+            }
+
+        new_award = dict(award)
+        new_award["pointsCredited"] = corrected_points
+        if balance_after is not None:
+            new_award["balanceAfter"] = balance_after
+        new_version = current_version + 1
+
+        try:
+            await submissions.update_one(
+                {"submissionId": submission_id},
+                {"$set": {
+                    "score": corrected_score,
+                    "award": new_award,
+                    "originalAward": original_award_snapshot,
+                    "correctionState": "applied",
+                    "correctionVersion": new_version,
+                }},
+            )
+            await awards.update_one(
+                {"submissionId": submission_id},
+                {"$set": {"points": corrected_points, "balanceAfter": new_award.get("balanceAfter")}},
+            )
+        except Exception as exc:  # noqa: BLE001
+            # From this point the REAL wallet adjustment has already
+            # happened (or was correctly skipped for a zero diff) — same
+            # honesty rule as _award_one: never pretend it didn't happen,
+            # log loudly for manual reconciliation instead.
+            log.critical(
+                "assessment: correction %s wallet-adjusted (student=%s submission=%s "
+                "adjustment=%s) but finalize write failed — manual reconciliation needed: %s",
+                correction_id, student_id, submission_id, wallet_adjustment, exc,
+            )
+
+        await corrections.update_one(
+            {"correctionId": correction_id},
+            {"$set": {"status": "applied", "walletTransactionId": wallet_txn_id, "appliedAt": now}},
+        )
+
+        notified_at = None
+        if wallet_adjustment != 0 and callable(fan_out_push) and callable(build_target_query):
+            try:
+                from_txt = f"{base_score.get('correct')}/{base_score.get('total')}"
+                to_txt = f"{corrected_score.get('correct')}/{corrected_score.get('total')}"
+                title = "Assessment corrected"
+                if wallet_adjustment > 0:
+                    body = (f"Your score increased from {from_txt} to {to_txt}. "
+                            f"+{wallet_adjustment:g} point(s) have been added to your balance.")
+                else:
+                    body = f"Your score has been updated from {from_txt} to {to_txt}."
+                query = build_target_query("students", [clean_id or student_id], None)
+                await fan_out_push(query, title, body, "/assessments")
+                notified_at = _iso_now()
+                await corrections.update_one({"correctionId": correction_id}, {"$set": {"notifiedAt": notified_at}})
+            except Exception as exc:  # noqa: BLE001
+                log.warning("assessment: correction notification failed for %s: %s", submission_id, exc)
+
+        final_correction = await corrections.find_one({"correctionId": correction_id}, {"_id": 0})
+        return {
+            "ok": True, "duplicate": False, "submissionId": submission_id,
+            "score": corrected_score, "award": new_award,
+            "correctionVersion": new_version,
+            "correction": _correction_summary(final_correction or correction_doc),
+        }
+
+    @api.get("/admin/assessments/submissions/{submission_id}/corrections")
+    async def admin_list_corrections(submission_id: str, admin=Depends(require_admin)):
+        _ = admin
+        docs = await corrections.find(
+            {"submissionId": submission_id}, {"_id": 0},
+        ).sort("createdAt", 1).to_list(200)
+        return {"ok": True, "corrections": docs}
 
     @api.post("/admin/assessments/submissions/{submission_id}/award")
     async def admin_award_submission(submission_id: str, admin=Depends(require_admin)):

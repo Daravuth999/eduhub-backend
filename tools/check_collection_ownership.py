@@ -121,6 +121,7 @@ OWNED_COLLECTIONS: dict[str, str] = {
     "assessments": "assessment_tools.py",
     "assessment_submissions": "assessment_tools.py",
     "assessment_awards": "assessment_tools.py",
+    "assessment_corrections": "assessment_tools.py",
 }
 
 # Specific (collection, offending file) pairs that are a deliberate, reviewed

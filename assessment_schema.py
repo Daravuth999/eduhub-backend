@@ -56,6 +56,30 @@ VALID_AWARD_STATUSES = ("pending", "credited", "failed")
 # Q9's answer into Q8's slot.
 ANSWER_STATES = ("answered", "blank", "uncertain")
 
+# ── post-award correction (reverse review) ──────────────────────────────
+# Deliberately NOT a new value on VALID_SUBMISSION_STATUSES: `status`
+# stays "awarded" (terminal) forever once a submission is awarded — a
+# correction changes HOW MANY points were credited, never whether the
+# submission is in the awarded state. `correctionState` is an orthogonal,
+# narrowly-scoped secondary field (same pattern as `award.status` already
+# living beside `submission.status`) that answers exactly one question:
+# has this submission ever been corrected since it was awarded. Entering
+# "review mode" in the teacher UI is a read-only, frontend-only phase (no
+# persisted lock) — concurrent-correction safety comes from
+# `correctionVersion` (optimistic concurrency, checked at apply time) and
+# the wallet's own idempotency_key, not from a server-side lock.
+CORRECTION_STATES = ("none", "applied")
+CORRECTION_REASONS = (
+    "teacher_grading_mistake",
+    "student_evidence_accepted",
+    "question_key_error",
+    "gemini_interpretation_error",
+    "listening_interpretation_error",
+    "technical_issue",
+    "other",
+)
+MAX_REASON_NOTE_LEN = 500
+
 MAX_QUESTIONS = 100
 MAX_ANSWER_LEN = 240
 MAX_PROMPT_LEN = 240
@@ -71,6 +95,10 @@ def new_submission_id() -> str:
 
 def new_award_id() -> str:
     return "aawd_" + uuid.uuid4().hex[:16]
+
+
+def new_correction_id() -> str:
+    return "acor_" + uuid.uuid4().hex[:16]
 
 
 # ── assessment (question set) ────────────────────────────────────────────
@@ -198,6 +226,10 @@ def build_submission_document(submission_id: str, assessment_id: str, *,
         "submittedAt": generated_at,
         "reviewedAt": None,
         "reviewedBy": None,
+        # Post-award correction (reverse review) — see CORRECTION_STATES.
+        "correctionState": "none",
+        "correctionVersion": 0,
+        "originalAward": None,
     }
 
 
@@ -283,4 +315,47 @@ def build_award_document(award_id: str, submission_id: str, assessment_id: str, 
         "creditedAt": None,
         "notifiedAt": None,
         "balanceAfter": None,
+    }
+
+
+# ── correction (post-award reverse-review audit record) ─────────────────
+def build_correction_document(correction_id: str, submission_id: str, assessment_id: str, *,
+                               student_id: str, clean_id: str, teacher_email: str,
+                               reason: str, reason_note: str,
+                               question_changes: list[dict],
+                               original_score: dict, corrected_score: dict,
+                               original_points: float, corrected_points: float,
+                               wallet_adjustment: float,
+                               wallet_transaction_id: str | None,
+                               idempotency_key: str, client_token: str,
+                               status: str = "pending", generated_at: str = "") -> dict:
+    """One append-only audit record per applied correction — never mutated
+    after `status` moves from "pending" to "applied" except to attach
+    `walletTransactionId`/`notifiedAt` (both write-once). The submission's
+    OWN `score`/`award` fields are updated in place to reflect the CURRENT
+    state (student-facing "what is true now"); this document is the
+    permanent, reconstructable "what changed and why" trail — see
+    assessment_tools.py's admin_apply_correction for the write order."""
+    return {
+        "correctionId": correction_id,
+        "submissionId": submission_id,
+        "assessmentId": assessment_id,
+        "studentId": student_id,
+        "cleanId": clean_id,
+        "teacherEmail": teacher_email,
+        "reason": reason,
+        "reasonNote": str(reason_note or "")[:MAX_REASON_NOTE_LEN],
+        "questionChanges": question_changes,
+        "originalScore": original_score,
+        "correctedScore": corrected_score,
+        "originalPoints": round(float(original_points or 0.0), 3),
+        "correctedPoints": round(float(corrected_points or 0.0), 3),
+        "walletAdjustment": round(float(wallet_adjustment or 0.0), 3),
+        "walletTransactionId": wallet_transaction_id,
+        "idempotencyKey": idempotency_key,
+        "clientToken": client_token,
+        "status": status,
+        "notifiedAt": None,
+        "createdAt": generated_at,
+        "appliedAt": None,
     }
