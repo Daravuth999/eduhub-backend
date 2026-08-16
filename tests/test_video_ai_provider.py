@@ -2,7 +2,7 @@
 Library. Two deliberately independent model configurations live in this
 module: VIDEO_AI_MODEL (fast path — speech recognition/ASR, default
 gemini-2.5-flash) and VIDEO_ANALYSIS_MODEL (deep path — whole-video story/
-scene understanding, default gemini-3.1-pro-preview). This file proves they are
+scene understanding, default gemini-3.1-pro). This file proves they are
 genuinely isolated from each other and that video_ai_provider.py has no
 importers outside the Video Library, so changing either constant here can
 never affect any other EduHub Gemini integration (Book Factory, EduTalk,
@@ -58,13 +58,13 @@ class _RecordingGeminiClient:
 
 def test_default_models_are_independent_constants():
     assert vap.DEFAULT_MODEL == "gemini-2.5-flash"
-    assert vap.DEFAULT_ANALYSIS_MODEL == "gemini-3.1-pro-preview"
+    assert vap.DEFAULT_ANALYSIS_MODEL == "gemini-3.1-pro"
     assert vap.DEFAULT_MODEL != vap.DEFAULT_ANALYSIS_MODEL
 
 
 def test_model_getters_default_correctly_with_no_env_set():
     assert vap._model() == "gemini-2.5-flash"
-    assert vap._analysis_model() == "gemini-3.1-pro-preview"
+    assert vap._analysis_model() == "gemini-3.1-pro"
 
 
 def test_analysis_model_override_never_affects_the_asr_model(monkeypatch):
@@ -80,7 +80,7 @@ def test_asr_model_override_never_affects_the_analysis_model(monkeypatch):
     deep-analysis model's default."""
     monkeypatch.setenv("VIDEO_AI_MODEL", "gemini-2.5-flash-lite")
     assert vap._model() == "gemini-2.5-flash-lite"
-    assert vap._analysis_model() == "gemini-3.1-pro-preview"
+    assert vap._analysis_model() == "gemini-3.1-pro"
 
 
 @pytest.mark.asyncio
@@ -93,7 +93,7 @@ async def test_align_asr_actually_requests_the_flash_model():
 
     assert len(client.calls) == 1
     assert "gemini-2.5-flash" in client.calls[0]
-    assert "gemini-3.1-pro-preview" not in client.calls[0]
+    assert "gemini-3.1-pro" not in client.calls[0]
 
 
 # ── ASR response-parsing robustness — root-caused against a real production
@@ -237,7 +237,7 @@ async def test_analyze_story_actually_requests_the_pro_model():
 
     assert result["ok"] is True
     assert len(client.calls) == 1
-    assert "gemini-3.1-pro-preview" in client.calls[0]
+    assert "gemini-3.1-pro" in client.calls[0]
 
 
 @pytest.mark.asyncio
@@ -254,7 +254,7 @@ async def test_draft_script_blueprint_also_uses_the_pro_model():
 
     assert result["ok"] is True
     assert len(client.calls) == 1
-    assert "gemini-3.1-pro-preview" in client.calls[0]
+    assert "gemini-3.1-pro" in client.calls[0]
 
 
 @pytest.mark.asyncio
@@ -282,7 +282,7 @@ async def test_analyze_story_uses_gemini_25_pro_url_via_injected_client(monkeypa
     )
     assert result["ok"] is True
     assert len(captured_urls) == 1
-    assert "gemini-3.1-pro-preview" in captured_urls[0]
+    assert "gemini-3.1-pro" in captured_urls[0]
     assert "gemini-2.5-flash" not in captured_urls[0]
 
 
@@ -414,7 +414,7 @@ async def test_analyze_story_provider_rejected_http_error_never_silently_falls_b
     # caller, not be collapsed to a bare, undiagnosable "provider_rejected".
     assert result["reason"].startswith("provider_rejected")
     assert "upstream overloaded" in result["reason"]
-    assert "gemini-3.1-pro-preview" in client.calls[0]
+    assert "gemini-3.1-pro" in client.calls[0]
 
 
 @pytest.mark.asyncio
@@ -444,7 +444,7 @@ async def test_analyze_story_surfaces_the_real_structured_gemini_error_not_a_bar
     assert "PERMISSION_DENIED" in result["reason"]
     assert "not enabled for this project" in result["reason"]
     # Confirms this really was the Pro-model call, not a silent Flash fallback.
-    assert "gemini-3.1-pro-preview" in client.calls[0]
+    assert "gemini-3.1-pro" in client.calls[0]
     assert "gemini-2.5-flash" not in client.calls[0]
 
 

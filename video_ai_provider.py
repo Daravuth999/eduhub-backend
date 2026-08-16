@@ -36,7 +36,7 @@ Env:
                          analysis (default: gemini-2.5-flash)
   VIDEO_ANALYSIS_MODEL — generateContent model for the DEEP whole-video
                          story/scene understanding path only (analyze_story
-                         / analyze_story_raw — default: gemini-3.1-pro-preview)
+                         / analyze_story_raw — default: gemini-3.1-pro)
   VIDEO_AI_MOCK        — "1"/"true" forces mock mode even with a key (testing)
 
 Two deliberately separate model configurations (2026-08 product direction):
@@ -92,9 +92,9 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 # models/gemini-2.5-pro is no longer available to new users..."}). The
 # retirement is at the model-id/account level, not per call site, so it
 # applies here identically (same GEMINI_API_KEY, same generateContent
-# endpoint). Replaced with "gemini-3.1-pro-preview" to match that fix.
+# endpoint). Replaced with "gemini-3.1-pro" to match that fix.
 # Override via VIDEO_ANALYSIS_MODEL without a redeploy if needed.
-DEFAULT_ANALYSIS_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_ANALYSIS_MODEL = "gemini-3.1-pro"
 
 
 def _env(name: str) -> str:
@@ -492,7 +492,7 @@ async def analyze_story(media_bytes: bytes, content_type: str, *, transcript_tex
     if not ai_available():
         return {"ok": True, "storyAnalysis": _mock_story_analysis(transcript_text), "engine": "mock"}
     try:
-        # Deep story/scene understanding gets its OWN model (gemini-3.1-pro-preview
+        # Deep story/scene understanding gets its OWN model (gemini-3.1-pro
         # by default, see _analysis_model()) — a separate GeminiVideoProvider
         # instance from whatever get_video_ai_provider() hands the ASR path,
         # constructed fresh right here so the override can never leak into
@@ -559,7 +559,7 @@ async def draft_script_blueprint(story_analysis: dict, *, transcript_text: str =
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"},
         }
-        # Deep-path model (gemini-3.1-pro-preview by default, see _analysis_model),
+        # Deep-path model (gemini-3.1-pro by default, see _analysis_model),
         # the SAME override used for the whole-video Story Analysis call
         # above — script drafting is grounded in that same full-story
         # context (and now also drafts the line's Khmer translation in the
