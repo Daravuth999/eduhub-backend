@@ -366,9 +366,17 @@ class _Wallet:
         self.seen = {}
         self.calls = 0
         self.debit_calls = 0
+        self.balance_lookups = 0
         self.fail = False
         self.debit_fail = False
+        self.get_balance_fail = False
         self.balances = {}
+
+    async def get_balance(self, student_id):
+        self.balance_lookups += 1
+        if self.get_balance_fail:
+            raise RuntimeError("simulated balance lookup failure")
+        return float(self.balances.get(student_id, 0.0))
 
     async def credit(self, student_id, amount, *, source, source_ref=None,
                       idempotency_key=None, clean_id=None, **kw):
@@ -1326,41 +1334,185 @@ def test_positive_correction_credits_exact_net_difference(monkeypatch):
     assert "+0.5" in corr_push["body"]
 
 
-def test_negative_correction_debits_exact_net_difference_with_allow_negative(monkeypatch):
-    """Teacher discovers Q1 was mis-graded correct when it was actually
-    wrong; corrected award drops by 0.5. Must be a real debit for the net
-    amount, using the wallet's existing allow_negative capability (edge
-    case: the student may have already spent the original award)."""
+# ── negative-correction wallet recovery: capped at zero, never negative ──
+# Product decision (explicit, post-audit): a correction reversal must NEVER
+# push a student's wallet below zero. Recover only what's actually there;
+# record the unrecovered remainder as an honest walletShortfall in the
+# audit trail. The academic correction (score/points) always applies in
+# full regardless of how much could be recovered.
+def _negative_correction_setup(monkeypatch, starting_balance):
     _patch_media_storage(monkeypatch)
     wallet = _Wallet()
     db, router, pushes = _build(wallet=wallet)
     sub_id, questions = _award_full_submission(db, router, wallet)
     assert wallet.balances["stu_alice"] == 15.0
+    wallet.balances["stu_alice"] = starting_balance
+    return wallet, db, router, pushes, sub_id, questions
 
-    # Simulate the student having already spent everything (real-world
-    # edge case 19H) — the wallet is allowed to go negative for a
-    # correction reversal, exactly as wallet_service.debit(allow_negative=True)
-    # already supports; this is not a workaround invented here.
-    wallet.balances["stu_alice"] = 0.0
 
+def test_negative_correction_sufficient_balance_recovers_in_full(monkeypatch):
+    """Balance comfortably covers the reversal — full recovery, zero
+    shortfall, exactly one debit call for the exact amount. Also confirms
+    the notification body never overclaims a specific deducted amount
+    (it already didn't, pre-audit) — still true under capped debits."""
+    wallet, db, router, pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 10.0)
     q1 = questions[0]["qid"]
-    result = _correct(
-        router, sub_id,
-        corrections=[{"qid": q1, "correct": False, "points": 0.0,
-                      "note": "Answer key itself was wrong for this item."}],
-        reason="question_key_error",
-    )
-    assert result["ok"] is True
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
     assert result["score"]["pointsEarned"] == 14.5
-    assert result["award"]["pointsCredited"] == 14.5
+    assert result["award"]["pointsCredited"] == 14.5  # academic correction applied in full
     assert result["correction"]["walletAdjustment"] == -0.5
+    assert result["correction"]["walletShortfall"] == 0.0
     assert wallet.debit_calls == 1
-    assert wallet.calls == 1  # only the ORIGINAL award ever called credit()
-    assert wallet.balances["stu_alice"] == -0.5  # negative, disclosed — not blocked
-
+    assert wallet.balances["stu_alice"] == 9.5  # 10.0 - 0.5, never negative
     corr_push = pushes[-1]
     assert "updated from" in corr_push["body"]
     assert "increased" not in corr_push["body"]
+
+
+def test_negative_correction_exact_balance_recovers_in_full_lands_on_zero(monkeypatch):
+    """Balance equals exactly the reversal amount — full recovery, wallet
+    lands precisely on zero (not below)."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.5)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["correction"]["walletAdjustment"] == -0.5
+    assert result["correction"]["walletShortfall"] == 0.0
+    assert wallet.balances["stu_alice"] == 0.0
+    assert result["award"]["pointsCredited"] == 14.5  # unaffected by wallet capping
+
+
+def test_negative_correction_insufficient_balance_caps_at_available_and_records_shortfall(monkeypatch):
+    """The student already spent most of it — the wallet is debited ONLY
+    down to zero (never negative), and the unrecovered remainder is
+    recorded explicitly as walletShortfall. The academic correction still
+    applies in full."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["score"]["pointsEarned"] == 14.5  # academic correction: full effect
+    assert result["award"]["pointsCredited"] == 14.5  # never blocked by the wallet limitation
+    assert result["correction"]["walletAdjustment"] == -0.2  # only what was actually recovered
+    assert result["correction"]["walletShortfall"] == 0.3  # 0.5 requested - 0.2 recovered
+    assert wallet.debit_calls == 1
+    assert wallet.balances["stu_alice"] == 0.0  # never negative
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["score"]["pointsEarned"] == 14.5
+    assert stored["award"]["pointsCredited"] == 14.5
+
+
+def test_negative_correction_zero_balance_recovers_nothing_never_calls_debit(monkeypatch):
+    """The student's balance is already zero — nothing to recover. No
+    wallet.debit() call is even attempted; the shortfall is the full
+    requested amount; the academic correction still applies."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.0)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["score"]["pointsEarned"] == 14.5
+    assert result["award"]["pointsCredited"] == 14.5
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert result["correction"]["walletShortfall"] == 0.5
+    assert wallet.debit_calls == 0  # never even attempted
+    assert wallet.balances["stu_alice"] == 0.0
+
+
+def test_negative_correction_debit_race_failure_still_applies_the_academic_correction(monkeypatch):
+    """A genuine race (balance drops between the read and the atomic
+    guarded debit, e.g. a concurrent unrelated spend) must NEVER block or
+    roll back the grading correction — it degrades to a full shortfall,
+    logged, never silently dropped."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 5.0)
+    wallet.debit_fail = True  # simulates the atomic debit itself failing
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["ok"] is True  # NOT a 502 — the correction still succeeded
+    assert result["score"]["pointsEarned"] == 14.5
+    assert result["award"]["pointsCredited"] == 14.5
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert result["correction"]["walletShortfall"] == 0.5  # full amount, honestly recorded
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["correctionState"] == "applied"  # academic correction DID apply
+
+
+def test_negative_correction_balance_lookup_failure_still_applies_the_academic_correction(monkeypatch):
+    """If even the balance READ fails, the correction must still not be
+    blocked — degrades to zero-recoverable, full shortfall."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 5.0)
+    wallet.get_balance_fail = True
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["ok"] is True
+    assert result["award"]["pointsCredited"] == 14.5
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert result["correction"]["walletShortfall"] == 0.5
+    assert wallet.debit_calls == 0  # never reached — the read itself failed
+
+
+def test_negative_correction_capped_debit_is_idempotent_on_retry(monkeypatch):
+    """Double-click Apply on a capped (partial-recovery) negative
+    correction must never debit twice — same clientToken, same result,
+    same balance."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1 = questions[0]["qid"]
+    first = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="question_key_error", client_token="cap-retry")
+    assert first["duplicate"] is False
+    assert wallet.debit_calls == 1
+    assert wallet.balances["stu_alice"] == 0.0
+
+    second = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error", client_token="cap-retry")
+    assert second["duplicate"] is True
+    assert wallet.debit_calls == 1  # not called again
+    assert wallet.balances["stu_alice"] == 0.0  # unchanged
+    assert second["correction"]["walletShortfall"] == 0.3  # same recorded shortfall, not recomputed
+
+
+def test_negative_correction_concurrent_stale_request_rejected_before_touching_wallet(monkeypatch):
+    """The CAS concurrency guard applies identically to capped-debit
+    corrections — a stale (already-superseded) request is rejected before
+    it ever reads the balance or touches the wallet."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1, q2 = questions[0]["qid"], questions[1]["qid"]
+
+    first = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="question_key_error", client_token="race-a", expected_version=0)
+    assert first["correctionVersion"] == 1
+    lookups_after_first = wallet.balance_lookups
+
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": q2, "correct": False, "points": 0.0}],
+                 reason="question_key_error", client_token="race-b-stale", expected_version=0)
+    assert "409" in str(exc_info.value) or "corrected since you opened it" in str(exc_info.value)
+    assert wallet.balance_lookups == lookups_after_first  # never even read the balance
+    assert wallet.debit_calls == 1  # only the first correction's debit
+
+
+def test_negative_correction_audit_trail_records_original_and_current_state(monkeypatch):
+    """The correction record preserves enough to reconstruct exactly what
+    was requested (originalPoints/correctedPoints), what actually moved
+    (walletAdjustment), and what could not be recovered (walletShortfall)
+    — append-only, never overwritten by a later correction."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1 = questions[0]["qid"]
+    _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+             reason="question_key_error", reason_note="", client_token="audit-1")
+
+    history = _call(router, "GET", "/admin/assessments/submissions/{submission_id}/corrections",
+                     submission_id=sub_id, admin=_Admin())
+    assert len(history["corrections"]) == 1
+    entry = history["corrections"][0]
+    assert entry["originalPoints"] == 15.0
+    assert entry["correctedPoints"] == 14.5
+    assert entry["walletAdjustment"] == -0.2
+    assert entry["walletShortfall"] == 0.3
+    assert entry["reason"] == "question_key_error"
 
 
 def test_zero_net_correction_makes_no_wallet_call_and_no_notification(monkeypatch):

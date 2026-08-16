@@ -326,8 +326,9 @@ def build_correction_document(correction_id: str, submission_id: str, assessment
                                original_score: dict, corrected_score: dict,
                                original_points: float, corrected_points: float,
                                wallet_adjustment: float,
-                               wallet_transaction_id: str | None,
-                               idempotency_key: str, client_token: str,
+                               wallet_shortfall: float = 0.0,
+                               wallet_transaction_id: str | None = None,
+                               idempotency_key: str = "", client_token: str = "",
                                status: str = "pending", generated_at: str = "") -> dict:
     """One append-only audit record per applied correction — never mutated
     after `status` moves from "pending" to "applied" except to attach
@@ -335,7 +336,20 @@ def build_correction_document(correction_id: str, submission_id: str, assessment
     OWN `score`/`award` fields are updated in place to reflect the CURRENT
     state (student-facing "what is true now"); this document is the
     permanent, reconstructable "what changed and why" trail — see
-    assessment_tools.py's admin_apply_correction for the write order."""
+    assessment_tools.py's admin_apply_correction for the write order.
+
+    `walletAdjustment` is the ACTUAL signed amount that moved in the
+    wallet — for a downward correction this may be LESS than the academic
+    delta (`correctedPoints - originalPoints`) if the student had already
+    spent some or all of the originally-awarded points; the wallet is
+    never debited below zero (see wallet_service.py's guarded debit()).
+    `walletShortfall` (always >= 0) is the portion of a downward
+    correction that could NOT be recovered from the wallet — recorded
+    explicitly, never silently dropped. The academic correction
+    (`correctedScore`/`correctedPoints`, and the submission's own score/
+    award fields) is applied in full regardless of how much of the
+    shortfall could be recovered — a wallet limitation never blocks the
+    grading correction itself."""
     return {
         "correctionId": correction_id,
         "submissionId": submission_id,
@@ -351,6 +365,7 @@ def build_correction_document(correction_id: str, submission_id: str, assessment
         "originalPoints": round(float(original_points or 0.0), 3),
         "correctedPoints": round(float(corrected_points or 0.0), 3),
         "walletAdjustment": round(float(wallet_adjustment or 0.0), 3),
+        "walletShortfall": round(float(wallet_shortfall or 0.0), 3),
         "walletTransactionId": wallet_transaction_id,
         "idempotencyKey": idempotency_key,
         "clientToken": client_token,

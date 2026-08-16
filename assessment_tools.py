@@ -780,6 +780,7 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             "originalPoints": doc.get("originalPoints"),
             "correctedPoints": doc.get("correctedPoints"),
             "walletAdjustment": doc.get("walletAdjustment"),
+            "walletShortfall": doc.get("walletShortfall"),
             "walletTransactionId": doc.get("walletTransactionId"),
             "teacherEmail": doc.get("teacherEmail"),
             "createdAt": doc.get("createdAt"),
@@ -971,6 +972,16 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
 
         balance_after = None
         wallet_txn_id = None
+        # Defaults for the zero/positive cases — the negative branch below
+        # is the only one that can make `final_wallet_adjustment` diverge
+        # from the full academic `wallet_adjustment`, or leave a nonzero
+        # `final_wallet_shortfall` (product decision: a correction reversal
+        # must NEVER push a student's wallet below zero — see the capped
+        # debit below — but the grading correction itself must never be
+        # blocked by how much of that reversal could actually be
+        # recovered from the wallet).
+        final_wallet_adjustment = wallet_adjustment
+        final_wallet_shortfall = 0.0
         if wallet_adjustment > 0:
             try:
                 result = await wallet.credit(
@@ -997,38 +1008,66 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             balance_after = float((result or {}).get("balance_after") or 0)
             wallet_txn_id = idem_key
         elif wallet_adjustment < 0:
+            # Product decision (explicit): a correction reversal must
+            # NEVER push a student's wallet below zero — the edge case
+            # where the student already spent some or all of the
+            # originally-awarded points is real, but the answer is to
+            # recover only what is actually there and record the rest as
+            # an honest, visible shortfall — not to let the wallet go
+            # negative. The grading correction (score/points) is applied
+            # in full regardless of how much could be recovered; a wallet
+            # limitation must never block the academic correction.
+            requested_debit = abs(wallet_adjustment)
             try:
-                # allow_negative=True is an existing, documented
-                # WalletService capability (wallet_service.py's debit())
-                # — not a workaround invented here. It is required for
-                # edge case: the student may have already spent the
-                # originally-awarded points before the teacher discovered
-                # the mistake. A correction reversal must never be
-                # silently dropped or blocked by the insufficient-funds
-                # guard that exists to protect VOLUNTARY spends; the
-                # wallet is allowed to go negative exactly as the
-                # architecture already supports, and that is disclosed
-                # (not hidden) in the response/report.
-                result = await wallet.debit(
-                    student_id, abs(wallet_adjustment),
-                    source="assessment_correction", source_ref=submission_id,
-                    idempotency_key=idem_key, clean_id=clean_id or None,
-                    allow_negative=True,
-                    payload={"assessment_id": sub["assessmentId"], "submission_id": submission_id,
-                             "correction_id": correction_id, "reason": reason},
+                current_balance = float(await wallet.get_balance(student_id))
+            except Exception as exc:  # noqa: BLE001
+                # A failed balance READ must not block the correction
+                # either — degrade to "nothing recoverable right now" and
+                # record the full amount as an outstanding shortfall.
+                log.warning(
+                    "assessment: correction balance lookup failed for %s "
+                    "(recording as fully unrecovered): %s", submission_id, exc,
                 )
-            except BaseException as exc:
-                await corrections.delete_one({"correctionId": correction_id, "status": "pending"})
-                await submissions.update_one(
-                    {"submissionId": submission_id, "correctionVersion": new_version},
-                    {"$set": {"correctionVersion": current_version}},
-                )
-                if not isinstance(exc, Exception):
-                    raise
-                log.error("assessment: correction debit failed for %s: %s", submission_id, exc)
-                raise HTTPException(502, "debit_failed")
-            balance_after = float((result or {}).get("balance_after") or 0)
-            wallet_txn_id = idem_key
+                current_balance = 0.0
+            actual_debit = round(min(requested_debit, max(0.0, current_balance)), 3)
+            final_wallet_shortfall = round(requested_debit - actual_debit, 3)
+            if actual_debit > 0:
+                try:
+                    result = await wallet.debit(
+                        student_id, actual_debit,
+                        source="assessment_correction", source_ref=submission_id,
+                        idempotency_key=idem_key, clean_id=clean_id or None,
+                        # allow_negative deliberately NOT set — actual_debit
+                        # is already capped to <= current_balance above, so
+                        # this debit can only ever bring the wallet to
+                        # exactly zero, never below. If a genuine race (a
+                        # concurrent, unrelated spend) makes even THIS
+                        # capped amount momentarily unavailable, the atomic
+                        # guarded debit raises and we fall into the except
+                        # below — recorded as a full shortfall, never a
+                        # blocked correction.
+                        payload={"assessment_id": sub["assessmentId"], "submission_id": submission_id,
+                                 "correction_id": correction_id, "reason": reason},
+                    )
+                    balance_after = float((result or {}).get("balance_after") or 0)
+                    wallet_txn_id = idem_key
+                    final_wallet_adjustment = -actual_debit
+                except BaseException as exc:
+                    if not isinstance(exc, Exception):
+                        raise
+                    log.warning(
+                        "assessment: correction debit failed for %s, recording as full "
+                        "shortfall rather than blocking the grading correction: %s",
+                        submission_id, exc,
+                    )
+                    final_wallet_adjustment = 0.0
+                    final_wallet_shortfall = requested_debit
+                    balance_after = current_balance
+            else:
+                # Balance is already zero (or the lookup failed above) —
+                # nothing to recover; the entire reversal is a shortfall.
+                final_wallet_adjustment = 0.0
+                balance_after = current_balance
         # wallet_adjustment == 0 -> intentionally NO wallet call at all.
 
         original_award_snapshot = reserved.get("originalAward")
@@ -1079,7 +1118,16 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
 
         await corrections.update_one(
             {"correctionId": correction_id},
-            {"$set": {"status": "applied", "walletTransactionId": wallet_txn_id, "appliedAt": now}},
+            {"$set": {
+                "status": "applied", "walletTransactionId": wallet_txn_id, "appliedAt": now,
+                # Overwrite the placeholder (academic-delta) values the doc
+                # was inserted with — these are now the REAL numbers: what
+                # actually moved in the wallet, and what could not be
+                # recovered (always 0 except for a capped downward
+                # correction). Never silently dropped.
+                "walletAdjustment": round(final_wallet_adjustment, 3),
+                "walletShortfall": round(final_wallet_shortfall, 3),
+            }},
         )
 
         notified_at = None
