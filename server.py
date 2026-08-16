@@ -51,6 +51,7 @@ from auth_roles import derive_user_role
 from password_reset_requests import register_password_reset_routes
 from student_avatar import register_student_avatar_routes
 from student_smart_login import register_student_smart_login_routes
+from admin_security import register_admin_security_routes
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -6100,6 +6101,18 @@ register_student_smart_login_routes(
     require_admin=require_admin,
     verify_turnstile=_verify_turnstile,
     issue_session=_issue_student_session,
+    log=log,
+)
+
+# Smart Login refinement — operational "Force All Users to Sign Out"
+# control for Author Studio. See admin_security.py for the full rationale
+# (reuses the existing session-deletion revocation pattern, no new
+# session architecture, does not touch accounts or Smart Login
+# credentials).
+register_admin_security_routes(
+    api,
+    db,
+    require_admin=require_admin,
     log=log,
 )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
