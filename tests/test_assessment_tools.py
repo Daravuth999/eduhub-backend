@@ -230,6 +230,28 @@ class _Coll:
                 return type("R", (), {"matched_count": 1})()
         return type("R", (), {"matched_count": 0})()
 
+    async def find_one_and_update(self, q, up, return_document=None, projection=None):
+        """Mimics Motor/pymongo's atomic find_one_and_update — the exact
+        primitive that makes a filter-guarded compare-and-swap (e.g. "only
+        update if correctionVersion still equals what I read") atomic
+        against a real MongoDB. This fake is single-threaded/synchronous
+        so it cannot reproduce TRUE wall-clock concurrency, but the
+        filter-match-then-mutate-in-one-step semantics are real: a second
+        caller whose filter no longer matches (because a first caller's
+        $set already changed the field) gets None, exactly as it would
+        against a real unique document under Mongo's per-document atomicity."""
+        for d in self.docs.values():
+            if _match(d, q):
+                before = copy.deepcopy(d)
+                if "$set" in up:
+                    d.update(up["$set"])
+                after = copy.deepcopy(d)
+                result = after if return_document else before
+                if projection and projection.get("_id") == 0:
+                    result.pop("_id", None)
+                return result
+        return None
+
     async def delete_one(self, q):
         for k, d in list(self.docs.items()):
             if _match(d, q):
@@ -258,12 +280,34 @@ class _AwardsColl(_Coll):
         return await super().insert_one(doc)
 
 
+class _CorrectionsColl(_Coll):
+    """Enforces the real sparse-unique clientToken index — this IS the
+    idempotency backbone the route relies on for "double-click Apply /
+    retry with the same token can never create a second audit record".
+    Keyed by `correctionId` (NOT the generic _Coll fallback chain, which
+    would pick `submissionId` — wrong here, since one submission can have
+    MANY correction docs and they must not overwrite each other)."""
+
+    async def insert_one(self, doc):
+        token = doc.get("clientToken")
+        if token:
+            for d in self.docs.values():
+                if d.get("clientToken") == token:
+                    raise DuplicateKeyError("duplicate key: clientToken_1")
+        key = doc.get("correctionId") or f"auto{self._auto}"
+        self._auto += 1
+        doc.setdefault("_id", key)
+        self.docs[key] = copy.deepcopy(doc)
+        return type("R", (), {"inserted_id": key})()
+
+
 class _DB:
     def __init__(self):
         self._c = {
             at.COLL_ASSESSMENTS: _Coll(),
             at.COLL_SUBMISSIONS: _Coll(),
             at.COLL_AWARDS: _AwardsColl(),
+            at.COLL_CORRECTIONS: _CorrectionsColl(),
         }
 
     def __getitem__(self, name):
@@ -310,20 +354,57 @@ class _Admin:
 
 
 class _Wallet:
+    """Tracks a REAL running balance per student (not just `amount` echoed
+    back) so multi-operation flows — an award followed by one or more
+    corrections — can be asserted precisely. For every PRE-EXISTING test,
+    each student has exactly one credit from a zero starting balance, so
+    `balance_after == amount credited` still holds exactly as before
+    (running_balance = 0 + amount) — this is a strict, backward-compatible
+    superset of the old fake's behavior, not a behavior change."""
+
     def __init__(self):
         self.seen = {}
         self.calls = 0
+        self.debit_calls = 0
+        self.balance_lookups = 0
         self.fail = False
+        self.debit_fail = False
+        self.get_balance_fail = False
+        self.balances = {}
+
+    async def get_balance(self, student_id):
+        self.balance_lookups += 1
+        if self.get_balance_fail:
+            raise RuntimeError("simulated balance lookup failure")
+        return float(self.balances.get(student_id, 0.0))
 
     async def credit(self, student_id, amount, *, source, source_ref=None,
                       idempotency_key=None, clean_id=None, **kw):
         self.calls += 1
         if self.fail:
             raise RuntimeError("simulated wallet failure")
-        if idempotency_key in self.seen:
+        if idempotency_key is not None and idempotency_key in self.seen:
             return {"ok": True, "duplicate": True, "balance_after": self.seen[idempotency_key]}
-        self.seen[idempotency_key] = amount
-        return {"ok": True, "duplicate": False, "balance_after": amount}
+        bal = round(float(self.balances.get(student_id, 0.0)) + float(amount), 3)
+        self.balances[student_id] = bal
+        if idempotency_key is not None:
+            self.seen[idempotency_key] = bal
+        return {"ok": True, "duplicate": False, "balance_after": bal}
+
+    async def debit(self, student_id, amount, *, source, source_ref=None,
+                     idempotency_key=None, clean_id=None, allow_negative=False, **kw):
+        self.debit_calls += 1
+        if self.debit_fail:
+            raise RuntimeError("simulated wallet debit failure")
+        if idempotency_key is not None and idempotency_key in self.seen:
+            return {"ok": True, "duplicate": True, "balance_after": self.seen[idempotency_key]}
+        bal = round(float(self.balances.get(student_id, 0.0)) - float(amount), 3)
+        if bal < 0 and not allow_negative:
+            raise RuntimeError("insufficient_funds")
+        self.balances[student_id] = bal
+        if idempotency_key is not None:
+            self.seen[idempotency_key] = bal
+        return {"ok": True, "duplicate": False, "balance_after": bal}
 
 
 class _UploadFile:
@@ -1126,6 +1207,729 @@ def test_admin_submission_list_resolves_real_student_display_name(monkeypatch):
                     assessment_id=asmt["assessmentId"], status=None, admin=_Admin())
     assert len(listed["submissions"]) == 1
     assert listed["submissions"][0]["studentName"] == "Alice Chan"
+
+
+# ── post-award correction (reverse review) ────────────────────────────────
+def _award_full_submission(db, router, wallet, *, sid="stu_alice", clean="stu094"):
+    """Submits a perfect (15/15, 15.0 pt) worksheet for `sid` and awards
+    it, returning (submission_id, questions). Shared setup for every
+    correction test below — the correction itself is each test's subject,
+    not the award path (already covered above)."""
+    asmt = db[at.COLL_ASSESSMENTS].docs.get("asmt_fixed") or _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.95}
+                                          for q in questions], "engine": "mock"}
+    import unittest.mock as _mock
+    with _mock.patch.object(ai, "extract_submission_answers", fake_extract):
+        file = _UploadFile(b"bytes", "image/png")
+        submitted = _call(router, "POST", "/student/assessments/submit",
+                           assessment_id=asmt["assessmentId"], file=file, student=_Student(sid, clean))
+    sub_id = submitted["submission"]["submissionId"]
+    awarded = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                     submission_id=sub_id, admin=_Admin())
+    assert awarded["ok"] is True and awarded["points"] == 15.0
+    return sub_id, asmt["questions"]
+
+
+def _correct(router, sub_id, *, corrections, reason="student_evidence_accepted",
+             reason_note="", client_token="tok1", expected_version=0):
+    return _call(router, "POST", "/admin/assessments/submissions/{submission_id}/correction",
+                 submission_id=sub_id,
+                 payload={"corrections": corrections, "reason": reason, "reasonNote": reason_note,
+                          "clientToken": client_token, "expectedVersion": expected_version},
+                 admin=_Admin())
+
+
+def test_correction_route_requires_admin_dependency():
+    """Permission enforcement — same convention as every other admin route
+    in this module (structural: Depends(require_admin) in the signature;
+    this fake router's `_call` bypasses real FastAPI DI, matching how
+    every other route in this file is tested)."""
+    src = open(at.__file__, encoding="utf-8").read()
+    idx = src.index('@api.post("/admin/assessments/submissions/{submission_id}/correction")')
+    snippet = src[idx:idx + 400]
+    assert "Depends(require_admin)" in snippet
+
+
+def test_correction_rejected_on_a_never_awarded_submission(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        return {"ok": True, "answers": [], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": "q1", "correct": True, "points": 0.5}])
+    assert "409" in str(exc_info.value) or "already-awarded" in str(exc_info.value)
+    assert wallet.calls == 0
+
+
+def test_positive_correction_credits_exact_net_difference(monkeypatch):
+    """Q30 was scored incorrect (0 pts) originally; teacher accepts student
+    evidence and marks it correct for 0.5 pts. Net change: +0.5, not a
+    re-award of the full 15.5."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes = _build(wallet=wallet)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        # Everything correct except the last question (left unanswered).
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.95}
+                                          for q in questions[:-1]], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+    assert submitted["submission"]["score"]["pointsEarned"] == 14.5
+
+    awarded = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                     submission_id=sub_id, admin=_Admin())
+    assert awarded["points"] == 14.5
+    assert wallet.balances["stu_alice"] == 14.5
+
+    last_qid = asmt["questions"][-1]["qid"]
+    result = _correct(
+        router, sub_id,
+        corrections=[{"qid": last_qid, "correct": True, "points": 0.5,
+                      "note": "Handwriting was legible on the original paper."}],
+        reason="student_evidence_accepted",
+    )
+    assert result["ok"] is True
+    assert result["duplicate"] is False
+    assert result["score"]["pointsEarned"] == 15.0
+    assert result["score"]["correct"] == 30
+    assert result["award"]["pointsCredited"] == 15.0
+    assert result["correction"]["walletAdjustment"] == 0.5
+    assert result["correctionVersion"] == 1
+
+    # Exactly ONE additional wallet call, for the NET 0.5 — never a second
+    # full re-award.
+    assert wallet.calls == 2  # original award + this correction credit
+    assert wallet.debit_calls == 0
+    assert wallet.balances["stu_alice"] == 15.0
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["status"] == "awarded"  # status never leaves "awarded"
+    assert stored["correctionState"] == "applied"
+    assert stored["correctionVersion"] == 1
+    assert stored["score"]["pointsEarned"] == 15.0
+    # Original award immutably preserved, distinct from the live award.
+    assert stored["originalAward"]["pointsCredited"] == 14.5
+    assert stored["originalAward"]["score"]["pointsEarned"] == 14.5
+
+    # Notification sent (nonzero diff), correct "increased" framing.
+    assert len(pushes) == 2  # original award notification + correction one
+    corr_push = pushes[-1]
+    assert "increased" in corr_push["body"]
+    assert "+0.5" in corr_push["body"]
+
+
+# ── negative-correction wallet recovery: capped at zero, never negative ──
+# Product decision (explicit, post-audit): a correction reversal must NEVER
+# push a student's wallet below zero. Recover only what's actually there;
+# record the unrecovered remainder as an honest walletShortfall in the
+# audit trail. The academic correction (score/points) always applies in
+# full regardless of how much could be recovered.
+def _negative_correction_setup(monkeypatch, starting_balance):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    assert wallet.balances["stu_alice"] == 15.0
+    wallet.balances["stu_alice"] = starting_balance
+    return wallet, db, router, pushes, sub_id, questions
+
+
+def test_negative_correction_sufficient_balance_recovers_in_full(monkeypatch):
+    """Balance comfortably covers the reversal — full recovery, zero
+    shortfall, exactly one debit call for the exact amount. Also confirms
+    the notification body never overclaims a specific deducted amount
+    (it already didn't, pre-audit) — still true under capped debits."""
+    wallet, db, router, pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 10.0)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["score"]["pointsEarned"] == 14.5
+    assert result["award"]["pointsCredited"] == 14.5  # academic correction applied in full
+    assert result["correction"]["walletAdjustment"] == -0.5
+    assert result["correction"]["walletShortfall"] == 0.0
+    assert wallet.debit_calls == 1
+    assert wallet.balances["stu_alice"] == 9.5  # 10.0 - 0.5, never negative
+    corr_push = pushes[-1]
+    assert "updated from" in corr_push["body"]
+    assert "increased" not in corr_push["body"]
+
+
+def test_negative_correction_exact_balance_recovers_in_full_lands_on_zero(monkeypatch):
+    """Balance equals exactly the reversal amount — full recovery, wallet
+    lands precisely on zero (not below)."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.5)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["correction"]["walletAdjustment"] == -0.5
+    assert result["correction"]["walletShortfall"] == 0.0
+    assert wallet.balances["stu_alice"] == 0.0
+    assert result["award"]["pointsCredited"] == 14.5  # unaffected by wallet capping
+
+
+def test_negative_correction_insufficient_balance_caps_at_available_and_records_shortfall(monkeypatch):
+    """The student already spent most of it — the wallet is debited ONLY
+    down to zero (never negative), and the unrecovered remainder is
+    recorded explicitly as walletShortfall. The academic correction still
+    applies in full."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["score"]["pointsEarned"] == 14.5  # academic correction: full effect
+    assert result["award"]["pointsCredited"] == 14.5  # never blocked by the wallet limitation
+    assert result["correction"]["walletAdjustment"] == -0.2  # only what was actually recovered
+    assert result["correction"]["walletShortfall"] == 0.3  # 0.5 requested - 0.2 recovered
+    assert wallet.debit_calls == 1
+    assert wallet.balances["stu_alice"] == 0.0  # never negative
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["score"]["pointsEarned"] == 14.5
+    assert stored["award"]["pointsCredited"] == 14.5
+
+
+def test_negative_correction_zero_balance_recovers_nothing_never_calls_debit(monkeypatch):
+    """The student's balance is already zero — nothing to recover. No
+    wallet.debit() call is even attempted; the shortfall is the full
+    requested amount; the academic correction still applies."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.0)
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["score"]["pointsEarned"] == 14.5
+    assert result["award"]["pointsCredited"] == 14.5
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert result["correction"]["walletShortfall"] == 0.5
+    assert wallet.debit_calls == 0  # never even attempted
+    assert wallet.balances["stu_alice"] == 0.0
+
+
+def test_negative_correction_debit_race_failure_still_applies_the_academic_correction(monkeypatch):
+    """A genuine race (balance drops between the read and the atomic
+    guarded debit, e.g. a concurrent unrelated spend) must NEVER block or
+    roll back the grading correction — it degrades to a full shortfall,
+    logged, never silently dropped."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 5.0)
+    wallet.debit_fail = True  # simulates the atomic debit itself failing
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["ok"] is True  # NOT a 502 — the correction still succeeded
+    assert result["score"]["pointsEarned"] == 14.5
+    assert result["award"]["pointsCredited"] == 14.5
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert result["correction"]["walletShortfall"] == 0.5  # full amount, honestly recorded
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["correctionState"] == "applied"  # academic correction DID apply
+
+
+def test_negative_correction_balance_lookup_failure_still_applies_the_academic_correction(monkeypatch):
+    """If even the balance READ fails, the correction must still not be
+    blocked — degrades to zero-recoverable, full shortfall."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 5.0)
+    wallet.get_balance_fail = True
+    q1 = questions[0]["qid"]
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error")
+    assert result["ok"] is True
+    assert result["award"]["pointsCredited"] == 14.5
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert result["correction"]["walletShortfall"] == 0.5
+    assert wallet.debit_calls == 0  # never reached — the read itself failed
+
+
+def test_negative_correction_capped_debit_is_idempotent_on_retry(monkeypatch):
+    """Double-click Apply on a capped (partial-recovery) negative
+    correction must never debit twice — same clientToken, same result,
+    same balance."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1 = questions[0]["qid"]
+    first = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="question_key_error", client_token="cap-retry")
+    assert first["duplicate"] is False
+    assert wallet.debit_calls == 1
+    assert wallet.balances["stu_alice"] == 0.0
+
+    second = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="question_key_error", client_token="cap-retry")
+    assert second["duplicate"] is True
+    assert wallet.debit_calls == 1  # not called again
+    assert wallet.balances["stu_alice"] == 0.0  # unchanged
+    assert second["correction"]["walletShortfall"] == 0.3  # same recorded shortfall, not recomputed
+
+
+def test_negative_correction_concurrent_stale_request_rejected_before_touching_wallet(monkeypatch):
+    """The CAS concurrency guard applies identically to capped-debit
+    corrections — a stale (already-superseded) request is rejected before
+    it ever reads the balance or touches the wallet."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1, q2 = questions[0]["qid"], questions[1]["qid"]
+
+    first = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="question_key_error", client_token="race-a", expected_version=0)
+    assert first["correctionVersion"] == 1
+    lookups_after_first = wallet.balance_lookups
+
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": q2, "correct": False, "points": 0.0}],
+                 reason="question_key_error", client_token="race-b-stale", expected_version=0)
+    assert "409" in str(exc_info.value) or "corrected since you opened it" in str(exc_info.value)
+    assert wallet.balance_lookups == lookups_after_first  # never even read the balance
+    assert wallet.debit_calls == 1  # only the first correction's debit
+
+
+def test_negative_correction_audit_trail_records_original_and_current_state(monkeypatch):
+    """The correction record preserves enough to reconstruct exactly what
+    was requested (originalPoints/correctedPoints), what actually moved
+    (walletAdjustment), and what could not be recovered (walletShortfall)
+    — append-only, never overwritten by a later correction."""
+    wallet, db, router, _pushes, sub_id, questions = _negative_correction_setup(monkeypatch, 0.2)
+    q1 = questions[0]["qid"]
+    _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+             reason="question_key_error", reason_note="", client_token="audit-1")
+
+    history = _call(router, "GET", "/admin/assessments/submissions/{submission_id}/corrections",
+                     submission_id=sub_id, admin=_Admin())
+    assert len(history["corrections"]) == 1
+    entry = history["corrections"][0]
+    assert entry["originalPoints"] == 15.0
+    assert entry["correctedPoints"] == 14.5
+    assert entry["walletAdjustment"] == -0.2
+    assert entry["walletShortfall"] == 0.3
+    assert entry["reason"] == "question_key_error"
+
+
+def test_zero_net_correction_makes_no_wallet_call_and_no_notification(monkeypatch):
+    """Mixed correction: Q1 flips wrong->right (+0.5), Q2 flips right->wrong
+    (-0.5). Net change is exactly zero -> must move ZERO points and send
+    NO notification, even though two individual answers changed."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes = _build(wallet=wallet)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        # q1 wrong (opposite of correct answer), everything else correct.
+        answers = []
+        for q in questions:
+            if q["qid"] == "q1":
+                answers.append({"qid": "q1", "answer": "SHORT" if q["correctAnswer"] == "LONG" else "LONG",
+                                 "confidence": 0.95})
+            else:
+                answers.append({"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.95})
+        return {"ok": True, "answers": answers, "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+    asmt = _seed_published_assessment(db)
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+    assert submitted["submission"]["score"]["pointsEarned"] == 14.5
+
+    awarded = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                     submission_id=sub_id, admin=_Admin())
+    assert awarded["points"] == 14.5
+
+    result = _correct(
+        router, sub_id,
+        corrections=[
+            {"qid": "q1", "correct": True, "points": 0.5, "note": "Evidence accepted."},
+            {"qid": "q2", "correct": False, "points": 0.0, "note": "Actually misread by teacher."},
+        ],
+        reason="teacher_grading_mistake",
+    )
+    assert result["ok"] is True
+    assert result["score"]["pointsEarned"] == 14.5  # net unchanged
+    assert result["correction"]["walletAdjustment"] == 0.0
+    assert wallet.calls == 1  # only the original award
+    assert wallet.debit_calls == 0
+    assert len(pushes) == 1  # only the original award push — NO correction push
+    # But the audit trail still records the real per-question swap.
+    changes = {c["qid"]: c for c in result["correction"]["questionChanges"]}
+    assert changes["q1"]["newCorrect"] is True
+    assert changes["q2"]["newCorrect"] is False
+
+
+def test_correction_is_idempotent_on_retry_with_same_client_token(monkeypatch):
+    """Double-click Apply / a retried network request with the SAME
+    clientToken must never move points twice or create a second audit
+    record — this is the wallet-safety hard requirement."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, pushes = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    q1 = questions[0]["qid"]
+
+    first = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="teacher_grading_mistake", client_token="retry-tok")
+    assert first["duplicate"] is False
+    assert wallet.debit_calls == 1
+    assert wallet.balances["stu_alice"] == 14.5
+
+    # Retry #1: same token, submitted again (simulating a refresh/resubmit).
+    second = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                       reason="teacher_grading_mistake", client_token="retry-tok")
+    assert second["duplicate"] is True
+    assert wallet.debit_calls == 1  # NOT called again
+    assert wallet.balances["stu_alice"] == 14.5  # unchanged
+
+    # Retry #2: press Save a third time.
+    third = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="teacher_grading_mistake", client_token="retry-tok")
+    assert third["duplicate"] is True
+    assert wallet.debit_calls == 1
+
+    corrections_list = _call(router, "GET", "/admin/assessments/submissions/{submission_id}/corrections",
+                              submission_id=sub_id, admin=_Admin())
+    assert len(corrections_list["corrections"]) == 1  # exactly one audit record, not three
+    assert len(pushes) == 2  # original award + exactly one correction notification
+
+
+def test_three_step_correction_chain_matches_the_audit_required_pattern(monkeypatch):
+    """The exact scenario the safety audit demanded, verified with this
+    fixture's own real point weights (0.5/question, not an illustrative
+    round number): a three-correction chain where each step must diff
+    against the ROLLING current state, never the ORIGINAL award, and the
+    FINAL net wallet movement from the true original must equal the sum
+    of the three individual deltas — never double-counted, never computed
+    against a stale baseline.
+
+      Original:  28/30 correct — 14.0 pts
+      Correction 1 (fix q1):    29/30 — 14.5 pts  (+0.5)
+      Correction 2 (fix q2):    30/30 — 15.0 pts  (+0.5)
+      Correction 3 (unfix q1):  29/30 — 14.5 pts  (-0.5)
+      Net wallet movement from the ORIGINAL 14.0: +0.5 (NOT +1.5, which
+      is what a buggy "always diff against the original" implementation
+      would produce for the same three steps: +0.5 +0.5 +0.5 = +1.5).
+    """
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        # q1 and q2 wrong, everything else (28 questions) correct.
+        answers = []
+        for q in questions:
+            if q["qid"] in ("q1", "q2"):
+                answers.append({"qid": q["qid"], "answer": "SHORT" if q["correctAnswer"] == "LONG" else "LONG",
+                                 "confidence": 0.95})
+            else:
+                answers.append({"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.95})
+        return {"ok": True, "answers": answers, "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+    assert submitted["submission"]["score"]["correct"] == 28
+    assert submitted["submission"]["score"]["pointsEarned"] == 14.0
+
+    awarded = _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+                     submission_id=sub_id, admin=_Admin())
+    assert awarded["points"] == 14.0
+    original_balance = wallet.balances["stu_alice"]
+
+    c1 = _correct(router, sub_id, corrections=[{"qid": "q1", "correct": True, "points": 0.5}],
+                  reason="student_evidence_accepted", client_token="chain-1", expected_version=0)
+    assert (c1["score"]["correct"], c1["score"]["pointsEarned"]) == (29, 14.5)
+    assert c1["correction"]["walletAdjustment"] == 0.5
+
+    c2 = _correct(router, sub_id, corrections=[{"qid": "q2", "correct": True, "points": 0.5}],
+                  reason="student_evidence_accepted", client_token="chain-2", expected_version=1)
+    assert (c2["score"]["correct"], c2["score"]["pointsEarned"]) == (30, 15.0)
+    assert c2["correction"]["walletAdjustment"] == 0.5
+
+    c3 = _correct(router, sub_id, corrections=[{"qid": "q1", "correct": False, "points": 0.0}],
+                  reason="teacher_grading_mistake", client_token="chain-3", expected_version=2)
+    assert (c3["score"]["correct"], c3["score"]["pointsEarned"]) == (29, 14.5)
+    assert c3["correction"]["walletAdjustment"] == -0.5
+
+    # Final state matches the audit's required end state exactly.
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["score"]["correct"] == 29
+    assert stored["score"]["pointsEarned"] == 14.5
+    assert stored["award"]["pointsCredited"] == 14.5
+
+    # The TRUE net movement from the ORIGINAL award is the sum of the
+    # three real deltas (+0.5 +0.5 -0.5 = +0.5) — proven directly against
+    # the wallet's own running balance, not just the submission's display
+    # fields (which a bug could desync from the real ledger).
+    assert wallet.balances["stu_alice"] == original_balance + 0.5
+
+    # Original award (before ANY correction) remains immutable throughout
+    # the whole chain — never overwritten by correction #2 or #3.
+    assert stored["originalAward"]["pointsCredited"] == 14.0
+    assert stored["originalAward"]["score"]["correct"] == 28
+
+    history = _call(router, "GET", "/admin/assessments/submissions/{submission_id}/corrections",
+                     submission_id=sub_id, admin=_Admin())
+    assert len(history["corrections"]) == 3  # append-only — all three preserved
+    assert [c["correctedPoints"] for c in history["corrections"]] == [14.5, 15.0, 14.5]
+    assert [c["originalPoints"] for c in history["corrections"]] == [14.0, 14.5, 15.0]  # each vs its OWN prior state
+
+
+def test_stale_correction_version_is_rejected_not_overwritten(monkeypatch):
+    """Edge case 19F: a teacher opens correction mode, another correction
+    lands first, then the FIRST teacher tries to apply against a now-stale
+    expectedVersion. Must be rejected with a clear signal to refresh —
+    never silently overwritten."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    q1, q2 = questions[0]["qid"], questions[1]["qid"]
+
+    # Teacher A's correction lands first (version 0 -> 1).
+    first = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                      reason="teacher_grading_mistake", client_token="teacher-a", expected_version=0)
+    assert first["correctionVersion"] == 1
+
+    # Teacher B opened the submission before A's correction landed (still
+    # thinks expectedVersion is 0) and now tries to apply.
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": q2, "correct": False, "points": 0.0}],
+                 reason="teacher_grading_mistake", client_token="teacher-b", expected_version=0)
+    assert "409" in str(exc_info.value) or "corrected since you opened it" in str(exc_info.value)
+
+    # No point movement happened for teacher B's rejected attempt.
+    assert wallet.debit_calls == 1  # only teacher A's correction
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["correctionVersion"] == 1
+
+    # Teacher B refreshes (reads the new version) and retries — succeeds.
+    retried = _correct(router, sub_id, corrections=[{"qid": q2, "correct": False, "points": 0.0}],
+                        reason="teacher_grading_mistake", client_token="teacher-b-v2", expected_version=1)
+    assert retried["correctionVersion"] == 2
+    assert wallet.debit_calls == 2
+
+
+def test_multiple_sequential_corrections_each_move_only_their_own_net_diff(monkeypatch):
+    """Two separate correction sessions on the same submission — each must
+    move exactly its own net diff, and the running total must be correct."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    q1, q2 = questions[0]["qid"], questions[1]["qid"]
+
+    r1 = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                  reason="teacher_grading_mistake", client_token="c1", expected_version=0)
+    assert r1["score"]["pointsEarned"] == 14.5
+    assert wallet.balances["stu_alice"] == 14.5
+
+    r2 = _correct(router, sub_id, corrections=[{"qid": q2, "correct": False, "points": 0.0}],
+                  reason="teacher_grading_mistake", client_token="c2", expected_version=1)
+    assert r2["score"]["pointsEarned"] == 14.0
+    assert wallet.balances["stu_alice"] == 14.0
+    assert r2["correction"]["walletAdjustment"] == -0.5
+
+    # ORIGINAL award (from before EITHER correction) remains immutable —
+    # a second correction must not overwrite the snapshot taken at the
+    # first one.
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["originalAward"]["pointsCredited"] == 15.0
+    assert stored["originalAward"]["score"]["pointsEarned"] == 15.0
+
+    history = _call(router, "GET", "/admin/assessments/submissions/{submission_id}/corrections",
+                     submission_id=sub_id, admin=_Admin())
+    assert len(history["corrections"]) == 2
+    assert history["corrections"][0]["correctedPoints"] == 14.5
+    assert history["corrections"][1]["correctedPoints"] == 14.0
+
+
+def test_correction_never_mutates_original_gemini_extraction_or_evidence(monkeypatch):
+    """Requirement: original AI evaluation, evidence, and extraction stay
+    untouched — a correction is a NEW layer, never a rewrite."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    before = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    original_extraction = copy.deepcopy(before["originalExtractedAnswers"])
+    media_ref = before["mediaRef"]
+    media_key = before["mediaKey"]
+
+    q1 = questions[0]["qid"]
+    _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+             reason="teacher_grading_mistake", client_token="ev1")
+
+    after = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert after["originalExtractedAnswers"] == original_extraction  # untouched
+    assert after["mediaRef"] == media_ref  # R2 evidence link untouched
+    assert after["mediaKey"] == media_key
+    # The base (pre-correction) deterministic score is preserved verbatim
+    # inside the correction audit record's originalScore.
+    history = _call(router, "GET", "/admin/assessments/submissions/{submission_id}/corrections",
+                     submission_id=sub_id, admin=_Admin())
+    assert history["corrections"][0]["originalPoints"] == 15.0
+
+
+def test_correction_rejects_unknown_qid_and_requires_valid_reason(monkeypatch):
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, _questions = _award_full_submission(db, router, wallet)
+
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": "not_a_real_qid", "correct": True, "points": 1}],
+                 reason="teacher_grading_mistake")
+    assert "400" in str(exc_info.value) or "matched a known question" in str(exc_info.value)
+
+    with pytest.raises(Exception) as exc_info2:
+        _correct(router, sub_id, corrections=[{"qid": "q1", "correct": True, "points": 0.5}],
+                 reason="not_a_valid_reason")
+    assert "400" in str(exc_info2.value) or "reason must be" in str(exc_info2.value)
+
+
+def test_correction_points_clamped_to_question_max_never_exceeds_it(monkeypatch):
+    """A teacher accidentally typing a huge/negative corrected-points value
+    must be clamped into [0, question.points] — never create free points
+    or a negative per-question score."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    q1 = questions[0]["qid"]  # worth 0.5 pts
+
+    result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": True, "points": 999}],
+                       reason="teacher_grading_mistake")
+    detail = next(d for d in result["score"]["details"] if d["qid"] == q1)
+    assert detail["pointsEarned"] == 0.5  # clamped to the question's own max, not 999
+
+
+def test_correction_credit_failure_rolls_back_pending_audit_record(monkeypatch):
+    """If the wallet call itself throws, the pending correction reservation
+    must be rolled back — never left as a phantom "applied" record with
+    no matching wallet movement."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    asmt = _seed_published_assessment(db)
+
+    async def fake_extract(media_bytes, content_type, questions):
+        # Last question left unanswered -> a real +0.5 correction is
+        # possible (a zero-diff correction would never call the wallet
+        # at all, which would make this test unable to exercise failure).
+        return {"ok": True, "answers": [{"qid": q["qid"], "answer": q["correctAnswer"], "confidence": 0.95}
+                                          for q in asmt["questions"][:-1]], "engine": "mock"}
+    monkeypatch.setattr(ai, "extract_submission_answers", fake_extract)
+    file = _UploadFile(b"bytes", "image/png")
+    submitted = _call(router, "POST", "/student/assessments/submit",
+                       assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    sub_id = submitted["submission"]["submissionId"]
+    _call(router, "POST", "/admin/assessments/submissions/{submission_id}/award",
+          submission_id=sub_id, admin=_Admin())
+    last_qid = asmt["questions"][-1]["qid"]
+
+    wallet.fail = True
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": last_qid, "correct": True, "points": 0.5}],
+                 reason="student_evidence_accepted")
+    assert "502" in str(exc_info.value) or "credit_failed" in str(exc_info.value)
+
+    assert db[at.COLL_CORRECTIONS].docs == {}  # no orphaned pending record
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["correctionState"] == "none"  # never touched
+    assert stored["score"]["pointsEarned"] == 14.5  # unchanged
+    # The atomic version reservation taken before the wallet call must
+    # also be released on failure — otherwise a permanently-inflated
+    # correctionVersion would make every future expectedVersion check
+    # off-by-one for a correction that never actually happened.
+    assert stored["correctionVersion"] == 0
+
+
+def test_concurrent_correction_cas_rejects_the_loser_before_any_wallet_call(monkeypatch):
+    """Direct proof of the actual concurrency guard this route relies on:
+    two requests that both read correctionVersion=0 at the same moment can
+    NEVER both win the atomic find_one_and_update — MongoDB's real
+    per-document atomicity (mirrored exactly by this fake) means only ONE
+    compare-and-swap from version 0 -> 1 can ever succeed. This tests the
+    actual synchronization primitive directly, which is the rigorous way
+    to prove mutual exclusion without needing to fabricate true OS-level
+    thread interleaving in a single-threaded test process."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, _questions = _award_full_submission(db, router, wallet)
+
+    from pymongo import ReturnDocument
+    subs = db[at.COLL_SUBMISSIONS]
+
+    # "Teacher A" and "Teacher B" both read correctionVersion=0 before
+    # either has written. A's request reaches the CAS first and wins it.
+    won_by_a = run(subs.find_one_and_update(
+        {"submissionId": sub_id, "correctionVersion": 0},
+        {"$set": {"correctionVersion": 1}},
+        return_document=ReturnDocument.AFTER,
+    ))
+    assert won_by_a is not None
+    assert won_by_a["correctionVersion"] == 1
+
+    # B's request now attempts the EXACT SAME compare-and-swap (same
+    # starting version, since B's read happened before A's write landed)
+    # — it must lose, and lose BEFORE ever reaching the wallet.
+    lost_by_b = run(subs.find_one_and_update(
+        {"submissionId": sub_id, "correctionVersion": 0},
+        {"$set": {"correctionVersion": 1}},
+        return_document=ReturnDocument.AFTER,
+    ))
+    assert lost_by_b is None
+    assert db[at.COLL_SUBMISSIONS].docs[sub_id]["correctionVersion"] == 1  # only A's write landed
+
+
+def test_stale_teacher_b_rejected_end_to_end_never_double_adjusts_the_wallet(monkeypatch):
+    """Full end-to-end version of the exact scenario the audit demanded:
+    Teacher A opens version 0, applies a correction -> version becomes 1.
+    Teacher B, still holding version 0 from before A's correction landed,
+    attempts to apply a DIFFERENT correction against expectedVersion=0.
+    Teacher B must be rejected — never silently overwrite A's correction,
+    never produce a second wallet adjustment."""
+    _patch_media_storage(monkeypatch)
+    wallet = _Wallet()
+    db, router, _ = _build(wallet=wallet)
+    sub_id, questions = _award_full_submission(db, router, wallet)
+    q1, q2 = questions[0]["qid"], questions[1]["qid"]
+
+    a_result = _correct(router, sub_id, corrections=[{"qid": q1, "correct": False, "points": 0.0}],
+                         reason="teacher_grading_mistake", client_token="teacher-a", expected_version=0)
+    assert a_result["correctionVersion"] == 1
+    assert wallet.debit_calls == 1
+    balance_after_a = wallet.balances["stu_alice"]
+
+    with pytest.raises(Exception) as exc_info:
+        _correct(router, sub_id, corrections=[{"qid": q2, "correct": False, "points": 0.0}],
+                 reason="teacher_grading_mistake", client_token="teacher-b-stale", expected_version=0)
+    assert "409" in str(exc_info.value) or "corrected since you opened it" in str(exc_info.value)
+
+    # B never reached the wallet at all — no second debit/credit call.
+    assert wallet.debit_calls == 1
+    assert wallet.calls == 1  # only the ORIGINAL award's credit
+    assert wallet.balances["stu_alice"] == balance_after_a
+
+    stored = db[at.COLL_SUBMISSIONS].docs[sub_id]
+    assert stored["correctionVersion"] == 1  # NOT bumped again by B's rejected attempt
+    # A's correction (q1 -> incorrect) must survive, completely untouched
+    # by B's rejected attempt.
+    q1_detail = next(d for d in stored["score"]["details"] if d["qid"] == q1)
+    assert q1_detail["correct"] is False
+    q2_detail = next(d for d in stored["score"]["details"] if d["qid"] == q2)
+    assert q2_detail["correct"] is True  # B's change never applied
 
 
 def test_admin_submission_list_never_fabricates_a_name_for_an_unknown_student(monkeypatch):

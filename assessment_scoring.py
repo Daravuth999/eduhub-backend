@@ -121,3 +121,81 @@ def score_submission(questions: list[dict], extracted_answers: list[dict]) -> di
         "uncertainCount": uncertain_count,
         "details": details,
     }
+
+
+def apply_teacher_overrides(score: dict, overrides: list[dict], questions: list[dict]) -> dict:
+    """Post-award reverse-review layer: applies a teacher's per-question
+    correctness/points overrides ON TOP OF an already-persisted `score`
+    dict (this function's own prior output, or a previously-corrected
+    result), WITHOUT touching `extractedAnswers` and WITHOUT re-running
+    Gemini or the string-match comparison in `score_submission` above.
+
+    This is the concrete mechanism behind "teacher/admin correction is
+    authoritative" (Gemini may inform the decision but never silently
+    overrides it): a teacher can mark a question correct/incorrect and
+    set its exact awarded points directly — e.g. because the student
+    provided evidence the AI's/answer-key's original read was wrong —
+    independent of what the student physically wrote.
+
+    `overrides` — list of {qid, correct?, points, note?}. A qid missing
+    from `score["details"]` (stale/unknown) is silently ignored — the
+    caller is responsible for validating qids against the assessment's
+    own known-question set before calling this. `points` is clamped into
+    [0, question.points] using `questions` (the assessment's own
+    build_question dicts) as the source of the per-question max; falls
+    back to the existing detail's own `points` ceiling if the qid is
+    somehow absent from `questions` (defensive, should not happen since
+    `questions` is the origin of `score["details"]` in the first place).
+
+    Never mutates `score` or its nested `details` list — returns a new
+    dict. `needsReview`/`answeredCount`/`blankCount`/`uncertainCount` are
+    carried over unchanged (they describe the physical extraction, which
+    a correctness override does not change)."""
+    by_qid_q = {str(q.get("qid")): q for q in (questions or [])}
+    ov_by_qid: dict[str, dict] = {}
+    for o in overrides or []:
+        if not isinstance(o, dict):
+            continue
+        qid = str(o.get("qid") or "")
+        if qid:
+            ov_by_qid[qid] = o
+
+    new_details: list[dict] = []
+    correct = 0
+    points_earned = 0.0
+    total_points = 0.0
+    for d in score.get("details") or []:
+        d = dict(d)
+        qid = str(d.get("qid") or "")
+        total_points += float(d.get("points") or 0.0)
+        ov = ov_by_qid.get(qid)
+        if ov is not None:
+            q = by_qid_q.get(qid)
+            max_points = float(q.get("points")) if q else float(d.get("points") or 0.0)
+            try:
+                pts = float(ov.get("points"))
+            except (TypeError, ValueError):
+                pts = max_points if ov.get("correct") else 0.0
+            pts = max(0.0, min(max_points, round(pts, 3)))
+            is_correct = bool(ov.get("correct")) if "correct" in ov else pts > 0
+            d["correct"] = is_correct
+            d["pointsEarned"] = pts
+            d["teacherOverride"] = True
+            note = ov.get("note")
+            if note:
+                d["overrideNote"] = str(note)[:240]
+        if d.get("correct"):
+            correct += 1
+        points_earned += float(d.get("pointsEarned") or 0.0)
+        new_details.append(d)
+
+    total = len(new_details)
+    score_pct = round((correct / total) * 100, 1) if total else 0.0
+    out = dict(score)
+    out["details"] = new_details
+    out["correct"] = correct
+    out["total"] = total
+    out["scorePct"] = score_pct
+    out["pointsEarned"] = round(points_earned, 3)
+    out["totalPoints"] = round(total_points, 3)
+    return out
