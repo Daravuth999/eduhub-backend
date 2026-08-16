@@ -337,8 +337,8 @@ def test_verification_pass_rechecks_only_suspect_qids(monkeypatch):
     questions = _questions()[:5]
     calls = []
 
-    async def fake_call(prompt, *, media_part=None, model=None):
-        calls.append({"prompt": prompt, "model": model})
+    async def fake_call(prompt, *, media_part=None, model=None, api_version=None):
+        calls.append({"prompt": prompt, "model": model, "api_version": api_version})
         if len(calls) == 1:
             answers = [{"qid": q["qid"], "answer": q["correctAnswer"],
                         "answer_state": "answered", "confidence": 0.95} for q in questions[:3]]

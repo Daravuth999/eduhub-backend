@@ -44,9 +44,9 @@ def _gemini_json_response(payload: dict) -> _FakeHttpResponse:
 
 
 class _RecordingGeminiClient:
-    """Captures every request URL (which embeds the model name — see
-    video_ai_provider._GEN_URL) so tests can assert exactly which model a
-    given call actually used."""
+    """Captures every request URL (which embeds the model name and API
+    version — see video_ai_provider._gen_url) so tests can assert exactly
+    which model/version a given call actually used."""
     def __init__(self, response: _FakeHttpResponse):
         self.calls: list[str] = []
         self._response = response
