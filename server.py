@@ -50,6 +50,7 @@ from auth_lifecycle import derive_student_status
 from auth_roles import derive_user_role
 from password_reset_requests import register_password_reset_routes
 from student_avatar import register_student_avatar_routes
+from student_smart_login import register_student_smart_login_routes
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -3525,6 +3526,19 @@ async def student_login(payload: dict, response: Response):
     if not doc or not _pw_ok:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    return await _issue_student_session(response, doc)
+
+
+# --------------------------------------------------------------------------- #
+# Shared session-issuance tail — Smart Login integration                      #
+# --------------------------------------------------------------------------- #
+# Extracted verbatim from student_login()'s previous inline body so that the
+# QR-based Smart Login path (student_smart_login.py) converges into the
+# EXACT same session mechanism instead of a duplicated copy that could drift.
+# Both entry doors (password, QR) call this one function; neither mints a
+# session any other way. See student_smart_login.py's module docstring for
+# the full rationale.
+async def _issue_student_session(response: Response, doc: dict) -> dict:
     now = datetime.now(timezone.utc)
     session_token = uuid.uuid4().hex
     await db.student_sessions.insert_one({
@@ -3899,6 +3913,12 @@ async def teacher_list_students(admin: User = Depends(require_admin)):
     # the Reuse ID button. The login endpoint still enforces is_active:True.
     cursor = db.students.find({}, {"_id": 0, "password_hash": 0})
     students = await cursor.to_list(length=2000)
+    # EduHub Smart Login — one query for every active credential's
+    # student_id, so the table can show a status indicator per row without
+    # an N+1 round-trip per student.
+    _smart_login_active_ids: set[str] = set()
+    async for _cred in db.student_smart_login_credentials.find({}, {"_id": 0, "student_id": 1}):
+        _smart_login_active_ids.add(_cred["student_id"])
     for s in students:
         if "enrolled_at" not in s:
             s["enrolled_at"] = s.get("created_at", "")
@@ -6070,6 +6090,18 @@ register_student_avatar_routes(
     require_student=require_student,
     log=log,
 )
+
+# EduHub Smart Login — optional QR-based second entry door into the exact
+# same student session _issue_student_session() mints. See
+# student_smart_login.py for the full design rationale.
+register_student_smart_login_routes(
+    api,
+    db,
+    require_admin=require_admin,
+    verify_turnstile=_verify_turnstile,
+    issue_session=_issue_student_session,
+    log=log,
+)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.add_middleware(
@@ -6168,6 +6200,10 @@ async def startup():
     await db.students.create_index("clean_id", unique=True)
     await db.students.create_index("student_id", unique=True)
     await db.student_sessions.create_index("session_token", unique=True)
+    # EduHub Smart Login — one credential row per student; lookup by hash
+    # must be O(1) since a verify request carries no student_id yet.
+    await db.student_smart_login_credentials.create_index("student_id", unique=True)
+    await db.student_smart_login_credentials.create_index("credential_lookup", unique=True)
     # Milestone 0 (auth TTL migration) — converts the plain expires_at index
     # into a real TTL index and clears the pre-migration string-typed
     # expired-session backlog. See auth_session_ttl.py for the full
