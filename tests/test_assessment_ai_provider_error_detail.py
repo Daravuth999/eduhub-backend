@@ -96,8 +96,11 @@ def test_extract_submission_answers_reason_includes_the_real_gemini_error(monkey
     assert result["ok"] is False
     # A teacher/admin reading this in Author Studio (or the honest
     # extractionError surfaced to the student) must see WHY — not just
-    # that Gemini said 404.
+    # that Gemini said 404. The model AND api_version actually used are
+    # both included, so a future misconfiguration of either is immediately
+    # diagnosable without Render log access.
     assert result["reason"] == (
-        "provider_rejected: Gemini HTTP 404 — "
+        "provider_rejected: Gemini HTTP 404 "
+        f"(model={ai.DEFAULT_SUBMISSION_MODEL}, api_version={ai.DEFAULT_SUBMISSION_API_VERSION}) — "
         "NOT_FOUND: models/gemini-2.5-pro is not found for API version v1beta."
     )
