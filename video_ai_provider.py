@@ -74,7 +74,12 @@ from video_scene_schema import normalize_script_blueprint, normalize_story_analy
 log = logging.getLogger("eduhub.video_ai")
 
 _TRUEY = {"1", "true", "yes", "on"}
-_GEN_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def _gen_url(model: str, api_version: str) -> str:
+    return f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
+
+
 _FILES_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 _FILES_GET_URL = "https://generativelanguage.googleapis.com/v1beta/{name}"
 _INLINE_MAX_BYTES = 15 * 1024 * 1024  # above this, use the Gemini Files API
@@ -82,19 +87,37 @@ _ALIGN_TIMEOUT = httpx.Timeout(480.0, connect=15.0)
 _ANALYZE_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+# Speech recognition / text-only analysis path — every OTHER Gemini 2.x
+# call site in this codebase uses this same version, all confirmed still
+# working.
+DEFAULT_API_VERSION = "v1beta"
+
 # Deep whole-video story/scene analysis ONLY — never used for speech
 # recognition or any other Gemini call in this module. See the module
 # docstring's "Two deliberately separate model configurations" note.
 #
-# 2026-08-16: "gemini-2.5-pro" is the same retired model id confirmed dead
-# in production for assessment_ai_provider.py's submission extraction (real
-# Render log: {"code": 404, "status": "NOT_FOUND", "message": "This model
-# models/gemini-2.5-pro is no longer available to new users..."}). The
-# retirement is at the model-id/account level, not per call site, so it
-# applies here identically (same GEMINI_API_KEY, same generateContent
-# endpoint). Replaced with "gemini-3.1-pro" to match that fix.
-# Override via VIDEO_ANALYSIS_MODEL without a redeploy if needed.
+# 2026-08-16, part 1: "gemini-2.5-pro" is the same retired model id
+# confirmed dead in production for assessment_ai_provider.py's submission
+# extraction (real Render log: {"code": 404, "status": "NOT_FOUND",
+# "message": "This model models/gemini-2.5-pro is no longer available to
+# new users..."}). The retirement is at the model-id/account level, not
+# per call site, so it applies here identically (same GEMINI_API_KEY, same
+# generateContent endpoint). Replaced with "gemini-3.1-pro" to match that
+# fix. Override via VIDEO_ANALYSIS_MODEL without a redeploy if needed.
+#
+# 2026-08-16, part 2: the corrected model id STILL 404'd — {"status":
+# "NOT_FOUND", "message": "models/gemini-3.1-pro is not found for API
+# version v1beta, or is not supported for generateContent..."}. Root cause
+# was the API VERSION, not the model id — this codebase already has a
+# LOCKED, tested precedent for exactly this: book_factory_image.py's
+# "gemini-3.1-flash-image" (same 3.1 generation) is explicitly pinned to
+# the stable "v1" endpoint per an explicit product decision, with its own
+# regression test locking the endpoint/model shape. The deep-analysis path
+# now uses v1 to match that established, working precedent. Override via
+# VIDEO_ANALYSIS_API_VERSION without a redeploy if Google's versioning
+# policy shifts again.
 DEFAULT_ANALYSIS_MODEL = "gemini-3.1-pro"
+DEFAULT_ANALYSIS_API_VERSION = "v1"
 
 
 def _env(name: str) -> str:
@@ -109,11 +132,22 @@ def _model() -> str:
     return _env("VIDEO_AI_MODEL") or DEFAULT_MODEL
 
 
+def _api_version() -> str:
+    return _env("VIDEO_AI_API_VERSION") or DEFAULT_API_VERSION
+
+
 def _analysis_model() -> str:
     """Model for GeminiVideoProvider.analyze_story_raw ONLY — deliberately
     independent of _model()/VIDEO_AI_MODEL (speech recognition) so a future
     change to either never silently affects the other."""
     return _env("VIDEO_ANALYSIS_MODEL") or DEFAULT_ANALYSIS_MODEL
+
+
+def _analysis_api_version() -> str:
+    """API version for the deep-analysis path ONLY — deliberately
+    independent of _api_version()/VIDEO_AI_API_VERSION (speech
+    recognition), same reasoning as _analysis_model()."""
+    return _env("VIDEO_ANALYSIS_API_VERSION") or DEFAULT_ANALYSIS_API_VERSION
 
 
 def _mock_forced() -> bool:
@@ -497,7 +531,8 @@ async def analyze_story(media_bytes: bytes, content_type: str, *, transcript_tex
         # instance from whatever get_video_ai_provider() hands the ASR path,
         # constructed fresh right here so the override can never leak into
         # any other call site.
-        provider = GeminiVideoProvider(http_client=http_client, model=_analysis_model())
+        provider = GeminiVideoProvider(http_client=http_client, model=_analysis_model(),
+                                        api_version=_analysis_api_version())
         raw_text, raw_payload = await provider.analyze_story_raw(
             media_bytes, content_type, transcript_text=transcript_text, title=title,
         )
@@ -566,14 +601,16 @@ async def draft_script_blueprint(story_analysis: dict, *, transcript_text: str =
         # same response), so it gets the same model quality. This is a
         # deliberate move OFF the ASR/Flash model (_model()) for this call
         # specifically; the ASR speech-recognition path itself is untouched.
+        blueprint_url = _gen_url(_analysis_model(), _analysis_api_version())
         if http_client is not None:
-            r = await http_client.post(_GEN_URL.format(model=_analysis_model()), params={"key": _api_key()}, json=body)
+            r = await http_client.post(blueprint_url, params={"key": _api_key()}, json=body)
         else:
             async with httpx.AsyncClient(timeout=_ANALYZE_TIMEOUT) as cli:
-                r = await cli.post(_GEN_URL.format(model=_analysis_model()), params={"key": _api_key()}, json=body)
+                r = await cli.post(blueprint_url, params={"key": _api_key()}, json=body)
         if r.status_code != 200:
             detail = _gemini_http_error_detail(r)
-            log.warning("video-ai: script-blueprint HTTP %s | body=%s", r.status_code, (r.text or "")[:300])
+            log.warning("video-ai: script-blueprint HTTP %s | model=%s | api_version=%s | body=%s",
+                        r.status_code, _analysis_model(), _analysis_api_version(), (r.text or "")[:300])
             reason = "provider_rejected" + (f": Gemini HTTP {r.status_code} — {detail}" if detail else f": Gemini HTTP {r.status_code}")
             return {"ok": False, "reason": reason}
         blueprint = normalize_script_blueprint(
@@ -594,9 +631,14 @@ class GeminiVideoProvider:
 
     category = "speech_recognition"
 
-    def __init__(self, *, api_key: str | None = None, model: str | None = None, http_client=None):
+    def __init__(self, *, api_key: str | None = None, model: str | None = None,
+                 api_version: str | None = None, http_client=None):
         self._api_key = api_key or _api_key()
         self._model = model or _model()
+        # Defaults to the ASR/speech-recognition version (v1beta) — callers
+        # constructing this provider for the deep-analysis path pass
+        # api_version=_analysis_api_version() explicitly (see analyze_story).
+        self._api_version = api_version or _api_version()
         self._http_client = http_client  # injectable for tests
         if not self._api_key:
             raise VideoAiError("no_api_key", "GEMINI_API_KEY is not configured")
@@ -673,13 +715,15 @@ class GeminiVideoProvider:
             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
         }
         r = await self._post(
-            _GEN_URL.format(model=self._model),
+            _gen_url(self._model, self._api_version),
             params={"key": self._api_key}, json=body,
         )
         if r.status_code != 200:
-            log.warning("video-ai: ASR HTTP %s | model=%s mime=%s | body=%s",
-                        r.status_code, self._model, content_type, (r.text or "")[:400])
-            raise VideoAiError("provider_rejected", f"Gemini HTTP {r.status_code}")
+            log.warning("video-ai: ASR HTTP %s | model=%s | api_version=%s | mime=%s | body=%s",
+                        r.status_code, self._model, self._api_version, content_type, (r.text or "")[:400])
+            raise VideoAiError("provider_rejected",
+                                f"Gemini HTTP {r.status_code} (model={self._model}, "
+                                f"api_version={self._api_version})")
 
         raw_payload = r.json()
         text = _candidate_text(raw_payload)
@@ -738,18 +782,21 @@ class GeminiVideoProvider:
             "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
         }
         r = await self._post(
-            _GEN_URL.format(model=self._model),
+            _gen_url(self._model, self._api_version),
             params={"key": self._api_key}, json=body,
         )
         if r.status_code != 200:
             detail = _gemini_http_error_detail(r)
-            log.warning("video-ai: story-analysis HTTP %s | model=%s | body=%s",
-                        r.status_code, self._model, (r.text or "")[:400])
+            log.warning("video-ai: story-analysis HTTP %s | model=%s | api_version=%s | body=%s",
+                        r.status_code, self._model, self._api_version, (r.text or "")[:400])
             # The real, provider-reported reason (e.g. "PERMISSION_DENIED:
             # ... model is not enabled for this project") reaches the
             # Studio's lastError field via this message — never collapsed
             # down to a bare "provider_rejected" the way it used to be.
-            message = f"Gemini HTTP {r.status_code}" + (f" — {detail}" if detail else "")
+            # Model + api_version are both included so a future
+            # misconfiguration of EITHER is immediately diagnosable.
+            message = (f"Gemini HTTP {r.status_code} (model={self._model}, "
+                        f"api_version={self._api_version})" + (f" — {detail}" if detail else ""))
             raise VideoAiError("provider_rejected", message)
         raw_payload = r.json()
         return _candidate_text(raw_payload), raw_payload
@@ -1050,13 +1097,15 @@ async def analyze_transcript(transcript: str, *, sentences: list[dict] | None = 
         "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
     }
     try:
+        analysis_url = _gen_url(_model(), _api_version())
         if http_client is not None:
-            r = await http_client.post(_GEN_URL.format(model=_model()), params={"key": _api_key()}, json=body)
+            r = await http_client.post(analysis_url, params={"key": _api_key()}, json=body)
         else:
             async with httpx.AsyncClient(timeout=_ANALYZE_TIMEOUT) as cli:
-                r = await cli.post(_GEN_URL.format(model=_model()), params={"key": _api_key()}, json=body)
+                r = await cli.post(analysis_url, params={"key": _api_key()}, json=body)
         if r.status_code != 200:
-            log.warning("video-ai: analysis HTTP %s | body=%s", r.status_code, (r.text or "")[:300])
+            log.warning("video-ai: analysis HTTP %s | model=%s | api_version=%s | body=%s",
+                        r.status_code, _model(), _api_version(), (r.text or "")[:300])
             return {"ok": False, "reason": "provider_rejected"}
         raw_data = _extract_json(_candidate_text(r.json()))
         learning = normalize_learning(raw_data)

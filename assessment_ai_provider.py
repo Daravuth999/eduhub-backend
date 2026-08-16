@@ -27,9 +27,15 @@ labeled deterministic response so both pipelines are exercisable in any
 environment, matching video_ai_provider.py's MockVideoProvider precedent.
 
 Env:
-  GEMINI_API_KEY        — provider key (absent => mock mode)
-  ASSESSMENT_AI_MODEL   — generateContent model (default: gemini-2.5-flash)
-  ASSESSMENT_AI_MOCK    — "1"/"true" forces mock mode even with a key
+  GEMINI_API_KEY                  — provider key (absent => mock mode)
+  ASSESSMENT_AI_MODEL                  — generateContent model (default: gemini-2.5-flash)
+  ASSESSMENT_AI_API_VERSION            — API version for the flash/answer-key path
+                                          (default: v1beta)
+  ASSESSMENT_AI_SUBMISSION_MODEL       — generateContent model for physical-worksheet
+                                          submission extraction (default: gemini-3.1-pro)
+  ASSESSMENT_AI_SUBMISSION_API_VERSION — API version for the submission-extraction path
+                                          (default: v1 — see DEFAULT_SUBMISSION_API_VERSION)
+  ASSESSMENT_AI_MOCK                   — "1"/"true" forces mock mode even with a key
 """
 from __future__ import annotations
 
@@ -44,33 +50,57 @@ import httpx
 log = logging.getLogger("eduhub.assessment_ai")
 
 _TRUEY = {"1", "true", "yes", "on"}
-_GEN_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def _gen_url(model: str, api_version: str) -> str:
+    return f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
+
+
 _FILES_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 _FILES_GET_URL = "https://generativelanguage.googleapis.com/v1beta/{name}"
 _INLINE_MAX_BYTES = 15 * 1024 * 1024
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+# Flash/answer-key path — Google's stable-but-evolving preview surface;
+# every OTHER Gemini 2.x call site in this codebase (book_factory_gemini.py,
+# gemini_engine.py, premium_ai_tools.py, voice_treasure_gemini.py, etc.)
+# uses this same version, all confirmed still working.
+DEFAULT_API_VERSION = "v1beta"
+
 # Physical-worksheet answer recognition REQUIRES a Pro-tier vision model
 # (2026-08 product direction) — never silently downgraded; the model
 # actually used is persisted in the submission's extraction metadata.
 #
-# 2026-08-16 incident: "gemini-2.5-pro" started returning a real, logged
-# Gemini error — {"code": 404, "status": "NOT_FOUND", "message": "This
-# model models/gemini-2.5-pro is no longer available to new users..."} —
-# confirming Google retired it (production Render log, not a guess).
-# Replaced with "gemini-3.1-pro", confirmed via the account's own Google
-# AI Studio quota/rate-limit list as a real, currently quota-tracked
+# 2026-08-16 incident, part 1: "gemini-2.5-pro" started returning a real,
+# logged Gemini error — {"code": 404, "status": "NOT_FOUND", "message":
+# "This model models/gemini-2.5-pro is no longer available to new
+# users..."} — confirming Google retired it (production Render log, not a
+# guess). Replaced with "gemini-3.1-pro", confirmed via the account's own
+# Google AI Studio quota/rate-limit list as a real, currently quota-tracked
 # "Text-out models" entry named exactly "Gemini 3.1 Pro" — no "Preview"
 # qualifier, unlike genuine previews in that same list ("Deep Research
-# Pro Preview", "Computer Use Preview"). Matches this codebase's own
-# display-name -> model-id convention confirmed elsewhere (book_factory_
-# image.py's "Nano Banana 2 (Gemini 3.1 Flash Image)" -> "gemini-3.1-
-# flash-image"). Override via ASSESSMENT_AI_SUBMISSION_MODEL without a
-# redeploy if Google renames/retires this one too — the improved
-# provider_rejected error (see _gemini_http_error_detail) will say so
-# explicitly instead of a bare "Gemini HTTP 404".
+# Pro Preview", "Computer Use Preview").
+#
+# 2026-08-16 incident, part 2: the corrected model id STILL 404'd —
+# {"status": "NOT_FOUND", "message": "models/gemini-3.1-pro is not found
+# for API version v1beta, or is not supported for generateContent..."}.
+# Root cause: the API VERSION, not the model id. This codebase already has
+# a LOCKED, tested precedent for exactly this — book_factory_image.py's
+# "gemini-3.1-flash-image" (same 3.1 generation) is explicitly pinned to
+# the stable "v1" endpoint, NOT "v1beta", per an explicit product decision
+# with its own regression test locking the endpoint/model shape. Every
+# OTHER Gemini call in this codebase that DOES use v1beta is on the 2.x
+# generation (gemini-2.5-flash), which is unaffected. Submission
+# extraction now uses v1 to match that established, working precedent —
+# not a new guess, the same fix already proven for a sibling 3.1-model
+# call site. Override via ASSESSMENT_AI_SUBMISSION_MODEL / ASSESSMENT_AI_
+# SUBMISSION_API_VERSION without a redeploy if Google's naming or
+# versioning policy shifts again — the improved provider_rejected error
+# (see _gemini_http_error_detail) will say so explicitly instead of a
+# bare "Gemini HTTP 404".
 DEFAULT_SUBMISSION_MODEL = "gemini-3.1-pro"
+DEFAULT_SUBMISSION_API_VERSION = "v1"
 VERIFY_CONFIDENCE_THRESHOLD = 0.6
 MAX_VERIFY_QIDS = 50
 
@@ -87,8 +117,16 @@ def _model() -> str:
     return _env("ASSESSMENT_AI_MODEL") or DEFAULT_MODEL
 
 
+def _api_version() -> str:
+    return _env("ASSESSMENT_AI_API_VERSION") or DEFAULT_API_VERSION
+
+
 def _submission_model() -> str:
     return _env("ASSESSMENT_AI_SUBMISSION_MODEL") or DEFAULT_SUBMISSION_MODEL
+
+
+def _submission_api_version() -> str:
+    return _env("ASSESSMENT_AI_SUBMISSION_API_VERSION") or DEFAULT_SUBMISSION_API_VERSION
 
 
 def _mock_forced() -> bool:
@@ -331,7 +369,7 @@ async def _media_part(api_key: str, media_bytes: bytes, content_type: str) -> di
 
 
 async def _call_gemini_json(prompt: str, *, media_part: dict | None = None,
-                             model: str | None = None) -> dict:
+                             model: str | None = None, api_version: str | None = None) -> dict:
     """Shared call+parse path for both extraction capabilities. Returns the
     parsed JSON object (dict) on success. Raises AssessmentAiError with a
     real, non-fabricated reason on any provider or parse failure."""
@@ -343,16 +381,22 @@ async def _call_gemini_json(prompt: str, *, media_part: dict | None = None,
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
     }
-    r = await _post(_GEN_URL.format(model=model or _model()), params={"key": api_key}, json=body)
+    resolved_model = model or _model()
+    resolved_version = api_version or _api_version()
+    r = await _post(_gen_url(resolved_model, resolved_version), params={"key": api_key}, json=body)
     if r.status_code != 200:
         detail = _gemini_http_error_detail(r)
-        log.warning("assessment-ai: HTTP %s | model=%s | body=%s",
-                    r.status_code, model or _model(), (r.text or "")[:400])
+        log.warning("assessment-ai: HTTP %s | model=%s | api_version=%s | body=%s",
+                    r.status_code, resolved_model, resolved_version, (r.text or "")[:400])
         # The real, provider-reported reason (e.g. "NOT_FOUND: models/foo is
         # not found" or "PERMISSION_DENIED: ... not enabled for this
         # project") must reach the caller — never collapsed down to a bare,
-        # undiagnosable "Gemini HTTP 404" the way it used to be.
-        message = f"Gemini HTTP {r.status_code}" + (f" — {detail}" if detail else "")
+        # undiagnosable "Gemini HTTP 404" the way it used to be. Model +
+        # api_version are both included so a future misconfiguration of
+        # EITHER is immediately diagnosable from the persisted extractionError
+        # alone, without needing Render log access.
+        message = (f"Gemini HTTP {r.status_code} (model={resolved_model}, "
+                    f"api_version={resolved_version})" + (f" — {detail}" if detail else ""))
         raise AssessmentAiError("provider_rejected", message)
     raw_payload = r.json()
     text = _candidate_text(raw_payload)
@@ -421,7 +465,8 @@ def _suspect_qids(answers: list, questions: list[dict]) -> list[str]:
 async def extract_submission_answers(media_bytes: bytes, content_type: str,
                                       questions: list[dict]) -> dict:
     """Extracts what a student physically marked/wrote from an uploaded
-    worksheet photo/PDF using Gemini 2.5 Pro, grounded against the
+    worksheet photo/PDF using the configured Pro-tier model (see
+    DEFAULT_SUBMISSION_MODEL), grounded against the
     assessment's own question prompts, with a focused second-pass
     verification of missing/uncertain/low-confidence questions only.
     Returns {"ok": True, "answers": [...], "engine": "gemini"|"mock",
@@ -435,9 +480,11 @@ async def extract_submission_answers(media_bytes: bytes, content_type: str,
         return {"ok": True, "answers": _mock_submission_answers(questions),
                 "engine": "mock", "model": "mock", "verification": None}
     model = _submission_model()
+    api_version = _submission_api_version()
     try:
         part = await _media_part(_api_key(), media_bytes, content_type or "application/octet-stream")
-        data = await _call_gemini_json(_submission_prompt(questions), media_part=part, model=model)
+        data = await _call_gemini_json(_submission_prompt(questions), media_part=part,
+                                        model=model, api_version=api_version)
         answers = data.get("answers")
         if not isinstance(answers, list):
             return {"ok": False, "reason": "bad_response: no answers array"}
@@ -448,7 +495,8 @@ async def extract_submission_answers(media_bytes: bytes, content_type: str,
             verification = {"model": model, "checkedQids": suspects, "updatedQids": []}
             try:
                 vdata = await _call_gemini_json(
-                    _verification_prompt(questions, suspects), media_part=part, model=model)
+                    _verification_prompt(questions, suspects), media_part=part,
+                    model=model, api_version=api_version)
                 vanswers = vdata.get("answers")
                 if isinstance(vanswers, list):
                     suspect_set = set(suspects)
