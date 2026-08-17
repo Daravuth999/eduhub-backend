@@ -417,7 +417,12 @@ def default_settings() -> dict:
         # no new reward collection, no new claim mechanism.
         "monthly_reward_enabled": False,
         "monthly_reward_threshold_pct": 0.85,
-        "monthly_reward_points": 200,
+        # The reward's real identity (name/points/availability) is never
+        # duplicated into attendance's own config — this references an
+        # existing Author Studio Login Reward campaign (login_reward_campaigns,
+        # field "id") by id, fetched live at both summary-display and
+        # claim time. None = admin hasn't attached a reward yet.
+        "monthly_reward_campaign_id": None,
         "checkin_window_minutes": 90,
         "late_grace_minutes": 10,
         "mid_session_enabled": True,
@@ -540,6 +545,63 @@ def _render_session_qr(payload_text: str) -> str:
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail="QR rendering failed") from exc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2 monthly reward — reads the REAL Login Reward campaign an admin attaches
+# to attendance in Settings, rather than inventing a duplicate reward
+# config. Reads only — never calls login_reward_tools.py's audience
+# eligibility or claim routes, since a campaign's normal audience gate
+# (all/specific/exclude) has no relationship to an attendance-percentage
+# rule. login_reward_campaigns is read directly (same pattern attendance
+# already uses to read db.students — a plain cross-module read, not a
+# private-function import) since login_reward_tools.py exposes no
+# dedicated public "get campaign status" API via DI.
+# ─────────────────────────────────────────────────────────────────────────────
+CAMP_LIVE = "live"
+CAMP_SCHEDULED = "scheduled"
+CAMP_EXPIRED = "expired"
+CAMP_DISABLED = "disabled"
+
+
+def _derive_campaign_status(camp: dict, now: datetime | None = None) -> str:
+    """Mirrors login_reward_tools.py's _lrc_campaign_status() exactly
+    (disabled/scheduled/live/expired) — duplicated rather than imported
+    to keep attendance_tools.py from reaching into another module's
+    private (`_lrc_`-prefixed) internals; this is ~6 lines of pure logic,
+    cheap to keep in sync and unit-tested on both sides."""
+    if not camp.get("enabled"):
+        return CAMP_DISABLED
+    now = now or _utcnow()
+    start = _parse_iso(camp.get("start_at"))
+    end = _parse_iso(camp.get("end_at"))
+    if start and now < start:
+        return CAMP_SCHEDULED
+    if end and now > end:
+        return CAMP_EXPIRED
+    return CAMP_LIVE
+
+
+async def _fetch_reward_campaign(db, campaign_id: str | None) -> dict | None:
+    """Live-fetch the attached Login Reward campaign's real identity.
+    Returns None if no campaign is attached, it no longer exists, or it
+    doesn't carry a points component (voucher-only campaigns can't fund
+    an attendance points reward). Never cached — the campaign's current
+    name/points/status are authoritative every time this is called."""
+    if not campaign_id:
+        return None
+    camp = await db["login_reward_campaigns"].find_one({"id": campaign_id}, {"_id": 0})
+    if not camp:
+        return None
+    points = int(camp.get("reward_points") or 0)
+    if camp.get("reward_kind") == "voucher" or points <= 0:
+        return None
+    return {
+        "campaign_id": campaign_id,
+        "name": camp.get("reward_label") or camp.get("name") or "",
+        "points": points,
+        "status": _derive_campaign_status(camp),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1228,12 +1290,22 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
         elig = compute_monthly_eligibility(stats, threshold)
         reward_enabled = bool(settings.get("monthly_reward_enabled"))
+
+        # The reward's real name/points/status are ALWAYS live-fetched from
+        # the attached Login Reward campaign — never a cached/copied value.
+        campaign = await _fetch_reward_campaign(db, settings.get("monthly_reward_campaign_id")) \
+            if reward_enabled else None
         already_claimed = False
         if reward_enabled:
             idem_key = f"attendance_monthly:{period}:{sid}"
             existing = await db[COLL_CLAIMS].find_one(
                 {"idempotency_key": idem_key}, {"_id": 0, "status": 1})
             already_claimed = bool(existing and existing.get("status") == "claimed")
+
+        can_claim = bool(
+            reward_enabled and campaign and campaign["status"] == CAMP_LIVE
+            and elig["met"] and not already_claimed
+        )
         return {
             "period": period,
             "class_id": class_id,
@@ -1241,9 +1313,12 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "required_pct": elig["required_pct"],
             "eligible": elig["met"],
             "reward_enabled": reward_enabled,
-            "reward_points": int(settings.get("monthly_reward_points") or 0),
+            "reward_configured": campaign is not None,
+            "reward_name": (campaign or {}).get("name"),
+            "reward_points": (campaign or {}).get("points"),
+            "reward_campaign_status": (campaign or {}).get("status"),
             "already_claimed": already_claimed,
-            "can_claim": reward_enabled and elig["met"] and not already_claimed,
+            "can_claim": can_claim,
         }
 
     @api.post("/attendance/rewards/monthly/claim")
@@ -1261,7 +1336,11 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         idem_key = f"attendance_monthly:{period}:{sid}"
         existing = await db[COLL_CLAIMS].find_one({"idempotency_key": idem_key}, {"_id": 0})
         if existing and existing.get("status") == "claimed":
-            return {"ok": True, "already_claimed": True, "points": existing.get("points", 0)}
+            return {
+                "ok": True, "already_claimed": True,
+                "points": existing.get("points", 0),
+                "reward_name": existing.get("reward_name"),
+            }
 
         # Re-verify eligibility fresh, server-side — the client's own summary
         # view is never trusted for the actual grant decision.
@@ -1272,7 +1351,16 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         if not elig["met"]:
             raise HTTPException(status_code=403, detail="not_eligible")
 
-        points = int(settings.get("monthly_reward_points") or 0)
+        # Live-fetch the campaign fresh at claim time too — if the admin
+        # changed the points/name (or disabled/expired it) since the
+        # student last loaded the summary, THIS is the value that's
+        # actually credited, never a stale client-held number.
+        campaign = await _fetch_reward_campaign(db, settings.get("monthly_reward_campaign_id"))
+        if not campaign:
+            raise HTTPException(status_code=400, detail="no_reward_configured")
+        if campaign["status"] != CAMP_LIVE:
+            raise HTTPException(status_code=409, detail="reward_unavailable")
+        points = campaign["points"]
         if points <= 0:
             raise HTTPException(status_code=400, detail="no_reward_configured")
         if wallet is None:
@@ -1297,6 +1385,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 "clean_id": sid,
                 "source_session_id": None,
                 "source_period": period,
+                "source_campaign_id": campaign["campaign_id"],
+                "reward_name": campaign["name"],
                 "points": points,
                 "status": "claimed",
                 "claimed_at": _utcnow_iso(),
@@ -1304,7 +1394,7 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             }},
             upsert=True,
         )
-        return {"ok": True, "already_claimed": False, "points": points}
+        return {"ok": True, "already_claimed": False, "points": points, "reward_name": campaign["name"]}
 
     # ─────────────────────────────────────────────────────────────────────
     # ADMIN ROUTES
