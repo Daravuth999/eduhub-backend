@@ -926,6 +926,10 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 "minutes_late": minutes_late,
                 "mid_session_confirmed": r.get("mid_session_confirmed"),
                 "miss_reason": r.get("miss_reason"),
+                # v2-only field — absent/None on legacy records and whenever
+                # v2 is off, since finalize_status() (the legacy path) never
+                # writes it. Purely additive.
+                "verification_status": r.get("verification_status"),
             })
         # Compute present/late/absent counts directly from history for the summary.
         present_count = sum(1 for h in history if h["status"] in (ST_PRESENT_FULL, ST_PRESENT_PARTIAL))

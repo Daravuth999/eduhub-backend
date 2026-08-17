@@ -668,3 +668,36 @@ def test_session_qr_404_for_unknown_session():
         assert False, "expected HTTPException"
     except Exception as exc:
         assert getattr(exc, "status_code", None) == 404
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# /attendance/me — verification_status surfaced for the new UI's "Verifying" tag
+# ─────────────────────────────────────────────────────────────────────────
+def test_me_history_surfaces_verification_status_when_v2_on(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings()
+    _seed_class(db)
+    _seed_open_session(db)
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="abc123"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+          session_id="ses_1", admin=_Admin())
+    res = _call(router, "GET", "/attendance/me", student=_Student("stu_alice"))
+    assert res["history"][0]["verification_status"] == "pending"
+    assert res["history"][0]["status"] == att.ST_PRESENT_FULL  # never Partial
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_me_history_verification_status_absent_on_legacy_records(monkeypatch):
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+    db, router = _build()
+    _seed_class(db)
+    _seed_open_session(db)
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="abc123"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+          session_id="ses_1", admin=_Admin())
+    res = _call(router, "GET", "/attendance/me", student=_Student("stu_alice"))
+    assert res["history"][0]["verification_status"] is None
+    assert res["history"][0]["status"] == att.ST_PRESENT_PARTIAL  # legacy unchanged
