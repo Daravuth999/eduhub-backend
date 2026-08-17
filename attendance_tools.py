@@ -28,14 +28,37 @@ testable without a database (see tests/test_attendance_*.py).
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+import segno
 from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger("eduhub.attendance")
+
+# ── v2 rollout flag ──────────────────────────────────────────────────────
+# AND-gated, fail-closed: BOTH an explicit env var AND a settings-doc toggle
+# must be true, mirroring speaking_lab_feature_flags.py's two-switch pattern
+# elsewhere in this codebase. Gates: the redesigned status model (no more
+# punitive "Partial" from a missed mid-session tap — see finalize_status_v2),
+# the monthly reward engine, and the new v2-only routes. With the flag off,
+# every existing route/behavior is byte-for-byte unchanged.
+V2_ENV_VAR = "ATTENDANCE_V2_ENABLED"
+
+
+def _env_flag_on(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _v2_active(settings: dict) -> bool:
+    if not _env_flag_on(V2_ENV_VAR):
+        return False
+    return bool(settings.get("v2_enabled"))
 
 # ── collections ────────────────────────────────────────────────────────────
 COLL_CLASSES = "attendance_classes"
@@ -148,6 +171,64 @@ def finalize_status(checked_in: bool, checkin_status: str | None,
     if mid_session_required and not mid_session_confirmed:
         return ST_PRESENT_PARTIAL
     return checkin_status or ST_PRESENT_FULL
+
+
+# ── v2 status model: attendance_status separated from verification_status ──
+# Root-cause finding: `present_partial` above is produced by a missed
+# mid-session "Still here?" tap — a UI confirmation that ships in the API
+# but is never rendered by any current frontend component, so on-time
+# students were structurally destined to be marked Partial through no
+# fault of their own. v2 stops treating an unconfirmed tap as an
+# attendance-status downgrade; verification becomes a separate, informational
+# field that never determines whether a student looks like they attended.
+def finalize_status_v2(checked_in: bool, checkin_status: str | None) -> str:
+    """v2 attendance status — decided ONLY by check-in timing. Never
+    downgraded by a missed mid-session confirmation."""
+    if not checked_in:
+        return ST_ABSENT
+    return checkin_status or ST_PRESENT_FULL
+
+
+def compute_verification_status(checked_in: bool, mid_session_confirmed: bool,
+                                mid_session_required: bool) -> str:
+    """v2 verification signal — informational only, never fed back into
+    `status`. One of: not_applicable (never checked in), not_required
+    (mid-session confirmation wasn't configured for this session),
+    confirmed, pending."""
+    if not checked_in:
+        return "not_applicable"
+    if not mid_session_required:
+        return "not_required"
+    return "confirmed" if mid_session_confirmed else "pending"
+
+
+# ── v2 monthly analytics — pure, reusable by both the student summary route
+# and the monthly-claim route's server-side re-verification. present_partial
+# counts as attended (it is a verification gap, never a genuine absence —
+# see the root-cause note above), matching admin_report()'s own existing
+# attendance_pct definition so the two never disagree. ──────────────────────
+def compute_monthly_stats(statuses: list[str]) -> dict:
+    present = sum(1 for s in statuses if s == ST_PRESENT_FULL)
+    partial = sum(1 for s in statuses if s == ST_PRESENT_PARTIAL)
+    late = sum(1 for s in statuses if s == ST_LATE)
+    absent = sum(1 for s in statuses if s == ST_ABSENT)
+    attended = present + partial + late
+    total = attended + absent
+    return {
+        "present": present, "partial": partial, "late": late, "absent": absent,
+        "attended": attended, "total": total,
+        "attendance_pct": round(100 * attended / total, 1) if total else 0.0,
+    }
+
+
+def compute_monthly_eligibility(stats: dict, threshold_pct: float) -> dict:
+    """Pure eligibility decision — always recomputed server-side, never
+    trusted from a client. threshold_pct is a fraction (0.85 == 85%).
+    A month with no finalized sessions yet is never "eligible" — an
+    undefined denominator must never look like a passing grade."""
+    required_pct = round(float(threshold_pct or 0) * 100, 1)
+    met = stats["total"] > 0 and stats["attendance_pct"] >= required_pct
+    return {"required_pct": required_pct, "met": met}
 
 
 def _clamp01(x: float) -> float:
@@ -328,6 +409,15 @@ def nudge_guardrail_allows(now: datetime,
 def default_settings() -> dict:
     return {
         "_id": SETTINGS_ID,
+        # v2 rollout — see V2_ENV_VAR / _v2_active() above. Both this AND the
+        # env var must be true for v2 behavior to activate anywhere.
+        "v2_enabled": False,
+        # Monthly attendance reward (v2-only). Reuses the existing wallet-
+        # backed credit + attendance_reward_claims idempotency machinery —
+        # no new reward collection, no new claim mechanism.
+        "monthly_reward_enabled": False,
+        "monthly_reward_threshold_pct": 0.85,
+        "monthly_reward_points": 200,
         "checkin_window_minutes": 90,
         "late_grace_minutes": 10,
         "mid_session_enabled": True,
@@ -435,6 +525,21 @@ def _merge_settings(stored: dict | None) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _render_session_qr(payload_text: str) -> str:
+    """Render `payload_text` (the full join URL, built client-side by the
+    same origin logic AttendanceStudio.jsx's existing copyJoinLink() already
+    uses) to a PNG data URI. Same segno usage as student_smart_login.py's
+    _render_qr — already a hard backend dependency, no new library."""
+    from fastapi import HTTPException
+    try:
+        qr = segno.make(payload_text, error="m")
+        buf = io.BytesIO()
+        qr.save(buf, kind="png", scale=8, border=2)
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="QR rendering failed") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -821,6 +926,10 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 "minutes_late": minutes_late,
                 "mid_session_confirmed": r.get("mid_session_confirmed"),
                 "miss_reason": r.get("miss_reason"),
+                # v2-only field — absent/None on legacy records and whenever
+                # v2 is off, since finalize_status() (the legacy path) never
+                # writes it. Purely additive.
+                "verification_status": r.get("verification_status"),
             })
         # Compute present/late/absent counts directly from history for the summary.
         present_count = sum(1 for h in history if h["status"] in (ST_PRESENT_FULL, ST_PRESENT_PARTIAL))
@@ -1078,6 +1187,125 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "failed_count": len(failed_idem_keys),
         }
 
+    # ── v2: rollout status, monthly analytics, monthly reward claim ────────
+    async def _student_monthly_statuses(sid: str, period: str, class_id: str | None) -> list[str]:
+        sessions_q: dict = {"date": {"$regex": f"^{period}"}}
+        if class_id:
+            sessions_q["class_id"] = class_id
+        session_ids = [
+            s["session_id"]
+            async for s in db[COLL_SESSIONS].find(sessions_q, {"_id": 0, "session_id": 1})
+        ]
+        if not session_ids:
+            return []
+        cur = db[COLL_RECORDS].find(
+            {"session_id": {"$in": session_ids}, "student_id": sid},
+            {"_id": 0, "status": 1},
+        )
+        return [r.get("status") async for r in cur if r.get("status")]
+
+    @api.get("/attendance/v2-status")
+    async def attendance_v2_status():
+        """Unauthenticated, boolean-only — fail-closed status check the
+        frontend uses to decide whether to render the v2 experience at all.
+        Same {enabled} contract as this codebase's other feature-flagged
+        status endpoints (e.g. getVideoLibraryCouponStatus)."""
+        settings = await _load_settings()
+        return {"enabled": _v2_active(settings)}
+
+    @api.get("/attendance/monthly-summary")
+    async def attendance_monthly_summary(
+        month: str | None = None, class_id: str | None = None,
+        student=Depends(require_student),
+    ):
+        settings = await _load_settings()
+        if not _v2_active(settings):
+            raise HTTPException(status_code=404, detail="not_available")
+        sid = _sid(student)
+        period = month or _utcnow().strftime("%Y-%m")
+        statuses = await _student_monthly_statuses(sid, period, class_id)
+        stats = compute_monthly_stats(statuses)
+        threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
+        elig = compute_monthly_eligibility(stats, threshold)
+        reward_enabled = bool(settings.get("monthly_reward_enabled"))
+        already_claimed = False
+        if reward_enabled:
+            idem_key = f"attendance_monthly:{period}:{sid}"
+            existing = await db[COLL_CLAIMS].find_one(
+                {"idempotency_key": idem_key}, {"_id": 0, "status": 1})
+            already_claimed = bool(existing and existing.get("status") == "claimed")
+        return {
+            "period": period,
+            "class_id": class_id,
+            "stats": stats,
+            "required_pct": elig["required_pct"],
+            "eligible": elig["met"],
+            "reward_enabled": reward_enabled,
+            "reward_points": int(settings.get("monthly_reward_points") or 0),
+            "already_claimed": already_claimed,
+            "can_claim": reward_enabled and elig["met"] and not already_claimed,
+        }
+
+    @api.post("/attendance/rewards/monthly/claim")
+    async def attendance_monthly_claim(payload: dict | None = None,
+                                       student=Depends(require_student)):
+        settings = await _load_settings()
+        if not _v2_active(settings):
+            raise HTTPException(status_code=404, detail="not_available")
+        if not settings.get("monthly_reward_enabled"):
+            raise HTTPException(status_code=403, detail="monthly_reward_disabled")
+        sid = _sid(student)
+        period = ((payload or {}).get("period") or "").strip() or _utcnow().strftime("%Y-%m")
+        class_id = (payload or {}).get("class_id")
+
+        idem_key = f"attendance_monthly:{period}:{sid}"
+        existing = await db[COLL_CLAIMS].find_one({"idempotency_key": idem_key}, {"_id": 0})
+        if existing and existing.get("status") == "claimed":
+            return {"ok": True, "already_claimed": True, "points": existing.get("points", 0)}
+
+        # Re-verify eligibility fresh, server-side — the client's own summary
+        # view is never trusted for the actual grant decision.
+        statuses = await _student_monthly_statuses(sid, period, class_id)
+        stats = compute_monthly_stats(statuses)
+        threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
+        elig = compute_monthly_eligibility(stats, threshold)
+        if not elig["met"]:
+            raise HTTPException(status_code=403, detail="not_eligible")
+
+        points = int(settings.get("monthly_reward_points") or 0)
+        if points <= 0:
+            raise HTTPException(status_code=400, detail="no_reward_configured")
+        if wallet is None:
+            raise HTTPException(status_code=503, detail="rewards_unavailable")
+
+        student_doc = await db.students.find_one({"clean_id": sid}, {"_id": 0, "student_id": 1})
+        wallet_sid = (student_doc or {}).get("student_id") or sid
+
+        result = await wallet.credit(
+            wallet_sid, points,
+            source="attendance_monthly",
+            source_ref=period,
+            idempotency_key=idem_key,
+            clean_id=sid,
+        )
+        await db[COLL_CLAIMS].update_one(
+            {"idempotency_key": idem_key},
+            {"$set": {
+                "idempotency_key": idem_key,
+                "student_id": sid,
+                "wallet_student_id": wallet_sid,
+                "clean_id": sid,
+                "source_session_id": None,
+                "source_period": period,
+                "points": points,
+                "status": "claimed",
+                "claimed_at": _utcnow_iso(),
+                "wallet_transaction_id": result.get("transaction_id"),
+            }},
+            upsert=True,
+        )
+        return {"ok": True, "already_claimed": False, "points": points}
+
     # ─────────────────────────────────────────────────────────────────────
     # ADMIN ROUTES
     # ─────────────────────────────────────────────────────────────────────
@@ -1199,6 +1427,24 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     async def admin_delete_session(session_id: str, admin=Depends(require_admin)):
         await db[COLL_SESSIONS].delete_one({"session_id": session_id})
         return {"ok": True}
+
+    @api.get("/admin/attendance/sessions/{session_id}/qr")
+    async def admin_session_qr(session_id: str, join_url: str, admin=Depends(require_admin)):
+        """Renders a scannable QR of the session's join link. `join_url` is
+        built client-side by AttendanceStudio.jsx using the SAME
+        `${window.location.origin}/attendance/j/${slug}` logic
+        copyJoinLink() already uses — the backend doesn't construct URLs for
+        the frontend elsewhere in this module and shouldn't start guessing
+        the deployed frontend's origin here. It's echoed back only to be
+        encoded into a QR image; the mismatch check below ensures an admin's
+        browser can't be tricked into rendering a QR for an unrelated URL
+        through this session's own endpoint."""
+        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
+        if not session:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        if not session.get("join_slug") or session["join_slug"] not in join_url:
+            raise HTTPException(status_code=400, detail="url_session_mismatch")
+        return {"ok": True, "qr_png_data_uri": _render_session_qr(join_url)}
 
     async def _bilingual(copy_block: dict) -> tuple[str, str]:
         title = f"{copy_block.get('title_en','')} / {copy_block.get('title_kh','')}".strip(" /")
@@ -1338,23 +1584,39 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         # (not just its clean_id) so the reward-credit step (§1) can address the
         # wallet by the internal UUID student_id while every other bookkeeping
         # path keeps keying on clean_id.
+        v2 = _v2_active(settings)
         present_students: list[tuple[dict, str]] = []
         for r in roster:
             sid = _norm(r["student_id"])
             rid = f"{session_id}:{sid}"
             rec = await db[COLL_RECORDS].find_one({"_id": rid}, {"_id": 0})
             checked = bool(rec and rec.get("checked_in_at"))
-            final = finalize_status(
-                checked, (rec or {}).get("checkin_status"),
-                bool((rec or {}).get("mid_session_confirmed")), mid_required,
-            )
+            confirmed = bool((rec or {}).get("mid_session_confirmed"))
+            set_fields: dict = {
+                "finalized": True, "updated_at": _utcnow_iso(),
+                "student_id": sid, "session_id": session_id,
+                "class_id": session.get("class_id"),
+            }
+            if v2:
+                # v2: attendance_status is never downgraded by a missed
+                # mid-session tap. verification_status carries that signal
+                # separately and is purely informational.
+                final = finalize_status_v2(checked, (rec or {}).get("checkin_status"))
+                set_fields["status"] = final
+                set_fields["verification_status"] = compute_verification_status(
+                    checked, confirmed, mid_required,
+                )
+            else:
+                # Legacy behavior — byte-for-byte unchanged when v2 is off.
+                final = finalize_status(
+                    checked, (rec or {}).get("checkin_status"), confirmed, mid_required,
+                )
+                set_fields["status"] = final
             await db[COLL_RECORDS].update_one(
                 {"_id": rid},
-                {"$set": {"status": final, "finalized": True, "updated_at": _utcnow_iso(),
-                          "student_id": sid, "session_id": session_id,
-                          "class_id": session.get("class_id")},
+                {"$set": set_fields,
                  "$setOnInsert": {"checked_in_at": (rec or {}).get("checked_in_at"),
-                                  "mid_session_confirmed": bool((rec or {}).get("mid_session_confirmed"))}},
+                                  "mid_session_confirmed": confirmed}},
                 upsert=True,
             )
             if final == ST_ABSENT:
