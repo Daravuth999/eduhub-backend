@@ -460,6 +460,18 @@ def test_monthly_summary_404_when_v2_off(monkeypatch):
         assert getattr(exc, "status_code", None) == 404
 
 
+def _seed_campaign(db, campaign_id="lrc_aug", *, name="August Attendance Bonus",
+                   reward_label="", points=50, enabled=True, reward_kind="points",
+                   start_at=None, end_at=None):
+    db["login_reward_campaigns"].docs[campaign_id] = {
+        "_id": campaign_id, "id": campaign_id, "campaign_id": campaign_id,
+        "name": name, "reward_label": reward_label,
+        "reward_points": points, "reward_kind": reward_kind,
+        "enabled": enabled, "start_at": start_at, "end_at": end_at,
+    }
+    return campaign_id
+
+
 def test_monthly_summary_zero_classes_never_eligible(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     db, router = _build()
@@ -472,11 +484,12 @@ def test_monthly_summary_zero_classes_never_eligible(monkeypatch):
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
 
-def test_monthly_summary_eligible_and_reward_enabled_allows_claim(monkeypatch):
+def test_monthly_summary_eligible_shows_real_campaign_name_and_points(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     db, router = _build()
+    cid = _seed_campaign(db, name="August Attendance Bonus", points=50)
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
-        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_points=200,
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
     _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
@@ -487,16 +500,101 @@ def test_monthly_summary_eligible_and_reward_enabled_allows_claim(monkeypatch):
                 class_id=None, student=_Student("stu_alice"))
     assert res["eligible"] is True
     assert res["reward_enabled"] is True
+    assert res["reward_configured"] is True
+    assert res["reward_name"] == "August Attendance Bonus"  # the REAL campaign name, never invented
+    assert res["reward_points"] == 50                        # the REAL configured points
+    assert res["reward_campaign_status"] == "live"
     assert res["can_claim"] is True
     assert res["already_claimed"] is False
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_summary_reward_label_overrides_campaign_name_when_set(monkeypatch):
+    """reward_label is the student-facing reward identity (e.g. "Attendance
+    Champion"); campaign `name` is the admin's internal campaign title.
+    reward_label wins when the admin has filled it in."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    cid = _seed_campaign(db, name="Internal Aug Campaign", reward_label="Attendance Champion", points=50)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.0, monthly_reward_campaign_id=cid,
+    )
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["reward_name"] == "Attendance Champion"
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_summary_no_campaign_attached_is_not_configured_not_a_fake_reward(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.0, monthly_reward_campaign_id=None,
+    )
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["reward_enabled"] is True
+    assert res["reward_configured"] is False
+    assert res["reward_name"] is None
+    assert res["reward_points"] is None
+    assert res["can_claim"] is False
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_summary_disabled_campaign_is_unavailable_not_claimable(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    cid = _seed_campaign(db, enabled=False)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_1", admin=_Admin())
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["eligible"] is True
+    assert res["reward_configured"] is True
+    assert res["reward_campaign_status"] == "disabled"
+    assert res["can_claim"] is False  # eligible, but the real reward isn't live
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_summary_expired_campaign_is_unavailable(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    cid = _seed_campaign(db, end_at="2020-01-01T00:00:00+00:00")
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.0, monthly_reward_campaign_id=cid,
+    )
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["reward_campaign_status"] == "expired"
+    assert res["can_claim"] is False
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_summary_voucher_only_campaign_cannot_fund_points_reward(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    cid = _seed_campaign(db, reward_kind="voucher", points=0)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.0, monthly_reward_campaign_id=cid,
+    )
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["reward_configured"] is False  # voucher-only campaigns don't count as configured here
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
 
 def test_monthly_summary_reward_disabled_never_allows_claim(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     db, router = _build()
+    cid = _seed_campaign(db)
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
-        monthly_reward_enabled=False, monthly_reward_threshold_pct=0.5,
+        monthly_reward_enabled=False, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
     _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
@@ -507,6 +605,7 @@ def test_monthly_summary_reward_disabled_never_allows_claim(monkeypatch):
                 class_id=None, student=_Student("stu_alice"))
     assert res["eligible"] is True         # attendance itself is still met
     assert res["reward_enabled"] is False
+    assert res["reward_configured"] is False  # not even fetched when the master toggle is off
     assert res["can_claim"] is False        # but claiming stays gated off
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
@@ -541,8 +640,9 @@ def test_monthly_claim_403_when_reward_disabled(monkeypatch):
 def test_monthly_claim_403_when_not_eligible(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     db, router = _build(wallet=_Wallet())
+    cid = _seed_campaign(db)
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
-        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.85,
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.85, monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
     _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
@@ -556,12 +656,13 @@ def test_monthly_claim_403_when_not_eligible(monkeypatch):
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
 
-def test_monthly_claim_success_credits_wallet_server_side_reverified(monkeypatch):
+def test_monthly_claim_success_credits_the_real_configured_points(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     wallet = _Wallet()
     db, router = _build(wallet=wallet)
+    cid = _seed_campaign(db, name="August Attendance Bonus", points=50)
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
-        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_points=200,
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
     _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
@@ -574,12 +675,62 @@ def test_monthly_claim_success_credits_wallet_server_side_reverified(monkeypatch
                 payload={"period": "2026-08"}, student=_Student("stu_alice"))
     assert res["ok"] is True
     assert res["already_claimed"] is False
-    assert res["points"] == 200
+    assert res["points"] == 50
+    assert res["reward_name"] == "August Attendance Bonus"
     assert wallet.calls == calls_after_session_close + 1
     claim = run(db[att.COLL_CLAIMS].find_one(
         {"idempotency_key": "attendance_monthly:2026-08:stu_alice"}))
     assert claim is not None
     assert claim["status"] == "claimed"
+    assert claim["source_campaign_id"] == cid
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_claim_uses_the_points_value_at_claim_time_not_a_stale_cached_number(monkeypatch):
+    """If the admin changes the campaign's points between when the student
+    loaded the summary and when they tap Claim, the amount actually
+    credited is whatever the campaign says RIGHT NOW — proving nothing is
+    cached/copied into attendance_settings."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    wallet = _Wallet()
+    db, router = _build(wallet=wallet)
+    cid = _seed_campaign(db, points=50)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_1", admin=_Admin())
+
+    # Admin bumps the campaign's points AFTER the student's summary loaded.
+    db["login_reward_campaigns"].docs[cid]["reward_points"] = 999
+
+    res = _call(router, "POST", "/attendance/rewards/monthly/claim",
+                payload={"period": "2026-08"}, student=_Student("stu_alice"))
+    assert res["points"] == 999
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_claim_409_when_campaign_became_unavailable(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build(wallet=_Wallet())
+    cid = _seed_campaign(db, enabled=False)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_1", admin=_Admin())
+    try:
+        _call(router, "POST", "/attendance/rewards/monthly/claim",
+              payload={"period": "2026-08"}, student=_Student("stu_alice"))
+        assert False, "expected HTTPException"
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 409
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
 
@@ -587,8 +738,9 @@ def test_monthly_claim_is_idempotent_never_double_credits(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     wallet = _Wallet()
     db, router = _build(wallet=wallet)
+    cid = _seed_campaign(db, points=50)
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
-        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_points=200,
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
     _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
@@ -603,17 +755,18 @@ def test_monthly_claim_is_idempotent_never_double_credits(monkeypatch):
                    payload={"period": "2026-08"}, student=_Student("stu_alice"))
     assert first["already_claimed"] is False
     assert second["already_claimed"] is True
+    assert second["reward_name"] == "August Attendance Bonus"
     # The second request short-circuits on the existing "claimed" row before
     # ever touching the wallet again — only the first claim call reaches it.
     assert wallet.calls == calls_after_session_close + 1
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
 
-def test_monthly_claim_400_when_no_points_configured(monkeypatch):
+def test_monthly_claim_400_when_no_campaign_configured(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     db, router = _build(wallet=_Wallet())
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
-        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_points=0,
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=None,
     )
     _seed_class(db)
     _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
@@ -627,6 +780,29 @@ def test_monthly_claim_400_when_no_points_configured(monkeypatch):
     except Exception as exc:
         assert getattr(exc, "status_code", None) == 400
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pure campaign-status helper
+# ─────────────────────────────────────────────────────────────────────────
+def test_derive_campaign_status_disabled_wins_over_dates():
+    assert att._derive_campaign_status({"enabled": False}) == att.CAMP_DISABLED
+
+
+def test_derive_campaign_status_live_with_no_dates():
+    assert att._derive_campaign_status({"enabled": True}) == att.CAMP_LIVE
+
+
+def test_derive_campaign_status_scheduled_before_start():
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    assert att._derive_campaign_status({"enabled": True, "start_at": future}) == att.CAMP_SCHEDULED
+
+
+def test_derive_campaign_status_expired_after_end():
+    from datetime import datetime, timedelta, timezone
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    assert att._derive_campaign_status({"enabled": True, "end_at": past}) == att.CAMP_EXPIRED
 
 
 # ─────────────────────────────────────────────────────────────────────────
