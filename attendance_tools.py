@@ -69,6 +69,12 @@ COLL_RECORDS = "attendance_records"
 COLL_STREAKS = "attendance_streaks"
 COLL_SETTINGS = "attendance_settings"
 COLL_CLAIMS = "attendance_reward_claims"
+# Append-only admin action log — covers cycle-start changes, session
+# exceptions, and individual record corrections. Modeled on
+# eduhub_platform/config.py's platform_config_audit (the only real audit
+# precedent found in this repo; see _record_audit there) rather than a new,
+# invented shape, since no generic cross-module audit log exists to reuse.
+COLL_ADMIN_AUDIT = "attendance_admin_audit"
 SETTINGS_ID = "attendance_settings"
 
 # ── attendance statuses ──────────────────────────────────────────────────────
@@ -82,6 +88,20 @@ _PRESENT_STATES = {ST_PRESENT_FULL, ST_PRESENT_PARTIAL, ST_LATE}
 SESS_SCHEDULED = "scheduled"
 SESS_OPEN = "open"
 SESS_CLOSED = "closed"
+
+# ── session exceptions (a session that was never genuinely available to
+# attend) ─────────────────────────────────────────────────────────────────
+# A SEPARATE field from `status` above (the open/close/finalize lifecycle
+# machine is left completely untouched). When set, a session is excluded
+# from every student's monthly denominator/numerator — see
+# _student_monthly_statuses — and _do_close never generates "absent"
+# records for it. Only these four values are backend-supported; nothing
+# else may be written here.
+EXC_CANCELLED = "cancelled"
+EXC_TEACHER_UNAVAILABLE = "teacher_unavailable"
+EXC_HOLIDAY = "holiday"
+EXC_TECHNICAL_ISSUE = "technical_issue"
+SESSION_EXCEPTIONS = {EXC_CANCELLED, EXC_TEACHER_UNAVAILABLE, EXC_HOLIDAY, EXC_TECHNICAL_ISSUE}
 
 # ── reliability tiers (ascending) ────────────────────────────────────────────
 TIER_BRONZE = "bronze"
@@ -434,6 +454,13 @@ def default_settings() -> dict:
         # field "id") by id, fetched live at both summary-display and
         # claim time. None = admin hasn't attached a reward yet.
         "monthly_reward_campaign_id": None,
+        # Attendance Cycle effective date (ISO "YYYY-MM-DD"), None = no
+        # cutoff. Set when Attendance launches mid-month so students are
+        # never penalized for classes that predate the system going live —
+        # sessions dated before this are excluded from the monthly
+        # denominator entirely (see _student_monthly_statuses's session
+        # query), not scored as 0% and not artificially inflated either.
+        "attendance_cycle_start": None,
         "checkin_window_minutes": 90,
         "late_grace_minutes": 10,
         "mid_session_enabled": True,
@@ -643,6 +670,21 @@ class SessionIn(BaseModel):
     mid_session_enabled: bool | None = None
 
 
+class RecordCorrectionIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    # Only the four statuses the real Attendance model actually supports —
+    # never an invented one.
+    status: Literal["present_full", "present_partial", "late", "absent"]
+    reason: str
+
+
+class SessionExceptionIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    # None clears a previously-set exception (session goes back to "held").
+    exception: Literal["cancelled", "teacher_unavailable", "holiday", "technical_issue"] | None = None
+    reason: str = ""
+
+
 class CheckInIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     slug: str
@@ -685,6 +727,9 @@ async def ensure_attendance_indexes(db) -> None:
         await db[COLL_CLAIMS].create_index([("student_id", 1), ("status", 1)])
         await db[COLL_CLAIMS].create_index("idempotency_key", unique=True, sparse=True)
         await db[COLL_CLAIMS].create_index("source_session_id")
+        await db[COLL_ADMIN_AUDIT].create_index([("at", -1)])
+        await db[COLL_ADMIN_AUDIT].create_index("student_id")
+        await db[COLL_ADMIN_AUDIT].create_index("session_id")
         log.info("attendance: indexes ensured")
     except Exception as exc:  # noqa: BLE001
         log.warning("attendance: index ensure failed (non-fatal): %s", exc)
@@ -706,6 +751,29 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     async def _load_settings() -> dict:
         stored = await db[COLL_SETTINGS].find_one({"_id": SETTINGS_ID})
         return _merge_settings(stored)
+
+    async def _write_admin_audit(
+        action: str, by: str, *, old_value=None, new_value=None,
+        student_id: str | None = None, session_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Append-only record of an administrative attendance mutation —
+        who, when, what changed, why. Best-effort: an audit-write failure
+        must never block the actual admin action (same non-fatal pattern as
+        platform_config.py's _record_audit)."""
+        try:
+            await db[COLL_ADMIN_AUDIT].insert_one({
+                "action": action,  # "cycle_start_change" | "session_exception" | "record_correction"
+                "old_value": old_value,
+                "new_value": new_value,
+                "student_id": student_id,
+                "session_id": session_id,
+                "reason": reason,
+                "by": by or "",
+                "at": _utcnow_iso(),
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("attendance: admin audit write failed for %r: %s", action, exc)
 
     def _sid(student) -> str:
         return _norm(getattr(student, "clean_id", "") or getattr(student, "student_id", ""))
@@ -1022,6 +1090,12 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 # v2 is off, since finalize_status() (the legacy path) never
                 # writes it. Purely additive.
                 "verification_status": r.get("verification_status"),
+                # True only after an authorized admin correction (see
+                # admin_correct_record) — lets the student see "Present ·
+                # Updated" instead of having to wonder why a percentage
+                # changed, without exposing who/why/when (that detail stays
+                # in attendance_admin_audit, admin-only).
+                "corrected": bool(r.get("corrected")),
             })
         # Compute present/late/absent counts directly from history for the summary.
         present_count = sum(1 for h in history if h["status"] in (ST_PRESENT_FULL, ST_PRESENT_PARTIAL))
@@ -1280,13 +1354,33 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         }
 
     # ── v2: rollout status, monthly analytics, monthly reward claim ────────
-    async def _student_monthly_statuses(sid: str, period: str, class_id: str | None) -> list[str]:
+    async def _student_monthly_statuses(
+        sid: str, period: str, class_id: str | None, *, cycle_start: str | None = None,
+    ) -> list[str]:
+        """The single source of truth for "which sessions count this month."
+        Every consumer (student summary, history, claim, admin preview,
+        goal-reached push) goes through this one function, so a fairness fix
+        here — the cycle-start cutoff, excepted sessions — automatically
+        applies everywhere at once; nothing computes a parallel percentage.
+
+        cycle_start excludes sessions dated before Attendance's effective
+        launch date (mid-month launch fairness) — a month entirely before it
+        naturally reads as `total=0` via compute_monthly_stats, the same
+        "no classes yet" state already handled everywhere, never a
+        fabricated 0%. Sessions with a `exception` set (cancelled / teacher
+        unavailable / holiday / technical issue) are dropped regardless of
+        whether a record already exists for them — a class that was never
+        genuinely available to attend can't count against or for a student.
+        """
         sessions_q: dict = {"date": {"$regex": f"^{period}"}}
         if class_id:
             sessions_q["class_id"] = class_id
+        if cycle_start:
+            sessions_q["date"]["$gte"] = cycle_start
         session_ids = [
             s["session_id"]
-            async for s in db[COLL_SESSIONS].find(sessions_q, {"_id": 0, "session_id": 1})
+            async for s in db[COLL_SESSIONS].find(sessions_q, {"_id": 0, "session_id": 1, "exception": 1})
+            if not s.get("exception")
         ]
         if not session_ids:
             return []
@@ -1315,7 +1409,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             raise HTTPException(status_code=404, detail="not_available")
         sid = _sid(student)
         period = month or _utcnow().strftime("%Y-%m")
-        statuses = await _student_monthly_statuses(sid, period, class_id)
+        cycle_start = settings.get("attendance_cycle_start")
+        statuses = await _student_monthly_statuses(sid, period, class_id, cycle_start=cycle_start)
         stats = compute_monthly_stats(statuses)
         threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
         elig = compute_monthly_eligibility(stats, threshold)
@@ -1342,6 +1437,13 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "stats": stats,
             "required_pct": elig["required_pct"],
             "eligible": elig["met"],
+            # stats.attended/stats.total already ARE the eligible-classes
+            # count (excluded/cancelled sessions never enter the query that
+            # produces them) — the frontend builds "6/7 eligible classes"
+            # straight from those two fields, no separate field needed.
+            # cycle_start is echoed back only so the frontend can decide
+            # whether the mid-month-launch explanation banner applies.
+            "cycle_start": cycle_start,
             "reward_enabled": reward_enabled,
             "reward_configured": campaign is not None,
             "reward_name": (campaign or {}).get("name"),
@@ -1365,12 +1467,13 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             raise HTTPException(status_code=404, detail="not_available")
         sid = _sid(student)
         threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
+        cycle_start = settings.get("attendance_cycle_start")
         current = _utcnow().strftime("%Y-%m")
         n = max(1, min(int(months), 12))
         out = []
         for back in range(n):
             period = _shift_period(current, back)
-            statuses = await _student_monthly_statuses(sid, period, class_id)
+            statuses = await _student_monthly_statuses(sid, period, class_id, cycle_start=cycle_start)
             stats = compute_monthly_stats(statuses)
             elig = compute_monthly_eligibility(stats, threshold)
             out.append({
@@ -1404,7 +1507,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
 
         # Re-verify eligibility fresh, server-side — the client's own summary
         # view is never trusted for the actual grant decision.
-        statuses = await _student_monthly_statuses(sid, period, class_id)
+        statuses = await _student_monthly_statuses(
+            sid, period, class_id, cycle_start=settings.get("attendance_cycle_start"))
         stats = compute_monthly_stats(statuses)
         threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
         elig = compute_monthly_eligibility(stats, threshold)
@@ -1488,10 +1592,20 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
 
     @api.put("/admin/attendance/settings")
     async def admin_put_settings(payload: SettingsIn, admin=Depends(require_admin)):
+        previous = await _load_settings()
         merged = _merge_settings(payload.settings)
         merged["_id"] = SETTINGS_ID
         merged["updated_at"] = _utcnow_iso()
         await db[COLL_SETTINGS].replace_one({"_id": SETTINGS_ID}, merged, upsert=True)
+        # The Attendance Cycle date directly changes what counts as fair for
+        # every student's eligibility — an audit trail here, not just for
+        # session/record edits, per the "no casual manipulation" requirement.
+        if previous.get("attendance_cycle_start") != merged.get("attendance_cycle_start"):
+            await _write_admin_audit(
+                "cycle_start_change", admin.email,
+                old_value=previous.get("attendance_cycle_start"),
+                new_value=merged.get("attendance_cycle_start"),
+            )
         return {"ok": True, "settings": merged}
 
     @api.get("/admin/attendance/classes")
@@ -1600,6 +1714,35 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     async def admin_delete_session(session_id: str, admin=Depends(require_admin)):
         await db[COLL_SESSIONS].delete_one({"session_id": session_id})
         return {"ok": True}
+
+    @api.patch("/admin/attendance/sessions/{session_id}/exception")
+    async def admin_set_session_exception(
+        session_id: str, payload: SessionExceptionIn, admin=Depends(require_admin),
+    ):
+        """A class that was never genuinely available to attend — cancelled,
+        teacher unavailable, a holiday, or a technical failure — must never
+        lower a student's monthly percentage. Setting `exception` here is
+        the single point that excludes this session from every monthly
+        calculation (see _student_monthly_statuses) and, for a session not
+        yet closed, prevents _do_close from ever generating "absent" rows
+        for it. Clearing it (exception=None) puts the session back to
+        counting normally."""
+        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
+        if not session:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        old_value = session.get("exception")
+        new_value = payload.exception
+        await db[COLL_SESSIONS].update_one(
+            {"session_id": session_id},
+            {"$set": {"exception": new_value, "exception_updated_at": _utcnow_iso()}},
+        )
+        if old_value != new_value:
+            await _write_admin_audit(
+                "session_exception", admin.email,
+                old_value=old_value, new_value=new_value,
+                session_id=session_id, reason=payload.reason.strip() or None,
+            )
+        return {"ok": True, "session_id": session_id, "exception": new_value}
 
     @api.get("/admin/attendance/sessions/{session_id}/qr")
     async def admin_session_qr(session_id: str, join_url: str, admin=Depends(require_admin)):
@@ -1746,6 +1889,31 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     async def _do_close(session: dict, settings: dict) -> dict:
         """Core close logic — shared by HTTP route and heartbeat."""
         session_id = session["session_id"]
+
+        # A session marked with an exception (cancelled / teacher unavailable
+        # / holiday / technical issue) was never genuinely available to
+        # attend — closing it must never generate "absent" records for a
+        # roster that had nothing to attend. Short-circuit before any of the
+        # per-student finalize/reward/push logic below runs: mark closed and
+        # stop. Any check-in records that already exist (a student joined
+        # before the exception was set) are left untouched as historical
+        # fact — never rewritten — but _student_monthly_statuses excludes
+        # this session_id from every monthly calculation regardless of what
+        # records exist for it, so this early return is a belt-and-braces
+        # guard against generating NEW bad records, not the sole enforcement
+        # point for fairness.
+        if session.get("exception"):
+            await db[COLL_SESSIONS].update_one(
+                {"session_id": session_id},
+                {"$set": {"status": SESS_CLOSED, "closed_at": _utcnow_iso()}},
+            )
+            return {
+                "ok": True, "present_count": 0, "absent_count": 0, "rewards_credited": 0,
+                "miss_followup_sent": 0, "escalation_sent": 0, "at_risk_auto_sent": 0,
+                "goal_reached_sent": 0, "monthly_reward_ready_sent": 0,
+                "excepted": session["exception"],
+            }
+
         mid_required = bool(session.get("mid_session_enabled", True)) and \
             bool((settings.get("notifications") or {}).get("mid_session_push_enabled", True))
         cls = await db[COLL_CLASSES].find_one({"class_id": session.get("class_id")}, {"_id": 0})
@@ -2003,7 +2171,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 already_reward = streak.get("reward_ready_notified_period") == period
                 if already_goal and already_reward:
                     continue
-                statuses = await _student_monthly_statuses(sid, period, None)
+                statuses = await _student_monthly_statuses(
+                    sid, period, None, cycle_start=settings.get("attendance_cycle_start"))
                 elig = compute_monthly_eligibility(compute_monthly_stats(statuses), threshold)
                 if not elig["met"]:
                     continue
@@ -2166,22 +2335,34 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     @api.get("/admin/attendance/monthly-reward/preview")
     async def admin_monthly_reward_preview(
         threshold_pct: float, month: str | None = None, class_id: str | None = None,
+        cycle_start: str | None = None,
         admin=Depends(require_admin),
     ):
         """Live "N/M students currently qualify" preview for the Settings
-        threshold slider — recomputed server-side from the SAME
+        threshold slider (and, per the fairness directive, the cycle-start
+        date field) — recomputed server-side from the SAME
         compute_monthly_stats/compute_monthly_eligibility pair the real
         per-student summary and claim routes use, never a separate estimate.
-        Read-only; never called from the student-facing routes."""
+        Read-only; never called from the student-facing routes.
+
+        `cycle_start` is an optional CANDIDATE override — Author Studio can
+        preview "students currently eligible: 8/33" for a date the admin is
+        considering before saving it. Omit it to preview against the
+        currently-saved cycle_start (or no cutoff at all if none is set)."""
         period = month or _utcnow().strftime("%Y-%m")
         roster = await _all_rostered_students(class_id)
+        if cycle_start is None:
+            settings = await _load_settings()
+            cycle_start = settings.get("attendance_cycle_start")
         qualifying = 0
         for s in roster:
-            statuses = await _student_monthly_statuses(s["student_id"], period, class_id)
+            statuses = await _student_monthly_statuses(
+                s["student_id"], period, class_id, cycle_start=cycle_start)
             stats = compute_monthly_stats(statuses)
             if compute_monthly_eligibility(stats, threshold_pct)["met"]:
                 qualifying += 1
-        return {"period": period, "class_id": class_id, "qualifying": qualifying, "total": len(roster)}
+        return {"period": period, "class_id": class_id, "qualifying": qualifying, "total": len(roster),
+                "cycle_start": cycle_start}
 
     @api.get("/admin/attendance/sessions/{session_id}/roster")
     async def admin_session_roster(session_id: str, admin=Depends(require_admin)):
@@ -2216,6 +2397,7 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 "display_name": s["display_name"],
                 "status": status,
                 "checked_in_at": checked_in_at,
+                "corrected": bool((rec or {}).get("corrected")),
             })
         rows.sort(key=lambda r: r["display_name"].lower())
         present = sum(1 for r in rows if r["status"] in (ST_PRESENT_FULL, ST_PRESENT_PARTIAL))
@@ -2225,6 +2407,7 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "session_id": session_id,
             "class_id": session.get("class_id"),
             "status": session.get("status"),
+            "exception": session.get("exception"),
             "roster": rows,
             "total": len(rows),
             "checked_in": checked_in,
@@ -2232,6 +2415,68 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "late": late,
             "absent": sum(1 for r in rows if r["status"] == ST_ABSENT),
         }
+
+    @api.patch("/admin/attendance/records/{session_id}/{student_id}")
+    async def admin_correct_record(
+        session_id: str, student_id: str, payload: RecordCorrectionIn, admin=Depends(require_admin),
+    ):
+        """Authorized correction of one student's recorded status for one
+        session (e.g. Absent -> Present when automatic check-in failed but
+        the teacher confirms real participation). Never a silent rewrite:
+        a non-empty reason is required and every correction is written to
+        attendance_admin_audit (old status, new status, who, when, why).
+
+        No separate recalculation step exists or is needed — monthly stats
+        (compute_monthly_stats/compute_monthly_eligibility) are always
+        computed live from attendance_records on every request, never
+        cached, so this correction is reflected in the student's
+        percentage, eligibility, and reward state on their very next
+        summary/history fetch."""
+        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
+        if not session:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        sid = _norm(student_id)
+        reason = payload.reason.strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail="reason_required")
+        rid = f"{session_id}:{sid}"
+        existing = await db[COLL_RECORDS].find_one({"_id": rid}, {"_id": 0})
+        old_status = (existing or {}).get("status") or ST_ABSENT
+        await db[COLL_RECORDS].update_one(
+            {"_id": rid},
+            {"$set": {
+                "student_id": sid, "session_id": session_id,
+                "class_id": session.get("class_id"),
+                "status": payload.status, "finalized": True,
+                "corrected": True, "corrected_at": _utcnow_iso(),
+                "corrected_by": admin.email, "correction_reason": reason,
+                "updated_at": _utcnow_iso(),
+            }},
+            upsert=True,
+        )
+        await _write_admin_audit(
+            "record_correction", admin.email,
+            old_value=old_status, new_value=payload.status,
+            student_id=sid, session_id=session_id, reason=reason,
+        )
+        return {"ok": True, "session_id": session_id, "student_id": sid,
+                "old_status": old_status, "new_status": payload.status}
+
+    @api.get("/admin/attendance/audit")
+    async def admin_list_audit(
+        student_id: str | None = None, session_id: str | None = None,
+        limit: int = 100, admin=Depends(require_admin),
+    ):
+        """Read-only transparency view over attendance_admin_audit — a
+        secondary/advanced tool, not surfaced prominently in the primary
+        Author Studio screen."""
+        q: dict = {}
+        if student_id:
+            q["student_id"] = _norm(student_id)
+        if session_id:
+            q["session_id"] = session_id
+        cur = db[COLL_ADMIN_AUDIT].find(q, {"_id": 0}).sort("at", -1).limit(max(1, min(int(limit), 500)))
+        return {"entries": [e async for e in cur]}
 
     # ── Heartbeat — auto open/close sessions so teacher can focus on teaching ──
 
