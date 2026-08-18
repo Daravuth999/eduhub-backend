@@ -401,6 +401,67 @@ def test_checkin_returns_tracked_false_when_window_closed():
     assert res["meet_url"] == "https://meet.google.com/stale"   # still reaches class
 
 
+def test_checkin_race_recovers_when_a_prior_write_already_succeeded():
+    """The exact reported bug: checkinWithRetry's first attempt writes a
+    real record but its HTTP response is lost (network drop); the retry
+    lands after the window has closed. The retry must return the REAL
+    tracked=True/status, never a false "not recorded" for a student who
+    genuinely already checked in."""
+    from datetime import datetime, timedelta, timezone
+    db, router, _ = _build()
+    _seed_class(db)
+    now = datetime.now(timezone.utc)
+    db[att.COLL_SESSIONS].docs["ses_race"] = {
+        "_id": "ses_race", "session_id": "ses_race", "class_id": "cls_x",
+        "join_slug": "race-slug", "meet_url": "https://meet.google.com/race",
+        "status": att.SESS_OPEN,
+        "opens_at": (now - timedelta(hours=1)).isoformat(),
+        "closes_at": (now - timedelta(minutes=1)).isoformat(),  # already closed
+        "grace_minutes": 10, "mid_session_enabled": True,
+        "date": now.date().isoformat(),
+    }
+    # A record already exists (the lost-response first attempt succeeded).
+    db[att.COLL_RECORDS].docs["ses_race:stu_alice"] = {
+        "_id": "ses_race:stu_alice", "student_id": "stu_alice", "session_id": "ses_race",
+        "class_id": "cls_x", "status": att.ST_PRESENT_FULL, "checkin_status": att.ST_PRESENT_FULL,
+        "checked_in_at": (now - timedelta(minutes=5)).isoformat(),
+        "mid_session_confirmed": False, "method": "checkin",
+        "attributed_via": "session_identity", "miss_reason": None,
+        "finalized": False, "updated_at": (now - timedelta(minutes=5)).isoformat(),
+    }
+    res = _call(router, "POST", "/attendance/checkin",
+                payload=att.CheckInIn(slug="race-slug"), student=_Student("stu_alice"))
+    assert res["tracked"] is True
+    assert res["ok"] is True
+    assert res["status"] == att.ST_PRESENT_FULL
+    assert res["is_open"] is False  # honestly reflects the window state
+    assert res["meet_url"] == "https://meet.google.com/race"
+
+
+def test_checkin_after_window_closed_never_creates_a_new_record():
+    """A genuinely-late first-ever arrival (no prior record exists) must
+    still be tracked=False — the race-recovery lookup is read-only and
+    never silently checks a student in for the first time after the
+    window has closed."""
+    from datetime import datetime, timedelta, timezone
+    db, router, _ = _build()
+    _seed_class(db)
+    now = datetime.now(timezone.utc)
+    db[att.COLL_SESSIONS].docs["ses_late"] = {
+        "_id": "ses_late", "session_id": "ses_late", "class_id": "cls_x",
+        "join_slug": "late-slug", "meet_url": "https://meet.google.com/late",
+        "status": att.SESS_OPEN,
+        "opens_at": (now - timedelta(hours=2)).isoformat(),
+        "closes_at": (now - timedelta(hours=1)).isoformat(),
+        "grace_minutes": 10, "mid_session_enabled": True,
+        "date": now.date().isoformat(),
+    }
+    res = _call(router, "POST", "/attendance/checkin",
+                payload=att.CheckInIn(slug="late-slug"), student=_Student("stu_alice"))
+    assert res["tracked"] is False
+    assert "ses_late:stu_alice" not in db[att.COLL_RECORDS].docs
+
+
 def test_open_session_resets_expired_window():
     """admin_open_session refreshes opens_at/closes_at when the window has already expired."""
     from datetime import datetime, timedelta, timezone

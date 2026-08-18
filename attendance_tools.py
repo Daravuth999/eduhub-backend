@@ -970,11 +970,26 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 log.warning("attendance: checkin write failed (degrading): %s", exc)
                 record = None
         else:
+            # A PRIOR request may already have written a real record before
+            # the window closed — e.g. checkinWithRetry's first attempt
+            # succeeded server-side but its HTTP response was lost (network
+            # drop, backgrounded tab), and the retry lands a moment later
+            # once is_open has flipped to False. Never tell an already-
+            # checked-in student "not recorded" just because THIS request
+            # arrived a beat too late — read-only lookup, never writes a
+            # NEW check-in here (a genuinely-late arrival after the window
+            # closes must still not be silently checked in for the first
+            # time).
+            rid = await _record_id(session["session_id"], target_sid)
+            existing = await db[COLL_RECORDS].find_one({"_id": rid}, {"_id": 0})
+            if existing and existing.get("checked_in_at"):
+                record = existing
             log.info(
                 "attendance: checkin outside open window — session=%s sid=%s "
-                "status=%s opens=%s closes=%s now=%s",
+                "status=%s opens=%s closes=%s now=%s existing_record=%s",
                 session.get("session_id"), target_sid, session.get("status"),
                 session.get("opens_at"), session.get("closes_at"), _iso(now),
+                bool(record),
             )
 
         # Always surface the Meet URL so the student reaches class even if the
