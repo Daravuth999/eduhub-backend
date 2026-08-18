@@ -98,9 +98,9 @@ def test_close_session_credits_once_and_is_idempotent():
                session_id="ses_1", admin=_Admin())
     assert r1["present_count"] == 1
     assert r1["absent_count"] == 0
-    # diamond multiplier (perfect record) × base 5 = 10
+    # diamond multiplier (perfect record) × base 1 (P0 rebuild default) = 2
     first_total = wallet.total
-    assert first_total == 10
+    assert first_total == 2
 
     # Running the SAME trigger again must not double-pay.
     _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
