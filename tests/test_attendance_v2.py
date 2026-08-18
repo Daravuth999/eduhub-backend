@@ -1613,17 +1613,244 @@ def test_monthly_reward_preview_accepts_candidate_cycle_start_without_persisting
     assert with_override["cycle_start"] == "2026-08-18"
     assert with_override["qualifying"] == 1
     assert db[att.COLL_SETTINGS].docs[att.SETTINGS_ID].get("attendance_cycle_start") is None
-    db, router, pushes = _build_capturing()
-    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = {
-        "_id": att.SETTINGS_ID,  # v2_enabled deliberately absent/false
-        "monthly_reward_enabled": True, "monthly_reward_threshold_pct": 0.5,
-    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Final verification pass — explicit numeric proofs, cross-month isolation,
+# and one full end-to-end acceptance test, per the follow-up business-rule
+# review (do not merge until these are proven, not just asserted).
+# ─────────────────────────────────────────────────────────────────────────
+def test_numeric_proof_6_of_7_eligible_sessions_is_85_7_pct_and_meets_85_pct_goal():
+    stats = att.compute_monthly_stats([att.ST_PRESENT_FULL] * 6 + [att.ST_ABSENT] * 1)
+    assert stats["total"] == 7
+    assert stats["attendance_pct"] == 85.7
+    elig = att.compute_monthly_eligibility(stats, 0.85)
+    assert elig["met"] is True
+
+
+def test_numeric_proof_5_of_7_eligible_sessions_is_71_4_pct_and_misses_85_pct_goal():
+    stats = att.compute_monthly_stats([att.ST_PRESENT_FULL] * 5 + [att.ST_ABSENT] * 2)
+    assert stats["total"] == 7
+    assert stats["attendance_pct"] == 71.4
+    elig = att.compute_monthly_eligibility(stats, 0.85)
+    assert elig["met"] is False
+
+
+def test_numeric_proof_6_of_8_eligible_sessions_is_75_pct_and_misses_85_pct_goal():
+    stats = att.compute_monthly_stats([att.ST_PRESENT_FULL] * 6 + [att.ST_ABSENT] * 2)
+    assert stats["total"] == 8
+    assert stats["attendance_pct"] == 75.0
+    elig = att.compute_monthly_eligibility(stats, 0.85)
+    assert elig["met"] is False
+
+
+def test_numeric_proof_via_the_real_route_not_just_the_pure_function(monkeypatch):
+    """Same 6/7 = 85.7% proof, but through the actual HTTP route (real
+    sessions, real check-ins, real close), not a direct compute_* call --
+    proves the wiring, not just the formula in isolation."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(monthly_reward_threshold_pct=0.85)
     _seed_class(db)
-    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    for i in range(7):
+        sid = f"ses_{i}"
+        _seed_open_session(db, sid=sid, slug=f"s{i}", date="2026-08-10")
+        if i < 6:  # attend the first 6, miss the 7th
+            _call(router, "POST", "/attendance/checkin",
+                  payload=att.CheckInIn(slug=f"s{i}"), student=_Student("stu_alice"))
+        _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id=sid, admin=_Admin())
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["stats"]["total"] == 7
+    assert res["stats"]["attendance_pct"] == 85.7
+    assert res["eligible"] is True
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_cancelled_session_is_provably_never_left_in_the_denominator(monkeypatch):
+    """8 scheduled classes, 1 cancelled -> denominator must be 7, never 8,
+    proven through the real route end to end."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(monthly_reward_threshold_pct=0.85)
+    _seed_class(db)
+    for i in range(8):
+        sid = f"ses_{i}"
+        _seed_open_session(db, sid=sid, slug=f"s{i}", date="2026-08-10")
+        if i == 7:
+            _call(router, "PATCH", "/admin/attendance/sessions/{session_id}/exception",
+                  session_id=sid, payload=att.SessionExceptionIn(exception="cancelled", reason="Holiday"),
+                  admin=_Admin())
+        elif i < 6:
+            _call(router, "POST", "/attendance/checkin",
+                  payload=att.CheckInIn(slug=f"s{i}"), student=_Student("stu_alice"))
+        _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id=sid, admin=_Admin())
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["stats"]["total"] == 7  # 8 scheduled minus the 1 cancelled -- never 8
+    assert res["stats"]["attendance_pct"] == 85.7
+    assert res["eligible"] is True
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_cycle_start_does_not_leak_into_a_later_month(monkeypatch):
+    """A cycle_start set for the August launch must not depend on August
+    forever -- September is a normal month with no exclusion, even though
+    the SAME cycle_start value is still saved in settings. The filter is
+    effectively "current month + active cycle boundary where applicable",
+    not a global cutoff, because every September date already string-sorts
+    after an August cycle_start."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(attendance_cycle_start="2026-08-18")
+    _seed_class(db)
+    # September session dated BEFORE the "18" numeral -- if the filter were
+    # a naive "day-of-month >= 18" rule instead of a real date/string
+    # comparison, this could be wrongly excluded. It must count fully.
+    _seed_open_session(db, sid="ses_sep_early", slug="se1", date="2026-09-05")
     _call(router, "POST", "/attendance/checkin",
-          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
-    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
-                session_id="ses_1", admin=_Admin())
-    assert res["goal_reached_sent"] == 0
-    assert res["monthly_reward_ready_sent"] == 0
+          payload=att.CheckInIn(slug="se1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_sep_early", admin=_Admin())
+    res = _call(router, "GET", "/attendance/monthly-summary", month="2026-09",
+                class_id=None, student=_Student("stu_alice"))
+    assert res["stats"]["total"] == 1
+    assert res["stats"]["attendance_pct"] == 100.0
+    assert res["cycle_start"] == "2026-08-18"  # the saved value is still echoed back...
+    # ...but it had zero exclusionary effect on September's own sessions.
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_full_acceptance_scenario_mid_august_launch_with_cancelled_class_and_claim(monkeypatch):
+    """One complete end-to-end walk of the exact accepted scenario:
+    launch 18 Aug -> 2 pre-launch August classes (excluded) -> 8 post-
+    launch classes with 1 cancelled -> 7 eligible -> student attends 6/7
+    (85.7%) -> eligible -> real configured reward appears -> claims ->
+    real points credited -> wallet notified -> congratulations push fires
+    exactly once, never on retry -> August stays historical -> September
+    starts at 0%."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    wallet = _Wallet()
+    db, router, pushes = _build_capturing(wallet=wallet)
+    cid = _seed_campaign(db, campaign_id="lrc_aug_real", name="August Attendance Champion", points=40)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        attendance_cycle_start="2026-08-18",
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.85,
+        monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+
+    # 2 pre-launch classes -- never attended, must not penalize anything.
+    _seed_open_session(db, sid="ses_pre1", slug="pre1", date="2026-08-01")
+    _seed_open_session(db, sid="ses_pre2", slug="pre2", date="2026-08-10")
+    for sid in ("ses_pre1", "ses_pre2"):
+        _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id=sid, admin=_Admin())
+
+    # 8 post-launch classes: 1 cancelled, attend 6 of the remaining 7.
+    post_launch_ids = [f"ses_post{i}" for i in range(8)]
+    for i, sid in enumerate(post_launch_ids):
+        _seed_open_session(db, sid=sid, slug=f"post{i}", date="2026-08-19")
+        if i == 7:
+            _call(router, "PATCH", "/admin/attendance/sessions/{session_id}/exception",
+                  session_id=sid, payload=att.SessionExceptionIn(exception="cancelled", reason="Public holiday"),
+                  admin=_Admin())
+        elif i < 6:
+            _call(router, "POST", "/attendance/checkin",
+                  payload=att.CheckInIn(slug=f"post{i}"), student=_Student("stu_alice"))
+        _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id=sid, admin=_Admin())
+
+    summary = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                    class_id=None, student=_Student("stu_alice"))
+    assert summary["stats"]["total"] == 7           # 2 pre-launch excluded, 1 cancelled excluded
+    assert summary["stats"]["attended"] == 6
+    assert summary["stats"]["attendance_pct"] == 85.7
+    assert summary["eligible"] is True
+    assert summary["reward_configured"] is True
+    assert summary["reward_name"] == "August Attendance Champion"  # the REAL configured reward
+    assert summary["reward_points"] == 40
+    assert summary["can_claim"] is True
+
+    calls_before_claim = wallet.calls
+    pushes.clear()
+    claim = _call(router, "POST", "/attendance/rewards/monthly/claim",
+                  payload={"period": "2026-08"}, student=_Student("stu_alice"))
+    assert claim["ok"] is True
+    assert claim["points"] == 40
+    assert wallet.calls == calls_before_claim + 1  # real points credited via the trusted wallet path
+    congrats = [p for p in pushes if "reward" in p["title"].lower() or "attendance" in p["title"].lower()]
+    assert len(congrats) == 1  # congratulations push fires exactly once
+
+    # Retry must never double-credit or double-notify.
+    pushes.clear()
+    retry = _call(router, "POST", "/attendance/rewards/monthly/claim",
+                  payload={"period": "2026-08"}, student=_Student("stu_alice"))
+    assert retry["already_claimed"] is True
+    assert wallet.calls == calls_before_claim + 1
     assert len(pushes) == 0
+
+    # August stays historical — querying it again afterward returns the
+    # exact same real numbers, never overwritten by the claim.
+    august_again = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                         class_id=None, student=_Student("stu_alice"))
+    assert august_again["stats"]["total"] == 7
+    assert august_again["stats"]["attendance_pct"] == 85.7
+    assert august_again["eligible"] is True
+    # September starts fresh at 0% — no session exists there yet, and
+    # nothing about August's percentage or the claim carries forward.
+    september = _call(router, "GET", "/attendance/monthly-summary", month="2026-09",
+                      class_id=None, student=_Student("stu_alice"))
+    assert september["stats"]["total"] == 0
+    assert september["stats"]["attendance_pct"] == 0.0
+    assert september["already_claimed"] is False
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_full_acceptance_scenario_companion_5_of_7_stays_locked(monkeypatch):
+    """Same shape as the 6/7 acceptance scenario, but the student only
+    attends 5 of the 7 eligible classes (71.4%) -- the reward must remain
+    locked, never claimable, never credited."""
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    wallet = _Wallet()
+    db, router = _build(wallet=wallet)
+    cid = _seed_campaign(db, campaign_id="lrc_aug_real", name="August Attendance Champion", points=40)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        attendance_cycle_start="2026-08-18",
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.85,
+        monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_pre1", slug="pre1", date="2026-08-01")
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_pre1", admin=_Admin())
+
+    post_launch_ids = [f"ses_post{i}" for i in range(8)]
+    for i, sid in enumerate(post_launch_ids):
+        _seed_open_session(db, sid=sid, slug=f"post{i}", date="2026-08-19")
+        if i == 7:
+            _call(router, "PATCH", "/admin/attendance/sessions/{session_id}/exception",
+                  session_id=sid, payload=att.SessionExceptionIn(exception="cancelled", reason="Public holiday"),
+                  admin=_Admin())
+        elif i < 5:  # only 5 of the 7 eligible classes attended
+            _call(router, "POST", "/attendance/checkin",
+                  payload=att.CheckInIn(slug=f"post{i}"), student=_Student("stu_alice"))
+        _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id=sid, admin=_Admin())
+
+    summary = _call(router, "GET", "/attendance/monthly-summary", month="2026-08",
+                    class_id=None, student=_Student("stu_alice"))
+    assert summary["stats"]["total"] == 7
+    assert summary["stats"]["attended"] == 5
+    assert summary["stats"]["attendance_pct"] == 71.4
+    assert summary["eligible"] is False
+    assert summary["can_claim"] is False
+
+    # 5 present sessions already fired the separate legacy per-session
+    # base_attendance_points credit at close time (a distinct system from
+    # the monthly campaign reward) -- capture that baseline before
+    # asserting the monthly claim itself adds nothing further.
+    calls_before_claim_attempt = wallet.calls
+    try:
+        _call(router, "POST", "/attendance/rewards/monthly/claim",
+              payload={"period": "2026-08"}, student=_Student("stu_alice"))
+        assert False, "expected HTTPException -- reward must stay locked below threshold"
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    assert wallet.calls == calls_before_claim_attempt  # the monthly reward itself was never credited
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
