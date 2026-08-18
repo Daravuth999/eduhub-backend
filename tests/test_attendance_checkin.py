@@ -194,6 +194,12 @@ class _Router:
             return fn
         return d
 
+    def patch(s, p):
+        def d(fn):
+            s.routes[("PATCH", p)] = fn
+            return fn
+        return d
+
 
 class _Student:
     def __init__(s, sid="stu_alice"):
