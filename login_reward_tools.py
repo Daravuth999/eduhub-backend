@@ -140,6 +140,24 @@ def _lrc_campaign_status(camp: dict, now: datetime | None = None) -> str:
     return "live"
 
 
+async def lrc_get_campaign_public(db, campaign_id: str | None) -> dict | None:
+    """Read-only campaign lookup for modules outside the reward chain (e.g.
+    attendance_tools.py, which attaches a campaign to its own attendance
+    rule and needs to display its real name/points/status). This is the
+    one sanctioned way to read login_reward_campaigns from outside this
+    module — keeps the collection's single-owner invariant real instead of
+    just documented. Returns the raw campaign doc plus a derived "status"
+    field, or None if it doesn't exist / no id was given.
+    """
+    if not campaign_id:
+        return None
+    camp = await db["login_reward_campaigns"].find_one({"id": campaign_id}, {"_id": 0})
+    if not camp:
+        return None
+    camp["status"] = _lrc_campaign_status(camp)
+    return camp
+
+
 def _lrc_eligible(camp: dict, student_norm_id: str) -> bool:
     aud = (camp.get("audience_type") or "all").lower()
     include = camp.get("include_student_ids") or []
