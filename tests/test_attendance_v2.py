@@ -877,3 +877,157 @@ def test_me_history_verification_status_absent_on_legacy_records(monkeypatch):
     res = _call(router, "GET", "/attendance/me", student=_Student("stu_alice"))
     assert res["history"][0]["verification_status"] is None
     assert res["history"][0]["status"] == att.ST_PRESENT_PARTIAL  # legacy unchanged
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# _shift_period — pure "YYYY-MM" arithmetic
+# ─────────────────────────────────────────────────────────────────────────
+def test_shift_period_one_month_back():
+    assert att._shift_period("2026-08", 1) == "2026-07"
+
+
+def test_shift_period_crosses_year_boundary():
+    assert att._shift_period("2026-08", 8) == "2025-12"
+
+
+def test_shift_period_zero_is_identity():
+    assert att._shift_period("2026-08", 0) == "2026-08"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /attendance/monthly-history — Attendance History card's own data,
+# separate from the per-session recent list.
+# ─────────────────────────────────────────────────────────────────────────
+def test_monthly_history_404_when_v2_off():
+    db, router = _build()
+    try:
+        _call(router, "GET", "/attendance/monthly-history", months=6, class_id=None,
+              student=_Student("stu_alice"))
+        assert False, "expected HTTPException"
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 404
+
+
+def test_monthly_history_current_month_first_reflects_real_attendance(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(monthly_reward_threshold_pct=0.5)
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+          session_id="ses_1", admin=_Admin())
+    res = _call(router, "GET", "/attendance/monthly-history", months=3, class_id=None,
+                student=_Student("stu_alice"))
+    assert len(res["months"]) == 3
+    current = res["months"][0]
+    assert current["period"] == "2026-08"
+    assert current["stats"]["total"] == 1
+    assert current["eligible"] is True
+    # Older months with nothing recorded are never a fake passing grade.
+    assert res["months"][1]["stats"]["total"] == 0
+    assert res["months"][1]["eligible"] is False
+
+
+def test_monthly_history_months_param_clamped(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router = _build()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings()
+    _seed_class(db)
+    res = _call(router, "GET", "/attendance/monthly-history", months=999, class_id=None,
+                student=_Student("stu_alice"))
+    assert len(res["months"]) == 12  # clamped, never an unbounded scan
+    res2 = _call(router, "GET", "/attendance/monthly-history", months=0, class_id=None,
+                 student=_Student("stu_alice"))
+    assert len(res2["months"]) == 1  # clamped to at least 1
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /admin/attendance/monthly-reward/preview — live "N/M qualify" for the
+# Settings threshold slider, server-side, same eligibility functions as the
+# real per-student routes.
+# ─────────────────────────────────────────────────────────────────────────
+def test_admin_preview_counts_qualifying_students_against_class_roster():
+    db, router = _build()
+    _seed_class(db, roster=("stu_alice", "stu_bob"))
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    # stu_bob never checks in — 0% this month.
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+          session_id="ses_1", admin=_Admin())
+    res = _call(router, "GET", "/admin/attendance/monthly-reward/preview",
+                threshold_pct=0.5, month="2026-08", class_id=None, admin=_Admin())
+    assert res["total"] == 2       # whole class roster, not just those with records
+    assert res["qualifying"] == 1  # only stu_alice meets 50%
+
+
+def test_admin_preview_scoped_to_one_class_excludes_other_classes_roster():
+    db, router = _build()
+    _seed_class(db, roster=("stu_alice",), cid="cls_a")
+    _seed_class(db, roster=("stu_bob",), cid="cls_b")
+    res = _call(router, "GET", "/admin/attendance/monthly-reward/preview",
+                threshold_pct=0.5, month="2026-08", class_id="cls_a", admin=_Admin())
+    assert res["total"] == 1
+    assert res["class_id"] == "cls_a"
+
+
+def test_admin_preview_unscoped_dedupes_students_across_classes():
+    db, router = _build()
+    _seed_class(db, roster=("stu_alice",), cid="cls_a")
+    _seed_class(db, roster=("stu_alice", "stu_bob"), cid="cls_b")
+    res = _call(router, "GET", "/admin/attendance/monthly-reward/preview",
+                threshold_pct=0.5, month="2026-08", class_id=None, admin=_Admin())
+    assert res["total"] == 2  # stu_alice counted once, not twice
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /admin/attendance/sessions/{session_id}/roster — real-time per-student
+# roster for ONE session (name, check-in time, status), never invented.
+# ─────────────────────────────────────────────────────────────────────────
+def test_admin_session_roster_shows_present_pending_and_absent():
+    db, router = _build()
+    _seed_class(db, roster=("stu_alice", "stu_bob", "stu_carol"))
+    _seed_open_session(db, sid="ses_1", slug="s1")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    res = _call(router, "GET", "/admin/attendance/sessions/{session_id}/roster",
+                session_id="ses_1", admin=_Admin())
+    assert res["total"] == 3
+    by_id = {r["student_id"]: r for r in res["roster"]}
+    assert by_id["stu_alice"]["status"] == att.ST_PRESENT_FULL
+    assert by_id["stu_alice"]["checked_in_at"] is not None
+    assert by_id["stu_alice"]["display_name"] == "STU_ALICE"
+    # Session still open — never-checked-in students are "pending", not
+    # falsely marked absent while there's still time to check in.
+    assert by_id["stu_bob"]["status"] == "pending"
+    assert by_id["stu_bob"]["checked_in_at"] is None
+    assert res["checked_in"] == 1
+    assert res["present"] == 1
+
+
+def test_admin_session_roster_marks_absent_once_session_closed():
+    db, router = _build()
+    _seed_class(db, roster=("stu_alice", "stu_bob"))
+    _seed_open_session(db, sid="ses_1", slug="s1")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+          session_id="ses_1", admin=_Admin())
+    res = _call(router, "GET", "/admin/attendance/sessions/{session_id}/roster",
+                session_id="ses_1", admin=_Admin())
+    by_id = {r["student_id"]: r for r in res["roster"]}
+    assert by_id["stu_bob"]["status"] == att.ST_ABSENT
+    assert res["absent"] == 1
+
+
+def test_admin_session_roster_404_unknown_session():
+    db, router = _build()
+    try:
+        _call(router, "GET", "/admin/attendance/sessions/{session_id}/roster",
+              session_id="ses_missing", admin=_Admin())
+        assert False, "expected HTTPException"
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 404

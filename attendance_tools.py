@@ -231,6 +231,15 @@ def compute_monthly_eligibility(stats: dict, threshold_pct: float) -> dict:
     return {"required_pct": required_pct, "met": met}
 
 
+def _shift_period(period: str, months_back: int) -> str:
+    """"YYYY-MM" arithmetic without pulling in a calendar dependency —
+    used to walk backwards N months for the student-facing monthly
+    history list."""
+    y, m = (int(x) for x in period.split("-"))
+    total = (y * 12 + (m - 1)) - months_back
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
 def _clamp01(x: float) -> float:
     try:
         x = float(x)
@@ -727,6 +736,21 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                 "display_name": s.get("display_name") or s.get("clean_id") or s.get("student_id"),
             })
         return out
+
+    async def _all_rostered_students(class_id: str | None) -> list[dict]:
+        """The population the monthly reward actually applies to — every
+        student enrolled in the given class, or (unscoped) the union of every
+        attendance-tracked class's roster, deduplicated by student_id. Never
+        the raw students collection — an unenrolled account shouldn't count
+        toward "students who qualify"."""
+        if class_id:
+            cls = await db[COLL_CLASSES].find_one({"class_id": class_id}, {"_id": 0})
+            return await _class_roster(cls) if cls else []
+        seen: dict[str, dict] = {}
+        async for cls in db[COLL_CLASSES].find({}, {"_id": 0}):
+            for s in await _class_roster(cls):
+                seen.setdefault(s["student_id"], s)
+        return list(seen.values())
 
     async def _record_id(session_id: str, sid: str) -> str:
         return f"{session_id}:{_norm(sid)}"
@@ -1320,6 +1344,36 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "already_claimed": already_claimed,
             "can_claim": can_claim,
         }
+
+    @api.get("/attendance/monthly-history")
+    async def attendance_monthly_history(
+        months: int = 6, class_id: str | None = None,
+        student=Depends(require_student),
+    ):
+        """Past N months (current month first) of stats + eligibility — the
+        Attendance History card's own data, kept separate from the recent
+        per-session list. months is clamped to a sane range so a malformed
+        client query can't force an unbounded scan."""
+        settings = await _load_settings()
+        if not _v2_active(settings):
+            raise HTTPException(status_code=404, detail="not_available")
+        sid = _sid(student)
+        threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
+        current = _utcnow().strftime("%Y-%m")
+        n = max(1, min(int(months), 12))
+        out = []
+        for back in range(n):
+            period = _shift_period(current, back)
+            statuses = await _student_monthly_statuses(sid, period, class_id)
+            stats = compute_monthly_stats(statuses)
+            elig = compute_monthly_eligibility(stats, threshold)
+            out.append({
+                "period": period,
+                "stats": stats,
+                "required_pct": elig["required_pct"],
+                "eligible": elig["met"],
+            })
+        return {"months": out}
 
     @api.post("/attendance/rewards/monthly/claim")
     async def attendance_monthly_claim(payload: dict | None = None,
@@ -2023,6 +2077,76 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "per_class": totals,
             "per_student": out_students,
             "by_date": sorted(by_date.values(), key=lambda x: x["date"]),
+        }
+
+    @api.get("/admin/attendance/monthly-reward/preview")
+    async def admin_monthly_reward_preview(
+        threshold_pct: float, month: str | None = None, class_id: str | None = None,
+        admin=Depends(require_admin),
+    ):
+        """Live "N/M students currently qualify" preview for the Settings
+        threshold slider — recomputed server-side from the SAME
+        compute_monthly_stats/compute_monthly_eligibility pair the real
+        per-student summary and claim routes use, never a separate estimate.
+        Read-only; never called from the student-facing routes."""
+        period = month or _utcnow().strftime("%Y-%m")
+        roster = await _all_rostered_students(class_id)
+        qualifying = 0
+        for s in roster:
+            statuses = await _student_monthly_statuses(s["student_id"], period, class_id)
+            stats = compute_monthly_stats(statuses)
+            if compute_monthly_eligibility(stats, threshold_pct)["met"]:
+                qualifying += 1
+        return {"period": period, "class_id": class_id, "qualifying": qualifying, "total": len(roster)}
+
+    @api.get("/admin/attendance/sessions/{session_id}/roster")
+    async def admin_session_roster(session_id: str, admin=Depends(require_admin)):
+        """Real-time per-student roster for ONE session — name, check-in
+        time, status — cross-joining the session's class roster against
+        attendance_records. Distinct from admin_report(), which aggregates
+        across a whole month and never carries display names or check-in
+        times. A roster student with no record yet is "pending" while the
+        session is still open, else "absent" — never invented as anything
+        else."""
+        session = await db[COLL_SESSIONS].find_one({"session_id": session_id}, {"_id": 0})
+        if not session:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        cls = await db[COLL_CLASSES].find_one({"class_id": session.get("class_id")}, {"_id": 0})
+        roster = await _class_roster(cls) if cls else []
+        records = {
+            r["student_id"]: r
+            async for r in db[COLL_RECORDS].find({"session_id": session_id}, {"_id": 0})
+        }
+        is_open = session.get("status") == SESS_OPEN
+        rows = []
+        for s in roster:
+            rec = records.get(s["student_id"])
+            if rec:
+                status = rec.get("status") or ST_ABSENT
+                checked_in_at = rec.get("checked_in_at")
+            else:
+                status = "pending" if is_open else ST_ABSENT
+                checked_in_at = None
+            rows.append({
+                "student_id": s["student_id"],
+                "display_name": s["display_name"],
+                "status": status,
+                "checked_in_at": checked_in_at,
+            })
+        rows.sort(key=lambda r: r["display_name"].lower())
+        present = sum(1 for r in rows if r["status"] in (ST_PRESENT_FULL, ST_PRESENT_PARTIAL))
+        late = sum(1 for r in rows if r["status"] == ST_LATE)
+        checked_in = sum(1 for r in rows if r["status"] not in ("pending", ST_ABSENT))
+        return {
+            "session_id": session_id,
+            "class_id": session.get("class_id"),
+            "status": session.get("status"),
+            "roster": rows,
+            "total": len(rows),
+            "checked_in": checked_in,
+            "present": present,
+            "late": late,
+            "absent": sum(1 for r in rows if r["status"] == ST_ABSENT),
         }
 
     # ── Heartbeat — auto open/close sessions so teacher can focus on teaching ──
