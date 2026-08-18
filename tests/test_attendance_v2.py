@@ -786,6 +786,55 @@ def test_monthly_claim_is_idempotent_never_double_credits(monkeypatch):
     monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
 
 
+def test_monthly_claim_success_fires_congratulations_push_with_real_points(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    wallet = _Wallet()
+    db, router, pushes = _build_capturing(wallet=wallet)
+    cid = _seed_campaign(db, name="August Attendance Bonus", points=50)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_1", admin=_Admin())
+    pushes.clear()  # only care about the claim's own push from here
+
+    _call(router, "POST", "/attendance/rewards/monthly/claim",
+          payload={"period": "2026-08"}, student=_Student("stu_alice"))
+    assert len(pushes) == 1
+    assert "50" in pushes[0]["body"]
+    assert pushes[0]["query"]["studentId"]["$in"] == ["stu_alice"]
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_monthly_claim_retry_never_resends_the_congratulations_push(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    wallet = _Wallet()
+    db, router, pushes = _build_capturing(wallet=wallet)
+    cid = _seed_campaign(db, points=50)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5, monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_1", admin=_Admin())
+    pushes.clear()
+
+    _call(router, "POST", "/attendance/rewards/monthly/claim",
+          payload={"period": "2026-08"}, student=_Student("stu_alice"))
+    assert len(pushes) == 1
+    # A retry (double-tap, refresh, retry-after-timeout) hits the
+    # already-claimed early return — must never re-send the congratulations.
+    _call(router, "POST", "/attendance/rewards/monthly/claim",
+          payload={"period": "2026-08"}, student=_Student("stu_alice"))
+    assert len(pushes) == 1
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
 def test_monthly_claim_400_when_no_campaign_configured(monkeypatch):
     monkeypatch.setenv(att.V2_ENV_VAR, "true")
     db, router = _build(wallet=_Wallet())

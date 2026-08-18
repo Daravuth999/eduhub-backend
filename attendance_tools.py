@@ -1463,6 +1463,29 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             }},
             upsert=True,
         )
+
+        # Congratulations push — fires ONLY here, after the credit above
+        # actually succeeded, never at eligibility time (that's the separate
+        # monthly_reward_ready push) and never on the already-claimed early
+        # return above, so a retried/duplicate claim can never re-send it.
+        # Reuses the SAME "reward_claimed" copy block + push flag the
+        # legacy per-session claim flow already uses (§1265 above) rather
+        # than inventing a second congratulations message.
+        if settings.get("reward_claimed_push_enabled", True):
+            copy_block = (settings.get("copy") or {}).get("reward_claimed", {})
+            raw_title = copy_block.get("title_en") or "Attendance reward"
+            raw_title_kh = copy_block.get("title_kh") or "រង្វាន់វត្តមាន"
+            raw_body = copy_block.get("body_en") or "+{points} points added to your account."
+            raw_body_kh = copy_block.get("body_kh") or "ពិន្ទុ +{points} ត្រូវបានបញ្ចូលទៅគណនីរបស់អ្នក។"
+            title = f"{raw_title} / {raw_title_kh}"
+            body = f"{raw_body.replace('{points}', str(points))} {raw_body_kh.replace('{points}', str(points))}"
+            try:
+                if callable(fan_out_push) and callable(build_target_query):
+                    query = build_target_query("students", [sid], None)
+                    await fan_out_push(query, title, body, "/attendance")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("attendance: monthly reward_claimed push failed: %s", exc)
+
         return {"ok": True, "already_claimed": False, "points": points, "reward_name": campaign["name"]}
 
     # ─────────────────────────────────────────────────────────────────────
