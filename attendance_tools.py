@@ -470,8 +470,12 @@ def default_settings() -> dict:
         "escalation_threshold": 70,
         "consecutive_absence_threshold": 2,
         # reward economy — base points credited per present session, scaled by
-        # the student's reliability-tier multiplier.
-        "base_attendance_points": 5,
+        # the student's reliability-tier multiplier. Author-Studio-configurable
+        # to exactly 1 / 2 / 3 (see admin_put_settings's validation below) —
+        # this is Layer A (per-session point accumulation), completely
+        # separate from the monthly_reward_* fields above (Layer B, the
+        # once-per-month campaign claim). Never a daily/session claim.
+        "base_attendance_points": 1,
         "reward_tiers": [
             {"tier": TIER_BRONZE, "min_attendance_rate": 0.0, "min_on_time_rate": 0.0, "multiplier": 1.0},
             {"tier": TIER_SILVER, "min_attendance_rate": 0.7, "min_on_time_rate": 0.6, "multiplier": 1.25},
@@ -1405,6 +1409,35 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
         )
         return [r.get("status") async for r in cur if r.get("status")]
 
+    async def _student_monthly_points(
+        sid: str, period: str, class_id: str | None, *, cycle_start: str | None = None,
+    ) -> int:
+        """Layer A total — accumulated per-session attendance points credited
+        this month. Deliberately mirrors _student_monthly_statuses's own
+        session-id query (same cycle_start cutoff, same exception exclusion)
+        so this can never drift out of sync with what counts as an eligible
+        session for the monthly percentage. This is NOT the monthly reward
+        (Layer B) — it's a running total of the small per-session credits
+        recorded on each record by _do_close, purely informational, with no
+        claim button of its own."""
+        sessions_q: dict = {"date": {"$regex": f"^{period}"}}
+        if class_id:
+            sessions_q["class_id"] = class_id
+        if cycle_start:
+            sessions_q["date"]["$gte"] = cycle_start
+        session_ids = [
+            s["session_id"]
+            async for s in db[COLL_SESSIONS].find(sessions_q, {"_id": 0, "session_id": 1, "exception": 1})
+            if not s.get("exception")
+        ]
+        if not session_ids:
+            return 0
+        cur = db[COLL_RECORDS].find(
+            {"session_id": {"$in": session_ids}, "student_id": sid},
+            {"_id": 0, "points_credited": 1},
+        )
+        return sum([int(r.get("points_credited") or 0) async for r in cur])
+
     @api.get("/attendance/v2-status")
     async def attendance_v2_status():
         """Unauthenticated, boolean-only — fail-closed status check the
@@ -1446,12 +1479,18 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             reward_enabled and campaign and campaign["status"] == CAMP_LIVE
             and elig["met"] and not already_claimed
         )
+        # Layer A — accumulated per-session points, entirely separate from
+        # the Layer B monthly reward computed above. No claim state, no
+        # claim button; purely a running total for transparency.
+        points_this_month = await _student_monthly_points(sid, period, class_id, cycle_start=cycle_start)
         return {
             "period": period,
             "class_id": class_id,
             "stats": stats,
             "required_pct": elig["required_pct"],
             "eligible": elig["met"],
+            "base_attendance_points": int(settings.get("base_attendance_points") or 0),
+            "attendance_points_this_month": points_this_month,
             # stats.attended/stats.total already ARE the eligible-classes
             # count (excluded/cancelled sessions never enter the query that
             # produces them) — the frontend builds "6/7 eligible classes"
@@ -1607,6 +1646,17 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
 
     @api.put("/admin/attendance/settings")
     async def admin_put_settings(payload: SettingsIn, admin=Depends(require_admin)):
+        # Layer A config — points per eligible Present session. Constrained
+        # to exactly 1/2/3 (never a free-form number) so this can never be
+        # confused with, or misconfigured to resemble, the Layer B monthly
+        # reward's own point value.
+        if "base_attendance_points" in payload.settings:
+            bap = payload.settings["base_attendance_points"]
+            if bap not in (1, 2, 3):
+                raise HTTPException(
+                    status_code=400,
+                    detail="base_attendance_points must be 1, 2, or 3",
+                )
         previous = await _load_settings()
         merged = _merge_settings(payload.settings)
         merged["_id"] = SETTINGS_ID
@@ -2088,6 +2138,18 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                             clean_id=clean_sid,
                         )
                         credited += 1
+                        # Layer A bookkeeping — records exactly what this ONE
+                        # session credited, on the record it already owns
+                        # (attendance_records), so "points this month" can be
+                        # summed later without reading wallet_service's own
+                        # ledger collection (points_transactions) at all. A
+                        # $set (not $inc) here mirrors wallet.credit()'s own
+                        # idempotency: re-processing the same session always
+                        # re-sets the same amount, never accumulates twice.
+                        await db[COLL_RECORDS].update_one(
+                            {"_id": f"{session_id}:{_norm(clean_sid)}"},
+                            {"$set": {"points_credited": amount}},
+                        )
                     except Exception as exc:  # noqa: BLE001
                         log.warning("attendance: reward credit failed sid=%s: %s", wallet_sid, exc)
 
