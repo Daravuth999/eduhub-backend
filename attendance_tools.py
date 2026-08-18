@@ -39,6 +39,8 @@ from typing import Any, Literal
 import segno
 from pydantic import BaseModel, ConfigDict, Field
 
+from login_reward_tools import _lrc_campaign_status, lrc_get_campaign_public
+
 log = logging.getLogger("eduhub.attendance")
 
 # ── v2 rollout flag ──────────────────────────────────────────────────────
@@ -577,33 +579,15 @@ def _render_session_qr(payload_text: str) -> str:
 # config. Reads only — never calls login_reward_tools.py's audience
 # eligibility or claim routes, since a campaign's normal audience gate
 # (all/specific/exclude) has no relationship to an attendance-percentage
-# rule. login_reward_campaigns is read directly (same pattern attendance
-# already uses to read db.students — a plain cross-module read, not a
-# private-function import) since login_reward_tools.py exposes no
-# dedicated public "get campaign status" API via DI.
+# rule. The underlying login-reward campaigns collection is read exclusively
+# inside login_reward_tools.py via lrc_get_campaign_public(db, campaign_id)
+# — this module goes through that accessor only, so the collection keeps a
+# single real owner (see tools/check_collection_ownership.py --strict).
 # ─────────────────────────────────────────────────────────────────────────────
 CAMP_LIVE = "live"
 CAMP_SCHEDULED = "scheduled"
 CAMP_EXPIRED = "expired"
 CAMP_DISABLED = "disabled"
-
-
-def _derive_campaign_status(camp: dict, now: datetime | None = None) -> str:
-    """Mirrors login_reward_tools.py's _lrc_campaign_status() exactly
-    (disabled/scheduled/live/expired) — duplicated rather than imported
-    to keep attendance_tools.py from reaching into another module's
-    private (`_lrc_`-prefixed) internals; this is ~6 lines of pure logic,
-    cheap to keep in sync and unit-tested on both sides."""
-    if not camp.get("enabled"):
-        return CAMP_DISABLED
-    now = now or _utcnow()
-    start = _parse_iso(camp.get("start_at"))
-    end = _parse_iso(camp.get("end_at"))
-    if start and now < start:
-        return CAMP_SCHEDULED
-    if end and now > end:
-        return CAMP_EXPIRED
-    return CAMP_LIVE
 
 
 async def _fetch_reward_campaign(db, campaign_id: str | None) -> dict | None:
@@ -612,9 +596,7 @@ async def _fetch_reward_campaign(db, campaign_id: str | None) -> dict | None:
     doesn't carry a points component (voucher-only campaigns can't fund
     an attendance points reward). Never cached — the campaign's current
     name/points/status are authoritative every time this is called."""
-    if not campaign_id:
-        return None
-    camp = await db["login_reward_campaigns"].find_one({"id": campaign_id}, {"_id": 0})
+    camp = await lrc_get_campaign_public(db, campaign_id)
     if not camp:
         return None
     points = int(camp.get("reward_points") or 0)
@@ -624,8 +606,17 @@ async def _fetch_reward_campaign(db, campaign_id: str | None) -> dict | None:
         "campaign_id": campaign_id,
         "name": camp.get("reward_label") or camp.get("name") or "",
         "points": points,
-        "status": _derive_campaign_status(camp),
+        "status": camp["status"],
     }
+
+
+def _derive_campaign_status(camp: dict, now: datetime | None = None) -> str:
+    """Thin re-export of login_reward_tools._lrc_campaign_status — kept as a
+    module-level name here (rather than inlined) because tests exercise it
+    directly, matching the pure-function-import convention this codebase's
+    other reward-chain siblings already use (e.g. mystery_box_tools.py's
+    `from login_reward_tools import _lrc_voucher_discount_label`)."""
+    return _lrc_campaign_status(camp, now)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
