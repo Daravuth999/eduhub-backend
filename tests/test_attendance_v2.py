@@ -234,6 +234,30 @@ def _build(wallet=None):
     return db, router
 
 
+def _build_capturing(wallet=None):
+    """Same as _build() but records every fan_out_push call — for the
+    monthly goal-reached/reward-ready push tests, which need to assert on
+    WHICH students were targeted and with what copy, not just that a route
+    didn't crash."""
+    db = _DB()
+    router = _Router()
+    pushes = []
+
+    async def fan_out(query, title, body, url):
+        pushes.append({"query": query, "title": title, "body": body, "url": url})
+        return (1, 0)
+
+    def build_q(target, ids, group):
+        return {"target": target, "studentId": {"$in": list(ids or [])}}
+
+    att.register_attendance_routes(
+        router, db, require_admin=_Admin(), require_student=object(),
+        current_student=None, fan_out_push=fan_out, build_target_query=build_q,
+        norm_student_id=lambda v: str(v or "").strip().lower(), wallet=wallet,
+    )
+    return db, router, pushes
+
+
 def _seed_class(db, roster=("stu_alice",), cid="cls_x"):
     db[att.COLL_CLASSES].docs[cid] = {
         "_id": cid, "class_id": cid, "title_en": "English A1", "title_kh": "",
@@ -1031,3 +1055,129 @@ def test_admin_session_roster_404_unknown_session():
         assert False, "expected HTTPException"
     except Exception as exc:
         assert getattr(exc, "status_code", None) == 404
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Monthly goal-reached / monthly-reward-ready pushes (session-close trigger)
+# ─────────────────────────────────────────────────────────────────────────
+def test_close_fires_goal_reached_push_when_threshold_met_no_campaign(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router, pushes = _build_capturing()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+                session_id="ses_1", admin=_Admin())
+    assert res["goal_reached_sent"] == 1
+    assert res["monthly_reward_ready_sent"] == 0  # no campaign attached
+    goal_pushes = [p for p in pushes if p["title"] and "goal" in p["title"].lower()]
+    assert len(goal_pushes) == 1
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_close_fires_both_pushes_when_a_live_campaign_is_attached(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router, pushes = _build_capturing()
+    cid = _seed_campaign(db, name="August Attendance Bonus", points=50)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5,
+        monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+                session_id="ses_1", admin=_Admin())
+    assert res["goal_reached_sent"] == 1
+    assert res["monthly_reward_ready_sent"] == 1
+    assert len(pushes) == 2
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_close_never_resends_goal_reached_or_reward_ready_same_month(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router, pushes = _build_capturing()
+    cid = _seed_campaign(db, name="August Attendance Bonus", points=50)
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5,
+        monthly_reward_campaign_id=cid,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+          session_id="ses_1", admin=_Admin())
+    assert len(pushes) == 2
+
+    # A second session closes for the same student, same month — already
+    # eligible from the first close, must never re-notify.
+    _seed_open_session(db, sid="ses_2", slug="s2", date="2026-08-02")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s2"), student=_Student("stu_alice"))
+    res2 = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+                 session_id="ses_2", admin=_Admin())
+    assert res2["goal_reached_sent"] == 0
+    assert res2["monthly_reward_ready_sent"] == 0
+    assert len(pushes) == 2  # unchanged
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_close_no_push_when_below_threshold(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router, pushes = _build_capturing()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=True, monthly_reward_threshold_pct=0.99,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    # stu_alice never checks in — 0% this month, well below 99%. Session
+    # close still legitimately fires ITS OWN unrelated absentee pushes
+    # (miss_followup etc.) — this test only asserts the NEW monthly
+    # goal/reward pushes stay silent, not that close() sends nothing at all.
+    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+                session_id="ses_1", admin=_Admin())
+    assert res["goal_reached_sent"] == 0
+    assert res["monthly_reward_ready_sent"] == 0
+    assert not any("goal" in p["title"].lower() or "reward" in p["title"].lower() for p in pushes)
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_close_no_push_when_monthly_reward_disabled(monkeypatch):
+    monkeypatch.setenv(att.V2_ENV_VAR, "true")
+    db, router, pushes = _build_capturing()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(
+        monthly_reward_enabled=False, monthly_reward_threshold_pct=0.5,
+    )
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+                session_id="ses_1", admin=_Admin())
+    assert res["goal_reached_sent"] == 0
+    assert res["monthly_reward_ready_sent"] == 0
+    assert len(pushes) == 0
+    monkeypatch.delenv(att.V2_ENV_VAR, raising=False)
+
+
+def test_close_no_monthly_push_when_v2_off():
+    db, router, pushes = _build_capturing()
+    db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = {
+        "_id": att.SETTINGS_ID,  # v2_enabled deliberately absent/false
+        "monthly_reward_enabled": True, "monthly_reward_threshold_pct": 0.5,
+    }
+    _seed_class(db)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    _call(router, "POST", "/attendance/checkin",
+          payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
+    res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
+                session_id="ses_1", admin=_Admin())
+    assert res["goal_reached_sent"] == 0
+    assert res["monthly_reward_ready_sent"] == 0
+    assert len(pushes) == 0

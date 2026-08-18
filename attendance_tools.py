@@ -519,6 +519,21 @@ def default_settings() -> dict:
                 "body_en": "Congratulations! +{points} points have been added to your account.",
                 "body_kh": "សូមអបអរសាទរ! ពិន្ទុ +{points} ត្រូវបានបញ្ចូលទៅគណនីរបស់អ្នកដោយជោគជ័យ។",
             },
+            # Monthly Login-Rewards-campaign-backed reward (Phase 7/8) — distinct
+            # from "reward_ready" above, which is the legacy per-session
+            # base_attendance_points claim flow.
+            "monthly_goal_reached": {
+                "title_en": "Monthly goal reached",
+                "title_kh": "សម្រេចបានគោលដៅប្រចាំខែ",
+                "body_en": "You've qualified for your attendance reward this month.",
+                "body_kh": "អ្នកបានមានលក្ខណៈសម្បត្តិគ្រប់គ្រាន់សម្រាប់រង្វាន់វត្តមានប្រចាំខែនេះ។",
+            },
+            "monthly_reward_ready": {
+                "title_en": "Your attendance reward is ready",
+                "title_kh": "រង្វាន់វត្តមានរបស់អ្នករួចរាល់ហើយ",
+                "body_en": "Your attendance reward is ready to claim.",
+                "body_kh": "រង្វាន់វត្តមានរបស់អ្នកអាចទទួលបានហើយ។",
+            },
         },
         "updated_at": _utcnow_iso(),
     }
@@ -1945,6 +1960,59 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                             {"$set": {"last_at_risk_nudge_at": _utcnow_iso()}},
                         )
 
+        # 7) Monthly goal-reached / monthly-reward-ready pushes. Distinct from
+        # the per-session "reward_ready" push above (§3, the legacy
+        # base_attendance_points claim flow) — this is about the MONTHLY
+        # Login-Rewards-campaign-backed reward from Phase 7/8. Event-driven
+        # like every other push in this function: it only re-evaluates a
+        # roster student's monthly eligibility at session-close time, using
+        # the SAME compute_monthly_stats/compute_monthly_eligibility pair
+        # the student-facing summary/claim routes use — never a separate
+        # estimate. Each of the two events is deduped once per student per
+        # month via its own stored period-stamp (so re-closing a session, or
+        # a later session closing after the goal was already reached, never
+        # re-sends); they're tracked separately so attaching a campaign
+        # AFTER a student already got the goal-reached push still lets the
+        # separate reward-ready push fire on that student's next close.
+        goal_sent = 0
+        monthly_reward_ready_sent = 0
+        if v2 and settings.get("monthly_reward_enabled"):
+            period = _utcnow().strftime("%Y-%m")
+            threshold = float(settings.get("monthly_reward_threshold_pct") or 0.85)
+            campaign = await _fetch_reward_campaign(db, settings.get("monthly_reward_campaign_id"))
+            goal_ids: list[str] = []
+            ready_ids: list[str] = []
+            for r in roster:
+                sid = _norm(r["student_id"])
+                streak = await db[COLL_STREAKS].find_one({"student_id": sid}, {"_id": 0}) or {}
+                already_goal = streak.get("goal_reached_notified_period") == period
+                already_reward = streak.get("reward_ready_notified_period") == period
+                if already_goal and already_reward:
+                    continue
+                statuses = await _student_monthly_statuses(sid, period, None)
+                elig = compute_monthly_eligibility(compute_monthly_stats(statuses), threshold)
+                if not elig["met"]:
+                    continue
+                updates: dict = {}
+                if not already_goal:
+                    goal_ids.append(r["student_id"])
+                    updates["goal_reached_notified_period"] = period
+                if not already_reward and campaign and campaign["status"] == CAMP_LIVE:
+                    ready_ids.append(r["student_id"])
+                    updates["reward_ready_notified_period"] = period
+                if updates:
+                    await db[COLL_STREAKS].update_one(
+                        {"student_id": sid},
+                        {"$set": updates, "$setOnInsert": {"student_id": sid}},
+                        upsert=True,
+                    )
+            if goal_ids:
+                title, body = await _bilingual((settings.get("copy") or {}).get("monthly_goal_reached", {}))
+                goal_sent, _ = await _push("students", goal_ids, title, body, "/attendance")
+            if ready_ids:
+                title, body = await _bilingual((settings.get("copy") or {}).get("monthly_reward_ready", {}))
+                monthly_reward_ready_sent, _ = await _push("students", ready_ids, title, body, "/attendance")
+
         return {
             "ok": True,
             "present_count": len(present_students),
@@ -1953,6 +2021,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "miss_followup_sent": miss_sent,
             "escalation_sent": esc_sent,
             "at_risk_auto_sent": atrisk_sent,
+            "goal_reached_sent": goal_sent,
+            "monthly_reward_ready_sent": monthly_reward_ready_sent,
         }
 
     @api.post("/admin/attendance/sessions/{session_id}/close")
