@@ -194,6 +194,16 @@ def _stub_sync_studio(monkeypatch):
 
     monkeypatch.setattr(vpt.video_render_tools, "extract_audio_track", _no_extraction)
 
+    # Same reasoning as extract_audio_track above, for the synchronization
+    # step's ground-truth timing probe (also real ffprobe) — this file's
+    # own correctness (watchdog/staleness) is unrelated to that diagnostic,
+    # and None is itself a real, honest "could not determine" result, not
+    # a shortcut.
+    async def _no_duration_probe(*a, **k):
+        return None
+
+    monkeypatch.setattr(vpt.video_render_tools, "probe_audio_duration_seconds", _no_duration_probe)
+
 
 # ── the actual regression: a stalled I/O call must become a truthful
 #    "failed" state, never an eternal "running" one ────────────────────────

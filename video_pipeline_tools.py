@@ -280,7 +280,45 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
                     {"lessonId": lesson_id, "durationSec": {"$in": [0, 0.0, None]}},
                     {"$set": {"durationSec": round(duration, 3)}},
                 )
-            await _set_step(db, lesson_id, run_id, "synchronization", "complete")
+            # Ground-truth timing check (2026-08 word-highlight-desync
+            # investigation). sync_doc's durationSec is ENTIRELY self-
+            # reported by Gemini — the last transcribed word's own end
+            # timestamp (see video_ai_provider.segments_to_sync); nothing
+            # upstream cross-checks it against the media's real, measured
+            # length. Long-context timestamp drift is a documented failure
+            # mode of multimodal ASR that this pipeline has no way to
+            # correct (fixing it would mean either fabricating corrected
+            # timestamps, which is never acceptable, or wiring in a real
+            # word-level ASR vendor as a second AI provider, which is
+            # explicitly out of scope for this fix). What CAN be done
+            # honestly is detection: reusing the existing ffprobe-based
+            # duration probe (already used elsewhere for narration
+            # assembly, never before wired into THIS pipeline) to catch
+            # the one case that is unambiguous, not a guess — Gemini's
+            # self-reported last-word timestamp landing AFTER the media's
+            # own real, measured end, which is a logical impossibility and
+            # hard proof the reported timing is wrong. This never blocks
+            # or fails the pipeline; it only leaves a note on the
+            # synchronization step for whoever reviews the transcript.
+            sync_note = None
+            if duration > 0:
+                try:
+                    measured = await video_render_tools.probe_audio_duration_seconds(transcribe_bytes)
+                except Exception:  # noqa: BLE001 — diagnostic only, never fatal
+                    measured = None
+                if measured is not None and duration > measured + 1.0:
+                    sync_note = (
+                        f"timing check: Gemini's transcript reports speech ending at "
+                        f"{duration:.1f}s, but the media measures {measured:.1f}s — the "
+                        f"reported timing exceeds the real duration and is not reliable. "
+                        f"Recommend reviewing playback sync before approving."
+                    )
+                    logger.warning(
+                        "video_pipeline: reported duration exceeds measured duration "
+                        "lesson=%s reported=%.3f measured=%.3f",
+                        lesson_id, duration, measured,
+                    )
+            await _set_step(db, lesson_id, run_id, "synchronization", "complete", sync_note)
         else:
             transcript_text = ""
             await _set_step(db, lesson_id, run_id, "speech_recognition", "skipped",
