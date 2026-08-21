@@ -7544,6 +7544,41 @@ register_edutalk_routes(api, db, require_admin, require_student)
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
 
+# ── Friday Vault (Speaking Lab Phase 1, additive, dark by default) ────────
+# One new beat between the teacher's existing Accept and the existing
+# Mystery Box reveal — POST .../vault/grant. Reuses login_reward_hooks'
+# credit_via_treasury (the SAME treasury path Mystery Box's own points
+# grant already uses) and the SAME push-notify adapter Direct Join uses.
+# Never imports/touches mystery_box_tools.py or lucky_draw.py — Phase 2
+# and the existing Mystery Box weighting are completely unaffected.
+# Gated by speaking_lab_feature_flags.vault_enabled (hard off by default).
+try:
+    from speaking_lab_vault import (
+        register_speaking_lab_vault_routes, ensure_speaking_lab_vault_indexes,
+    )
+    register_speaking_lab_vault_routes(
+        api, db, require_admin,
+        credit_via_treasury=(
+            _login_reward_hooks.credit_via_treasury if _login_reward_hooks else None
+        ),
+        push_notify=_speaking_lab_direct_join_push_notify,
+    )
+
+    @app.on_event("startup")
+    async def _speaking_lab_vault_startup():
+        try:
+            await ensure_speaking_lab_vault_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "speaking_lab_vault: index ensure failed (non-fatal): %s", exc,
+            )
+    logging.getLogger("eduhub").info("speaking_lab_vault: routes registered (Friday Vault)")
+except Exception as _vault_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "speaking_lab_vault.py failed to load (Friday Vault disabled): %s",
+        _vault_load_err,
+    )
+
 # ── ACTIVITY CENTER routes (isolated, additive — notification_center.py) ────
 # /api/notifications (list) · /unread-count · /{id}/read · /read-all and the
 # realtime WS at /api/notifications/ws. Student-session auth reused as-is.

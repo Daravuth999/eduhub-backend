@@ -99,6 +99,48 @@ async def wallet_cutover_enabled(db) -> bool:
     )
 
 
+async def vault_enabled(db) -> bool:
+    """speaking_lab_vault_enabled — gates the Friday Vault experience layer
+    (speaking_lab_vault.py). When False, POST .../vault/grant returns a
+    safe, explicit "disabled" response and credits nothing; the frontend
+    skips the Vault entirely and proceeds straight to the existing Mystery
+    Box flow, exactly as it did before this feature existed."""
+    return await _flag(
+        db, "SPEAKING_LAB_VAULT_ENABLED", "speaking_lab_vault_enabled",
+    )
+
+
+def vault_env_flag_set() -> bool:
+    """Read-only: is the ops-controlled half of the AND-gate set in THIS
+    environment? Author Studio can toggle the DB half (see
+    speaking_lab_vault.py's vault-config panel) but can never set this —
+    it's an infrastructure-level switch, flipped once per environment by
+    whoever manages deployment config, never from a web UI. Exposed so
+    the admin panel can honestly show "also needs an infra flag" instead
+    of a toggle that silently does nothing."""
+    return _env_flag("SPEAKING_LAB_VAULT_ENABLED") is True
+
+
+async def get_vault_db_flag(db) -> bool:
+    """The admin-editable half only — NOT the full AND-gated decision.
+    Callers that need to know whether the feature actually runs must use
+    vault_enabled(db), which requires both halves."""
+    return await _db_flag(db, "speaking_lab_vault_enabled")
+
+
+async def set_vault_db_flag(db, value: bool) -> None:
+    """Author Studio's Friday Vault "Enabled" toggle writes here. This is
+    deliberately only HALF of the AND-gate — flipping it alone does
+    nothing in an environment where the ops env var isn't also set,
+    preserving the "two independent, deliberate actions" safety
+    contract documented at the top of this module."""
+    await db[SETTINGS_COLLECTION].update_one(
+        {"_id": SETTINGS_DOC_ID},
+        {"$set": {"speaking_lab_vault_enabled": bool(value)}},
+        upsert=True,
+    )
+
+
 async def all_flags(db) -> dict:
     """Snapshot of every flag's live value — used by tests and the
     activation runbook, never by product logic (each gate re-checks its
@@ -114,4 +156,5 @@ async def all_flags(db) -> dict:
         "speaking_lab_direct_join_enabled": await direct_join_enabled(db),
         "speaking_lab_wallet_payout_enabled": await wallet_payout_enabled(db),
         "speaking_lab_wallet_cutover_enabled": await wallet_cutover_enabled(db),
+        "speaking_lab_vault_enabled": await vault_enabled(db),
     }
