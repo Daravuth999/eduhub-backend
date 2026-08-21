@@ -77,6 +77,7 @@ def test_1_all_flags_default_off_with_no_env_and_no_db_doc():
         "speaking_lab_direct_join_enabled": False,
         "speaking_lab_wallet_payout_enabled": False,
         "speaking_lab_wallet_cutover_enabled": False,
+        "speaking_lab_vault_enabled": False,
     }
 
 
@@ -107,6 +108,7 @@ def test_3_a_stale_legacy_ab_db_field_is_silently_ignored():
         "speaking_lab_direct_join_enabled": False,
         "speaking_lab_wallet_payout_enabled": False,
         "speaking_lab_wallet_cutover_enabled": False,
+        "speaking_lab_vault_enabled": False,
     }
 
 

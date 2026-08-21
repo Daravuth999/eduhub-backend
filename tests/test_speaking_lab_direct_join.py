@@ -1079,6 +1079,7 @@ async def test_32_feature_flags_default_off():
         "speaking_lab_direct_join_enabled": False,
         "speaking_lab_wallet_payout_enabled": False,
         "speaking_lab_wallet_cutover_enabled": False,
+        "speaking_lab_vault_enabled": False,
     }
 
 
