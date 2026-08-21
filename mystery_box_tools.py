@@ -286,6 +286,10 @@ class _RoundCreateIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     campaign_id: str
     session_id: Optional[str] = ""  # Speaking Lab session id, optional
+    # Friday Vault "Mystery Box Boost" — optional, defaults False so every
+    # existing/other caller's behavior is byte-for-byte unchanged. See
+    # _mbt_resolve_boosted_layout below.
+    boosted: Optional[bool] = False
 
 
 class _SelectIn(BaseModel):
@@ -1194,12 +1198,43 @@ def register_mystery_box_routes(
         _r.shuffle(out)
         return out
 
+    # Friday Vault "Mystery Box Boost" — best-of-N reroll wrapper. Calls the
+    # SAME, completely unmodified _mbt_resolve_campaign_layout multiple
+    # times and keeps whichever roll contains the single rarest box, rather
+    # than changing how any individual roll is weighted. This is
+    # deliberately the safest possible way to give a boosted round better
+    # odds: the core sampling function above is never touched, so every
+    # OTHER caller (every non-boosted round, i.e. the entire existing
+    # Mystery Box system) is provably unaffected.
+    _RARITY_RANK = {"common": 1, "rare": 2, "epic": 3, "legendary": 4}
+    _BOOST_ATTEMPTS = 3
+
+    def _best_rarity_rank(layout: List[dict]) -> int:
+        return max((_RARITY_RANK.get((p.get("rarity") or "common").lower(), 1) for p in layout), default=0)
+
+    async def _mbt_resolve_boosted_layout(camp: dict) -> List[dict]:
+        best_layout: List[dict] = []
+        best_rank = -1
+        for _ in range(_BOOST_ATTEMPTS):
+            candidate = await _mbt_resolve_campaign_layout(camp)
+            if not candidate:
+                continue
+            rank = _best_rarity_rank(candidate)
+            if rank > best_rank:
+                best_rank = rank
+                best_layout = candidate
+        return best_layout
+
     @api.post("/speaking-lab/mystery-box/rounds")
     async def mbt_create_round(payload: _RoundCreateIn, admin=Depends(require_admin)):
         camp = await _mbt_campaigns.find_one({"id": payload.campaign_id, "enabled": True}, {"_id": 0})
         if not camp:
             raise HTTPException(status_code=404, detail="campaign not found or disabled")
-        layout = await _mbt_resolve_campaign_layout(camp)
+        layout = (
+            await _mbt_resolve_boosted_layout(camp)
+            if payload.boosted
+            else await _mbt_resolve_campaign_layout(camp)
+        )
         if not layout:
             raise HTTPException(status_code=400, detail="campaign has no enabled prizes")
         rid = "rnd_" + _mbt_secrets.token_hex(10)
@@ -1231,6 +1266,7 @@ def register_mystery_box_routes(
             "campaign_name": camp.get("name") or "",
             "box_count": int(camp.get("box_count") or len(layout)),
             "session_id": (payload.session_id or "").strip(),
+            "boosted": bool(payload.boosted),    # Friday Vault Mystery Box Boost, audit-only field
             "layout": box_layout,                # contains prize_id per box
             "closed_boxes": closed_boxes,        # safe to surface to client
             "selected_box_index": None,

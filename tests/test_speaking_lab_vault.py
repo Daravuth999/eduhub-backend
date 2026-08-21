@@ -282,6 +282,46 @@ async def test_admin_config_round_trip():
 
 
 @pytest.mark.asyncio
+async def test_enabled_toggle_is_only_half_the_gate(monkeypatch):
+    """The Author Studio "Enabled" toggle writes only the DB half of the
+    AND-gate. Without the env var also set, fully_enabled must stay False
+    and the grant route must still report itself disabled — proving the
+    admin UI can never single-handedly activate a financial feature."""
+    monkeypatch.delenv("SPEAKING_LAB_VAULT_ENABLED", raising=False)
+    db = _FakeDB()
+    credit_calls = []
+    client = _build_app(db, credit_calls=credit_calls)
+
+    put_res = client.put("/api/admin/speaking-lab/vault-config", json={"enabled": True})
+    body = put_res.json()
+    assert body["enabled"] is True          # DB half: on
+    assert body["env_flag_set"] is False     # infra half: off (nothing set it)
+    assert body["fully_enabled"] is False    # the gate that actually matters
+
+    grant_res = client.post(
+        "/api/speaking-lab/sessions/sess-1/vault/grant",
+        json={"student_id": "stu001", "round_key": "r1"},
+    )
+    assert grant_res.json() == {"enabled": False}  # still hard off
+
+
+@pytest.mark.asyncio
+async def test_enabled_toggle_off_reports_correctly_even_with_env_set():
+    db = _FakeDB()
+    os.environ["SPEAKING_LAB_VAULT_ENABLED"] = "true"
+    try:
+        credit_calls = []
+        client = _build_app(db, credit_calls=credit_calls)
+        get_res = client.get("/api/admin/speaking-lab/vault-config")
+        body = get_res.json()
+        assert body["enabled"] is False       # DB half never set — defaults off
+        assert body["env_flag_set"] is True
+        assert body["fully_enabled"] is False  # still needs the DB half too
+    finally:
+        os.environ.pop("SPEAKING_LAB_VAULT_ENABLED", None)
+
+
+@pytest.mark.asyncio
 async def test_missing_fields_do_not_500():
     db = _FakeDB()
     await _enable(db)
