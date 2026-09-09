@@ -35,12 +35,15 @@ reading video_purchases, never by trusting anything the frontend sends.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import io
 import logging
 
 from fastapi import Body, Depends, File, Form, HTTPException, UploadFile
 
 import video_library_points_adapter as points
 import sync_studio_tools
+import video_render_tools
 from video_schema import (
     RETRYABLE_STATES,
     build_bookmark_record,
@@ -177,6 +180,58 @@ async def update_video_lesson(db, lesson_id: str, updates: dict) -> dict:
     return merged
 
 
+async def _retire_media(db, *, media_ref: str | None, sync_id: str | None) -> None:
+    """2026-09 (Video Factory surgical bug-fix pass, §2e/4e) — best-effort
+    cleanup for a mediaRef/syncId a lesson no longer points to (replaced,
+    detached, or the lesson itself deleted). NEVER raises and never
+    blocks the caller's own Mongo-side action, which has already
+    committed by the time this runs — a lingering orphaned object is a
+    cleanup concern, not a correctness one, exactly matching assessment_
+    tools.py's `_delete_media_from_r2` posture. The media bucket is
+    constructed INSIDE this function's own try/except (not passed in by
+    the caller) so that even a bucket-construction failure can never
+    propagate out and break the delete/detach action that already
+    succeeded — only the best-effort cleanup is skipped.
+
+    Ownership-respecting reference count: this module owns `video_lessons`
+    and queries it directly; sync_studio_tools.py owns `chapter_sync` and
+    is asked (never queried directly) whether it still references the
+    same mediaRef. Content-hash dedup (sync_studio_tools.create_sync_
+    from_upload) means two independent documents CAN legitimately share
+    one storage object — the object is deleted only when NEITHER
+    collection references it any longer."""
+    if not sync_id and not media_ref:
+        return
+    try:
+        media_bucket = sync_studio_tools.get_media_bucket(db)
+        if sync_id:
+            # The chapter_sync document itself is retired unconditionally
+            # (it's Video Library's own, now-superseded row — "latest
+            # wins", per sync_studio_tools.py's own documented binding
+            # model, so an old one has no further purpose). Its mediaRef
+            # is used below if the caller didn't already have one.
+            freed_ref = await sync_studio_tools.delete_chapter_sync_document(db, sync_id)
+            media_ref = media_ref or freed_ref
+        if not media_ref:
+            return
+        still_referenced = (
+            await sync_studio_tools.is_media_referenced_in_chapter_sync(db, media_ref)
+            or await db[LESSONS_COLL].find_one({"mediaRef": media_ref}, {"_id": 1}) is not None
+        )
+        if still_referenced:
+            logger.info("video_library: mediaRef still referenced elsewhere, storage object kept ref=%s", media_ref)
+            return
+        deleted = await sync_studio_tools.delete_media_object(media_ref, media_bucket)
+        if not deleted:
+            logger.critical(
+                "video_library: media retired from Mongo but its storage object "
+                "(ref=%s) could NOT be confirmed deleted — manual cleanup needed", media_ref,
+            )
+    except Exception:  # noqa: BLE001
+        logger.critical("video_library: unexpected error retiring media ref=%s sync_id=%s — manual cleanup needed",
+                         media_ref, sync_id)
+
+
 async def attach_lesson_media(
     db, lesson_id: str, *, raw: bytes, declared_content_type: str, media_bucket, uploaded_by: str = "",
 ) -> dict:
@@ -194,10 +249,17 @@ async def attach_lesson_media(
     the sync document at playback time) so video playback never depends
     on sync_schema.is_servable_to_students()'s alignment-readiness gate —
     see build_video_lesson()'s docstring for why that gate must stay
-    scoped to captions/highlighting only."""
+    scoped to captions/highlighting only.
+
+    2026-09 — a re-upload (replacing existing media) now retires the
+    PREVIOUS media only AFTER the lesson has been successfully repointed
+    at the new one — never before, so a failure while cleaning up the old
+    media can never leave the lesson without a working mediaRef/syncId."""
     lesson = await get_video_lesson(db, lesson_id)
     if not lesson:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
+    previous_media_ref = lesson.get("mediaRef")
+    previous_sync_id = lesson.get("syncId")
 
     try:
         sync_doc = await sync_studio_tools.create_sync_from_upload(
@@ -207,26 +269,39 @@ async def attach_lesson_media(
     except sync_studio_tools.SyncStudioError as exc:
         raise VideoLibraryError(exc.code, exc.message, exc.http_status) from exc
 
-    return await update_video_lesson(
+    updated = await update_video_lesson(
         db, lesson_id, {"syncId": sync_doc["syncId"], "mediaRef": sync_doc["mediaRef"]},
     )
+
+    if previous_sync_id and previous_sync_id != sync_doc["syncId"]:
+        await _retire_media(db, media_ref=previous_media_ref, sync_id=previous_sync_id)
+
+    return updated
 
 
 async def detach_lesson_media(db, lesson_id: str) -> dict:
     """Media delete — clears mediaRef/syncId/contentType/pipeline/duration
     so a fresh upload starts clean. Refused while published (students would
-    lose a playable lesson in one step — unpublish first)."""
+    lose a playable lesson in one step — unpublish first).
+
+    2026-09 — also retires the underlying storage object (and the now-
+    orphaned chapter_sync document) once nothing else references it —
+    see _retire_media. Runs AFTER the Mongo clear commits, matching
+    assessment_tools.py's own delete-then-best-effort-cleanup ordering."""
     lesson = await get_video_lesson(db, lesson_id)
     if not lesson:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
     if lesson.get("status") == "published":
         raise VideoLibraryError("lesson_published", "unpublish this lesson before removing its media", 409)
+    media_ref = lesson.get("mediaRef")
+    sync_id = lesson.get("syncId")
     await db[LESSONS_COLL].update_one(
         {"lessonId": lesson_id},
         {"$set": {"mediaRef": None, "syncId": None, "durationSec": 0.0},
          "$unset": {"pipeline": "", "contentType": "", "learning": ""}},
     )
     logger.info("video_library: media detached lessonId=%s", lesson_id)
+    await _retire_media(db, media_ref=media_ref, sync_id=sync_id)
     return await get_video_lesson(db, lesson_id)
 
 
@@ -235,7 +310,11 @@ async def delete_video_lesson(db, lesson_id: str) -> None:
     a lesson students can currently see/purchase can never silently vanish
     in one step. Purchase and progress records are deliberately RETAINED
     (they are the financial audit trail; entitlement history outlives the
-    catalog entry, matching the codebase's reconciliation discipline)."""
+    catalog entry, matching the codebase's reconciliation discipline).
+
+    2026-09 — also retires the underlying storage object (and the now-
+    orphaned chapter_sync document) once nothing else references it —
+    see _retire_media. Runs AFTER the lesson document is deleted."""
     lesson = await get_video_lesson(db, lesson_id)
     if not lesson:
         raise VideoLibraryError("lesson_not_found", f"no lesson {lesson_id!r}", 404)
@@ -245,6 +324,7 @@ async def delete_video_lesson(db, lesson_id: str) -> None:
         )
     await db[LESSONS_COLL].delete_one({"lessonId": lesson_id})
     logger.info("video_library: lesson deleted lessonId=%s", lesson_id)
+    await _retire_media(db, media_ref=lesson.get("mediaRef"), sync_id=lesson.get("syncId"))
 
 
 # ── Ownership (the ONLY function anything should call to decide access) ────
@@ -485,6 +565,115 @@ async def admin_reconcile_purchase(db, student_id: str, lesson_id: str, *, resol
     return await get_purchase(db, student_id, lesson_id)
 
 
+# ── faststart backfill (2026-09, Video Factory surgical bug-fix pass,
+#    §2c/4b) — for lessons uploaded BEFORE remux_faststart existed. Manual-
+#    trigger only (an admin route below, never scheduled/automatic), dry-
+#    run by default, non-destructive: a fresh, separately content-
+#    addressed object is created and verified (same duration, same video
+#    frame count) BEFORE the lesson is ever repointed at it — the original
+#    object is left completely untouched if anything is inconclusive.
+#    NOT executed against any real data as part of this pass. ────────────
+async def backfill_faststart_scan_lesson(db, lesson: dict, media_bucket, *, dry_run: bool = True) -> dict:
+    """Per-lesson faststart backfill. Returns a status row, never a bare
+    bool — an ambiguous outcome (couldn't read the media, couldn't parse
+    its box structure, couldn't verify a remux) is always its OWN honest
+    status, never coerced into "fine" or "fixed".
+
+    status is one of:
+      not_video | unreadable | already_fixed | needs_fix (dry_run only)
+      | fixed | remux_failed | verification_failed | store_failed
+    """
+    lesson_id = lesson.get("lessonId")
+    media_ref = lesson.get("mediaRef")
+    content_type = (lesson.get("contentType") or "").lower()
+    if not media_ref or "video" not in content_type:
+        return {"lessonId": lesson_id, "status": "not_video"}
+
+    import video_pipeline_tools as _pipeline  # lazy — avoids the module cycle noted elsewhere in this file
+    try:
+        raw, _ct = await _pipeline.load_media_bytes(db, media_bucket, media_ref)
+    except Exception as exc:  # noqa: BLE001
+        return {"lessonId": lesson_id, "status": "unreadable", "detail": f"{type(exc).__name__}: {exc}"}
+
+    # mp4_moov_before_mdat returns True when moov ALREADY comes first (the
+    # file is already fine) — do not rename this without re-checking every
+    # branch below; a prior version of this exact line stored the result
+    # directly into a variable named `needs_fix` without inverting it,
+    # silently swapping "already_fixed" and "needs_fix" for every lesson.
+    moov_already_first = video_render_tools.mp4_moov_before_mdat(raw)
+    if moov_already_first is None:
+        return {"lessonId": lesson_id, "status": "unreadable", "detail": "could not parse MP4 box structure"}
+    if moov_already_first:
+        return {"lessonId": lesson_id, "status": "already_fixed"}
+    if dry_run:
+        return {"lessonId": lesson_id, "status": "needs_fix"}
+
+    remuxed = await video_render_tools.remux_faststart(raw, content_type)
+    if not remuxed:
+        return {"lessonId": lesson_id, "status": "remux_failed"}
+
+    orig_duration = await video_render_tools.probe_container_duration_seconds(raw)
+    new_duration = await video_render_tools.probe_container_duration_seconds(remuxed)
+    orig_frames = await video_render_tools.probe_video_frame_count(raw)
+    new_frames = await video_render_tools.probe_video_frame_count(remuxed)
+    if None in (orig_duration, new_duration, orig_frames, new_frames):
+        return {"lessonId": lesson_id, "status": "verification_failed", "detail": "could not measure duration/frames"}
+    if abs(new_duration - orig_duration) > 0.5 or new_frames != orig_frames:
+        return {
+            "lessonId": lesson_id, "status": "verification_failed",
+            "detail": f"duration {orig_duration}s->{new_duration}s, frames {orig_frames}->{new_frames}",
+        }
+
+    content_hash = hashlib.sha256(remuxed).hexdigest()
+    key = f"sync-media/{content_hash}.mp4"
+    new_ref = await sync_studio_tools._upload_media_to_r2(
+        remuxed, key, content_type, {"contentHash": content_hash, "backfill": "faststart"},
+    )
+    if not new_ref:
+        filename = f"{content_hash}.mp4"
+        new_ref = await sync_studio_tools._gridfs_ref_if_already_stored(media_bucket, filename)
+        if not new_ref:
+            try:
+                await media_bucket.upload_from_stream(
+                    filename, io.BytesIO(remuxed), metadata={"contentType": content_type, "backfill": "faststart"},
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {"lessonId": lesson_id, "status": "store_failed", "detail": f"{type(exc).__name__}: {exc}"}
+            new_ref = f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/{filename}"
+
+    old_media_ref = media_ref
+    sync_id = lesson.get("syncId")
+    await update_video_lesson(db, lesson_id, {"mediaRef": new_ref})
+    if sync_id:
+        await sync_studio_tools.update_chapter_sync_media_ref(db, sync_id, new_ref)
+    # Retire the old object only now that the lesson genuinely points
+    # somewhere else — never before, and never if this lesson is the only
+    # thing that changed sync_id would matter for _retire_media's
+    # reference check, which is why chapter_sync was updated above FIRST.
+    await _retire_media(db, media_ref=old_media_ref, sync_id=None)
+    return {"lessonId": lesson_id, "status": "fixed", "mediaRef": new_ref}
+
+
+async def backfill_faststart_scan_all(db, media_bucket, *, dry_run: bool = True, limit: int = 200) -> dict:
+    """Batchable/resumable scan: processes up to `limit` lessons per call
+    (an admin re-invokes with the same dry_run flag until `scanned <
+    limit`, i.e. nothing left) rather than trying to do an entire library
+    in one request. Never raises on a single lesson's failure — one bad
+    lesson is recorded in its own row and the scan continues."""
+    cursor = db[LESSONS_COLL].find({"contentType": {"$regex": "video"}}, {"_id": 0}).limit(limit)
+    rows = []
+    async for lesson in cursor:
+        try:
+            row = await backfill_faststart_scan_lesson(db, lesson, media_bucket, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001
+            row = {"lessonId": lesson.get("lessonId"), "status": "skipped_error", "detail": f"{type(exc).__name__}: {exc}"}
+        rows.append(row)
+    summary: dict = {"scanned": len(rows)}
+    for row in rows:
+        summary[row["status"]] = summary.get(row["status"], 0) + 1
+    return {"dryRun": dry_run, "summary": summary, "lessons": rows}
+
+
 def register_video_library_routes(api, db, require_admin, require_student) -> None:
     """Mounts Video Library routes. Matches this codebase's
     register_*_routes(api, db, ...) DI convention exactly.
@@ -705,6 +894,23 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
     async def list_reconcile_purchases_route(_admin=Depends(require_admin)):
         docs = await list_reconcile_purchases(db)
         return {"purchases": docs}
+
+    @api.post("/admin/video/lessons/backfill-faststart")
+    async def backfill_faststart_route(payload: dict = Body(default_factory=dict), _admin=Depends(require_admin)):
+        """Manual-trigger-only faststart backfill for lessons uploaded
+        before remux_faststart existed. dry_run defaults True (safe) —
+        an admin must explicitly pass {"dryRun": false} to actually write
+        anything, matching this codebase's own migration-tool convention
+        (see wallet_service.py's /teacher/migration/import-wallets).
+        Batchable via `limit` (default 200) — re-invoke with the same
+        dryRun flag until `summary.scanned < limit` to cover a larger
+        library. Never runs automatically or on a schedule."""
+        dry_run = bool(payload.get("dryRun", True))
+        limit = min(int(payload.get("limit", 200)), 500)
+        result = await backfill_faststart_scan_all(
+            db, sync_studio_tools.get_media_bucket(db), dry_run=dry_run, limit=limit,
+        )
+        return result
 
     @api.post("/admin/video/purchases/{student_id}/{lesson_id}/reconcile")
     async def reconcile_route(student_id: str, lesson_id: str, payload: dict = Body(...), admin=Depends(require_admin)):

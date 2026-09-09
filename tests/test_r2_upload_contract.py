@@ -27,11 +27,31 @@ import sync_studio_tools as sst
 
 
 class _RecordingS3Handler(http.server.BaseHTTPRequestHandler):
-    """Minimal S3-compatible PUT handler: enough for boto3's put_object to
-    consider the request successful (200 + ETag), while recording exactly
-    what was sent so tests can assert on the real request shape."""
+    """Minimal S3-compatible PUT/HEAD handler: enough for boto3's
+    put_object/head_object to behave like a real bucket, while recording
+    exactly what was sent so tests can assert on the real request shape.
+
+    2026-09 — do_HEAD added: sync_studio_tools._upload_media_to_r2 now
+    HEAD-checks a key before PUTting (content-addressed dedup — see
+    assess_speaker_continuity_quality's sibling change in the same pass).
+    A real S3/R2 bucket answers HEAD with 404 for an unknown key and 200
+    for one that's genuinely stored; this mock now does the same
+    (tracking which paths have actually been PUT), rather than falling
+    through to BaseHTTPRequestHandler's default 501 for an unimplemented
+    method — which would have made boto3's head_object raise a non-404
+    ClientError and incorrectly abort the whole upload as "R2 failed"."""
     requests: list[dict] = []
     status_to_return = 200
+    stored_paths: set = set()
+
+    def do_HEAD(self):
+        if self.path in _RecordingS3Handler.stored_paths:
+            self.send_response(200)
+            self.send_header("ETag", '"deadbeef"')
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_PUT(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -46,6 +66,7 @@ class _RecordingS3Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(_RecordingS3Handler.status_to_return)
             self.end_headers()
             return
+        _RecordingS3Handler.stored_paths.add(self.path)
         self.send_response(200)
         self.send_header("ETag", '"deadbeef"')
         self.end_headers()
@@ -58,6 +79,7 @@ class _RecordingS3Handler(http.server.BaseHTTPRequestHandler):
 def mock_s3_server():
     _RecordingS3Handler.requests = []
     _RecordingS3Handler.status_to_return = 200
+    _RecordingS3Handler.stored_paths = set()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RecordingS3Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -138,6 +160,24 @@ async def test_failure_behavior_never_raises_and_returns_none_for_the_caller_to_
     )
     assert result is None
     assert len(handler.requests) >= 1, "the request genuinely reached the server and was genuinely rejected"
+
+
+@pytest.mark.asyncio
+async def test_a_second_upload_to_the_same_key_is_skipped_via_head_check_dedup(mock_s3_server):
+    """The actual content-hash-dedup contract (2026-09): a key that's
+    already genuinely stored (a real prior PUT succeeded against this
+    same mock server) must never be PUT again — HEAD confirms it exists
+    and the function returns the same URL without a second network
+    write."""
+    endpoint, handler = mock_s3_server
+    key = "sync-media/deadbeefdeadbeef.mp4"
+
+    first = await sst._upload_media_to_r2(b"same-bytes", key, "video/mp4", {}, endpoint_override=endpoint)
+    assert len(handler.requests) == 1  # the real PUT happened
+
+    second = await sst._upload_media_to_r2(b"same-bytes", key, "video/mp4", {}, endpoint_override=endpoint)
+    assert second == first
+    assert len(handler.requests) == 1  # NOT 2 — the second call never PUT again
 
 
 @pytest.mark.asyncio

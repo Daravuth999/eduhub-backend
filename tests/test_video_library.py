@@ -13,6 +13,7 @@ import asyncio
 
 import pytest
 
+import video_render_tools as vrt
 import video_schema as schema
 import video_library_points_adapter as points
 import video_library_tools as vlt
@@ -162,14 +163,31 @@ class _Cursor:
             self._docs = sorted(self._docs, key=lambda d: d.get(key) or "", reverse=(direction == -1))
         return self
 
+    def limit(self, n):
+        self._docs = self._docs[:n]
+        return self
+
     async def to_list(self, length=None):
         return [dict(d) for d in self._docs[:length]]
+
+    def __aiter__(self):
+        self._iter = iter(self._docs)
+        return self
+
+    async def __anext__(self):
+        try:
+            return dict(next(self._iter))
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 def _matches(doc, query):
     for k, v in (query or {}).items():
         if isinstance(v, dict) and "$in" in v:
             if doc.get(k) not in v["$in"]:
+                return False
+        elif isinstance(v, dict) and "$regex" in v:
+            if v["$regex"] not in (doc.get(k) or ""):
                 return False
         elif doc.get(k) != v:
             return False
@@ -304,14 +322,15 @@ async def test_update_video_lesson_not_found_raises():
 
 # ── media upload — reuses sync_studio_tools.py, no duplicated storage logic ─
 class _FakeGridOut:
-    def __init__(self, data, metadata):
+    def __init__(self, data, metadata, file_id):
         self._data, self._pos, self.metadata, self.length = data, 0, metadata, len(data)
+        self._id = file_id
 
     async def seek(self, pos):
         self._pos = pos
 
-    async def read(self, n):
-        chunk = self._data[self._pos:self._pos + n]
+    async def read(self, n=-1):
+        chunk = self._data[self._pos:] if n is None or n < 0 else self._data[self._pos:self._pos + n]
         self._pos += len(chunk)
         return chunk
 
@@ -319,13 +338,22 @@ class _FakeGridOut:
 class _FakeMediaBucket:
     def __init__(self):
         self.files: dict = {}
+        self.upload_count = 0
 
     async def upload_from_stream(self, filename, stream, metadata=None):
-        self.files[filename] = (stream.read(), metadata or {})
+        self.upload_count += 1
+        self.files[filename] = (stream.read(), metadata or {}, filename)
 
     async def open_download_stream_by_name(self, filename):
-        data, metadata = self.files[filename]
-        return _FakeGridOut(data, metadata)
+        data, metadata, file_id = self.files[filename]
+        return _FakeGridOut(data, metadata, file_id)
+
+    async def delete(self, file_id):
+        for name, (_data, _meta, fid) in list(self.files.items()):
+            if fid == file_id:
+                del self.files[name]
+                return
+        raise KeyError(file_id)  # mirrors real GridFS: deleting an unknown id is an error
 
 
 @pytest.mark.asyncio
@@ -374,6 +402,329 @@ async def test_attach_lesson_media_lesson_not_found():
             db, "missing", raw=b"x", declared_content_type="video/mp4", media_bucket=_FakeMediaBucket(),
         )
     assert exc.value.http_status == 404
+
+
+# ── storage lifecycle: content-hash dedup + reference-aware delete
+#    (2026-09, Video Factory surgical bug-fix pass §2e/4e) ──────────────────
+@pytest.mark.asyncio
+async def test_reuploading_byte_identical_content_reuses_the_same_media_ref_no_new_storage_write():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="Ordering Coffee", price=50, created_by="a")
+    bucket = _FakeMediaBucket()
+
+    first = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"identical-bytes", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    assert bucket.upload_count == 1
+
+    second = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"identical-bytes", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    assert second["mediaRef"] == first["mediaRef"]
+    assert bucket.upload_count == 1  # NOT 2 — the second call never re-uploaded
+
+
+@pytest.mark.asyncio
+async def test_content_different_upload_still_uploads_normally():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+    bucket = _FakeMediaBucket()
+
+    first = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"bytes-one", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    second = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"bytes-two", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    assert second["mediaRef"] != first["mediaRef"]
+    assert bucket.upload_count == 2
+
+
+@pytest.mark.asyncio
+async def test_replacing_a_lessons_media_retires_the_previous_object_when_unreferenced(monkeypatch):
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+    bucket = _FakeMediaBucket()
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", lambda _db: bucket)
+
+    first = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"old-content", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    old_sync_id = first["syncId"]
+    assert db.chapter_sync.docs.get(old_sync_id) is not None
+    assert len(bucket.files) == 1
+
+    updated = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"new-content", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+
+    assert updated["mediaRef"] != first["mediaRef"]
+    # The old chapter_sync document is gone (superseded, "latest wins")...
+    assert db.chapter_sync.docs.get(old_sync_id) is None
+    # ...and since nothing else referenced the old content, its storage
+    # object was genuinely deleted, not left orphaned.
+    assert len(bucket.files) == 1  # only the NEW file remains
+    assert updated["mediaRef"].rsplit("/", 1)[-1] in bucket.files
+
+
+@pytest.mark.asyncio
+async def test_replacing_a_lessons_media_keeps_the_object_when_another_lesson_still_shares_it(monkeypatch):
+    """Content-hash dedup means two lessons CAN legitimately share one
+    storage object — replacing one lesson's media must never delete an
+    object a different, still-live lesson depends on."""
+    db = _FakeDB()
+    lesson_a = await vlt.create_video_lesson(db, title="A", price=10, created_by="a")
+    lesson_b = await vlt.create_video_lesson(db, title="B", price=10, created_by="a")
+    bucket = _FakeMediaBucket()
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", lambda _db: bucket)
+
+    shared = await vlt.attach_lesson_media(
+        db, lesson_a["lessonId"], raw=b"shared-content", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    await vlt.attach_lesson_media(
+        db, lesson_b["lessonId"], raw=b"shared-content", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    assert len(bucket.files) == 1  # deduped — one object, two lessons
+
+    # Lesson A moves on to different media — the SHARED object must survive
+    # because lesson B still points at it.
+    await vlt.attach_lesson_media(
+        db, lesson_a["lessonId"], raw=b"lesson-a-new-content", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+
+    filename = shared["mediaRef"].rsplit("/", 1)[-1]
+    assert filename in bucket.files, "shared object was wrongly deleted while lesson B still references it"
+    lesson_b_after = await vlt.get_video_lesson(db, lesson_b["lessonId"])
+    assert lesson_b_after["mediaRef"] == shared["mediaRef"]
+
+
+@pytest.mark.asyncio
+async def test_detaching_media_deletes_the_storage_object_and_the_chapter_sync_document(monkeypatch):
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+    bucket = _FakeMediaBucket()
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", lambda _db: bucket)
+
+    attached = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"detach-me", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    sync_id = attached["syncId"]
+    assert len(bucket.files) == 1
+
+    result = await vlt.detach_lesson_media(db, lesson["lessonId"])
+
+    assert result["mediaRef"] is None
+    assert result["syncId"] is None
+    assert db.chapter_sync.docs.get(sync_id) is None
+    assert len(bucket.files) == 0
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_lesson_deletes_the_storage_object_and_the_chapter_sync_document(monkeypatch):
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+    bucket = _FakeMediaBucket()
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", lambda _db: bucket)
+
+    attached = await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"delete-me", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    sync_id = attached["syncId"]
+
+    await vlt.delete_video_lesson(db, lesson["lessonId"])
+
+    assert await vlt.get_video_lesson(db, lesson["lessonId"]) is None
+    assert db.chapter_sync.docs.get(sync_id) is None
+    assert len(bucket.files) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_storage_delete_failure_never_blocks_or_fails_detach_best_effort_only(monkeypatch):
+    """assessment_tools.py's own best-effort/log-critical/never-block
+    contract, applied here: a simulated GridFS delete failure must never
+    propagate out of detach_lesson_media — the Mongo-side detach (the
+    user-facing action) has already succeeded and must stay succeeded."""
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+
+    class _BrokenBucket(_FakeMediaBucket):
+        async def delete(self, file_id):
+            raise RuntimeError("simulated storage outage")
+
+    bucket = _BrokenBucket()
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", lambda _db: bucket)
+
+    await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"will-fail-to-delete", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+
+    result = await vlt.detach_lesson_media(db, lesson["lessonId"])
+    assert result["mediaRef"] is None  # detach itself still fully succeeded
+
+
+# ── faststart backfill tool (2026-09, §2c/4b) — manual-trigger-only,
+#    never run against real data in this pass; these tests are the only
+#    verification it gets. ────────────────────────────────────────────────
+def _mp4_box(box_type: bytes, payload: bytes = b"") -> bytes:
+    size = 8 + len(payload)
+    return size.to_bytes(4, "big") + box_type + payload
+
+
+async def _seed_pre_existing_video_lesson(db, bucket, *, lesson_id, raw: bytes, filename: str):
+    """Simulates a lesson uploaded BEFORE remux_faststart existed —
+    directly seeds the lesson document, its chapter_sync counterpart (the
+    real relationship attach_lesson_media always creates one of), and the
+    storage object — bypassing attach_lesson_media entirely, since it now
+    applies the fix to every NEW upload and can never be used to
+    construct an un-fixed fixture."""
+    media_ref = f"gridfs://sync_media/{filename}"
+    sync_id = f"sync_{lesson_id}"
+    lesson = schema.build_video_lesson(
+        title="Pre-existing", price=10, lesson_id=lesson_id,
+        sync_id=sync_id, media_ref=media_ref,
+        status="draft", created_at="t0",
+    )
+    lesson["contentType"] = "video/mp4"
+    await db[vlt.LESSONS_COLL].insert_one(lesson)
+    await db.chapter_sync.insert_one({
+        "syncId": sync_id, "mediaRef": media_ref, "ownerRef": f"video_lesson:{lesson_id}",
+    })
+    bucket.files[filename] = (raw, {"contentType": "video/mp4"}, filename)
+    return lesson
+
+
+@pytest.mark.asyncio
+async def test_backfill_dry_run_reports_needs_fix_and_writes_nothing():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    mdat_first = _mp4_box(b"ftyp", b"isom") + _mp4_box(b"mdat", b"y" * 100) + _mp4_box(b"moov", b"x" * 20)
+    lesson = await _seed_pre_existing_video_lesson(db, bucket, lesson_id="vid_needs_fix", raw=mdat_first, filename="needs-fix.mp4")
+    starting_upload_count = bucket.upload_count
+
+    row = await vlt.backfill_faststart_scan_lesson(db, lesson, bucket, dry_run=True)
+
+    assert row["status"] == "needs_fix"
+    assert bucket.upload_count == starting_upload_count  # dry run made ZERO storage writes
+    unchanged = await vlt.get_video_lesson(db, lesson["lessonId"])
+    assert unchanged["mediaRef"] == lesson["mediaRef"]  # nothing was repointed either
+
+
+@pytest.mark.asyncio
+async def test_backfill_reports_already_fixed_for_moov_first_content():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    moov_first = _mp4_box(b"ftyp", b"isom") + _mp4_box(b"moov", b"x" * 20) + _mp4_box(b"mdat", b"y" * 100)
+    lesson = await _seed_pre_existing_video_lesson(db, bucket, lesson_id="vid_already_fixed", raw=moov_first, filename="already-fixed.mp4")
+
+    row = await vlt.backfill_faststart_scan_lesson(db, lesson, bucket, dry_run=True)
+    assert row["status"] == "already_fixed"
+
+    # A real run for an already-fixed lesson must also be a complete no-op.
+    starting_upload_count = bucket.upload_count
+    row2 = await vlt.backfill_faststart_scan_lesson(db, await vlt.get_video_lesson(db, lesson["lessonId"]), bucket, dry_run=False)
+    assert row2["status"] == "already_fixed"
+    assert bucket.upload_count == starting_upload_count
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_non_video_lessons_honestly():
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+    bucket = _FakeMediaBucket()
+    await vlt.attach_lesson_media(
+        db, lesson["lessonId"], raw=b"audio-bytes-not-a-container", declared_content_type="audio/mpeg", media_bucket=bucket,
+    )
+    row = await vlt.backfill_faststart_scan_lesson(db, await vlt.get_video_lesson(db, lesson["lessonId"]), bucket, dry_run=True)
+    assert row["status"] == "not_video"
+
+
+@pytest.mark.asyncio
+async def test_backfill_scan_all_is_batchable_and_summarizes_by_status():
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    mdat_first = _mp4_box(b"ftyp", b"isom") + _mp4_box(b"mdat", b"y" * 100) + _mp4_box(b"moov", b"x" * 20)
+    moov_first = _mp4_box(b"ftyp", b"isom") + _mp4_box(b"moov", b"x" * 20) + _mp4_box(b"mdat", b"y" * 100)
+    await _seed_pre_existing_video_lesson(db, bucket, lesson_id="vid_needs", raw=mdat_first, filename="needs.mp4")
+    await _seed_pre_existing_video_lesson(db, bucket, lesson_id="vid_fixed", raw=moov_first, filename="fixed.mp4")
+
+    result = await vlt.backfill_faststart_scan_all(db, bucket, dry_run=True, limit=200)
+    assert result["dryRun"] is True
+    assert result["summary"]["scanned"] == 2
+    assert result["summary"].get("needs_fix") == 1
+    assert result["summary"].get("already_fixed") == 1
+
+
+NO_FFMPEG_FOR_LIB_TEST = not vrt.ffmpeg_available()
+NO_FFPROBE_FOR_LIB_TEST = not vrt.ffprobe_available()
+
+
+async def _make_mdat_first_video_for_backfill(*, duration: float = 1.0) -> bytes:
+    import os as _os
+    import tempfile as _tempfile
+    import uuid as _uuid
+    path = _os.path.join(_tempfile.gettempdir(), f"vlt_backfill_{_uuid.uuid4().hex}.mp4")
+    args = (
+        vrt._resolve_ffmpeg(), "-y",
+        "-f", "lavfi", "-i", f"color=c=red:s=160x120:d={duration}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", path,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, args, 30.0, False)
+    with open(path, "rb") as f:
+        data = f.read()
+    _os.remove(path)
+    return data
+
+
+@pytest.mark.skipif(NO_FFMPEG_FOR_LIB_TEST or NO_FFPROBE_FOR_LIB_TEST, reason="ffmpeg/ffprobe not installed")
+@pytest.mark.asyncio
+async def test_backfill_real_run_fixes_verifies_and_retires_the_old_object(monkeypatch):
+    db = _FakeDB()
+    bucket = _FakeMediaBucket()
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", lambda _db: bucket)
+
+    real_mdat_first = await _make_mdat_first_video_for_backfill()
+    old_filename = "pre-existing-real.mp4"
+    lesson = await _seed_pre_existing_video_lesson(
+        db, bucket, lesson_id="vid_real_backfill", raw=real_mdat_first, filename=old_filename,
+    )
+    old_ref = lesson["mediaRef"]
+    assert old_filename in bucket.files
+    assert vrt.mp4_moov_before_mdat(real_mdat_first) is False, "fixture itself must genuinely need fixing"
+
+    row = await vlt.backfill_faststart_scan_lesson(db, lesson, bucket, dry_run=False)
+
+    assert row["status"] == "fixed"
+    updated = await vlt.get_video_lesson(db, lesson["lessonId"])
+    assert updated["mediaRef"] == row["mediaRef"]
+    assert updated["mediaRef"] != old_ref
+    # The chapter_sync document's own mediaRef was kept in sync.
+    assert db.chapter_sync.docs[updated["syncId"]]["mediaRef"] == updated["mediaRef"]
+    # The old object is gone (nothing else referenced it); only the new one remains.
+    assert old_filename not in bucket.files
+    assert updated["mediaRef"].rsplit("/", 1)[-1] in bucket.files
+    assert len(bucket.files) == 1
+    # The fixed file genuinely has moov before mdat now.
+    new_filename = updated["mediaRef"].rsplit("/", 1)[-1]
+    new_bytes = bucket.files[new_filename][0]
+    assert vrt.mp4_moov_before_mdat(new_bytes) is True
+
+
+@pytest.mark.asyncio
+async def test_get_media_bucket_construction_failure_never_blocks_delete(monkeypatch):
+    """Even a failure constructing the media bucket itself (e.g. against a
+    test/fake db context) must never break the actual, already-committed
+    lesson delete — only the best-effort storage cleanup is skipped."""
+    db = _FakeDB()
+    lesson = await vlt.create_video_lesson(db, title="X", price=10, created_by="a")
+
+    def _boom(_db):
+        raise TypeError("simulated bucket construction failure")
+
+    monkeypatch.setattr(vlt.sync_studio_tools, "get_media_bucket", _boom)
+
+    await vlt.delete_video_lesson(db, lesson["lessonId"])
+    assert await vlt.get_video_lesson(db, lesson["lessonId"]) is None
 
 
 # ── ownership serialization ──────────────────────────────────────────────

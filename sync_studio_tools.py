@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import hashlib
 import io
 import logging
 import os
@@ -58,6 +59,7 @@ from fastapi import Body, Depends, File, Form, HTTPException, Request, UploadFil
 from fastapi.responses import Response, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
+import video_render_tools
 from sync_provider import reshape_elevenlabs_word_timestamps
 from sync_schema import (
     VALID_REVIEW_STATUSES,
@@ -191,6 +193,19 @@ def _r2_config() -> dict | None:
     return cfg if all(cfg.values()) else None
 
 
+def _r2_client(cfg: dict, endpoint: str):
+    import boto3
+    from botocore.config import Config as _BotocoreConfig
+
+    return boto3.client(
+        "s3", endpoint_url=endpoint,
+        aws_access_key_id=cfg["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+        config=_BotocoreConfig(signature_version="s3v4"),
+    )
+
+
 async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata: dict,
                                *, endpoint_override: str | None = None) -> str | None:
     """R2 upload for native media uploads. NEVER raises — returns None on
@@ -200,6 +215,15 @@ async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata:
     hero_artwork_tools.py's R2-or-nothing pattern — this project's own
     architecture study (§8, Risks) flags that pattern as a real failure
     mode for a future media pipeline without a GridFS-style fallback.
+
+    2026-09 — `key` is now content-addressed (sha256 of the raw bytes,
+    see create_sync_from_upload) rather than a random UUID, so this
+    HEAD-checks the key first and skips the PUT entirely when that exact
+    content is already stored — the SAME dedup pattern already proven in
+    assessment_tools.py's `_upload_media_to_r2` (never shared/imported
+    across modules, per this codebase's own R2-client-per-module
+    isolation convention — see that module's identical HEAD-then-PUT
+    structure).
 
     `endpoint_override` exists ONLY for tests — no production call site
     ever passes it, so real behavior (the actual R2 endpoint below) is
@@ -211,28 +235,32 @@ async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata:
     if cfg is None:
         return None
     try:
-        import boto3
-        from botocore.config import Config as _BotocoreConfig
+        from botocore.exceptions import ClientError
 
         endpoint = endpoint_override or f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
 
-        def _do_upload():
-            s3 = boto3.client(
-                "s3", endpoint_url=endpoint,
-                aws_access_key_id=cfg["R2_ACCESS_KEY_ID"],
-                aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"],
-                region_name="auto",
-                config=_BotocoreConfig(signature_version="s3v4"),
-            )
+        def _do_upload() -> bool:
+            s3 = _r2_client(cfg, endpoint)
+            try:
+                s3.head_object(Bucket=cfg["R2_BUCKET_NAME"], Key=key)
+                return True  # content-addressed object already stored — nothing to do
+            except ClientError as exc:
+                code = str((exc.response or {}).get("Error", {}).get("Code") or "")
+                if code not in ("404", "NoSuchKey", "NotFound"):
+                    raise
             s3.put_object(
                 Bucket=cfg["R2_BUCKET_NAME"], Key=key, Body=raw, ContentType=content_type,
                 Metadata={str(k): str(v) for k, v in (metadata or {}).items()},
             )
+            return False
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _do_upload)
+        already_existed = await loop.run_in_executor(None, _do_upload)
         url = f"{cfg['R2_PUBLIC_URL'].rstrip('/')}/{key}"
-        logger.info("sync_studio_tools: uploaded %s (%d bytes) url=%s", key, len(raw), url)
+        if already_existed:
+            logger.info("sync_studio_tools: content-addressed object already exists, skipped upload key=%s", key)
+        else:
+            logger.info("sync_studio_tools: uploaded %s (%d bytes) url=%s", key, len(raw), url)
         return url
     except Exception as exc:  # noqa: BLE001
         # logger.exception (not .warning(str(exc))) — a bare str() of a
@@ -267,6 +295,20 @@ def _validate_media_upload(raw: bytes, declared_content_type: str) -> tuple[str,
     return ext, content_type
 
 
+async def _gridfs_ref_if_already_stored(media_bucket, filename: str) -> str | None:
+    """Content-addressed GridFS dedup check — mirrors _upload_media_to_r2's
+    HEAD-before-PUT for the GridFS fallback path. Returns the existing
+    `gridfs://...` reference when `filename` is already stored, None
+    otherwise — including on any lookup error, since a failed existence
+    check must never block the caller's own upload attempt (it just
+    proceeds to store fresh, exactly as before this dedup existed)."""
+    try:
+        await media_bucket.open_download_stream_by_name(filename)
+        return f"gridfs://{MEDIA_GRIDFS_BUCKET}/{filename}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def create_sync_from_upload(
     db, *, raw: bytes, declared_content_type: str, media_bucket,
     slug: str | None = None, chapter_index: int | None = None,
@@ -285,32 +327,62 @@ async def create_sync_from_upload(
     binding string for non-Books callers (e.g. Video Library passes
     `f"video_lesson:{lesson_id}"`) so OTHER products can reuse this exact
     storage/schema path without this module knowing anything about videos —
-    it only ever stores whatever reference string the caller gives it."""
+    it only ever stores whatever reference string the caller gives it.
+
+    2026-09 (Video Factory surgical bug-fix pass, §2e/4e + §2c/4b):
+      - The storage key is now content-addressed — sha256 of the ORIGINAL
+        uploaded bytes — instead of a random UUID, so retrying an upload
+        (or an admin re-submitting the identical file after an unclear
+        pipeline step) can never create a duplicate, permanent storage
+        object; it just re-resolves to whatever is already there. `raw`
+        is hashed BEFORE any remux, so dedup stays stable even if the
+        ffmpeg version changes between deploys — only the stored bytes
+        benefit from the remux below, never the dedup key.
+      - A video upload is passed through video_render_tools.
+        remux_faststart first (best-effort, never blocks): relocates the
+        MP4 moov atom to the front so playback duration/seeking resolves
+        immediately instead of requiring the whole file to download first
+        — the same zero-risk fix already proven for the AI-narration
+        master, now applied to the original video every student actually
+        watches by default."""
     ext, content_type = _validate_media_upload(raw, declared_content_type)
 
-    media_id = uuid.uuid4().hex
-    path_hint = owner_ref or (f"{slug}/{chapter_index}" if slug is not None else "unbound")
-    key = f"sync-media/{path_hint}/{media_id}.{ext}"
-    metadata = {"uploadedBy": uploaded_by}
+    content_hash = hashlib.sha256(raw).hexdigest()
+
+    stored_bytes = raw
+    if "video" in (content_type or "").lower():
+        remuxed = await video_render_tools.remux_faststart(raw, content_type)
+        if remuxed:
+            stored_bytes = remuxed
+
+    key = f"sync-media/{content_hash}.{ext}"
+    metadata = {"uploadedBy": uploaded_by, "contentHash": content_hash}
     if slug is not None:
         metadata["slug"] = slug
         metadata["chapterIndex"] = str(chapter_index)
     if owner_ref:
         metadata["ownerRef"] = owner_ref
 
-    media_ref = await _upload_media_to_r2(raw, key, content_type, metadata)
+    media_ref = await _upload_media_to_r2(stored_bytes, key, content_type, metadata)
     if not media_ref:
-        filename = f"{media_id}.{ext}"
-        try:
-            await media_bucket.upload_from_stream(
-                filename, io.BytesIO(raw),
-                metadata={**metadata, "contentType": content_type},
+        filename = f"{content_hash}.{ext}"
+        media_ref = await _gridfs_ref_if_already_stored(media_bucket, filename)
+        if media_ref:
+            logger.info(
+                "sync_studio_tools: content-addressed GridFS object already exists, "
+                "skipped upload filename=%s", filename,
             )
-        except Exception as exc:  # noqa: BLE001
-            raise SyncStudioError(
-                "storage_failed", f"failed to store media: {type(exc).__name__}: {exc}", 500,
-            ) from exc
-        media_ref = f"gridfs://{MEDIA_GRIDFS_BUCKET}/{filename}"
+        else:
+            try:
+                await media_bucket.upload_from_stream(
+                    filename, io.BytesIO(stored_bytes),
+                    metadata={**metadata, "contentType": content_type},
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise SyncStudioError(
+                    "storage_failed", f"failed to store media: {type(exc).__name__}: {exc}", 500,
+                ) from exc
+            media_ref = f"gridfs://{MEDIA_GRIDFS_BUCKET}/{filename}"
 
     doc = build_sync_document(
         media_ref=media_ref,
@@ -335,6 +407,118 @@ async def create_sync_from_upload(
     await db[CHAPTER_SYNC_COLL].insert_one(dict(doc))
     doc.pop("_id", None)
     return doc
+
+
+# ── storage-lifecycle cleanup (2026-09, Video Factory surgical bug-fix
+#    pass, §2e/4e) — content-hash dedup above means a `mediaRef` can now
+#    legitimately be shared by more than one chapter_sync/video_lessons
+#    document, so these three helpers exist to make the OTHER half of
+#    dedup safe: never delete a storage object a real document still
+#    references, matching assessment_tools.py's own best-effort/log-
+#    critical/never-block delete discipline (never shared/imported across
+#    modules, per this codebase's own R2-client-per-module isolation
+#    convention — the underlying delete call is duplicated, not reused).
+#
+#    Ownership discipline (tools/check_collection_ownership.py): this
+#    module owns `chapter_sync` exclusively. It therefore exposes a
+#    delete + a reference-check over that ONE collection; a caller that
+#    also owns another collection referencing the same mediaRef (e.g.
+#    video_library_tools.py's `video_lessons`) is responsible for
+#    checking its OWN collection itself before deciding the object is
+#    genuinely orphaned — this module never reaches into another
+#    module's collection to do that for it. ──────────────────────────────
+async def delete_chapter_sync_document(db, sync_id: str) -> str | None:
+    """Deletes ONE chapter_sync document by syncId and returns the
+    mediaRef it referenced (None if no such document existed). Mongo-only
+    — never touches storage; the caller decides afterward, via
+    is_media_referenced_in_chapter_sync (and its own collection, if any),
+    whether the underlying object is now safe to delete."""
+    doc = await db[CHAPTER_SYNC_COLL].find_one({"syncId": sync_id}, {"_id": 0, "mediaRef": 1})
+    if not doc:
+        return None
+    await db[CHAPTER_SYNC_COLL].delete_one({"syncId": sync_id})
+    return doc.get("mediaRef")
+
+
+async def update_chapter_sync_media_ref(db, sync_id: str, new_media_ref: str) -> bool:
+    """Owner-respecting single-field update for the one case a caller
+    legitimately needs to repoint an EXISTING chapter_sync document at a
+    different storage object without creating a new document — the
+    faststart backfill tool (§2c/4b): the video content itself is
+    unchanged (same duration/frames, verified before this is ever
+    called), only its container was re-muxed, so the alignment/syncId
+    stays valid and only mediaRef needs to move. Returns True if a
+    document was actually found and updated, False otherwise — never
+    raises on a missing document."""
+    result = await db[CHAPTER_SYNC_COLL].update_one(
+        {"syncId": sync_id}, {"$set": {"mediaRef": new_media_ref}},
+    )
+    return bool(getattr(result, "matched_count", 0))
+
+
+async def is_media_referenced_in_chapter_sync(db, media_ref: str) -> bool:
+    """Read-only reference check against chapter_sync ONLY (this module's
+    own collection) — content-hash dedup means two independent documents
+    can legitimately point at the same mediaRef, so this must be checked
+    before any caller deletes the underlying storage object."""
+    if not media_ref:
+        return False
+    existing = await db[CHAPTER_SYNC_COLL].find_one({"mediaRef": media_ref}, {"_id": 1})
+    return existing is not None
+
+
+async def delete_media_object(media_ref: str, media_bucket) -> bool:
+    """Best-effort delete of the underlying R2 or GridFS object a
+    `mediaRef` string points to — storage-only, touches no collection.
+    NEVER raises: a real failure (network/credentials, an unexpected
+    GridFS lookup error) is logged CRITICAL for manual follow-up rather
+    than propagated, exactly matching assessment_tools.py's
+    `_delete_media_from_r2` contract. Returns True on confirmed deletion
+    (including "already gone"), False when R2 isn't configured, the
+    object couldn't be resolved, or the delete genuinely failed."""
+    if not media_ref:
+        return False
+    if media_ref.startswith("gridfs://"):
+        # "gridfs://{bucket}/{filename}" — only the filename is needed;
+        # GridFS deletion itself is keyed by the file's ObjectId, obtained
+        # by looking the filename up first (mirrors tuition_receipt_files.
+        # py's `await bucket.delete(old_id)` precedent for this codebase's
+        # only other explicit GridFS-delete call site).
+        filename = media_ref.rsplit("/", 1)[-1]
+        try:
+            gridout = await media_bucket.open_download_stream_by_name(filename)
+            await media_bucket.delete(gridout._id)
+            logger.info("sync_studio_tools: deleted GridFS object filename=%s", filename)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.critical(
+                "sync_studio_tools: GridFS delete FAILED or object already absent "
+                "filename=%s — verify manually if this is unexpected", filename,
+            )
+            return False
+
+    cfg = _r2_config()
+    if cfg is None:
+        return False
+    if not media_ref.startswith(cfg["R2_PUBLIC_URL"].rstrip("/") + "/"):
+        # Not one of OUR R2 objects (e.g. a legacy books/audioUrl reference
+        # from a different pipeline) — refuse to guess a key from an
+        # unrelated URL shape rather than risk deleting the wrong object.
+        return False
+    key = media_ref[len(cfg["R2_PUBLIC_URL"].rstrip("/")) + 1:]
+    try:
+        endpoint = f"https://{cfg['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+
+        def _do_delete():
+            _r2_client(cfg, endpoint).delete_object(Bucket=cfg["R2_BUCKET_NAME"], Key=key)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_delete)
+        logger.info("sync_studio_tools: deleted R2 object key=%s", key)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.critical("sync_studio_tools: R2 delete FAILED for key=%s — manual cleanup needed", key)
+        return False
 
 
 async def stream_sync_media(media_bucket, filename: str, request: Request):
