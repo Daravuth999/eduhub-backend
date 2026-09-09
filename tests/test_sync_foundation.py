@@ -11,12 +11,19 @@ get_current_chapter_sync needs it).
 """
 from __future__ import annotations
 
+import asyncio
+import os
+import tempfile
+import tracemalloc
+import uuid
+
 import pytest
 
 import sync_schema as schema
 import sync_provider as provider
 import sync_reading_profiles as profiles
 import sync_studio_tools as studio
+import video_render_tools as vrt
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -843,3 +850,136 @@ async def test_apply_alignment_result_reprocessing_failure_never_touches_approve
     # No call to apply_alignment_result at all (simulating a failed run).
     after = await studio.get_sync_document(db, "sync_1")
     assert after == before
+
+
+# ── large-upload OOM regression (2026-09) ───────────────────────────────
+# Real production incident: a 164.7MB video upload crashed the server
+# ("Network error during upload"); Render's own restart banner appeared
+# ~12s after ffmpeg's remux completed, consistent with an OOM kill.
+# CONFIRMED root cause via direct reproduction of this exact function
+# against a real ~175MB video: process RSS went 204MB (after the initial
+# full-buffer read, which happens upstream in the upload route before
+# this function is ever called) -> 379MB right after remux_faststart
+# returned a SECOND full-size `bytes` copy of the remuxed video, which
+# then coexisted with the original `raw` for the rest of the function,
+# including the slow, network-bound upload to storage. Fix: stream the
+# remuxed output from disk (video_render_tools.remux_faststart_to_file)
+# instead of ever materializing it as a second in-memory buffer.
+async def _make_small_real_video(*, duration: float = 3.0) -> bytes:
+    """A real ffmpeg-generated MP4 — deliberately small (a few hundred KB
+    to a few MB) for fast CI, but exercising the IDENTICAL remux_faststart_
+    to_file code branch a 150-250MB production upload takes. This is a
+    faithful reproduction of the confirmed mechanism, not just "large
+    enough to look similar": the bug this test catches (a second full
+    buffer coexisting with the first) is a STRUCTURAL property of which
+    code path runs, not a size threshold, and tracemalloc's exact
+    byte-level Python allocation tracking makes the doubling (or its
+    absence) unambiguous even at a small, fast size — unlike the
+    real incident's own OS-level RSS reproduction, which needed a
+    realistically large file specifically to rule out noise."""
+    path = os.path.join(tempfile.gettempdir(), f"sync_studio_oom_repro_{uuid.uuid4().hex}.mp4")
+    args = (
+        vrt._resolve_ffmpeg(), "-y",
+        "-f", "lavfi", "-i", f"testsrc2=size=640x480:rate=30:duration={duration}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", path,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, args, 30.0, False)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+@pytest.mark.skipif(not vrt.ffmpeg_available(), reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_does_not_double_buffer_a_video_remux(monkeypatch):
+    """The actual regression test for the confirmed OOM: create_sync_from_
+    upload's own peak Python-level memory for a video upload must stay
+    close to 1x the input size (the original buffer alone), never ~2x
+    (original + a second full remuxed copy). The downstream storage call
+    is stubbed to a cheap recorder (the REAL streaming upload contract —
+    that bytes genuinely reach a server via file_path= — is separately
+    proven end-to-end in tests/test_r2_upload_contract.py against a real
+    mock S3-compatible server); this test isolates the measurement to
+    exactly the code this incident's fix changed.
+
+    tracemalloc MUST be started BEFORE the test video's own bytes are
+    allocated — tracemalloc only tracks allocations made after start(),
+    so starting it later would make it blind to the input buffer entirely
+    and the test would pass no matter what the code does (confirmed by
+    directly measuring both the pre-fix and post-fix code shapes against
+    a real video: with tracemalloc started early, the pre-fix shape
+    measured ratio 2.10 [peak-baseline vs. the input's own tracked size]
+    and the post-fix shape measured 1.15; started late as this test's
+    first draft mistakenly did, BOTH measured ~1.0-1.15 and the test
+    could not tell them apart — an easy, real mistake, so it's spelled
+    out here for the next person editing this test)."""
+    tracemalloc.start()
+    baseline, _ = tracemalloc.get_traced_memory()
+    real_video = await _make_small_real_video(duration=3.0)
+    after_video, _ = tracemalloc.get_traced_memory()
+    video_tracked_size = after_video - baseline
+    assert video_tracked_size > 50_000, "fixture must be large enough for an unambiguous tracemalloc signal"
+
+    calls: list[dict] = []
+
+    async def _stub_upload_media_to_r2(raw, key, content_type, metadata, *, endpoint_override=None, file_path=None):
+        calls.append({"raw_is_none": raw is None, "file_path": file_path})
+        return f"https://cdn.example.test/{key}"
+
+    monkeypatch.setattr(studio, "_upload_media_to_r2", _stub_upload_media_to_r2)
+    db = _FakeDB()
+
+    doc = await studio.create_sync_from_upload(
+        db, raw=real_video, declared_content_type="video/mp4", media_bucket=None,
+        owner_ref="video_lesson:oom_repro_test",
+    )
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert doc["mediaRef"].startswith("https://cdn.example.test/")
+    assert len(calls) == 1
+    assert calls[0]["file_path"] is not None, (
+        "a video upload must take the streaming (file_path=) branch, not pass a second "
+        "full in-memory buffer as raw="
+    )
+    assert calls[0]["raw_is_none"] is True
+
+    total_peak = peak - baseline
+    # Confirmed via direct measurement: the pre-fix shape reaches ~2.1x the
+    # input's own tracked size (input + one full remuxed copy); the
+    # post-fix shape stays ~1.15x (input alone, plus small I/O/subprocess
+    # overhead). 1.6x sits cleanly between the two.
+    assert total_peak < video_tracked_size * 1.6, (
+        f"peak traced memory ({total_peak} bytes) is >= 1.6x the input's own tracked "
+        f"size ({video_tracked_size} bytes) — the remux step is holding a second full "
+        "in-memory copy again, which is exactly the confirmed cause of the real "
+        "production crash this test guards against"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_sync_from_upload_audio_never_remuxes_and_stays_single_buffer(monkeypatch):
+    """Non-video uploads never went through remux at all — this documents
+    that the fix's new file_path branch is video-only and an audio upload
+    still takes the plain raw= upload path unchanged."""
+    calls: list[dict] = []
+
+    async def _stub_upload_media_to_r2(raw, key, content_type, metadata, *, endpoint_override=None, file_path=None):
+        calls.append({"raw_is_none": raw is None, "file_path": file_path})
+        return f"https://cdn.example.test/{key}"
+
+    monkeypatch.setattr(studio, "_upload_media_to_r2", _stub_upload_media_to_r2)
+    db = _FakeDB()
+
+    await studio.create_sync_from_upload(
+        db, raw=b"a-real-small-audio-payload", declared_content_type="audio/mpeg", media_bucket=None,
+        owner_ref="video_lesson:audio_test",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["file_path"] is None
+    assert calls[0]["raw_is_none"] is False

@@ -584,6 +584,59 @@ async def mux_narration_into_video(
                 pass
 
 
+async def _remux_faststart_to_path_impl(media_bytes: bytes, content_type: str, *, timeout: float) -> str | None:
+    """Shared implementation: writes `media_bytes` to a temp input file, runs
+    the real `-movflags +faststart` remux, and returns the OUTPUT temp file's
+    path — never reads it back into memory itself. Deletes the input temp
+    file always; the OUTPUT file is left on disk for the caller to consume
+    and is ONLY deleted here on a failure path (nothing left behind on any
+    return-None). A successful return hands ownership of `out_path` to the
+    caller, who is responsible for deleting it once done.
+
+    Root-cause context (real production incident: a 164.7MB video upload
+    crashed the server — Render's own restart banner appeared ~12s after
+    ffmpeg's remux completed, consistent with an OOM kill): the previous
+    single bytes-in/bytes-out `remux_faststart` (still below, now a thin
+    wrapper over this) reads the WHOLE remuxed output back into a NEW
+    Python `bytes` object, which coexists in memory with the original
+    upload's bytes (already fully buffered upstream by the FastAPI route)
+    for the remainder of the request — confirmed by direct reproduction
+    against this exact code path with a real 174.8MB video: process RSS
+    went 204MB (after the original buffer) -> 379MB (after remux_faststart
+    returned a second full copy), i.e. ~2x the file size held
+    simultaneously, right before the slow, network-bound upload to
+    storage. This path-returning variant lets a caller stream the remuxed
+    output directly from disk to storage instead, so peak memory for the
+    remux step returns to ~1x (the original buffer alone) instead of ~2x."""
+    if not media_bytes:
+        return None
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    ext = ".mp4" if "mp4" in (content_type or "").lower() else ".bin"
+    work_id = uuid.uuid4().hex
+    in_path = os.path.join(tempfile.gettempdir(), f"vnr_faststart_{work_id}_in{ext}")
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_faststart_{work_id}_out{ext}")
+    try:
+        with open(in_path, "wb") as f:
+            f.write(media_bytes)
+        code, _out, _err = await _run(
+            ffmpeg, "-y", "-i", in_path, "-c", "copy", "-movflags", "+faststart", out_path,
+            timeout=timeout,
+        )
+        if code != 0 or not os.path.exists(out_path):
+            return None
+        return out_path
+    except (RenderError, OSError):
+        return None
+    finally:
+        try:
+            if os.path.exists(in_path):
+                os.remove(in_path)
+        except OSError:
+            pass
+
+
 async def remux_faststart(media_bytes: bytes, content_type: str, *, timeout: float = 120.0) -> bytes | None:
     """Pure container-only remux — relocates the MP4 "moov" atom to the
     front of the file via `-movflags +faststart`, with `-c copy` on both
@@ -603,36 +656,62 @@ async def remux_faststart(media_bytes: bytes, content_type: str, *, timeout: flo
     non-zero exit, a timeout, or any other exception — so the caller can
     safely fall back to storing the original, unmodified bytes rather than
     failing the upload just because this optimization couldn't be applied.
-    """
-    if not media_bytes:
+
+    Kept exactly as-is (bytes in, bytes out) for existing callers/tests
+    that need the whole result in memory (e.g. the faststart backfill
+    tool's before/after verification). A caller uploading a large real
+    file to remote storage afterward should prefer remux_faststart_to_file
+    below instead, to avoid holding two full copies of the file at once —
+    see that function's docstring for the confirmed production incident
+    this exists to fix."""
+    out_path = await _remux_faststart_to_path_impl(media_bytes, content_type, timeout=timeout)
+    if out_path is None:
         return None
-    ffmpeg = _resolve_ffmpeg()
-    if not ffmpeg:
-        return None
-    ext = ".mp4" if "mp4" in (content_type or "").lower() else ".bin"
-    work_id = uuid.uuid4().hex
-    in_path = os.path.join(tempfile.gettempdir(), f"vnr_faststart_{work_id}_in{ext}")
-    out_path = os.path.join(tempfile.gettempdir(), f"vnr_faststart_{work_id}_out{ext}")
     try:
-        with open(in_path, "wb") as f:
-            f.write(media_bytes)
-        code, _out, _err = await _run(
-            ffmpeg, "-y", "-i", in_path, "-c", "copy", "-movflags", "+faststart", out_path,
-            timeout=timeout,
+        with open(out_path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
+
+async def remux_faststart_to_file(media_bytes: bytes, content_type: str, *, timeout: float = 120.0) -> str | None:
+    """Same real `-movflags +faststart` remux as remux_faststart, but
+    returns the output TEMP FILE PATH instead of reading it into a second
+    in-memory `bytes` object — see _remux_faststart_to_path_impl's
+    docstring for the confirmed production OOM this exists to avoid.
+
+    The caller takes ownership of the returned path and MUST delete it
+    (e.g. in a `finally`) once it has streamed the file to its final
+    destination. Returns None on any failure, exactly like
+    remux_faststart — nothing is left on disk in that case."""
+    return await _remux_faststart_to_path_impl(media_bytes, content_type, timeout=timeout)
+
+
+async def probe_container_duration_seconds_from_path(path: str, *, timeout: float = 30.0) -> float | None:
+    """Same probe as probe_container_duration_seconds below, but reads an
+    EXISTING file already on disk instead of writing `media_bytes` to a
+    temp file first — lets a caller that already has the file on disk
+    (e.g. remux_faststart_to_file's output) verify it without ever
+    materializing it as a second in-memory `bytes` object. Never deletes
+    `path` — that stays the caller's responsibility."""
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe or not path or not os.path.exists(path):
+        return None
+    try:
+        code, out, _err = await _run(
+            ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
+            timeout=timeout, capture_stdout=True,
         )
         if code != 0:
             return None
-        with open(out_path, "rb") as f:
-            return f.read()
-    except (RenderError, OSError):
+        return round(float(out.decode("utf-8", errors="replace").strip()), 3)
+    except (RenderError, ValueError):
         return None
-    finally:
-        for p in (in_path, out_path):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
 
 
 async def probe_container_duration_seconds(media_bytes: bytes, *, timeout: float = 30.0) -> float | None:
@@ -645,22 +724,15 @@ async def probe_container_duration_seconds(media_bytes: bytes, *, timeout: float
     for any reason; a caller using this for before/after verification
     (see the Video Factory faststart backfill tool) must treat None as
     "could not verify" and refuse to proceed, never as "0 seconds"."""
-    ffprobe = _resolve_ffprobe()
-    if not ffprobe or not media_bytes:
+    if not media_bytes:
         return None
     work_id = uuid.uuid4().hex
     path = os.path.join(tempfile.gettempdir(), f"vnr_cdur_{work_id}.mp4")
     try:
         with open(path, "wb") as f:
             f.write(media_bytes)
-        code, out, _err = await _run(
-            ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
-            timeout=timeout, capture_stdout=True,
-        )
-        if code != 0:
-            return None
-        return round(float(out.decode("utf-8", errors="replace").strip()), 3)
-    except (RenderError, ValueError):
+        return await probe_container_duration_seconds_from_path(path, timeout=timeout)
+    except OSError:
         return None
     finally:
         try:
@@ -670,22 +742,15 @@ async def probe_container_duration_seconds(media_bytes: bytes, *, timeout: float
             pass
 
 
-async def probe_video_frame_count(media_bytes: bytes, *, timeout: float = 60.0) -> int | None:
-    """Best-effort VIDEO STREAM frame count via ffprobe's `-count_frames`
-    (a real decode-count, not the often-unreliable container-metadata
-    `nb_frames` field) — exists specifically to verify a remux changed
-    nothing about the actual encoded video content (same frame count in
-    vs out). Returns None — never raises, never guesses — whenever
-    ffprobe is unavailable, there is no video stream, or the probe fails
-    for any reason; a caller must treat None as "could not verify"."""
+async def probe_video_frame_count_from_path(path: str, *, timeout: float = 60.0) -> int | None:
+    """Same probe as probe_video_frame_count below, but reads an EXISTING
+    file already on disk instead of writing `media_bytes` to a temp file
+    first — see probe_container_duration_seconds_from_path's docstring for
+    why. Never deletes `path`."""
     ffprobe = _resolve_ffprobe()
-    if not ffprobe or not media_bytes:
+    if not ffprobe or not path or not os.path.exists(path):
         return None
-    work_id = uuid.uuid4().hex
-    path = os.path.join(tempfile.gettempdir(), f"vnr_frames_{work_id}.mp4")
     try:
-        with open(path, "wb") as f:
-            f.write(media_bytes)
         code, out, _err = await _run(
             ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path,
@@ -696,6 +761,26 @@ async def probe_video_frame_count(media_bytes: bytes, *, timeout: float = 60.0) 
         text = out.decode("utf-8", errors="replace").strip()
         return int(text) if text.isdigit() else None
     except (RenderError, ValueError):
+        return None
+
+
+async def probe_video_frame_count(media_bytes: bytes, *, timeout: float = 60.0) -> int | None:
+    """Best-effort VIDEO STREAM frame count via ffprobe's `-count_frames`
+    (a real decode-count, not the often-unreliable container-metadata
+    `nb_frames` field) — exists specifically to verify a remux changed
+    nothing about the actual encoded video content (same frame count in
+    vs out). Returns None — never raises, never guesses — whenever
+    ffprobe is unavailable, there is no video stream, or the probe fails
+    for any reason; a caller must treat None as "could not verify"."""
+    if not media_bytes:
+        return None
+    work_id = uuid.uuid4().hex
+    path = os.path.join(tempfile.gettempdir(), f"vnr_frames_{work_id}.mp4")
+    try:
+        with open(path, "wb") as f:
+            f.write(media_bytes)
+        return await probe_video_frame_count_from_path(path, timeout=timeout)
+    except OSError:
         return None
     finally:
         try:

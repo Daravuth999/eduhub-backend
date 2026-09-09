@@ -942,3 +942,79 @@ async def test_remux_faststart_moves_moov_before_mdat_and_preserves_duration_and
 async def test_probe_container_duration_and_frame_count_return_none_for_garbage_input():
     assert await vrt.probe_container_duration_seconds(b"not a real video") is None
     assert await vrt.probe_video_frame_count(b"not a real video") is None
+
+
+# ── remux_faststart_to_file / *_from_path (2026-09 large-upload OOM fix) ──
+# See sync_studio_tools.create_sync_from_upload's docstring for the
+# confirmed production incident this exists to fix: remux_faststart (bytes
+# in, bytes out) forces a caller to hold two full copies of a large video
+# at once. These path-returning variants let a caller stream the result
+# from disk instead.
+@pytest.mark.asyncio
+async def test_remux_faststart_to_file_returns_none_for_empty_input():
+    assert await vrt.remux_faststart_to_file(b"", "video/mp4") is None
+
+
+@pytest.mark.asyncio
+async def test_remux_faststart_to_file_returns_none_when_ffmpeg_unavailable(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    assert await vrt.remux_faststart_to_file(b"fake-bytes", "video/mp4") is None
+
+
+@pytest.mark.asyncio
+async def test_remux_faststart_to_file_returns_none_and_leaves_no_output_file_on_nonzero_exit(monkeypatch):
+    async def _failing_run(*args, **kwargs):
+        return 1, b"", b"ffmpeg: invalid data found when processing input"
+
+    monkeypatch.setattr(vrt, "_run", _failing_run)
+    result = await vrt.remux_faststart_to_file(b"not-really-a-video", "video/mp4")
+    assert result is None
+    # the temp INPUT file this call created must also be cleaned up even
+    # though ffmpeg "failed" (no real ffmpeg ran here at all)
+    leftover = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("vnr_faststart_")]
+    assert leftover == []
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_remux_faststart_to_file_produces_a_real_streamable_output_file():
+    """End-to-end proof that the path-returning variant produces byte-
+    identical results to the bytes-returning remux_faststart — same moov
+    relocation, same duration, same frame count — just without ever
+    holding the whole output in a second Python bytes object."""
+    original = await _make_video_with_mdat_first(duration=2.0)
+    assert vrt.mp4_moov_before_mdat(original) is False
+
+    out_path = await vrt.remux_faststart_to_file(original, "video/mp4")
+    try:
+        assert out_path is not None
+        assert os.path.exists(out_path)
+        with open(out_path, "rb") as f:
+            remuxed_from_path = f.read()
+        assert vrt.mp4_moov_before_mdat(remuxed_from_path) is True
+
+        orig_duration = await vrt.probe_container_duration_seconds(original)
+        new_duration = await vrt.probe_container_duration_seconds_from_path(out_path)
+        assert orig_duration is not None and new_duration is not None
+        assert new_duration == pytest.approx(orig_duration, abs=0.05)
+
+        orig_frames = await vrt.probe_video_frame_count(original)
+        new_frames = await vrt.probe_video_frame_count_from_path(out_path)
+        assert orig_frames is not None and new_frames is not None
+        assert new_frames == orig_frames
+
+        # Bytes-returning and path-returning variants must be equivalent —
+        # neither one silently applies a different transformation.
+        remuxed_via_bytes = await vrt.remux_faststart(original, "video/mp4")
+        assert remuxed_via_bytes == remuxed_from_path
+    finally:
+        if out_path and os.path.exists(out_path):
+            os.remove(out_path)
+
+
+@pytest.mark.asyncio
+async def test_probe_from_path_variants_return_none_for_a_missing_or_garbage_path():
+    assert await vrt.probe_container_duration_seconds_from_path("") is None
+    assert await vrt.probe_video_frame_count_from_path("") is None
+    assert await vrt.probe_container_duration_seconds_from_path("/no/such/file.mp4") is None
+    assert await vrt.probe_video_frame_count_from_path("/no/such/file.mp4") is None

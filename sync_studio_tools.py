@@ -206,8 +206,8 @@ def _r2_client(cfg: dict, endpoint: str):
     )
 
 
-async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata: dict,
-                               *, endpoint_override: str | None = None) -> str | None:
+async def _upload_media_to_r2(raw: bytes | None, key: str, content_type: str, metadata: dict,
+                               *, endpoint_override: str | None = None, file_path: str | None = None) -> str | None:
     """R2 upload for native media uploads. NEVER raises — returns None on
     any failure (env vars absent, boto3 missing, network error) so the
     caller falls back to GridFS transparently, matching server.py's own
@@ -224,6 +224,18 @@ async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata:
     across modules, per this codebase's own R2-client-per-module
     isolation convention — see that module's identical HEAD-then-PUT
     structure).
+
+    2026-09 (large-upload OOM fix) — `file_path`, when given, streams the
+    PUT body directly from that file instead of requiring the caller to
+    pass the whole thing as `raw: bytes` (pass `raw=None` in that case).
+    boto3's `put_object` accepts a seekable file object for `Body` and
+    reads it in chunks itself; this is what lets create_sync_from_upload
+    upload a remuxed video straight from the temp file remux_faststart_
+    to_file produced, without ever holding a second full in-memory copy of
+    a large file alongside the original upload buffer — see that
+    function's docstring for the confirmed production OOM this fixes.
+    Exactly one of `raw`/`file_path` should be given; existing callers are
+    unaffected — they keep passing `raw` and never set `file_path`.
 
     `endpoint_override` exists ONLY for tests — no production call site
     ever passes it, so real behavior (the actual R2 endpoint below) is
@@ -248,19 +260,25 @@ async def _upload_media_to_r2(raw: bytes, key: str, content_type: str, metadata:
                 code = str((exc.response or {}).get("Error", {}).get("Code") or "")
                 if code not in ("404", "NoSuchKey", "NotFound"):
                     raise
-            s3.put_object(
-                Bucket=cfg["R2_BUCKET_NAME"], Key=key, Body=raw, ContentType=content_type,
+            put_kwargs = dict(
+                Bucket=cfg["R2_BUCKET_NAME"], Key=key, ContentType=content_type,
                 Metadata={str(k): str(v) for k, v in (metadata or {}).items()},
             )
+            if file_path is not None:
+                with open(file_path, "rb") as f:
+                    s3.put_object(Body=f, **put_kwargs)
+            else:
+                s3.put_object(Body=raw, **put_kwargs)
             return False
 
         loop = asyncio.get_event_loop()
         already_existed = await loop.run_in_executor(None, _do_upload)
         url = f"{cfg['R2_PUBLIC_URL'].rstrip('/')}/{key}"
+        size = os.path.getsize(file_path) if file_path is not None else len(raw or b"")
         if already_existed:
             logger.info("sync_studio_tools: content-addressed object already exists, skipped upload key=%s", key)
         else:
-            logger.info("sync_studio_tools: uploaded %s (%d bytes) url=%s", key, len(raw), url)
+            logger.info("sync_studio_tools: uploaded %s (%d bytes) url=%s", key, size, url)
         return url
     except Exception as exc:  # noqa: BLE001
         # logger.exception (not .warning(str(exc))) — a bare str() of a
@@ -344,45 +362,83 @@ async def create_sync_from_upload(
         immediately instead of requiring the whole file to download first
         — the same zero-risk fix already proven for the AI-narration
         master, now applied to the original video every student actually
-        watches by default."""
+        watches by default.
+
+    2026-09 (real production incident fix — a 164.7MB video upload
+    crashed the server with "Network error during upload"; Render's own
+    restart banner appeared ~12s after ffmpeg's remux completed,
+    consistent with an OOM kill): CONFIRMED via direct reproduction of
+    this exact function's code path against a real ~175MB video — process
+    RSS went from ~204MB (after the initial full-buffer read, which
+    happens upstream in the route before this function is ever called) to
+    ~379MB right after the remux step, because remux_faststart used to
+    read the whole remuxed output back into a SECOND full-size `bytes`
+    object that then coexisted with the original `raw` for the rest of
+    this function, including the slow, network-bound upload to storage.
+    Fix: stream the remuxed output from disk (video_render_tools.
+    remux_faststart_to_file, deleted here once the upload finishes)
+    instead of materializing it as a second in-memory buffer — peak
+    memory for this function is now back to ~1x the file size (the
+    original buffer alone) instead of ~2x, for the exact same reason a
+    plain audio upload (never remuxed) never had this problem. The sha256
+    hash is now computed off the event loop (a real, separately-confirmed
+    ~0.5s-per-175MB blocking call previously ran directly on it) — a
+    small, low-risk fix for the same investigation, not a memory fix."""
     ext, content_type = _validate_media_upload(raw, declared_content_type)
 
-    content_hash = hashlib.sha256(raw).hexdigest()
+    content_hash = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: hashlib.sha256(raw).hexdigest(),
+    )
 
     stored_bytes = raw
+    stored_path: str | None = None
     if "video" in (content_type or "").lower():
-        remuxed = await video_render_tools.remux_faststart(raw, content_type)
-        if remuxed:
-            stored_bytes = remuxed
+        stored_path = await video_render_tools.remux_faststart_to_file(raw, content_type)
 
-    key = f"sync-media/{content_hash}.{ext}"
-    metadata = {"uploadedBy": uploaded_by, "contentHash": content_hash}
-    if slug is not None:
-        metadata["slug"] = slug
-        metadata["chapterIndex"] = str(chapter_index)
-    if owner_ref:
-        metadata["ownerRef"] = owner_ref
+    try:
+        key = f"sync-media/{content_hash}.{ext}"
+        metadata = {"uploadedBy": uploaded_by, "contentHash": content_hash}
+        if slug is not None:
+            metadata["slug"] = slug
+            metadata["chapterIndex"] = str(chapter_index)
+        if owner_ref:
+            metadata["ownerRef"] = owner_ref
 
-    media_ref = await _upload_media_to_r2(stored_bytes, key, content_type, metadata)
-    if not media_ref:
-        filename = f"{content_hash}.{ext}"
-        media_ref = await _gridfs_ref_if_already_stored(media_bucket, filename)
-        if media_ref:
-            logger.info(
-                "sync_studio_tools: content-addressed GridFS object already exists, "
-                "skipped upload filename=%s", filename,
-            )
+        if stored_path is not None:
+            media_ref = await _upload_media_to_r2(None, key, content_type, metadata, file_path=stored_path)
         else:
-            try:
-                await media_bucket.upload_from_stream(
-                    filename, io.BytesIO(stored_bytes),
-                    metadata={**metadata, "contentType": content_type},
+            media_ref = await _upload_media_to_r2(stored_bytes, key, content_type, metadata)
+        if not media_ref:
+            filename = f"{content_hash}.{ext}"
+            media_ref = await _gridfs_ref_if_already_stored(media_bucket, filename)
+            if media_ref:
+                logger.info(
+                    "sync_studio_tools: content-addressed GridFS object already exists, "
+                    "skipped upload filename=%s", filename,
                 )
-            except Exception as exc:  # noqa: BLE001
-                raise SyncStudioError(
-                    "storage_failed", f"failed to store media: {type(exc).__name__}: {exc}", 500,
-                ) from exc
-            media_ref = f"gridfs://{MEDIA_GRIDFS_BUCKET}/{filename}"
+            else:
+                try:
+                    if stored_path is not None:
+                        with open(stored_path, "rb") as f:
+                            await media_bucket.upload_from_stream(
+                                filename, f, metadata={**metadata, "contentType": content_type},
+                            )
+                    else:
+                        await media_bucket.upload_from_stream(
+                            filename, io.BytesIO(stored_bytes),
+                            metadata={**metadata, "contentType": content_type},
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    raise SyncStudioError(
+                        "storage_failed", f"failed to store media: {type(exc).__name__}: {exc}", 500,
+                    ) from exc
+                media_ref = f"gridfs://{MEDIA_GRIDFS_BUCKET}/{filename}"
+    finally:
+        if stored_path is not None:
+            try:
+                os.remove(stored_path)
+            except OSError:
+                pass
 
     doc = build_sync_document(
         media_ref=media_ref,

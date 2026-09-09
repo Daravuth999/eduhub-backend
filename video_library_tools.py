@@ -34,10 +34,11 @@ reading video_purchases, never by trusting anything the frontend sends.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import hashlib
-import io
 import logging
+import os
 
 from fastapi import Body, Depends, File, Form, HTTPException, UploadFile
 
@@ -573,6 +574,21 @@ async def admin_reconcile_purchase(db, student_id: str, lesson_id: str, *, resol
 #    frame count) BEFORE the lesson is ever repointed at it — the original
 #    object is left completely untouched if anything is inconclusive.
 #    NOT executed against any real data as part of this pass. ────────────
+def _sha256_of_file(path: str) -> str:
+    """Streaming (chunked) sha256 of an on-disk file — never reads the
+    whole file into one `bytes` object just to hash it, unlike the
+    hashlib.sha256(remuxed_bytes) this replaces (see
+    backfill_faststart_scan_lesson's 2026-09 OOM-fix comment)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 async def backfill_faststart_scan_lesson(db, lesson: dict, media_bucket, *, dry_run: bool = True) -> dict:
     """Per-lesson faststart backfill. Returns a status row, never a bare
     bool — an ambiguous outcome (couldn't read the media, couldn't parse
@@ -608,38 +624,52 @@ async def backfill_faststart_scan_lesson(db, lesson: dict, media_bucket, *, dry_
     if dry_run:
         return {"lessonId": lesson_id, "status": "needs_fix"}
 
-    remuxed = await video_render_tools.remux_faststart(raw, content_type)
-    if not remuxed:
-        return {"lessonId": lesson_id, "status": "remux_failed"}
-
     orig_duration = await video_render_tools.probe_container_duration_seconds(raw)
-    new_duration = await video_render_tools.probe_container_duration_seconds(remuxed)
     orig_frames = await video_render_tools.probe_video_frame_count(raw)
-    new_frames = await video_render_tools.probe_video_frame_count(remuxed)
-    if None in (orig_duration, new_duration, orig_frames, new_frames):
-        return {"lessonId": lesson_id, "status": "verification_failed", "detail": "could not measure duration/frames"}
-    if abs(new_duration - orig_duration) > 0.5 or new_frames != orig_frames:
-        return {
-            "lessonId": lesson_id, "status": "verification_failed",
-            "detail": f"duration {orig_duration}s->{new_duration}s, frames {orig_frames}->{new_frames}",
-        }
 
-    content_hash = hashlib.sha256(remuxed).hexdigest()
-    key = f"sync-media/{content_hash}.mp4"
-    new_ref = await sync_studio_tools._upload_media_to_r2(
-        remuxed, key, content_type, {"contentHash": content_hash, "backfill": "faststart"},
-    )
-    if not new_ref:
-        filename = f"{content_hash}.mp4"
-        new_ref = await sync_studio_tools._gridfs_ref_if_already_stored(media_bucket, filename)
+    # 2026-09 (same production OOM fix as create_sync_from_upload — see its
+    # docstring): stream the remux output from disk instead of reading it
+    # into a second full-size `bytes` object that would coexist with
+    # `raw` (already a full in-memory copy of this — potentially large,
+    # pre-existing — lesson's media, from load_media_bytes above) for the
+    # rest of this function, including verification and upload.
+    remuxed_path = await video_render_tools.remux_faststart_to_file(raw, content_type)
+    if not remuxed_path:
+        return {"lessonId": lesson_id, "status": "remux_failed"}
+    try:
+        new_duration = await video_render_tools.probe_container_duration_seconds_from_path(remuxed_path)
+        new_frames = await video_render_tools.probe_video_frame_count_from_path(remuxed_path)
+        if None in (orig_duration, new_duration, orig_frames, new_frames):
+            return {"lessonId": lesson_id, "status": "verification_failed", "detail": "could not measure duration/frames"}
+        if abs(new_duration - orig_duration) > 0.5 or new_frames != orig_frames:
+            return {
+                "lessonId": lesson_id, "status": "verification_failed",
+                "detail": f"duration {orig_duration}s->{new_duration}s, frames {orig_frames}->{new_frames}",
+            }
+
+        content_hash = await asyncio.get_event_loop().run_in_executor(None, _sha256_of_file, remuxed_path)
+        key = f"sync-media/{content_hash}.mp4"
+        new_ref = await sync_studio_tools._upload_media_to_r2(
+            None, key, content_type, {"contentHash": content_hash, "backfill": "faststart"},
+            file_path=remuxed_path,
+        )
         if not new_ref:
-            try:
-                await media_bucket.upload_from_stream(
-                    filename, io.BytesIO(remuxed), metadata={"contentType": content_type, "backfill": "faststart"},
-                )
-            except Exception as exc:  # noqa: BLE001
-                return {"lessonId": lesson_id, "status": "store_failed", "detail": f"{type(exc).__name__}: {exc}"}
-            new_ref = f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/{filename}"
+            filename = f"{content_hash}.mp4"
+            new_ref = await sync_studio_tools._gridfs_ref_if_already_stored(media_bucket, filename)
+            if not new_ref:
+                try:
+                    with open(remuxed_path, "rb") as f:
+                        await media_bucket.upload_from_stream(
+                            filename, f, metadata={"contentType": content_type, "backfill": "faststart"},
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    return {"lessonId": lesson_id, "status": "store_failed", "detail": f"{type(exc).__name__}: {exc}"}
+                new_ref = f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/{filename}"
+    finally:
+        try:
+            os.remove(remuxed_path)
+        except OSError:
+            pass
 
     old_media_ref = media_ref
     sync_id = lesson.get("syncId")

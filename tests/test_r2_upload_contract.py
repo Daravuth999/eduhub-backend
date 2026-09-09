@@ -19,6 +19,8 @@ specifically for this file — no production call site ever passes it.
 from __future__ import annotations
 
 import http.server
+import os
+import tempfile
 import threading
 
 import pytest
@@ -178,6 +180,68 @@ async def test_a_second_upload_to_the_same_key_is_skipped_via_head_check_dedup(m
     second = await sst._upload_media_to_r2(b"same-bytes", key, "video/mp4", {}, endpoint_override=endpoint)
     assert second == first
     assert len(handler.requests) == 1  # NOT 2 — the second call never PUT again
+
+
+@pytest.mark.asyncio
+async def test_file_path_upload_streams_the_real_file_content_not_a_second_buffer(mock_s3_server):
+    """2026-09 large-upload OOM fix: _upload_media_to_r2 now accepts
+    file_path= (raw=None) so create_sync_from_upload can stream a remuxed
+    video straight from disk instead of holding a second full in-memory
+    copy alongside the original upload buffer — see that function's
+    docstring for the confirmed production crash this fixes. Proven
+    against the REAL mock server (not a mocked-away boto3 call): a real
+    on-disk file's exact bytes genuinely reach the server via a real
+    signed PUT when passed as file_path instead of raw."""
+    endpoint, handler = mock_s3_server
+    key = "sync-media/streamed-from-disk.mp4"
+    content = b"a-real-remuxed-video-payload-streamed-from-a-temp-file" * 1000
+
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+
+        url = await sst._upload_media_to_r2(
+            None, key, "video/mp4", {"backfill": "faststart"}, endpoint_override=endpoint, file_path=path,
+        )
+    finally:
+        os.remove(path)
+
+    assert url == "https://media.example-cdn.test/" + key
+    assert len(handler.requests) == 1
+    assert handler.requests[0]["body"] == content
+    assert handler.requests[0]["content_type"] == "video/mp4"
+
+
+@pytest.mark.asyncio
+async def test_file_path_upload_also_participates_in_head_check_dedup(mock_s3_server):
+    """The file_path path must go through the exact same HEAD-before-PUT
+    dedup as the raw-bytes path — a second upload of an already-stored
+    content-addressed key must never PUT again, whether the caller has
+    the content as bytes or as a file on disk."""
+    endpoint, handler = mock_s3_server
+    key = "sync-media/streamed-dedup-check.mp4"
+    content = b"identical-content-uploaded-twice-from-disk"
+
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        first = await sst._upload_media_to_r2(None, key, "video/mp4", {}, endpoint_override=endpoint, file_path=path)
+    finally:
+        os.remove(path)
+    assert len(handler.requests) == 1
+
+    fd2, path2 = tempfile.mkstemp(suffix=".mp4")
+    try:
+        with os.fdopen(fd2, "wb") as f:
+            f.write(content)
+        second = await sst._upload_media_to_r2(None, key, "video/mp4", {}, endpoint_override=endpoint, file_path=path2)
+    finally:
+        os.remove(path2)
+
+    assert second == first
+    assert len(handler.requests) == 1  # NOT 2 — HEAD found it already stored
 
 
 @pytest.mark.asyncio
