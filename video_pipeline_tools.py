@@ -269,7 +269,12 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
             await sync_studio_tools.mark_alignment_processing(db, sync_id)
             result = await provider.align(transcribe_bytes, transcribe_ct)
             transcript_text = result.get("transcriptText", "")
-            await _set_step(db, lesson_id, run_id, "speech_recognition", "complete")
+            # 2026-09 speaker-continuity quality signal (§2d/4c) — never
+            # blocks or fails the step; a non-fatal note only, same
+            # pattern as the synchronization step's ground-truth timing
+            # check below.
+            speaker_quality_note = video_ai_provider.assess_speaker_continuity_quality(result.get("sync") or {})
+            await _set_step(db, lesson_id, run_id, "speech_recognition", "complete", speaker_quality_note)
 
             # 3 — synchronization generation (canonical schema, versioned)
             await _set_step(db, lesson_id, run_id, "synchronization", "running")

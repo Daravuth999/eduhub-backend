@@ -132,6 +132,50 @@ def ffmpeg_source() -> str | None:
     return "bundled" if _resolve_ffmpeg() else None
 
 
+def mp4_moov_before_mdat(data: bytes) -> bool | None:
+    """Pure, ffmpeg-free ISO-BMFF (MP4) top-level box walker: does the
+    'moov' box appear (by byte offset) BEFORE the 'mdat' box? This is
+    exactly what `-movflags +faststart` (remux_faststart above) fixes — a
+    browser needs 'moov' first to resolve duration/seek points without
+    downloading the whole file; many camera/phone exports write 'mdat'
+    (the actual media data, often the bulk of the file) first instead.
+
+    No subprocess, no ffprobe — reads only box HEADERS (4- or 8-byte size
+    + 4-byte type) and jumps between them using each box's own declared
+    size, so this is fast even for a multi-GB file already held in
+    memory. Returns None — never guesses — when the input isn't a
+    parseable top-level ISO-BMFF box stream, or either box is missing; a
+    caller (the faststart backfill tool) must treat None as "could not
+    determine" and skip the lesson rather than assume either outcome."""
+    pos = 0
+    n = len(data)
+    moov_at: int | None = None
+    mdat_at: int | None = None
+    while pos + 8 <= n:
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        box_type = data[pos + 4:pos + 8]
+        header_len = 8
+        if size == 1:
+            if pos + 16 > n:
+                return None
+            size = int.from_bytes(data[pos + 8:pos + 16], "big")
+            header_len = 16
+        if box_type == b"moov" and moov_at is None:
+            moov_at = pos
+        elif box_type == b"mdat" and mdat_at is None:
+            mdat_at = pos
+        if moov_at is not None and mdat_at is not None:
+            return moov_at < mdat_at
+        if size == 0:  # box extends to EOF (only valid for the last box)
+            break
+        if size < header_len:
+            return None  # malformed — refuse to guess
+        pos += size
+    if moov_at is None or mdat_at is None:
+        return None
+    return moov_at < mdat_at
+
+
 def ffprobe_available() -> bool:
     return _resolve_ffprobe() is not None
 
@@ -538,6 +582,127 @@ async def mux_narration_into_video(
                     os.remove(p)
             except OSError:  # noqa: PERF203 — best-effort cleanup, never fails the render
                 pass
+
+
+async def remux_faststart(media_bytes: bytes, content_type: str, *, timeout: float = 120.0) -> bytes | None:
+    """Pure container-only remux — relocates the MP4 "moov" atom to the
+    front of the file via `-movflags +faststart`, with `-c copy` on both
+    streams (no re-encode, no quality/timing change whatsoever). This is
+    the SAME zero-risk technique already proven above for the AI-narration
+    master (mux_narration_into_video), applied here for the first time to
+    the ORIGINAL author-uploaded video — which is what students actually
+    watch by default, and never had this treatment before. A camera/phone
+    export (or many non-web-optimized export tools) commonly writes the
+    moov atom at the END of the file, forcing a browser to download the
+    entire file before duration/seeking resolve — the exact "stuck --:--
+    duration, indefinite loading spinner" symptom already fixed for the
+    narration master.
+
+    Best-effort and NEVER blocks an upload: returns None (never raises) on
+    ANY failure — no video stream, ffmpeg unavailable, empty input, a
+    non-zero exit, a timeout, or any other exception — so the caller can
+    safely fall back to storing the original, unmodified bytes rather than
+    failing the upload just because this optimization couldn't be applied.
+    """
+    if not media_bytes:
+        return None
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    ext = ".mp4" if "mp4" in (content_type or "").lower() else ".bin"
+    work_id = uuid.uuid4().hex
+    in_path = os.path.join(tempfile.gettempdir(), f"vnr_faststart_{work_id}_in{ext}")
+    out_path = os.path.join(tempfile.gettempdir(), f"vnr_faststart_{work_id}_out{ext}")
+    try:
+        with open(in_path, "wb") as f:
+            f.write(media_bytes)
+        code, _out, _err = await _run(
+            ffmpeg, "-y", "-i", in_path, "-c", "copy", "-movflags", "+faststart", out_path,
+            timeout=timeout,
+        )
+        if code != 0:
+            return None
+        with open(out_path, "rb") as f:
+            return f.read()
+    except (RenderError, OSError):
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+async def probe_container_duration_seconds(media_bytes: bytes, *, timeout: float = 30.0) -> float | None:
+    """Best-effort OVERALL CONTAINER duration probe (`format=duration` —
+    works for a video or an audio-only file alike). Unlike
+    probe_audio_duration_seconds below (a narrower, standalone-audio-clip
+    helper), this exists specifically to verify a remux preserved timing:
+    "does the output's overall duration match the input's". Returns None
+    — never raises — whenever ffprobe is unavailable or the probe fails
+    for any reason; a caller using this for before/after verification
+    (see the Video Factory faststart backfill tool) must treat None as
+    "could not verify" and refuse to proceed, never as "0 seconds"."""
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe or not media_bytes:
+        return None
+    work_id = uuid.uuid4().hex
+    path = os.path.join(tempfile.gettempdir(), f"vnr_cdur_{work_id}.mp4")
+    try:
+        with open(path, "wb") as f:
+            f.write(media_bytes)
+        code, out, _err = await _run(
+            ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
+            timeout=timeout, capture_stdout=True,
+        )
+        if code != 0:
+            return None
+        return round(float(out.decode("utf-8", errors="replace").strip()), 3)
+    except (RenderError, ValueError):
+        return None
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+async def probe_video_frame_count(media_bytes: bytes, *, timeout: float = 60.0) -> int | None:
+    """Best-effort VIDEO STREAM frame count via ffprobe's `-count_frames`
+    (a real decode-count, not the often-unreliable container-metadata
+    `nb_frames` field) — exists specifically to verify a remux changed
+    nothing about the actual encoded video content (same frame count in
+    vs out). Returns None — never raises, never guesses — whenever
+    ffprobe is unavailable, there is no video stream, or the probe fails
+    for any reason; a caller must treat None as "could not verify"."""
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe or not media_bytes:
+        return None
+    work_id = uuid.uuid4().hex
+    path = os.path.join(tempfile.gettempdir(), f"vnr_frames_{work_id}.mp4")
+    try:
+        with open(path, "wb") as f:
+            f.write(media_bytes)
+        code, out, _err = await _run(
+            ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path,
+            timeout=timeout, capture_stdout=True,
+        )
+        if code != 0:
+            return None
+        text = out.decode("utf-8", errors="replace").strip()
+        return int(text) if text.isdigit() else None
+    except (RenderError, ValueError):
+        return None
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 async def probe_audio_duration_seconds(audio_bytes: bytes, *, timeout: float = 30.0) -> float | None:

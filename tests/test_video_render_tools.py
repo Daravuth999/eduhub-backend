@@ -822,3 +822,123 @@ async def test_run_pipeline_acquires_the_heavy_op_semaphore(monkeypatch):
     assert "available_during_run" in observed, "run_pipeline never acquired the shared heavy_op_semaphore"
     assert observed["available_during_run"] == before - 1
     assert after == before, "the semaphore permit was not released after the run finished"
+
+
+# ── faststart remux + moov/mdat detection (2026-09 Video Factory
+#    surgical bug-fix pass, §2c/4b) ──────────────────────────────────────
+def _box(box_type: bytes, payload: bytes = b"") -> bytes:
+    size = 8 + len(payload)
+    return size.to_bytes(4, "big") + box_type + payload
+
+
+def test_mp4_moov_before_mdat_true_when_moov_comes_first():
+    data = _box(b"ftyp", b"isom") + _box(b"moov", b"x" * 20) + _box(b"mdat", b"y" * 100)
+    assert vrt.mp4_moov_before_mdat(data) is True
+
+
+def test_mp4_moov_before_mdat_false_when_mdat_comes_first():
+    # The exact "needs faststart" shape: mdat (often huge) written before
+    # moov, which forces a browser to download the whole file first.
+    data = _box(b"ftyp", b"isom") + _box(b"mdat", b"y" * 100) + _box(b"moov", b"x" * 20)
+    assert vrt.mp4_moov_before_mdat(data) is False
+
+
+def test_mp4_moov_before_mdat_none_when_moov_is_missing():
+    data = _box(b"ftyp", b"isom") + _box(b"mdat", b"y" * 100)
+    assert vrt.mp4_moov_before_mdat(data) is None
+
+
+def test_mp4_moov_before_mdat_none_when_mdat_is_missing():
+    data = _box(b"ftyp", b"isom") + _box(b"moov", b"x" * 20)
+    assert vrt.mp4_moov_before_mdat(data) is None
+
+
+def test_mp4_moov_before_mdat_none_for_garbage_input():
+    assert vrt.mp4_moov_before_mdat(b"not an mp4 at all") is None
+    assert vrt.mp4_moov_before_mdat(b"") is None
+    assert vrt.mp4_moov_before_mdat(b"\x00\x00\x00\x04xxxx") is None  # size < header_len
+
+
+def test_mp4_moov_before_mdat_skips_over_a_large_mdat_efficiently():
+    # A real "needs fixing" file has a MULTI-MB mdat before a small moov —
+    # this must jump via the declared size, not scan every byte.
+    huge_mdat = _box(b"mdat", b"z" * 5_000_000)
+    data = _box(b"ftyp", b"isom") + huge_mdat + _box(b"moov", b"x" * 20)
+    assert vrt.mp4_moov_before_mdat(data) is False
+
+
+@pytest.mark.asyncio
+async def test_remux_faststart_returns_none_for_empty_input():
+    assert await vrt.remux_faststart(b"", "video/mp4") is None
+
+
+@pytest.mark.asyncio
+async def test_remux_faststart_returns_none_when_ffmpeg_unavailable(monkeypatch):
+    monkeypatch.setattr(vrt, "_resolve_ffmpeg", lambda: None)
+    assert await vrt.remux_faststart(b"fake-bytes", "video/mp4") is None
+
+
+@pytest.mark.asyncio
+async def test_remux_faststart_returns_none_on_a_nonzero_ffmpeg_exit(monkeypatch):
+    async def _failing_run(*args, **kwargs):
+        return 1, b"", b"ffmpeg: invalid data found when processing input"
+
+    monkeypatch.setattr(vrt, "_run", _failing_run)
+    result = await vrt.remux_faststart(b"not-really-a-video", "video/mp4")
+    assert result is None
+
+
+NO_FFMPEG = not vrt.ffmpeg_available()
+NO_FFPROBE = not vrt.ffprobe_available()
+
+
+async def _make_video_with_mdat_first(*, duration: float = 2.0) -> bytes:
+    """A real ffmpeg-generated MP4 whose moov atom is at the END (ffmpeg's
+    own default when -movflags +faststart is NOT passed) — the genuine
+    "needs fixing" shape this whole fix exists for."""
+    import os as _os
+    path = _os.path.join(tempfile.gettempdir(), f"vrt_mdatfirst_{uuid.uuid4().hex}.mp4")
+    args = (
+        vrt._resolve_ffmpeg(), "-y",
+        "-f", "lavfi", "-i", f"color=c=blue:s=320x240:d={duration}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", path,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(vrt._executor, vrt._run_blocking, args, 30.0, False)
+    with open(path, "rb") as f:
+        data = f.read()
+    _os.remove(path)
+    return data
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_remux_faststart_moves_moov_before_mdat_and_preserves_duration_and_frame_count():
+    """The real, end-to-end proof: a genuinely mdat-first video (ffmpeg's
+    own default) gets moov relocated to the front, with byte-for-byte
+    preserved duration and video frame count — a container-only change,
+    never a re-encode."""
+    original = await _make_video_with_mdat_first(duration=2.0)
+    assert vrt.mp4_moov_before_mdat(original) is False, "test fixture itself must need fixing, or this proves nothing"
+
+    remuxed = await vrt.remux_faststart(original, "video/mp4")
+    assert remuxed is not None
+    assert vrt.mp4_moov_before_mdat(remuxed) is True
+
+    orig_duration = await vrt.probe_container_duration_seconds(original)
+    new_duration = await vrt.probe_container_duration_seconds(remuxed)
+    assert orig_duration is not None and new_duration is not None
+    assert new_duration == pytest.approx(orig_duration, abs=0.05)
+
+    orig_frames = await vrt.probe_video_frame_count(original)
+    new_frames = await vrt.probe_video_frame_count(remuxed)
+    assert orig_frames is not None and new_frames is not None
+    assert new_frames == orig_frames
+
+
+@pytest.mark.skipif(NO_FFMPEG or NO_FFPROBE, reason="ffmpeg/ffprobe not installed in this environment")
+@pytest.mark.asyncio
+async def test_probe_container_duration_and_frame_count_return_none_for_garbage_input():
+    assert await vrt.probe_container_duration_seconds(b"not a real video") is None
+    assert await vrt.probe_video_frame_count(b"not a real video") is None

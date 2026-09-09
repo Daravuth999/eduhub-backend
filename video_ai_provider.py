@@ -359,6 +359,18 @@ class VideoAiError(Exception):
 
 
 # ── Gemini provider ──────────────────────────────────────────────────────
+# 2026-09 — speaker-continuity guidance added (Video Factory surgical
+# bug-fix pass, §2d/4c): the prior wording ("label them consistently") gave
+# Gemini no instruction for HOW to stay consistent across a jump cut, a
+# camera-angle change, or a speaker who goes silent and returns later —
+# exactly the scenario reported as "synchronization between speakers"
+# breaking down. This is a prompt-quality improvement only, not a fix for
+# Gemini's inherent multimodal-transcription accuracy ceiling: real,
+# reliable speaker continuity across cuts is fundamentally a voice-based
+# diarization capability, which this prompt can request but Gemini is not
+# guaranteed to execute perfectly (see assess_speaker_continuity_quality
+# below for the honest, code-side safety net over this remaining
+# uncertainty — a review-routing signal, never a claimed fix).
 _ASR_PROMPT = (
     "You are a professional transcription engine for an English-learning "
     "platform. Transcribe the attached media EXACTLY as spoken.\n"
@@ -370,9 +382,80 @@ _ASR_PROMPT = (
     "- One segment per natural spoken sentence, in chronological order.\n"
     "- start/end are SECONDS from the beginning of the media, as numbers (e.g. 12.4), never clock strings.\n"
     "- If there are multiple speakers, label them consistently S1, S2, S3…; if one speaker, use S1 for every segment.\n"
+    "- Identify each speaker by VOICE — pitch, tone, cadence — never by what is visible on screen. A camera-angle "
+    "change, a jump cut, or a change of location/background is NOT evidence of a new speaker.\n"
+    "- If a voice you heard earlier returns later — even after a silence, a scene change, or another speaker's "
+    "turn — reuse that SAME speaker label. Do not assign a new speaker id just because time has passed or the "
+    "visual scene changed.\n"
     "- Include every spoken word. Do not summarize, translate, or censor.\n"
     "- If the media contains no speech, return {\"language\": \"en\", \"segments\": []}."
 )
+
+
+def assess_speaker_continuity_quality(sync_doc: dict) -> str | None:
+    """Best-effort, code-only sanity check on Gemini's speaker labeling —
+    NOT a correctness fix (a real fix would require a dedicated voice-
+    based diarization provider, explicitly out of scope for this pass per
+    the "no second AI provider" ground rule) — purely a signal that routes
+    a lesson toward human review in Sync Review Studio rather than letting
+    a likely-wrong speaker assignment publish silently.
+
+    Flags two concrete, evidence-based patterns, never a vague "accuracy
+    is uncertain" guess:
+      - a "flicker": a lone single-sentence run of speaker B interrupting
+        an otherwise-continuous run of speaker A (A's run is at least 2
+        sentences on at least one side of the interruption) before A
+        resumes — a brief false switch-and-immediate-revert, the classic
+        single-sentence diarization-confusion signature. Deliberately
+        run-length-based, NOT a plain "A,B,A" text match: a genuine,
+        sustained back-and-forth conversation (S1,S2,S1,S2,S1,S2 — every
+        run length 1) also matches "A,B,A" everywhere but is completely
+        normal and must never be flagged; only a lone interruption of an
+        otherwise-continuous speaker counts.
+      - an implausibly high ratio of distinct speaker ids to sentences —
+        more speaker identities than a short lesson could plausibly need.
+
+    Returns None whenever there isn't enough data to judge honestly
+    (fewer than 4 sentences, or no speaker labels present at all) rather
+    than fabricating a flag from insufficient evidence — this mirrors this
+    codebase's own build_confidence() convention of "unknown stays None,
+    never guessed"."""
+    speaker_ids = [
+        s.get("speakerId")
+        for p in (sync_doc.get("paragraphs") or [])
+        for s in (p.get("sentences") or [])
+    ]
+    if len(speaker_ids) < 4 or not any(speaker_ids):
+        return None
+
+    # Run-length encode: [(speaker, run_length), ...].
+    runs: list[list] = []
+    for sid in speaker_ids:
+        if runs and runs[-1][0] == sid:
+            runs[-1][1] += 1
+        else:
+            runs.append([sid, 1])
+
+    flickers = sum(
+        1 for i in range(1, len(runs) - 1)
+        if runs[i][1] == 1 and runs[i][0] is not None
+        and runs[i - 1][0] is not None
+        and runs[i - 1][0] == runs[i + 1][0]
+        and (runs[i - 1][1] >= 2 or runs[i + 1][1] >= 2)
+    )
+    unique_speakers = len({s for s in speaker_ids if s})
+
+    reasons = []
+    if flickers >= 3:
+        reasons.append(f"{flickers} single-sentence speaker changes (possible diarization confusion)")
+    if unique_speakers >= 4 and unique_speakers > len(speaker_ids) / 3:
+        reasons.append(f"{unique_speakers} distinct speakers across only {len(speaker_ids)} sentences")
+    if not reasons:
+        return None
+    return (
+        "speaker labeling quality check: " + "; ".join(reasons) +
+        " — recommend a human reviewer verify speaker continuity in Sync Review Studio before approving."
+    )
 
 
 _STORY_PROMPT_TEMPLATE = (
