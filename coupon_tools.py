@@ -142,6 +142,43 @@ def register_coupon_routes(api, db, require_admin, User):
             raise _coupon_error(400, "already_used", "You have already used this coupon for this book.")
         return doc
 
+    def _effective_promotion_id(coupon: dict) -> str | None:
+        """The key actually used for the one-redemption-per-user check.
+
+        CRITICAL CORRECTION (see git history): the previous implementation
+        made this protection entirely opt-in — an admin had to manually
+        set promotion_id on a coupon, and it silently did nothing on any
+        coupon that predated the field or where the admin simply never
+        touched it. A public 100%-off coupon with that field unset gave
+        every student unlimited free books (redeem the same code once per
+        book) — reproduced end to end in this file's own tests before this
+        fix.
+
+        Now: an admin-set promotion_id always wins (explicit grouping of
+        several rotated codes under one shared limit — unchanged from
+        before). When none is set, a coupon that is BOTH public
+        (assigned_to is empty — anyone can redeem it) AND a full 100%
+        discount (type == "percent", value >= 100) is AUTOMATICALLY
+        treated as its own one-code promotion, keyed on its own code —
+        zero admin action required. This is deliberately narrow: a
+        partial-discount or student-assigned coupon is never auto-limited,
+        since an admin may legitimately want a reusable discount code
+        (e.g. "SAVE20" usable by the same student across many books) — only
+        a coupon that gives a book away for free, to anyone, is inherently
+        the one-time promotional-freebie shape this limit protects against.
+        A fixed-amount ("pts off") coupon is never auto-included either —
+        whether it happens to cover 100% of a given book's price is
+        price-dependent, not a static, unambiguous coupon property.
+        """
+        explicit = coupon.get("promotion_id")
+        if explicit:
+            return explicit
+        is_public = not (coupon.get("assigned_to") or [])
+        is_full_percent_off = coupon.get("type") == "percent" and float(coupon.get("value") or 0) >= 100
+        if is_public and is_full_percent_off:
+            return f"__auto__:{coupon['code']}"
+        return None
+
     async def _promotion_already_redeemed(promotion_id: str | None, student_id: str) -> bool:
         """Read-only check — used by /validate for early UI feedback only.
         The actual enforcement (race-proof against concurrent requests) is
@@ -323,7 +360,8 @@ def register_coupon_routes(api, db, require_admin, User):
         # atomically inside redeem_coupon. This just lets the redemption
         # modal show "Promotion Already Redeemed" (distinct from "invalid
         # voucher") before the student even attempts to redeem.
-        if coupon.get("promotion_id") and await _promotion_already_redeemed(coupon["promotion_id"], student_id):
+        effective_promo_id = _effective_promotion_id(coupon)
+        if effective_promo_id and await _promotion_already_redeemed(effective_promo_id, student_id):
             raise _coupon_error(
                 409, "promotion_already_redeemed",
                 "You've already redeemed this promotional offer. It can only be used once per account.",
@@ -370,7 +408,7 @@ def register_coupon_routes(api, db, require_admin, User):
         # unrelated reason (e.g. a concurrent usage-limit race on this
         # specific code), the claim is rolled back so the student isn't
         # unfairly locked out of the promotion by an unrelated failure.
-        promotion_id = coupon.get("promotion_id")
+        promotion_id = _effective_promotion_id(coupon)
         promo_claimed = False
         if promotion_id:
             try:
