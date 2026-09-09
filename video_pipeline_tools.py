@@ -135,22 +135,70 @@ async def _finish(db, lesson_id: str, run_id: str, state: str, error: str | None
     )
 
 
+# 2026-09 stuck-pipeline incident (vid_bb7134374575431b, ~250MB upload
+# wedged indefinitely at "Media validation"). CONFIRMED root cause, via
+# code reading + empirical reproduction against this project's actual
+# installed httpx and Python 3.14 interpreter (not assumed):
+#
+#   1. httpx's `read` timeout (the 300.0 below) bounds the gap BETWEEN
+#      successive received chunks, never the TOTAL transfer time.
+#      Reproduced directly: a request receiving a trickle of data every
+#      <read-timeout>s succeeds no matter how long the WHOLE transfer
+#      takes. A slow-but-technically-progressing ~250MB R2 fetch can
+#      therefore run for many minutes without httpx itself ever raising.
+#   2. The GridFS branch has NO timeout of its own at all — and
+#      server.py's shared AsyncIOMotorClient sets no socketTimeoutMS
+#      (confirmed by reading its construction), so a stalled socket read
+#      there can also run unbounded.
+#   3. The pipeline's own asyncio.wait_for(_run_stages(), timeout=
+#      PIPELINE_TIMEOUT_S) watchdog DOES still correctly bound the whole
+#      run even against a genuinely-blocking underlying call — verified
+#      empirically (asyncio.wait_for raised TimeoutError to the caller
+#      within the configured window even when the wrapped work was a
+#      real, uninterruptible blocking call dispatched to a thread) — so
+#      this was never a case of "stuck forever with the watchdog broken".
+#      But it meant a stalled media fetch could silently consume nearly
+#      the ENTIRE pipeline budget with zero diagnostic signal about which
+#      operation actually stalled, starving every later stage of the
+#      time meant for Gemini transcription/analysis.
+#
+# Fix: a dedicated, tighter ceiling around the fetch itself — REUSING
+# (not inventing) the same 300s figure already chosen for the httpx
+# client below, now applied as a genuine TOTAL-time bound via
+# asyncio.wait_for. A stalled fetch now fails fast, specifically, and
+# honestly at 300s (half the pipeline's total budget) instead of
+# silently eating the whole 600s with a generic "stalled I/O" message;
+# a merely-slow-but-healthy transfer still completes normally.
+MEDIA_FETCH_TIMEOUT_S = 300
+
+
 async def load_media_bytes(db, media_bucket, media_ref: str) -> tuple[bytes, str]:
     """Fetch the lesson's stored media back for processing. GridFS refs are
     read from the shared sync_media bucket; R2 refs are fetched over HTTP
-    (Cloudflare serves them publicly by design)."""
-    prefix = f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/"
-    if media_ref.startswith(prefix):
-        filename = media_ref[len(prefix):]
-        gridout = await media_bucket.open_download_stream_by_name(filename)
-        raw = await gridout.read()
-        content_type = (gridout.metadata or {}).get("contentType", "application/octet-stream")
-        return raw, content_type
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as cli:
-        r = await cli.get(media_ref)
-        if r.status_code != 200:
-            raise RuntimeError(f"media fetch failed: HTTP {r.status_code}")
-        return r.content, r.headers.get("content-type", "application/octet-stream")
+    (Cloudflare serves them publicly by design). Bounded to
+    MEDIA_FETCH_TIMEOUT_S as a real total-time ceiling — see the module-
+    level comment above for why this exists and what it fixes."""
+    async def _fetch() -> tuple[bytes, str]:
+        prefix = f"gridfs://{sync_studio_tools.MEDIA_GRIDFS_BUCKET}/"
+        if media_ref.startswith(prefix):
+            filename = media_ref[len(prefix):]
+            gridout = await media_bucket.open_download_stream_by_name(filename)
+            raw = await gridout.read()
+            content_type = (gridout.metadata or {}).get("contentType", "application/octet-stream")
+            return raw, content_type
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as cli:
+            r = await cli.get(media_ref)
+            if r.status_code != 200:
+                raise RuntimeError(f"media fetch failed: HTTP {r.status_code}")
+            return r.content, r.headers.get("content-type", "application/octet-stream")
+
+    try:
+        return await asyncio.wait_for(_fetch(), timeout=MEDIA_FETCH_TIMEOUT_S)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"media fetch stalled — no response within {MEDIA_FETCH_TIMEOUT_S}s "
+            "(a slow or stalled connection to storage, not a code deadlock — safe to retry)"
+        ) from exc
 
 
 async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:

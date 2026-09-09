@@ -221,6 +221,92 @@ async def test_stalled_media_fetch_times_out_to_a_truthful_failed_state():
 
 
 @pytest.mark.asyncio
+async def test_media_fetch_has_its_own_tighter_timeout_than_the_whole_pipeline(monkeypatch):
+    """2026-09 follow-up incident (vid_bb7134374575431b, a real ~250MB
+    upload wedged at "Media validation" for 7.5+ minutes and counting).
+
+    Investigation confirmed the OUTER watchdog above (PIPELINE_TIMEOUT_S
+    via asyncio.wait_for) still works correctly — re-verified by direct
+    empirical reproduction against this project's actual Python 3.14
+    interpreter, including against a genuinely-blocking (uninterruptible)
+    call dispatched to a thread, the real-world shape of a stalled Mongo
+    socket read with no socketTimeoutMS configured (confirmed absent in
+    server.py's AsyncIOMotorClient construction). The incident log
+    provided only covered ~7.5 minutes of a 600-second (10-minute) budget
+    — not yet proof of a broken watchdog.
+
+    The GENUINE gap found: httpx's own `read` timeout bounds the gap
+    BETWEEN chunks, never the total transfer time (reproduced directly:
+    a slow-drip response succeeded well past the configured read
+    timeout), and the GridFS branch had no timeout of its own at all —
+    so a merely SLOW (not fully dead) ~250MB fetch could silently consume
+    nearly the entire pipeline budget before anything raised, with zero
+    diagnostic signal about which operation stalled. load_media_bytes
+    now has its own tighter MEDIA_FETCH_TIMEOUT_S ceiling (reusing, not
+    inventing, the same 300s already chosen for the httpx client) — this
+    proves it fires well before the outer pipeline watchdog would, with
+    a specific, honest message."""
+    monkeypatch.setattr(vpt, "MEDIA_FETCH_TIMEOUT_S", 0.1)
+    # Real headroom above the fetch timeout, so this test actually proves
+    # the FETCH-specific ceiling fires first, not the outer pipeline one
+    # (which _fast_watchdog already set to 0.2s — too close to 0.1s to
+    # prove ordering cleanly, so this test picks its own wider gap).
+    monkeypatch.setattr(vpt, "PIPELINE_TIMEOUT_S", 5.0)
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+
+    import time
+    t0 = time.monotonic()
+    pipeline = await vpt.run_pipeline(db, "vid_1", _HangingBucket())
+    elapsed = time.monotonic() - t0
+
+    assert pipeline["state"] == "failed"
+    assert pipeline["steps"]["media_check"]["status"] == "failed"
+    assert "media fetch stalled" in pipeline["error"].lower()
+    assert "safe to retry" in pipeline["error"].lower()
+    # The SPECIFIC fetch timeout fired — not the generic outer-pipeline
+    # "Processing timed out after Xs" message the 5.0s ceiling would have
+    # produced had this fix not existed.
+    assert "processing timed out after" not in pipeline["error"].lower()
+    assert elapsed < 2.0, (
+        "the fetch-specific timeout should fire in well under a second, "
+        "not wait for the outer 5s pipeline ceiling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_merely_slow_but_healthy_fetch_still_succeeds_within_the_fetch_timeout(monkeypatch):
+    """No false positives: the new MEDIA_FETCH_TIMEOUT_S must not turn a
+    legitimately-slow-but-completing transfer into a failure."""
+    monkeypatch.setattr(vpt, "MEDIA_FETCH_TIMEOUT_S", 5.0)
+    # Real headroom above both the simulated fetch delay AND a real
+    # ffprobe subprocess call this run also reaches (audio_extraction's
+    # probe_audio_stream_status, video content type) — the file's default
+    # 0.2s _fast_watchdog ceiling is intentionally tight for tests that
+    # never get this far; this one legitimately needs more room.
+    monkeypatch.setattr(vpt, "PIPELINE_TIMEOUT_S", 5.0)
+
+    class _SlowButHealthyBucket:
+        class _GridOut:
+            metadata = {"contentType": "video/mp4"}
+
+            async def read(self):
+                await asyncio.sleep(0.2)  # slow, but well within the 5s ceiling
+                return b"fake-media-bytes"
+
+        async def open_download_stream_by_name(self, filename):
+            return self._GridOut()
+
+    db = _FakeDB()
+    await db.video_lessons.insert_one(dict(LESSON))
+    _stub_sync_studio(monkeypatch)
+
+    pipeline = await vpt.run_pipeline(db, "vid_1", _SlowButHealthyBucket())
+
+    assert pipeline["steps"]["media_check"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
 async def test_stalled_run_never_leaves_the_lesson_permanently_running():
     """The exact symptom from the incident: pipeline.state must not still
     read 'running' after the watchdog fires — that permanent-running state
