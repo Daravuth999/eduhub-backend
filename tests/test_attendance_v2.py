@@ -290,9 +290,15 @@ def _seed_class(db, roster=("stu_alice",), cid="cls_x"):
 
 
 def _seed_open_session(db, cid="cls_x", slug="abc123", sid="ses_1",
-                       mid_session_enabled=True, date=None):
+                       mid_session_enabled=True, date=None, now=None):
+    """``now`` defaults to the real wall clock (unchanged for every
+    existing caller). Tests that need check-in's real-time window check
+    (_session_open) to agree with a frozen att._utcnow() — see
+    _freeze_time_to_fixed_august below — pass the SAME fixed instant here
+    so opens_at/closes_at/grace_deadline are anchored to it instead of
+    real time."""
     from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     db[att.COLL_SESSIONS].docs[sid] = {
         "_id": sid, "session_id": sid, "class_id": cid, "join_slug": slug,
         "meet_url": "https://meet.google.com/real-xyz", "status": att.SESS_OPEN,
@@ -302,6 +308,22 @@ def _seed_open_session(db, cid="cls_x", slug="abc123", sid="ses_1",
         "date": date or now.date().isoformat(),
     }
     return sid
+
+
+def _freeze_time_to_fixed_august(monkeypatch):
+    """Freeze att._utcnow() to a fixed August 2026 instant so 'current
+    period' deterministically resolves to 2026-08 regardless of the real
+    wall-clock date the suite happens to run on (these tests' own session
+    dates are hardcoded to 2026-08-xx). Returns the fixed instant — pass
+    it to _seed_open_session(..., now=fixed) too, so a session's own
+    opens_at/closes_at window is anchored to the SAME instant; otherwise
+    check-in's real-time window check (_session_open) would reject every
+    check-in once real wall-clock time drifts outside whatever window a
+    real datetime.now() produced at seed time."""
+    from datetime import datetime, timezone
+    fixed = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(att, "_utcnow", lambda: fixed)
+    return fixed
 
 
 def _v2_settings(**overrides):
@@ -1017,7 +1039,8 @@ def test_monthly_history_current_month_first_reflects_real_attendance(monkeypatc
     db, router = _build()
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings(monthly_reward_threshold_pct=0.5)
     _seed_class(db)
-    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    fixed_now = _freeze_time_to_fixed_august(monkeypatch)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01", now=fixed_now)
     _call(router, "POST", "/attendance/checkin",
           payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
     _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
@@ -1147,7 +1170,8 @@ def test_close_fires_goal_reached_push_when_threshold_met_no_campaign(monkeypatc
         monthly_reward_enabled=True, monthly_reward_threshold_pct=0.5,
     )
     _seed_class(db)
-    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    fixed_now = _freeze_time_to_fixed_august(monkeypatch)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01", now=fixed_now)
     _call(router, "POST", "/attendance/checkin",
           payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
     res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
@@ -1168,7 +1192,8 @@ def test_close_fires_both_pushes_when_a_live_campaign_is_attached(monkeypatch):
         monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
-    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    fixed_now = _freeze_time_to_fixed_august(monkeypatch)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01", now=fixed_now)
     _call(router, "POST", "/attendance/checkin",
           payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
     res = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
@@ -1188,7 +1213,8 @@ def test_close_never_resends_goal_reached_or_reward_ready_same_month(monkeypatch
         monthly_reward_campaign_id=cid,
     )
     _seed_class(db)
-    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01")
+    fixed_now = _freeze_time_to_fixed_august(monkeypatch)
+    _seed_open_session(db, sid="ses_1", slug="s1", date="2026-08-01", now=fixed_now)
     _call(router, "POST", "/attendance/checkin",
           payload=att.CheckInIn(slug="s1"), student=_Student("stu_alice"))
     _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
@@ -1197,7 +1223,7 @@ def test_close_never_resends_goal_reached_or_reward_ready_same_month(monkeypatch
 
     # A second session closes for the same student, same month — already
     # eligible from the first close, must never re-notify.
-    _seed_open_session(db, sid="ses_2", slug="s2", date="2026-08-02")
+    _seed_open_session(db, sid="ses_2", slug="s2", date="2026-08-02", now=fixed_now)
     _call(router, "POST", "/attendance/checkin",
           payload=att.CheckInIn(slug="s2"), student=_Student("stu_alice"))
     res2 = _call(router, "POST", "/admin/attendance/sessions/{session_id}/close",
@@ -1443,7 +1469,8 @@ def test_scenario8_new_month_starts_at_zero_previous_month_stays_historical(monk
     db, router = _build()
     db[att.COLL_SETTINGS].docs[att.SETTINGS_ID] = _v2_settings()
     _seed_class(db)
-    _seed_open_session(db, sid="ses_aug", slug="a1", date="2026-08-10")
+    fixed_now = _freeze_time_to_fixed_august(monkeypatch)
+    _seed_open_session(db, sid="ses_aug", slug="a1", date="2026-08-10", now=fixed_now)
     _call(router, "POST", "/attendance/checkin",
           payload=att.CheckInIn(slug="a1"), student=_Student("stu_alice"))
     _call(router, "POST", "/admin/attendance/sessions/{session_id}/close", session_id="ses_aug", admin=_Admin())
