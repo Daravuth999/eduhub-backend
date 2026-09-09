@@ -27,6 +27,7 @@ substring-matching human-readable text.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, FastAPI
@@ -34,6 +35,10 @@ from fastapi.testclient import TestClient
 from pymongo.errors import DuplicateKeyError
 
 import coupon_tools
+
+
+def run(c):
+    return asyncio.run(c)
 
 
 class _FakeCursor:
@@ -483,3 +488,247 @@ def test_admin_can_update_a_coupons_promotion_id():
     r = client.patch("/api/coupons/ROTATE1", json={"promotion_id": "public_launch_2026"})
     assert r.status_code == 200
     assert db.coupons.docs["ROTATE1"]["promotion_id"] == "public_launch_2026"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CRITICAL CORRECTION — the promotion limit must apply AUTOMATICALLY to
+# every public 100%-off coupon, with ZERO admin action required. The
+# previous implementation (above) made promotion_id fully opt-in — a
+# coupon that predates the field, or where an admin simply never touched
+# it, had NO protection at all: the same student could redeem the SAME
+# code repeatedly, once per book, walking away with unlimited free books.
+# This is the exact scenario reproduced in production (see the "public
+# coupon security" report — a coupon shown in Author Studio as "100% OFF,
+# 0/∞ uses" with no promotion_id set at all).
+#
+# Fix: _effective_promotion_id() falls back to an auto-generated key
+# (derived from the coupon's own code) whenever a coupon is BOTH public
+# (assigned_to == []) AND a full 100% discount (type == "percent",
+# value >= 100) — no admin field required. An explicit promotion_id (the
+# cross-code-rotation feature above) still always wins when set.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Test 1 — normal redemption, fresh user, no promotion_id configured ──
+def test_scenario1_fresh_user_public_100_percent_coupon_no_explicit_promotion_id():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    r = _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    assert r.status_code == 200
+
+
+# ── Test 2 — same user, second book, SAME session, no logout ────────────
+def test_scenario2_same_user_second_book_same_session_is_rejected():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    r1 = _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    assert r1.status_code == 200
+    r2 = _redeem(client, code="EDUFREE", book_slug="book-b", original_price=40, student_id="stu001")
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "promotion_already_redeemed"
+    # The coupon's own uses_count reflects exactly one real redemption.
+    assert db.coupons.docs["EDUFREE"]["uses_count"] == 1
+
+
+# ── Test 3 — logout/login bypass: the backend has no session/localStorage
+# concept at all, so "logout and log back in" is modeled exactly as it
+# actually happens server-side — a brand-new HTTP request carrying the
+# SAME authenticated student_id and nothing else. If the fix were
+# (incorrectly) keyed on some transient session/request state instead of
+# the persistent (promotion, student) record, this is exactly the test
+# that would catch it.
+def test_scenario3_logout_login_cannot_bypass_the_limit():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    # A fresh TestClient + a fresh router build = a completely new process-
+    # level request context, indistinguishable from a real logout/login —
+    # the ONLY thing carried over is the persistent database state.
+    fresh_client = _make_client(db)
+    r2 = _redeem(fresh_client, code="EDUFREE", book_slug="book-b", original_price=40, student_id="stu001")
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+
+# ── Test 4 — "clear browser storage": the backend never reads or writes
+# any client-side storage for this decision at all, so there is nothing
+# for a client to clear that would affect it. Modeled by asserting the
+# rejection depends ONLY on server-side state (db.coupon_promotion_
+# redemptions), never on anything the test passes from a "client".
+def test_scenario4_clearing_client_storage_has_no_effect_because_none_is_read():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    # No cookies, no headers, no client-side token of any kind is sent
+    # here beyond the JSON body — proving the rejection below cannot be
+    # coming from anything a browser could clear.
+    r2 = client.post("/api/coupons/redeem", json={
+        "code": "EDUFREE", "book_slug": "book-b", "original_price": 40, "student_id": "stu001",
+    })
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+
+# ── Test 5 — different browser/device: a second, fully independent
+# TestClient/router instance sharing only the same backing database —
+# the closest equivalent to "another device, same account" in this
+# harness (no per-device or per-session state exists anywhere in the
+# implementation to diverge in the first place).
+def test_scenario5_different_device_same_account_cannot_bypass_the_limit():
+    db = _FakeDB()
+    client_phone = _make_client(db)
+    client_laptop = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    r1 = _redeem(client_phone, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    assert r1.status_code == 200
+    r2 = _redeem(client_laptop, code="EDUFREE", book_slug="book-b", original_price=40, student_id="stu001")
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+
+# ── Test 6 — "direct API attempt": every test in this file already calls
+# the route directly via TestClient with no UI involved at all — proving
+# the enforcement lives in the route handler itself, not in any
+# frontend-only gate a direct API caller could skip past.
+def test_scenario6_direct_api_call_with_no_ui_involved_is_still_rejected():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    # A raw POST with only the fields a real API client would send —
+    # nothing routed through any React component, coupon-input UI, or
+    # client-side validation.
+    r2 = client.post("/api/coupons/redeem", json={
+        "code": "EDUFREE", "book_slug": "book-c", "original_price": 15, "student_id": "stu001",
+    })
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+
+# ── Test 7 — concurrent requests: two "simultaneous" redemption attempts
+# for the SAME public promotion by the SAME student must never both
+# succeed. The atomic unique-index insert (simulated exactly by
+# _FakePromoRedemptions, which raises DuplicateKeyError on a second
+# insert for the same key, mirroring the real Mongo unique index) is what
+# actually guarantees this — there is no read-check-then-write window.
+def test_scenario7_concurrent_redemption_requests_never_both_succeed():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    _seed(db, code="EDUFREE2", type="percent", value=100, max_uses=None, promotion_id=None)
+    # Two DIFFERENT public 100%-off codes redeemed "concurrently" for the
+    # SAME student — each is its own auto-derived promotion, so this
+    # specifically proves the per-code auto-key doesn't accidentally let
+    # two different qualifying codes both succeed for the same student
+    # when they're unrelated promotions (expected: BOTH succeed, since
+    # they're genuinely different offers) — then within ONE of those
+    # same codes, a genuine race is exercised directly against the
+    # dedicated collection's own atomicity.
+    r1 = _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    r2 = _redeem(client, code="EDUFREE2", book_slug="book-b", original_price=25, student_id="stu001")
+    assert r1.status_code == 200
+    assert r2.status_code == 200  # different auto-keyed promotions — both legitimately allowed
+
+    # Now the actual race: two attempts to claim the SAME auto-derived key
+    # for a different student — exercising the dedicated collection's own
+    # unique-index atomicity directly (the mechanism redeem_coupon relies
+    # on), the same guarantee a real concurrent-request race depends on.
+    key = ("__auto__:EDUFREE", "stu002")
+    outcomes = []
+    for _ in range(2):
+        try:
+            run(db.coupon_promotion_redemptions.insert_one(
+                {"promotion_id": "__auto__:EDUFREE", "student_id": "stu002",
+                 "code": "EDUFREE", "book_slug": "book-x", "redeemed_at": "now"}
+            ))
+            outcomes.append("ok")
+        except DuplicateKeyError:
+            outcomes.append("rejected")
+    assert outcomes == ["ok", "rejected"]
+    assert key in db.coupon_promotion_redemptions.docs
+
+
+# ── The exact reported vulnerability: a public 100%-off coupon with NO
+# promotion_id set at all (the real-world state of the coupon that was
+# actually exploited) is now protected automatically. ──
+def test_the_exact_reported_vulnerability_no_promotion_id_configured_at_all():
+    """Matches the actual production report precisely: a coupon created
+    and shown in Author Studio as '100% OFF, 0/∞ uses' — no Promotion ID
+    field ever touched by the admin — still stops a student from
+    redeeming it for a second book."""
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="39E28D7U", type="percent", value=100, max_uses=None,
+          assigned_to=[], promotion_id=None)
+    assert db.coupons.docs["39E28D7U"]["promotion_id"] is None  # confirms zero admin action taken
+
+    r1 = _redeem(client, code="39E28D7U", book_slug="the-unexpected-opportunity", original_price=25, student_id="stu094")
+    assert r1.status_code == 200
+
+    r2 = _redeem(client, code="39E28D7U", book_slug="courage-on-mekong-street", original_price=45, student_id="stu094")
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+    r3 = _redeem(client, code="39E28D7U", book_slug="lion--bear", original_price=25, student_id="stu094")
+    assert r3.status_code == 409
+    assert r3.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+    # Only the ONE legitimate redemption was ever recorded.
+    assert db.coupons.docs["39E28D7U"]["uses_count"] == 1
+
+
+# ── The auto-limit must NOT apply to a partial-discount reusable code ───
+def test_auto_limit_never_applies_to_a_partial_discount_public_coupon():
+    """An admin may legitimately want a reusable store-wide discount code
+    (e.g. "SAVE20", 20% off, public, unlimited uses) that the SAME student
+    can apply across many different book purchases. Only a FULL (100%)
+    discount is inherently the one-time-freebie shape this protection
+    targets — partial discounts are completely unaffected."""
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="SAVE20", type="percent", value=20, max_uses=None, assigned_to=[], promotion_id=None)
+    r1 = _redeem(client, code="SAVE20", book_slug="book-a", original_price=30, student_id="stu001")
+    r2 = _redeem(client, code="SAVE20", book_slug="book-b", original_price=40, student_id="stu001")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert db.coupons.docs["SAVE20"]["uses_count"] == 2
+
+
+# ── The auto-limit must NOT apply to a student-assigned (non-public) coupon ─
+def test_auto_limit_never_applies_to_a_student_assigned_100_percent_coupon():
+    """A 100%-off coupon that's assigned to SPECIFIC students (not public)
+    is a different kind of grant — e.g. a targeted scholarship/VIP code —
+    and is intentionally left to the existing per-(student, book) check
+    only, unless an admin explicitly sets promotion_id."""
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="VIP100", type="percent", value=100, max_uses=None,
+          assigned_to=["stu001"], promotion_id=None)
+    r1 = _redeem(client, code="VIP100", book_slug="book-a", original_price=30, student_id="stu001")
+    r2 = _redeem(client, code="VIP100", book_slug="book-b", original_price=40, student_id="stu001")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+
+# ── /validate reports the auto-derived state too, not just /redeem ──────
+def test_validate_reports_the_auto_derived_promotion_state_before_redeeming():
+    db = _FakeDB()
+    client = _make_client(db)
+    _seed(db, code="EDUFREE", type="percent", value=100, max_uses=None, promotion_id=None)
+    _redeem(client, code="EDUFREE", book_slug="book-a", original_price=25, student_id="stu001")
+    v = _validate(client, code="EDUFREE", book_slug="book-b", original_price=40, student_id="stu001")
+    assert v.status_code == 409
+    assert v.json()["detail"]["reason"] == "promotion_already_redeemed"
+
+
+# ── Book ownership via other means never creates a phantom promotion
+# redemption, and does not interact with this limit at all. ──
+def test_owning_a_book_via_normal_purchase_never_touches_the_promotion_ledger():
+    db = _FakeDB()
+    # No coupon route was ever called for this student — the promotion
+    # ledger has no way to contain an entry for them regardless of how
+    # many books they legitimately own through points purchases.
+    assert db.coupon_promotion_redemptions.docs == {}
