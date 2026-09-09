@@ -6312,6 +6312,14 @@ async def startup():
     await db.coupons.create_index("code", unique=True)
     await db.coupons.create_index("enabled")
     await db.coupons.create_index("expires_at")
+    # Public-promotion redemption limit (see coupon_tools.py's
+    # COLL_PROMO_REDEMPTIONS docstring) — this unique index IS the actual
+    # race-proof enforcement of "at most one successful redemption per
+    # student per promotion," independent of which individual coupon code
+    # was used or whether that code is later deleted/rotated.
+    await db.coupon_promotion_redemptions.create_index(
+        [("promotion_id", 1), ("student_id", 1)], unique=True
+    )
     # Payment Bridge indexes: moved into payment_bridge.py's own
     # _payment_bridge_ensure_indexes (Architecture Reconstruction Phase 1e,
     # Collection Ownership — server.py used to touch payment_intents /

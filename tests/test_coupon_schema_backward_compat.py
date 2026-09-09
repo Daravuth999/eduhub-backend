@@ -272,7 +272,7 @@ def test_video_library_points_coupon_cannot_be_redeemed_as_a_book_discount():
         "code": "VLIB1", "book_slug": "some-book", "original_price": 100, "student_id": "stu1",
     })
     assert resp.status_code == 404
-    assert "not found" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["reason"] == "not_found"
 
 
 # ── assigned_to normalization: edutalk_points only, book_discount untouched ─
@@ -377,7 +377,7 @@ def test_edutalk_live_coupon_cannot_be_redeemed_as_a_book_discount():
     })
     # Generic 404 — never leaks that the code exists for a different purpose.
     assert resp.status_code == 404
-    assert "not found" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["reason"] == "not_found"
 
 
 # ── smoke coverage for the routes not exercised above ──────────────────────
