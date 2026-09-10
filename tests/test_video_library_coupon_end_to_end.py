@@ -99,6 +99,7 @@ def _apply_path(doc, path, value, array_filters, op):
 class _Coll:
     def __init__(self):
         self.docs: dict[str, dict] = {}
+        self._seq = 0
 
     async def find_one(self, q, projection=None):
         for d in self.docs.values():
@@ -107,14 +108,29 @@ class _Coll:
         return None
 
     async def insert_one(self, doc):
-        self.docs[doc["code"]] = copy.deepcopy(doc)
+        # §2: video_library_restricted_points.py's ledger inserts a plain
+        # transaction row with no "code" field — generalized beyond the
+        # coupon-doc-only shape this fake previously assumed.
+        self._seq += 1
+        key = doc.get("code") or f"{doc.get('student_id', 'row')}:{self._seq}"
+        self.docs[key] = copy.deepcopy(doc)
+        return type("Result", (), {"inserted_id": key})()
 
-    async def find_one_and_update(self, q, update, upsert=False, return_document=None):
+    async def find_one_and_update(self, q, update, upsert=False, return_document=None, projection=None):
         for d in self.docs.values():
             if _match(d, q):
-                before = copy.deepcopy(d)
                 _apply(d, update)
-                return before
+                return copy.deepcopy(d)
+        # §2: video_library_restricted_points.py's credit() relies on
+        # upsert=True to create a student's wallet doc on first credit.
+        if upsert:
+            new_doc = {k: v for k, v in q.items() if not isinstance(v, dict)}
+            if "$setOnInsert" in update:
+                new_doc.update(update["$setOnInsert"])
+            _apply(new_doc, {k: v for k, v in update.items() if k != "$setOnInsert"})
+            key = new_doc.get("student_id") or new_doc.get("code") or str(len(self.docs))
+            self.docs[key] = new_doc
+            return copy.deepcopy(new_doc)
         return None
 
     async def update_one(self, q, update, upsert=False, array_filters=None):
@@ -174,9 +190,11 @@ def _enable(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _default_credit_succeeds(monkeypatch):
-    async def ok(student_clean_id, amount):
-        return True, ""
-    monkeypatch.setattr(vlc, "_credit_video_library_points", ok)
+    """2026-09: credit now goes to video_library_restricted_points.py's
+    ledger (§2) via a real credit() call the fake DB's upsert-capable
+    _Coll above already supports — no mocking needed. Kept as a no-op so
+    existing test bodies referencing this fixture don't need editing."""
+    return None
 
 
 def test_full_lifecycle_author_studio_creation_to_student_redemption():

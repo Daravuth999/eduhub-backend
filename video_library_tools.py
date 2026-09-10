@@ -39,10 +39,13 @@ import datetime as _dt
 import hashlib
 import logging
 import os
+import secrets
 
 from fastapi import Body, Depends, File, Form, HTTPException, UploadFile
 
 import video_library_points_adapter as points
+import video_library_coupon_tools as coupon_tools
+import video_library_restricted_points as restricted_points
 import sync_studio_tools
 import video_render_tools
 from video_schema import (
@@ -468,23 +471,96 @@ async def serialize_lesson_for_student(db, lesson: dict, student_id: str | None)
     return out
 
 
+# ── §4 Khmer/English bilingual "purchase successful" push ───────────────────
+# Same established "points"-flavored bilingual convention as
+# video_library_coupon_tools.py's redemption push — see that module's own
+# comment for the honesty caveat on the newly-composed (not native-speaker-
+# reviewed) phrasing. Kept as a pure function so its wording is unit-
+# testable without touching any notification-sending machinery.
+def _compose_purchase_notification(lesson_title: str, *, restricted_used: int, gas_used: int) -> tuple[str, str]:
+    title = "🎬 បានទិញវីដេអូជោគជ័យ! / Video Purchase Successful!"
+    title_line = f'"{lesson_title}"'
+    if restricted_used and gas_used:
+        body = (
+            f"អ្នកបានទិញមេរៀន {title_line} ដោយចំណាយ {restricted_used} ពិន្ទុវីដេអូ និង {gas_used} ពិន្ទុទូទៅ ✨\n"
+            f'You purchased "{lesson_title}" using {restricted_used} Video points + {gas_used} general points.'
+        )
+    elif restricted_used:
+        body = (
+            f"អ្នកបានទិញមេរៀន {title_line} ដោយចំណាយ {restricted_used} ពិន្ទុវីដេអូ ✨\n"
+            f'You purchased "{lesson_title}" using {restricted_used} Video points.'
+        )
+    else:
+        body = (
+            f"អ្នកបានទិញមេរៀន {title_line} ដោយចំណាយ {gas_used} ពិន្ទុ ✨\n"
+            f'You purchased "{lesson_title}" for {gas_used} points.'
+        )
+    return title, body
+
+
+async def _send_purchase_push(fan_out_push, student_id: str, lesson_title: str, *,
+                               restricted_used: int, gas_used: int, purchase_key: str) -> None:
+    if not callable(fan_out_push):
+        return
+    title, body = _compose_purchase_notification(lesson_title, restricted_used=restricted_used, gas_used=gas_used)
+    try:
+        await fan_out_push(
+            {"studentId": student_id}, title=title, body=body, url="/library/video",
+            category="vouchers", dedupe_key=f"video_library_purchase:{purchase_key}",
+        )
+    except Exception as exc:  # noqa: BLE001 — a push failure must never affect a purchase that already succeeded
+        logger.warning("video_library: purchase push notification failed key=%s: %s", purchase_key, exc)
+
+
 # ── Purchase state machine ──────────────────────────────────────────────────
 async def initiate_purchase(
     db, *, student_id: str, lesson_id: str, password: str,
+    coupon_code: str | None = None, fan_out_push=None,
 ) -> dict:
     lesson = await get_video_lesson(db, lesson_id)
     if not lesson or lesson.get("status") != "published":
         raise VideoLibraryError("lesson_not_found", f"no published lesson {lesson_id!r}", 404)
 
-    price = int(lesson.get("price") or 0)
-    if price <= 0:
+    original_price = int(lesson.get("price") or 0)
+    if original_price <= 0:
         raise VideoLibraryError("free_lesson", "this lesson is free — no purchase needed", 400)
+
+    # (§1) percent-type Video Library coupon — read-only validation BEFORE
+    # the purchase state machine even starts, so a bad/expired/already-used
+    # code is rejected cheaply. The coupon's use is only ever RECORDED
+    # after the purchase actually succeeds (see the OUTCOME_OK branch
+    # below) — a failed/ambiguous purchase must never burn the code.
+    coupon_doc = None
+    normalized_coupon_code = coupon_tools.normalize_code(coupon_code) if coupon_code else ""
+    if normalized_coupon_code:
+        coupon_doc, coupon_reason = await coupon_tools.find_valid_percent_coupon(
+            db, normalized_coupon_code, student_id,
+        )
+        if not coupon_doc:
+            raise VideoLibraryError(
+                "invalid_coupon",
+                coupon_tools._FRIENDLY_MESSAGES.get(coupon_reason, "This coupon could not be applied."),
+                400,
+            )
+    price = (
+        coupon_tools.apply_percent_discount(original_price, coupon_doc)
+        if coupon_doc else original_price
+    )
 
     key = _purchase_key(student_id, lesson_id)
     now = _utcnow_iso()
 
-    # (a) idempotent seed — never overwrites an existing record.
-    seed = {**build_purchase_record(student_id=student_id, lesson_id=lesson_id, price=price, created_at=now), "_id": key}
+    # (a) idempotent seed — never overwrites an existing record. `price` is
+    #     the FINAL (possibly coupon-discounted) amount actually charged
+    #     this attempt; `originalPrice`/`couponCode` are carried alongside
+    #     purely for admin/student transparency, never re-derived later.
+    seed = {
+        **build_purchase_record(student_id=student_id, lesson_id=lesson_id, price=price, created_at=now),
+        "_id": key,
+        "originalPrice": original_price,
+        "couponCode": normalized_coupon_code or None,
+        "restrictedUsed": 0,
+    }
     await db[PURCHASES_COLL].update_one({"_id": key}, {"$setOnInsert": seed}, upsert=True)
 
     # (b) atomic claim — exactly one concurrent request transitions this
@@ -512,26 +588,113 @@ async def initiate_purchase(
             "a prior purchase attempt could not be confirmed and is pending admin review", 409,
         )
 
-    # (c) the ONE real GAS call for this attempt.
-    result = await points.debit_purchase(student_id, password, price)
+    # (§2.4) RESTRICTED-FIRST SPEND ORDERING. Video Library restricted
+    # points (credited by video_library_coupon_tools.py's "points" coupon
+    # type — a genuinely separate Mongo ledger, see
+    # video_library_restricted_points.py's own module docstring for why it
+    # is NOT part of the shared GAS balance or wallet_service.py) are
+    # spent FIRST, so they never sit unspendable. Only whatever remains of
+    # the price after restricted funds are exhausted is charged against
+    # the real GAS balance — this is the ONLY place in the app that reads
+    # or spends this restricted balance; no other feature's points-
+    # spending path is touched by this addition at all.
+    #
+    # Idempotency key is per-ATTEMPT (a fresh random nonce — NOT derived
+    # from `now`, which is only second-precision and can genuinely collide
+    # across two attempts claimed within the same second, e.g. a fast
+    # automated retry; confirmed by this round's own test suite catching
+    # exactly that collision before this fix), not per-purchase-key: a
+    # REJECTED attempt refunds its own restricted debit below and returns
+    # the purchase to "failed" (RETRYABLE_STATES includes "failed" —
+    # video_schema.py), so a genuine retry must be able to debit
+    # restricted funds again, fresh — a timestamp-only key would make that
+    # retry's debit silently look like a replay of the FIRST (already-
+    # refunded) attempt and skip re-debiting entirely.
+    restricted_balance = await restricted_points.get_balance(db, student_id)
+    restricted_used = min(restricted_balance, price)
+    gas_amount = price - restricted_used
+    restricted_debit_key = f"{key}:{secrets.token_hex(8)}:restricted-debit"
+    restricted_debit_applied = False
+    if restricted_used > 0:
+        try:
+            await restricted_points.debit(
+                db, student_id, restricted_used,
+                source="video_purchase", source_ref=lesson_id,
+                idempotency_key=restricted_debit_key,
+            )
+            restricted_debit_applied = True
+        except restricted_points.InsufficientRestrictedFunds:
+            # Race: balance changed between the read above and the debit
+            # (e.g. spent by a concurrent request against another lesson).
+            # Fall back to charging the FULL price to the real GAS balance
+            # — never guess a partial amount, never block the purchase for
+            # a restricted-balance race the student can't see or control.
+            restricted_used = 0
+            gas_amount = price
+        if restricted_used > 0:
+            await db[PURCHASES_COLL].update_one(
+                {"_id": key}, {"$set": {"restrictedUsed": restricted_used}},
+            )
+
+    # (c) the ONE real GAS call for this attempt — only for whatever
+    #     remains after restricted funds. Skipped entirely (never called)
+    #     when restricted points already cover the full price.
+    if gas_amount > 0:
+        result = await points.debit_purchase(student_id, password, gas_amount)
+    else:
+        result = {"outcome": points.OUTCOME_OK, "reason": ""}
     outcome = result.get("outcome")
     ts = _utcnow_iso()
 
     if outcome == points.OUTCOME_OK:
-        post_balance, _ = await points.get_authoritative_balance(student_id, password)
+        post_balance = None
+        if gas_amount > 0:
+            post_balance, _ = await points.get_authoritative_balance(student_id, password)
         await db[PURCHASES_COLL].update_one(
             {"_id": key, "state": "initiating"},
             {"$set": {"state": "succeeded", "pointsAfter": post_balance, "updatedAt": ts},
              "$push": {"stateHistory": {"state": "succeeded", "at": ts}}},
         )
-        logger.info("video_library: purchase succeeded student=%s lesson=%s", student_id, lesson_id)
+        logger.info(
+            "video_library: purchase succeeded student=%s lesson=%s restricted_used=%s gas_used=%s coupon=%s",
+            student_id, lesson_id, restricted_used, gas_amount, normalized_coupon_code or None,
+        )
+        if coupon_doc:
+            await coupon_tools.finalize_percent_coupon_use(
+                db, normalized_coupon_code, student_id, lesson_id=lesson_id,
+                original_price=original_price, discounted_price=price,
+            )
+        await _send_purchase_push(
+            fan_out_push, student_id, lesson.get("title") or "your lesson",
+            restricted_used=restricted_used, gas_used=gas_amount, purchase_key=key,
+        )
     elif outcome == points.OUTCOME_REJECTED:
+        # Definitive failure — safe to retry (RETRYABLE_STATES includes
+        # "failed"). Any restricted points already debited for THIS
+        # attempt must be refunded so a retry starts with them available
+        # again — otherwise a rejected purchase would silently strand
+        # restricted points the student never actually spent.
+        if restricted_debit_applied:
+            await restricted_points.credit(
+                db, student_id, restricted_used,
+                source="video_purchase_refund", source_ref=lesson_id,
+                idempotency_key=f"{restricted_debit_key}:refund",
+            )
         await db[PURCHASES_COLL].update_one(
             {"_id": key, "state": "initiating"},
-            {"$set": {"state": "failed", "reason": result.get("reason"), "updatedAt": ts},
+            {"$set": {"state": "failed", "reason": result.get("reason"), "restrictedUsed": 0, "updatedAt": ts},
              "$push": {"stateHistory": {"state": "failed", "at": ts}}},
         )
     else:  # OUTCOME_AMBIGUOUS — never guessed, never auto-retried.
+        # Deliberately NOT refunding any restricted debit here, symmetric
+        # with how the real GAS side is handled: we do not know whether
+        # the GAS debit actually applied, so we do not know whether this
+        # purchase actually succeeded either. `restrictedUsed` stays
+        # recorded on the purchase doc (set above) for admin
+        # reconciliation to see and decide — auto-refunding could
+        # double-spend restricted points if the purchase turns out to have
+        # succeeded after all. This is a real, open edge case — see this
+        # round's report.
         await db[PURCHASES_COLL].update_one(
             {"_id": key, "state": "initiating"},
             {"$set": {"state": "reconcile", "reason": result.get("reason"), "updatedAt": ts},
@@ -704,7 +867,7 @@ async def backfill_faststart_scan_all(db, media_bucket, *, dry_run: bool = True,
     return {"dryRun": dry_run, "summary": summary, "lessons": rows}
 
 
-def register_video_library_routes(api, db, require_admin, require_student) -> None:
+def register_video_library_routes(api, db, require_admin, require_student, *, fan_out_push=None) -> None:
     """Mounts Video Library routes. Matches this codebase's
     register_*_routes(api, db, ...) DI convention exactly.
 
@@ -994,10 +1157,22 @@ def register_video_library_routes(api, db, require_admin, require_student) -> No
         try:
             purchase = await initiate_purchase(
                 db, student_id=student_id, lesson_id=lesson_id, password=payload.get("password", ""),
+                coupon_code=(payload or {}).get("couponCode") or None,
+                fan_out_push=fan_out_push,
             )
         except VideoLibraryError as exc:
             _raise(exc)
         return {"ok": purchase.get("state") == "succeeded", "purchase": purchase}
+
+    @api.get("/video/restricted-points")
+    async def restricted_points_balance_route(student=Depends(require_student)):
+        """§2.7 — surfaced distinctly from the student's general points
+        balance, never merged into one displayed number, since the two
+        have different spending rules (restricted funds are Video-Library-
+        only and always spent before general points on a purchase)."""
+        student_id = getattr(student, "clean_id", "") or getattr(student, "student_id", "")
+        balance = await restricted_points.get_balance(db, student_id)
+        return {"restrictedBalance": balance}
 
     @api.get("/video/purchases/mine")
     async def my_purchases_route(student=Depends(require_student)):
