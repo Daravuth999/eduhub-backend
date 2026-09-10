@@ -771,6 +771,12 @@ async def apply_alignment_result(db, sync_id: str, aligned: dict) -> dict:
     }
     if aligned.get("speakers"):
         result_fields["speakers"] = aligned["speakers"]
+    # 2026-09 real per-word alignment telemetry (video_word_alignment.py,
+    # §1.8) — admin-visible quality signal (Sync Review Studio), never
+    # read by any playback path. Threaded through both branches below so
+    # it survives the approved-document candidate-staging path too.
+    if aligned.get("wordAlignment") is not None:
+        result_fields["wordAlignment"] = aligned["wordAlignment"]
 
     if doc.get("reviewStatus") == "approved":
         candidate = {**result_fields, "alignmentVersion": int(doc.get("alignmentVersion", 1)) + 1}
