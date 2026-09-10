@@ -358,6 +358,59 @@ class VideoAiError(Exception):
         self.message = message or code
 
 
+async def upload_media_to_files_api(media_bytes: bytes, content_type: str, *, api_key: str,
+                                     post=None, get=None) -> str:
+    """Gemini Files API raw upload — extracted to module scope (2026-09,
+    word-alignment redesign) so it can be shared by GeminiVideoProvider
+    (large-file ASR/analysis inputs, which fall back to this above
+    `_INLINE_MAX_BYTES`) AND video_word_alignment.py's
+    GeminiWordTimestampProvider, which MUST always upload rather than
+    inline: gemini-3.5-transcribe's Interactions API only accepts a file
+    `uri`, never inline base64 audio (confirmed against Gemini's own
+    audio-transcription guide, not assumed). `post`/`get` are injectable
+    async callables matching httpx's `.post`/`.get` signature — default to
+    a real httpx client, identical behavior to before this was extracted.
+    Returns the file URI once the file reaches ACTIVE state."""
+    import asyncio as _asyncio
+
+    async def _default_post(url, **kwargs):
+        async with httpx.AsyncClient(timeout=_ALIGN_TIMEOUT) as cli:
+            return await cli.post(url, **kwargs)
+
+    async def _default_get(url, **kwargs):
+        async with httpx.AsyncClient(timeout=_ALIGN_TIMEOUT) as cli:
+            return await cli.get(url, **kwargs)
+
+    _post = post or _default_post
+    _get = get or _default_get
+
+    r = await _post(
+        _FILES_UPLOAD_URL,
+        params={"key": api_key},
+        headers={
+            "X-Goog-Upload-Protocol": "raw",
+            "Content-Type": content_type or "application/octet-stream",
+        },
+        content=media_bytes,
+    )
+    if r.status_code != 200:
+        raise VideoAiError("files_upload_failed", f"Gemini Files API HTTP {r.status_code}: {r.text[:300]}")
+    info = (r.json() or {}).get("file") or {}
+    uri, name, state = info.get("uri"), info.get("name"), info.get("state")
+    if not uri:
+        raise VideoAiError("files_upload_failed", "Files API returned no file uri")
+    waited = 0.0
+    while state == "PROCESSING" and waited < 120.0:
+        await _asyncio.sleep(3.0)
+        waited += 3.0
+        g = await _get(_FILES_GET_URL.format(name=name), params={"key": api_key})
+        if g.status_code == 200:
+            state = (g.json() or {}).get("state")
+    if state not in (None, "ACTIVE"):
+        raise VideoAiError("files_processing_failed", f"Files API state: {state}")
+    return uri
+
+
 # ── Gemini provider ──────────────────────────────────────────────────────
 # 2026-09 — speaker-continuity guidance added (Video Factory surgical
 # bug-fix pass, §2d/4c): the prior wording ("label them consistently") gave
@@ -745,33 +798,9 @@ class GeminiVideoProvider:
     async def _upload_to_files_api(self, media_bytes: bytes, content_type: str) -> str:
         """Gemini Files API raw upload — required for media above the inline
         limit. Returns the file URI once the file reaches ACTIVE state."""
-        import asyncio as _asyncio
-
-        r = await self._post(
-            _FILES_UPLOAD_URL,
-            params={"key": self._api_key},
-            headers={
-                "X-Goog-Upload-Protocol": "raw",
-                "Content-Type": content_type or "application/octet-stream",
-            },
-            content=media_bytes,
+        return await upload_media_to_files_api(
+            media_bytes, content_type, api_key=self._api_key, post=self._post, get=self._get,
         )
-        if r.status_code != 200:
-            raise VideoAiError("files_upload_failed", f"Gemini Files API HTTP {r.status_code}: {r.text[:300]}")
-        info = (r.json() or {}).get("file") or {}
-        uri, name, state = info.get("uri"), info.get("name"), info.get("state")
-        if not uri:
-            raise VideoAiError("files_upload_failed", "Files API returned no file uri")
-        waited = 0.0
-        while state == "PROCESSING" and waited < 120.0:
-            await _asyncio.sleep(3.0)
-            waited += 3.0
-            g = await self._get(_FILES_GET_URL.format(name=name), params={"key": self._api_key})
-            if g.status_code == 200:
-                state = (g.json() or {}).get("state")
-        if state not in (None, "ACTIVE"):
-            raise VideoAiError("files_processing_failed", f"Files API state: {state}")
-        return uri
 
     async def _media_part(self, media_bytes: bytes, content_type: str) -> dict:
         """Shared inline-vs-Files-API branching used by every media-grounded

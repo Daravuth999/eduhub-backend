@@ -322,9 +322,23 @@ def test_video_ai_provider_has_no_importers_outside_video_library():
     system import this module, this test fails loudly instead of silently
     coupling an unrelated system to the Video Library's model choices.
     Plain filesystem scan (no git/subprocess dependency, so this can't be
-    flaky in an environment without git on PATH)."""
+    flaky in an environment without git on PATH).
+
+    2026-09: video_word_alignment.py added to `allowed` — the Gemini-only
+    word-alignment redesign deliberately reuses this module's GEMINI_API_KEY
+    availability check (ai_available()) and Gemini Files API upload helper
+    (upload_media_to_files_api) rather than re-implementing either, per the
+    explicit "reuse the existing Gemini client/credential setup" instruction
+    that redesign was built under. video_word_alignment.py is itself still
+    Video-Library-internal (see its own static import-boundary test in
+    tests/test_video_word_alignment.py — importable ONLY by
+    video_pipeline_tools.py), so this does not widen the isolation claim
+    this test actually protects, only who-imports-whom WITHIN it."""
     repo_root = Path(__file__).resolve().parent.parent
-    allowed = {"video_narration_tools.py", "video_pipeline_tools.py", "video_ai_provider.py"}
+    allowed = {
+        "video_narration_tools.py", "video_pipeline_tools.py", "video_ai_provider.py",
+        "video_word_alignment.py",
+    }
     importers: set[str] = set()
     for py_file in repo_root.glob("*.py"):
         if py_file.name in allowed:

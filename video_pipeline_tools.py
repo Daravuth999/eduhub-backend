@@ -327,20 +327,27 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
             # character length, an honest ESTIMATE, never a measurement
             # (confidence.alignment is already None for every word this
             # produces). This runs a second, independent transcription of
-            # the SAME already-extracted audio through ElevenLabs Scribe
-            # (real per-word measured timestamps + real confidence) and
+            # the SAME already-extracted audio through Gemini's own
+            # gemini-3.5-transcribe model (real per-word measured
+            # timestamps — no per-word confidence is published by this
+            # provider, see video_word_alignment.py's module docstring) and
             # merges its timing onto Gemini's existing sentence/speaker
             # structure wherever the two transcriptions agree on a word —
             # see video_word_alignment.py's module docstring for exactly
             # why this (not literal reference-conditioned forced
             # alignment, which no available provider actually offers) is
             # the honest, evidence-based design. NEVER raises: a missing
-            # API key or a Scribe outage leaves Gemini's own interpolated
-            # timing in place, exactly as before this feature existed —
-            # this is additive, not a replacement dependency.
+            # API key or a Gemini word-timestamp outage leaves Gemini's own
+            # interpolated timing in place, exactly as before this feature
+            # existed — this is additive, not a replacement dependency.
+            # `transcribe_ct` (the same real mime type already used for the
+            # segmentation call above) is passed through so the Gemini
+            # Files API upload inside video_word_alignment.py transcodes
+            # correctly — see run_word_alignment's own docstring.
             alignment_provider = video_word_alignment.get_word_alignment_provider()
             aligned_sync, word_alignment_meta = await video_word_alignment.run_word_alignment(
-                transcribe_bytes, transcript_text, result.get("sync") or {}, provider=alignment_provider,
+                transcribe_bytes, transcript_text, result.get("sync") or {}, transcribe_ct,
+                provider=alignment_provider,
             )
             result["sync"] = aligned_sync
             result["sync"]["wordAlignment"] = word_alignment_meta
