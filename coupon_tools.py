@@ -241,7 +241,40 @@ def register_coupon_routes(api, db, require_admin, User):
             # duplicate check applies exactly as before (zero behavior
             # change for every coupon that predates this field).
             promotion_id = (payload.get("promotion_id") or "").strip() or None
-        else:  # edutalk_points / video_library_points — flat points grant, no discount fields
+        elif benefit_type == "video_library_points":
+            # 2026-09 (Video Library coupons round): a Video Library
+            # voucher now offers ONE of two, mutually exclusive kinds —
+            # "percent" (discount a lesson's PRICE at purchase time,
+            # applied by video_library_tools.py's purchase flow — credits
+            # NO points balance at all, restricted or otherwise) or
+            # "points" (the ORIGINAL, unchanged flat-points-grant shape —
+            # default, so every coupon created before this field existed
+            # keeps behaving identically). This mirrors book_discount's own
+            # percent-over-100 validation VERBATIM rather than inventing a
+            # new rule, per the explicit "follow the existing validation
+            # approach for consistency" instruction — see
+            # video_library_coupon_tools.py for how "points" now credits
+            # the NEW restricted balance (§2) instead of a real GAS
+            # treasury transfer.
+            offer_type = payload.get("type") or "points"
+            if offer_type not in ("percent", "points"):
+                raise HTTPException(status_code=400, detail="type must be 'percent' or 'points' for a Video Library coupon.")
+            if offer_type == "percent":
+                discount_type = "percent"
+                value = float(payload.get("value", 0))
+                if value <= 0:
+                    raise HTTPException(status_code=400, detail="value must be > 0.")
+                if value > 100:
+                    raise HTTPException(status_code=400, detail="Percent discount cannot exceed 100.")
+                benefit_amount = None
+            else:
+                discount_type = None
+                value = None
+                benefit_amount = payload.get("benefit_amount")
+                if not isinstance(benefit_amount, int) or isinstance(benefit_amount, bool) or not (1 <= benefit_amount <= 1000):
+                    raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
+            promotion_id = None  # promotion-limit concept is book-discount-only
+        else:  # edutalk_points — flat points grant, no discount fields (UNCHANGED)
             discount_type = None
             value = None
             benefit_amount = payload.get("benefit_amount")
@@ -304,11 +337,26 @@ def register_coupon_routes(api, db, require_admin, User):
         """Update coupon fields. Supports: enabled, expires_at, max_uses, assigned_to, book_slugs, value,
         benefit_type, benefit_amount."""
         allowed = {"enabled", "expires_at", "max_uses", "assigned_to", "book_slugs", "value", "valid_from",
-                   "benefit_type", "benefit_amount", "promotion_id"}
+                   "benefit_type", "benefit_amount", "promotion_id", "type"}
         updates = {k: v for k, v in payload.items() if k in allowed}
         if not updates:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
-        if updates.get("benefit_type") in ("edutalk_points", "video_library_points"):
+        if "type" in updates and updates["type"] not in ("percent", "fixed", "points", None):
+            raise HTTPException(status_code=400, detail="type must be 'percent', 'fixed', or 'points'.")
+        if updates.get("type") == "percent":
+            val = updates.get("value")
+            if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0 or val > 100:
+                raise HTTPException(status_code=400, detail="value must be a percent between 0 (exclusive) and 100.")
+        if updates.get("benefit_type") == "edutalk_points":
+            amt = updates.get("benefit_amount")
+            if not isinstance(amt, int) or isinstance(amt, bool) or not (1 <= amt <= 1000):
+                raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
+        elif updates.get("benefit_type") == "video_library_points" and updates.get("type") != "percent":
+            # A video_library_points coupon being (re)switched to "points"
+            # (or left at its default) in this same update still needs a
+            # valid benefit_amount, exactly like edutalk_points always has
+            # — but NOT when this same call is setting it to "percent",
+            # which uses `value` instead (validated just above).
             amt = updates.get("benefit_amount")
             if not isinstance(amt, int) or isinstance(amt, bool) or not (1 <= amt <= 1000):
                 raise HTTPException(status_code=400, detail="benefit_amount must be an integer between 1 and 1000.")
