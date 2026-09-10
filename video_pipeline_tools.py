@@ -39,6 +39,7 @@ from fastapi import Body, Depends, HTTPException
 import sync_studio_tools
 import video_ai_provider
 import video_render_tools
+import video_word_alignment
 
 logger = logging.getLogger("eduhub.video_pipeline")
 
@@ -317,6 +318,33 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
             await sync_studio_tools.mark_alignment_processing(db, sync_id)
             result = await provider.align(transcribe_bytes, transcribe_ct)
             transcript_text = result.get("transcriptText", "")
+
+            # 2026-09 real per-word alignment (Teleprompter karaoke
+            # structural fix, §1): Gemini's own ASR prompt only ever asks
+            # for SENTENCE-level start/end (confirmed by reading _ASR_
+            # PROMPT directly) — video_ai_provider.distribute_words then
+            # spreads word timing evenly across each sentence's span by
+            # character length, an honest ESTIMATE, never a measurement
+            # (confidence.alignment is already None for every word this
+            # produces). This runs a second, independent transcription of
+            # the SAME already-extracted audio through ElevenLabs Scribe
+            # (real per-word measured timestamps + real confidence) and
+            # merges its timing onto Gemini's existing sentence/speaker
+            # structure wherever the two transcriptions agree on a word —
+            # see video_word_alignment.py's module docstring for exactly
+            # why this (not literal reference-conditioned forced
+            # alignment, which no available provider actually offers) is
+            # the honest, evidence-based design. NEVER raises: a missing
+            # API key or a Scribe outage leaves Gemini's own interpolated
+            # timing in place, exactly as before this feature existed —
+            # this is additive, not a replacement dependency.
+            alignment_provider = video_word_alignment.get_word_alignment_provider()
+            aligned_sync, word_alignment_meta = await video_word_alignment.run_word_alignment(
+                transcribe_bytes, transcript_text, result.get("sync") or {}, provider=alignment_provider,
+            )
+            result["sync"] = aligned_sync
+            result["sync"]["wordAlignment"] = word_alignment_meta
+
             # 2026-09 speaker-continuity quality signal (§2d/4c) — never
             # blocks or fails the step; a non-fatal note only, same
             # pattern as the synchronization step's ground-truth timing
