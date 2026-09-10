@@ -89,6 +89,87 @@ def _pipeline_is_stale(pipeline_doc: dict | None) -> bool:
     return started < _iso_in(-PIPELINE_TIMEOUT_S)
 
 
+# 2026-09 — startup-time orphaned-pipeline reconciliation (§2). COMPLEMENTARY
+# to _pipeline_is_stale above, not a replacement: that check runs INSIDE an
+# already-running process (get_pipeline_status's self-heal, triggered by the
+# Studio's ~2.5s poller) and is deliberately conservative — a PIPELINE_
+# TIMEOUT_S=600s age threshold — since a live process genuinely cannot tell
+# "this run was abandoned by a dead process" apart from "this run is just
+# slow" any other way. That mechanism IS real and DOES already fire
+# server-side (confirmed by reading get_pipeline_status directly — the
+# "Processing stalled...Safe to retry" message a prior investigation
+# attributed to a purely client-side timer is actually written by THIS
+# server-side self-heal, evidenced by its exact text matching and by a
+# real incident log line in the pipeline's own `log` array timestamped
+# exactly PIPELINE_TIMEOUT_S after that run's startedAt). But it is LAZY:
+# it only runs when a client happens to poll, and only once the full 600s
+# has elapsed since the run's OWN startedAt — a run orphaned by a restart
+# late in its lifetime (or one nobody polls for a while) can sit
+# unreconciled for most of that window even though the server itself has
+# been back up and fully healthy the whole time.
+#
+# This function closes that gap differently: it runs exactly ONCE, at
+# process startup. No age threshold is needed or appropriate here — unlike
+# the in-process check above, a FRESH process's boot has, by definition, no
+# live asyncio task associated with any pre-existing "running" pipeline
+# document, no matter how recently that document's startedAt claims it
+# began. If pipeline.state=="running" exists in Mongo at the exact moment
+# this runs, the task that would ever have moved it out of "running" died
+# with whatever process wrote it. So every such document is unconditionally
+# reconciled immediately, cutting the worst-case reconciliation delay from
+# "up to ~600s, and only if/when a client happens to poll" down to
+# "however long this boot's own startup phase takes" (a few seconds, per
+# this app's own boot log).
+#
+# No storage cleanup is needed here (verified by reading every stage this
+# could interrupt, not assumed): media_check/audio_extraction/
+# speech_recognition only ever hold already-uploaded media in a local
+# Python bytes variable and local ffmpeg temp files (already removed in
+# `finally` blocks in video_render_tools.py on every code path, success or
+# failure); the first stage that writes anything durable at all
+# (synchronization) only ever writes a Mongo document via sync_studio_
+# tools.apply_alignment_result, never a new R2/GridFS object. A restart
+# mid-run therefore never leaves a partial storage object behind to
+# release — only this Mongo pipeline-state field, which is exactly what
+# this function reconciles.
+ORPHANED_PIPELINE_RESTART_MESSAGE = (
+    "Processing was interrupted by a server restart and could not finish. "
+    "Safe to retry — no partial data was left behind."
+)
+
+
+async def reconcile_orphaned_pipelines(db) -> int:
+    """Finds every lesson whose pipeline.state is still "running" at the
+    moment this is called (intended to run once, at FastAPI startup — see
+    server.py) and marks each one failed with an honest, retryable message,
+    reusing the SAME _set_step/_finish helpers run_pipeline's own exception
+    handler and get_pipeline_status's self-heal already use, for byte-
+    identical document shape and Studio UI rendering (the failed step's
+    `pipeline.steps.{step}.status`/`.error` are set exactly as they would be
+    by either of those existing paths). Fenced on each document's own
+    runId, exactly like every other writer of this field, so this can never
+    clobber a genuinely-new run that manages to claim and start between
+    this query and this function's own write (astronomically unlikely at
+    boot, before any request has been served, but the fencing is free and
+    matches this codebase's own established discipline for this field
+    regardless). Returns the number of pipelines reconciled, for the
+    startup log."""
+    cursor = db[LESSONS_COLL].find(
+        {"pipeline.state": "running"},
+        {"_id": 0, "lessonId": 1, "pipeline.runId": 1, "pipeline.currentStep": 1},
+    )
+    count = 0
+    async for doc in cursor:
+        lesson_id = doc.get("lessonId")
+        pipeline_doc = doc.get("pipeline") or {}
+        run_id = pipeline_doc.get("runId")
+        current_step = pipeline_doc.get("currentStep") or PIPELINE_STEPS[0]
+        await _set_step(db, lesson_id, run_id, current_step, "failed", ORPHANED_PIPELINE_RESTART_MESSAGE)
+        await _finish(db, lesson_id, run_id, "failed", ORPHANED_PIPELINE_RESTART_MESSAGE)
+        count += 1
+    return count
+
+
 def build_pipeline_record(provider_version: str, run_id: str | None = None) -> dict:
     return {
         "runId": run_id or uuid.uuid4().hex[:12],

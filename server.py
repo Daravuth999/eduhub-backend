@@ -7404,9 +7404,32 @@ except Exception as _video_library_load_err:  # noqa: BLE001
 # neutral behind the Universal Synchronization Engine — video_pipeline_
 # tools.py). Same isolated, non-fatal registration discipline as above.
 try:
-    from video_pipeline_tools import register_video_pipeline_routes
+    from video_pipeline_tools import register_video_pipeline_routes, reconcile_orphaned_pipelines
 
     register_video_pipeline_routes(api, db, require_admin)
+
+    # §2, 2026-09 — real incident: lesson "Pchum Ben" (a 172MB upload) sat
+    # orphaned in pipeline.state="running" for minutes after a server
+    # restart before anything noticed. Complementary to (never a
+    # replacement for) video_pipeline_tools.get_pipeline_status's own
+    # in-process self-heal — see reconcile_orphaned_pipelines's own
+    # docstring for exactly how these two relate. Runs once per boot,
+    # after route registration but as part of the SAME startup phase as
+    # every other module's index-creation hook below, so its own failure
+    # is logged and non-fatal rather than blocking the rest of startup.
+    @app.on_event("startup")
+    async def _video_pipeline_reconcile_startup():
+        try:
+            reconciled = await reconcile_orphaned_pipelines(db)
+            if reconciled:
+                logging.getLogger("eduhub").info(
+                    "video_pipeline_tools: reconciled %d orphaned pipeline(s) from a prior restart",
+                    reconciled,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "video_pipeline_tools: orphaned-pipeline reconciliation failed (non-fatal): %s", exc,
+            )
 except Exception as _video_pipeline_load_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "video_pipeline_tools: disabled (%s)", _video_pipeline_load_err
@@ -7519,6 +7542,16 @@ try:
     logging.getLogger("eduhub").info(
         "mystery_box_tools: routes registered (Speaking Lab Mystery Box + EduTalk Pass)"
     )
+
+    @app.on_event("startup")
+    async def _mystery_box_indexes_startup():
+        try:
+            await _mystery_box_hooks["_mbt_ensure_indexes"]()
+            logging.getLogger("eduhub").info("mystery_box: indexes ready")
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "mystery_box: index ensure failed (non-fatal): %s", exc,
+            )
 except Exception as _mbt_load_err:
     logging.getLogger("eduhub").warning(
         "mystery_box_tools.py failed to load (feature disabled): %s",
@@ -7556,6 +7589,23 @@ except Exception as _lmb_load_err:
         _lmb_load_err,
     )
 register_edutalk_routes(api, db, require_admin, require_student)
+try:
+    import edutalk_audio_cache as _edutalk_audio_cache_for_startup
+
+    @app.on_event("startup")
+    async def _edutalk_audio_cache_indexes_startup():
+        try:
+            await _edutalk_audio_cache_for_startup.ensure_indexes(db)
+            logging.getLogger("eduhub").info("edutalk: audio-cache indexes ready")
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "edutalk: audio-cache index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _edutalk_audio_cache_import_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "edutalk: audio-cache module unavailable, indexes not scheduled (%s)",
+        _edutalk_audio_cache_import_err,
+    )
 # PHASE 3 — tier-aware AI feature config + promotions (isolated, additive).
 register_tier_config_routes(api, db, require_admin, require_student)
 

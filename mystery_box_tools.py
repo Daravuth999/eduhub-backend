@@ -1994,16 +1994,23 @@ def register_mystery_box_routes(
         )
         return {"ok": True, "result": result}
 
-    # ── ensure indexes once at module load (best-effort) ─────────────────
-    try:
-        loop = _mbt_asyncio.get_event_loop()
-        if loop.is_running():
-            _mbt_asyncio.ensure_future(_mbt_ensure_indexes())
-        else:
-            loop.run_until_complete(_mbt_ensure_indexes())
-    except Exception as _mbt_idx_err:
-        _MBT_LOG.warning("mystery_box: deferred index creation: %s", _mbt_idx_err)
-
+    # 2026-09 (§3): index creation is intentionally NOT scheduled here.
+    # register_mystery_box_routes runs at module-registration time, before
+    # Uvicorn's event loop exists — `asyncio.get_event_loop()` in that
+    # context raises "There is no current event loop in thread 'MainThread'"
+    # on every real boot (confirmed against this exact code, not assumed:
+    # the warning below is that exact exception's message, seen in every
+    # server startup log this project has). The try/except caught that
+    # exception and logged it as a harmless warning, but "deferred" was
+    # never accurate — nothing else in this codebase ever called
+    # _mbt_ensure_indexes() again afterward, so these indexes were silently
+    # NEVER created, on any boot, ever — a real functional gap, not just
+    # log noise. _mbt_ensure_indexes is already exposed via this function's
+    # own returned hooks dict (`_ns["_mbt_ensure_indexes"]` below); server.py
+    # now calls it from a proper `@app.on_event("startup")` handler, the
+    # same established pattern this codebase already uses correctly for
+    # question_bank/notification_packs/prize_pool/etc. — registered AFTER
+    # the real event loop exists, so it actually runs.
     _MBT_LOG.info(
         "mystery_box_tools: routes registered "
         "(/api/admin/mystery-box/*, /api/admin/edutalk-passes/*, "
