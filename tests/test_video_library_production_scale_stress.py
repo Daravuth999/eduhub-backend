@@ -167,3 +167,73 @@ async def test_1_vs_2_vs_3_simultaneous_jobs_queue_behind_the_real_cap(realistic
         f"3 jobs against cap={cap} finished in {t3:.3f}s, expected >= {HOLD_S * 1.8:.3f}s — "
         "the third job did not genuinely queue for a slot"
     )
+
+
+# ── 2026-09 — Audio Extraction stage memory investigation (video pipeline
+#    crash/reconciliation round, §1). Real incident: lesson "Pchum Ben", a
+#    172MB upload, stalled specifically at "Audio extraction" right before
+#    a Render service restart. Investigated whether this is the SAME OOM
+#    class as the ea40e84 remux double-buffer fix above (reading a full
+#    ffmpeg OUTPUT back into a SECOND full-size Python bytes object,
+#    coexisting with the original upload buffer) — confirmed, by reading
+#    video_render_tools.probe_audio_stream_status/extract_audio_track
+#    directly, that this is a DIFFERENT, much healthier shape: both
+#    functions write the (already-in-memory) input to ONE temp file for
+#    ffmpeg/ffprobe to read, and the OUTPUT they read back is either a tiny
+#    probe status string or dramatically-smaller audio-only data (mono/
+#    16kHz/64kbps — "a few MB" per extract_audio_track's own docstring),
+#    never a second full-size copy of the video. This test proves that
+#    property with the SAME realistic ~130MB fixture the remux stress test
+#    above uses, and is a permanent regression guard: it would fail if a
+#    future change ever reintroduced a same-order-of-magnitude second
+#    buffer into either function. ────────────────────────────────────────
+@pytest.mark.skipif(NO_FFMPEG, reason="ffmpeg not installed in this environment")
+@pytest.mark.asyncio
+async def test_audio_extraction_stage_never_holds_a_second_full_size_buffer(realistic_video_bytes):
+    """Mirrors run_pipeline's own real call order for a video-typed lesson:
+    probe_audio_stream_status() first, then extract_audio_track() — both
+    against the SAME already-in-memory upload, exactly as
+    video_pipeline_tools._run_stages does."""
+    fixture_mb = len(realistic_video_bytes) / (1024 * 1024)
+
+    tracemalloc.start()
+    gc.collect()
+
+    status = await vrt.probe_audio_stream_status(realistic_video_bytes, content_type="video/mp4")
+    peak_after_probe = tracemalloc.get_traced_memory()[1] / (1024 * 1024)
+
+    extracted = await vrt.extract_audio_track(realistic_video_bytes, "video/mp4")
+    peak_after_extract = tracemalloc.get_traced_memory()[1] / (1024 * 1024)
+
+    tracemalloc.stop()
+
+    assert status == "present"  # the synthetic fixture genuinely has an audio track
+    assert extracted, "extraction should succeed for a real, valid fixture with audio"
+    extracted_mb = len(extracted) / (1024 * 1024)
+    print(f"\n[audio-extraction memory] fixture={fixture_mb:.1f}MB "
+          f"peak_after_probe={peak_after_probe:.1f}MB peak_after_extract={peak_after_extract:.1f}MB "
+          f"extracted_audio={extracted_mb:.2f}MB")
+
+    # The remux bug's exact signature was ~2x fixture size (original +
+    # a second full-size copy). This stage's real output is audio-only —
+    # dramatically smaller than the video input, never a second
+    # comparable-size buffer — so peak traced memory should stay close to
+    # ONE copy of the fixture plus a small amount of overhead, with
+    # generous headroom (1.6x) that would still comfortably catch a
+    # reintroduced ~2x double-buffer if one ever appeared.
+    assert peak_after_probe < fixture_mb * 1.6, (
+        f"probe_audio_stream_status peak traced memory ({peak_after_probe:.1f}MB) suggests a second "
+        f"large buffer for a {fixture_mb:.1f}MB fixture — investigate before assuming this is still healthy"
+    )
+    assert peak_after_extract < fixture_mb * 1.6, (
+        f"extract_audio_track peak traced memory ({peak_after_extract:.1f}MB) suggests a second "
+        f"large buffer for a {fixture_mb:.1f}MB fixture — investigate before assuming this is still healthy"
+    )
+    # The extracted audio itself must be genuinely small (this is WHY this
+    # stage's memory profile differs fundamentally from the remux bug,
+    # whose output was the same order of magnitude as its input).
+    assert extracted_mb < fixture_mb * 0.3, (
+        f"extracted audio ({extracted_mb:.2f}MB) is not dramatically smaller than the "
+        f"{fixture_mb:.1f}MB source — if a future change makes this stage produce comparable-size "
+        "output, the double-buffer risk this test guards against becomes real again"
+    )
