@@ -1,14 +1,22 @@
 """tests/test_video_word_alignment.py — real per-word alignment merge
 (video_word_alignment.py), the Teleprompter karaoke structural-fix §1.
 
-Covers: honest word-level merging (matched words get real Scribe timing +
-confidence, unmatched words keep Gemini's own interpolation untouched),
-multi-speaker/silence/off-script handling, provider-failure resilience
-(never blocks the pipeline), and the architectural guarantee that the
-alignment provider is reachable ONLY from the authoring-time pipeline,
-never from any playback path — proven two ways: a call-count spy through
-the real pipeline run, and a static import-boundary check that can never
-regress silently.
+2026-09: ElevenLabs Scribe removed from this feature (explicit project-owner
+instruction) — get_word_alignment_provider() now always returns None, so
+every lesson runs with Gemini's own interpolated timing until a replacement
+provider is wired in the very next commit. The merge/orchestration logic
+(merge_real_word_timing, run_word_alignment) was already provider-agnostic
+and is covered unchanged below; the provider-specific tests for the old
+ElevenLabs Scribe wiring have been removed rather than adapted, since that
+wiring no longer exists.
+
+Covers: honest word-level merging (matched words get real measured timing;
+unmatched words keep Gemini's own interpolation untouched), multi-speaker/
+silence/off-script handling, provider-failure resilience (never blocks the
+pipeline), and the architectural guarantee that the alignment provider is
+reachable ONLY from the authoring-time pipeline, never from any playback
+path — proven two ways: a call-count spy through the real pipeline run, and
+a static import-boundary check that can never regress silently.
 """
 from __future__ import annotations
 
@@ -25,8 +33,11 @@ def _gemini_word(word, start, end):
     return build_word(word, start, end, confidence=build_confidence(transcript=None, alignment=None))
 
 
-def _scribe_word(word, start, end, *, confidence=0.95):
-    return build_word(word, start, end, confidence=build_confidence(transcript=confidence, alignment=None))
+def _measured_word(word, start, end):
+    """A word from a second, independent transcription pass — flat
+    {"word","start","end"} shape, whatever a real provider's align()
+    returns once one is wired in."""
+    return {"word": word, "start": start, "end": end}
 
 
 def _gemini_doc(words, *, speaker_id=None):
@@ -39,45 +50,42 @@ def _gemini_doc(words, *, speaker_id=None):
 
 
 # ── merge_real_word_timing — the core matching/merge logic ────────────────
-def test_matched_words_get_real_timing_and_honest_confidence():
+def test_matched_words_get_real_timing():
     gemini = _gemini_doc([_gemini_word("hello", 0.0, 0.5), _gemini_word("world", 0.5, 1.0)])
-    scribe_words = [_scribe_word("hello", 0.02, 0.48, confidence=0.99), _scribe_word("world", 0.51, 0.97, confidence=0.91)]
+    measured = [_measured_word("hello", 0.02, 0.48), _measured_word("world", 0.51, 0.97)]
 
-    merged, telemetry = vwa.merge_real_word_timing(gemini, scribe_words)
+    merged, telemetry = vwa.merge_real_word_timing(gemini, measured, provider_version="test-provider-v1")
 
     words = merged["paragraphs"][0]["sentences"][0]["words"]
     assert words[0]["start"] == 0.02 and words[0]["end"] == 0.48
-    assert words[0]["confidence"]["alignment"] == 0.99
     assert words[1]["start"] == 0.51 and words[1]["end"] == 0.97
-    assert words[1]["confidence"]["alignment"] == 0.91
     assert telemetry == {
-        "status": "complete", "provider": "elevenlabs-scribe-v1",
+        "status": "complete", "provider": "test-provider-v1",
         "totalWords": 2, "matchedWords": 2, "matchRatio": 1.0,
-        "meanAlignmentConfidence": pytest.approx(0.95),
-        "lowConfidenceWordCount": 0,
+        "meanAlignmentConfidence": None,
+        "lowConfidenceWordCount": None,
         "attemptedAt": telemetry["attemptedAt"],  # timestamp, not asserted exactly
     }
 
 
-def test_off_script_or_unrecognized_words_stay_interpolated_and_honestly_unconfident():
-    """A word Gemini transcribed that Scribe's independent ASR did not
+def test_off_script_or_unrecognized_words_stay_interpolated():
+    """A word Gemini transcribed that the second, independent pass did not
     recognize the same way (background noise, a mumble, genuine ASR
-    disagreement) must NEVER be assigned a fabricated real timing —
-    the interpolated estimate and its None alignment confidence are the
-    honest answer here, exactly as before this feature existed."""
+    disagreement) must NEVER be assigned a fabricated real timing — the
+    interpolated estimate is the honest answer here, exactly as before this
+    feature existed."""
     gemini = _gemini_doc([
         _gemini_word("the", 0.0, 0.3), _gemini_word("quick", 0.3, 0.7), _gemini_word("fox", 0.7, 1.0),
     ])
-    # Scribe only clearly recognized "the" and "fox" — "quick" is absent
-    # (masked by noise), a real and expected ASR-disagreement scenario.
-    scribe_words = [_scribe_word("the", 0.01, 0.29, confidence=0.98), _scribe_word("fox", 0.75, 1.05, confidence=0.9)]
+    # The second pass only clearly recognized "the" and "fox" — "quick" is
+    # absent (masked by noise), a real and expected ASR-disagreement scenario.
+    measured = [_measured_word("the", 0.01, 0.29), _measured_word("fox", 0.75, 1.05)]
 
-    merged, telemetry = vwa.merge_real_word_timing(gemini, scribe_words)
+    merged, telemetry = vwa.merge_real_word_timing(gemini, measured)
     words = merged["paragraphs"][0]["sentences"][0]["words"]
 
     assert words[0]["start"] == 0.01  # "the" — matched, real timing
     assert words[1]["start"] == 0.3 and words[1]["end"] == 0.7  # "quick" — untouched interpolation
-    assert words[1]["confidence"].get("alignment") is None  # never fabricated (key omitted, per build_confidence)
     assert words[2]["start"] == 0.75  # "fox" — matched, real timing
     assert telemetry["totalWords"] == 3
     assert telemetry["matchedWords"] == 2
@@ -86,9 +94,9 @@ def test_off_script_or_unrecognized_words_stay_interpolated_and_honestly_unconfi
 
 def test_multi_speaker_structure_and_labels_are_never_touched():
     """Gemini's own sentence/speaker segmentation is the preserved source
-    of truth (§1.4) — this function only ever rewrites word start/end/
-    confidence, never speakerId, sentence boundaries, or paragraph
-    grouping, even when merging in real per-word timing."""
+    of truth (§1.4) — this function only ever rewrites word start/end,
+    never speakerId, sentence boundaries, or paragraph grouping, even when
+    merging in real per-word timing."""
     s1 = build_sentence("s1", [_gemini_word("hi", 0.0, 0.4)], speaker_id="S1")
     s2 = build_sentence("s2", [_gemini_word("hello", 1.0, 1.4)], speaker_id="S2")
     gemini = build_sync_document(
@@ -96,9 +104,9 @@ def test_multi_speaker_structure_and_labels_are_never_touched():
         paragraphs=[build_paragraph("p1", [s1, s2])], generated_at="2026-01-01T00:00:00Z",
         duration_sec=1.4, speakers=[{"id": "S1", "label": "S1"}, {"id": "S2", "label": "S2"}],
     )
-    scribe_words = [_scribe_word("hi", 0.05, 0.35), _scribe_word("hello", 1.02, 1.38)]
+    measured = [_measured_word("hi", 0.05, 0.35), _measured_word("hello", 1.02, 1.38)]
 
-    merged, _telemetry = vwa.merge_real_word_timing(gemini, scribe_words)
+    merged, _telemetry = vwa.merge_real_word_timing(gemini, measured)
 
     assert merged["paragraphs"][0]["sentences"][0]["speakerId"] == "S1"
     assert merged["paragraphs"][0]["sentences"][1]["speakerId"] == "S2"
@@ -106,32 +114,24 @@ def test_multi_speaker_structure_and_labels_are_never_touched():
     assert merged["paragraphs"][0]["sentences"][0]["words"][0]["start"] == 0.05  # still got real timing
 
 
-def test_silence_gap_with_zero_scribe_words_leaves_everything_interpolated():
-    """A sentence-level silence/no-recognizable-speech result from Scribe
-    (e.g. it returned nothing at all) must degrade to the existing
-    interpolated behavior, not error or fabricate timing."""
+def test_silence_gap_with_zero_measured_words_leaves_everything_interpolated():
+    """A sentence-level silence/no-recognizable-speech result from the
+    second pass (e.g. it returned nothing at all) must degrade to the
+    existing interpolated behavior, not error or fabricate timing."""
     gemini = _gemini_doc([_gemini_word("quiet", 0.0, 0.5)])
     merged, telemetry = vwa.merge_real_word_timing(gemini, [])
     words = merged["paragraphs"][0]["sentences"][0]["words"]
     assert words[0]["start"] == 0.0 and words[0]["end"] == 0.5
-    assert words[0]["confidence"].get("alignment") is None
     assert telemetry["matchedWords"] == 0
     assert telemetry["matchRatio"] == 0.0
     assert telemetry["meanAlignmentConfidence"] is None
 
 
-def test_low_confidence_matched_words_are_counted_honestly():
-    gemini = _gemini_doc([_gemini_word("mumble", 0.0, 0.5)])
-    merged, telemetry = vwa.merge_real_word_timing(gemini, [_scribe_word("mumble", 0.02, 0.48, confidence=0.2)])
-    assert merged["paragraphs"][0]["sentences"][0]["words"][0]["confidence"]["alignment"] == 0.2
-    assert telemetry["lowConfidenceWordCount"] == 1
-
-
-def test_an_inverted_scribe_span_is_rejected_not_persisted():
+def test_an_inverted_measured_span_is_rejected_not_persisted():
     """Defensive: a provider returning a genuinely malformed end<start span
     must never corrupt the document — the interpolated span is kept."""
     gemini = _gemini_doc([_gemini_word("word", 1.0, 1.5)])
-    bad = build_word("word", 2.0, 1.0, confidence=build_confidence(transcript=0.9))
+    bad = {"word": "word", "start": 2.0, "end": 1.0}
     merged, telemetry = vwa.merge_real_word_timing(gemini, [bad])
     words = merged["paragraphs"][0]["sentences"][0]["words"]
     assert words[0]["start"] == 1.0 and words[0]["end"] == 1.5  # untouched
@@ -154,10 +154,10 @@ async def test_run_word_alignment_never_raises_and_falls_back_on_provider_failur
     timeout, HTTP error) must never block the lesson — the pipeline must
     still complete using Gemini's existing interpolated timing."""
     class _FailingProvider:
-        provider_version = "elevenlabs-scribe-v1"
+        provider_version = "test-provider-v1"
 
-        async def align(self, audio_bytes, transcript=None, **kwargs):
-            raise RuntimeError("ElevenLabs Scribe 429: rate limited")
+        async def align(self, audio_bytes, content_type=None, **kwargs):
+            raise RuntimeError("provider 429: rate limited")
 
     gemini = _gemini_doc([_gemini_word("hi", 0.0, 0.4)])
     sync_doc, telemetry = await vwa.run_word_alignment(b"audio", "hi", gemini, provider=_FailingProvider())
@@ -166,19 +166,18 @@ async def test_run_word_alignment_never_raises_and_falls_back_on_provider_failur
     assert sync_doc["paragraphs"][0]["sentences"][0]["words"][0]["start"] == 0.0  # interpolated, untouched
     assert telemetry["status"] == "failed"
     assert "rate limited" in telemetry["error"]
-    assert telemetry["provider"] == "elevenlabs-scribe-v1"
+    assert telemetry["provider"] == "test-provider-v1"
 
 
 @pytest.mark.asyncio
 async def test_run_word_alignment_merges_on_a_successful_provider_call():
     class _FakeProvider:
-        provider_version = "elevenlabs-scribe-v1"
+        provider_version = "test-provider-v1"
         calls = 0
 
-        async def align(self, audio_bytes, transcript=None, **kwargs):
+        async def align(self, audio_bytes, content_type=None, **kwargs):
             self.calls += 1
-            scribe_doc = _gemini_doc([_scribe_word("hi", 0.03, 0.37, confidence=0.93)])
-            return {"sync": scribe_doc}
+            return {"sync": {"paragraphs": [{"sentences": [{"words": [_measured_word("hi", 0.03, 0.37)]}]}]}}
 
     provider = _FakeProvider()
     gemini = _gemini_doc([_gemini_word("hi", 0.0, 0.4)])
@@ -190,17 +189,26 @@ async def test_run_word_alignment_merges_on_a_successful_provider_call():
     assert telemetry["matchedWords"] == 1
 
 
-def test_get_word_alignment_provider_is_none_without_an_api_key(monkeypatch):
-    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+def test_get_word_alignment_provider_always_returns_none():
+    """ElevenLabs Scribe removed, no replacement wired yet in this commit —
+    see module docstring. Every lesson runs with Gemini's interpolated
+    timing only until the next commit adds a real provider."""
     assert vwa.get_word_alignment_provider() is None
 
 
-def test_get_word_alignment_provider_constructs_a_real_scribe_provider_when_key_present(monkeypatch):
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key-123")
-    provider = vwa.get_word_alignment_provider()
-    assert provider is not None
-    assert provider.category == "speech_recognition"
-    assert provider.provider_version == "elevenlabs-scribe-v1"
+def test_no_dead_elevenlabs_code_remains_in_this_module():
+    """Permanent regression guard for Rule 1: no ElevenLabs/Scribe IMPORT,
+    ENV VAR, OR NETWORK CALL left in this feature's module. Deliberately
+    does NOT ban the words "ElevenLabs"/"Scribe" outright: the module
+    docstring intentionally documents what was removed and why (this
+    codebase's own "dense version-history header comments explaining why a
+    change was made" convention) — that is documentation, not dead code."""
+    source = Path(vwa.__file__).read_text(encoding="utf-8")
+    assert "ELEVENLABS_API_KEY" not in source
+    assert "ScribeAlignmentProvider" not in source
+    assert "ElevenLabsProvider" not in source
+    assert "sync_provider" not in source  # that's where both of the above live
+    assert "api.elevenlabs.io" not in source
 
 
 # ── architectural guarantee (§1.3/§1.7): authoring-time only, never
@@ -247,14 +255,14 @@ async def test_alignment_provider_is_called_exactly_once_per_pipeline_run_via_a_
     import video_pipeline_tools as vpt
 
     class _CountingProvider:
-        provider_version = "elevenlabs-scribe-v1"
+        provider_version = "test-provider-v1"
 
         def __init__(self):
             self.call_count = 0
 
-        async def align(self, audio_bytes, transcript=None, **kwargs):
+        async def align(self, audio_bytes, content_type=None, **kwargs):
             self.call_count += 1
-            return {"sync": _gemini_doc([_scribe_word("hi", 0.02, 0.38)])}
+            return {"sync": {"paragraphs": [{"sentences": [{"words": [_measured_word("hi", 0.02, 0.38)]}]}]}}
 
     counting_provider = _CountingProvider()
 
