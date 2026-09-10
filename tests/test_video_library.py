@@ -262,6 +262,66 @@ class _Coll:
         return _Cursor([d for d in self.docs.values() if _matches(d, query or {})])
 
 
+class _RestrictedWalletsColl:
+    """Minimal fake for video_library_restricted_points.py's own
+    COLL_WALLETS — the generic `_Coll` above doesn't support the `$gte`
+    balance guard + `upsert` this module's credit()/debit() rely on, so a
+    dedicated fake (matching tests/test_video_library_restricted_points.py's
+    own) is used instead, rather than risking `_Coll`'s existing, already-
+    tested behavior for every other collection that uses it."""
+
+    def __init__(self):
+        self.docs: dict[str, dict] = {}
+
+    async def find_one(self, query, projection=None):
+        sid = query.get("student_id")
+        doc = self.docs.get(sid)
+        return dict(doc) if doc is not None else None
+
+    async def find_one_and_update(self, filt, update, upsert=False, return_document=None, projection=None):
+        sid = filt.get("student_id")
+        existing = self.docs.get(sid)
+        if existing is None:
+            if not upsert or "balance" in filt:
+                return None
+            existing = {"student_id": sid, "balance": 0}
+            if "$setOnInsert" in update:
+                existing.update(update["$setOnInsert"])
+            self.docs[sid] = existing
+        elif "balance" in filt:
+            cond = filt["balance"]
+            if isinstance(cond, dict) and "$gte" in cond and int(existing.get("balance") or 0) < cond["$gte"]:
+                return None
+        if "$inc" in update:
+            for k, v in update["$inc"].items():
+                existing[k] = existing.get(k, 0) + v
+        if "$set" in update:
+            existing.update(update["$set"])
+        return dict(existing)
+
+    async def create_index(self, *a, **k):
+        return None
+
+
+class _RestrictedTxnsColl:
+    def __init__(self):
+        self.rows: list[dict] = []
+
+    async def find_one(self, query, projection=None):
+        key = query.get("idempotency_key")
+        for d in self.rows:
+            if d.get("idempotency_key") == key:
+                return dict(d)
+        return None
+
+    async def insert_one(self, doc):
+        self.rows.append(dict(doc))
+        return _Result(inserted_id=len(self.rows))
+
+    async def create_index(self, *a, **k):
+        return None
+
+
 class _FakeDB:
     def __init__(self):
         self.video_lessons = _Coll()
@@ -269,6 +329,9 @@ class _FakeDB:
         self.video_progress = _Coll()
         self.video_bookmarks = _Coll()
         self.chapter_sync = _Coll()  # sync_studio_tools.py's collection — cross-module reuse test
+        self.coupons = _Coll()  # §1/§2: percent-coupon lookup in initiate_purchase
+        self._restricted_wallets = _RestrictedWalletsColl()
+        self._restricted_txns = _RestrictedTxnsColl()
 
     def __getitem__(self, name):
         if name == vlt.LESSONS_COLL:
@@ -279,6 +342,12 @@ class _FakeDB:
             return self.video_progress
         if name == vlt.BOOKMARKS_COLL:
             return self.video_bookmarks
+        if name == "coupons":
+            return self.coupons
+        if name == "video_library_restricted_wallets":
+            return self._restricted_wallets
+        if name == "video_library_restricted_transactions":
+            return self._restricted_txns
         if name == "chapter_sync":
             return self.chapter_sync
         raise AssertionError(f"unexpected collection: {name}")

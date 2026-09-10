@@ -87,6 +87,16 @@ def _apply_path(doc, path, value, array_filters, op):
 class _Coll:
     def __init__(self):
         self.docs: dict[str, dict] = {}
+        self._seq = 0
+
+    async def insert_one(self, doc):
+        # §2: video_library_restricted_points.py's ledger writes via a
+        # real insert_one — this fake previously never needed one since
+        # every existing test seeds coupons by writing `.docs` directly.
+        self._seq += 1
+        key = doc.get("student_id") and f"{doc.get('student_id')}:{self._seq}" or self._seq
+        self.docs[key] = dict(doc)
+        return type("Result", (), {"inserted_id": key})()
 
     async def find_one(self, q, projection=None):
         for d in self.docs.values():
@@ -94,12 +104,23 @@ class _Coll:
                 return copy.deepcopy(d)
         return None
 
-    async def find_one_and_update(self, q, update, upsert=False, return_document=None):
+    async def find_one_and_update(self, q, update, upsert=False, return_document=None, projection=None):
         for d in self.docs.values():
             if _match(d, q):
-                before = copy.deepcopy(d)
                 _apply(d, update)
-                return before
+                return copy.deepcopy(d)
+        # §2 (restricted points): video_library_restricted_points.py's
+        # credit() relies on upsert=True to create a student's wallet doc
+        # on first credit — a real Mongo capability this fake previously
+        # never needed since no collection used it before this addition.
+        if upsert:
+            new_doc = {k: v for k, v in q.items() if not isinstance(v, dict)}
+            if "$setOnInsert" in update:
+                new_doc.update(update["$setOnInsert"])
+            _apply(new_doc, {k: v for k, v in update.items() if k != "$setOnInsert"})
+            key = new_doc.get("student_id") or new_doc.get("code") or str(len(self.docs))
+            self.docs[key] = new_doc
+            return copy.deepcopy(new_doc)
         return None
 
     async def update_one(self, q, update, upsert=False, array_filters=None):
@@ -164,9 +185,15 @@ def _enable(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _default_credit_succeeds(monkeypatch):
-    async def ok(student_clean_id, amount):
-        return True, ""
-    monkeypatch.setattr(vlc, "_credit_video_library_points", ok)
+    """2026-09: credit now goes to video_library_restricted_points.py's
+    ledger (§2), not a mockable standalone GAS-call function — the default
+    fake DB's own upsert-capable _Coll (see above) makes a REAL credit()
+    call succeed without any mocking needed at all; this fixture is now a
+    no-op kept only so existing tests that reference it don't need
+    editing, and new tests can still override credit() itself when they
+    need to simulate a failure (see test_credit_failure_does_not_burn_code_
+    and_message_is_friendly below)."""
+    return None
 
 
 def _redeem(client, code, **extra):
@@ -267,7 +294,7 @@ def test_assigned_to_restriction_and_normalization():
     assert body2["state"] == "not_assigned"
 
 
-# ── redeem happy path + real credit into the SHARED GAS points balance ─────
+# ── redeem happy path + real credit into the restricted-points ledger (§2) ─
 def test_successful_redeem_credits_points_and_records_ledger():
     db = _DB()
     _seed_coupon(db)
@@ -286,10 +313,11 @@ def test_successful_redeem_credits_points_and_records_ledger():
 
 def test_no_credit_call_on_invalid_code(monkeypatch):
     called = {"n": 0}
-    async def spy(student_clean_id, amount):
+    real_credit = vlc.restricted_points.credit
+    async def spy(*a, **k):
         called["n"] += 1
-        return True, ""
-    monkeypatch.setattr(vlc, "_credit_video_library_points", spy)
+        return await real_credit(*a, **k)
+    monkeypatch.setattr(vlc.restricted_points, "credit", spy)
     db = _DB()
     client = _make_client(db)
     _redeem(client, "NOSUCHCODE")
@@ -323,10 +351,11 @@ def test_concurrent_double_redeem_only_one_reservation_created():
 # ── idempotent retry ─────────────────────────────────────────────────────────
 def test_idempotent_retry_after_success_never_recredits(monkeypatch):
     calls = {"n": 0}
-    async def counting_credit(student_clean_id, amount):
+    real_credit = vlc.restricted_points.credit
+    async def counting_credit(*a, **k):
         calls["n"] += 1
-        return True, ""
-    monkeypatch.setattr(vlc, "_credit_video_library_points", counting_credit)
+        return await real_credit(*a, **k)
+    monkeypatch.setattr(vlc.restricted_points, "credit", counting_credit)
     db = _DB()
     _seed_coupon(db)
     client = _make_client(db)
@@ -347,16 +376,16 @@ def test_validate_reports_already_redeemed_state():
 
 # ── credit failure never permanently burns the code ─────────────────────────
 def test_credit_failure_does_not_burn_code_and_message_is_friendly(monkeypatch):
-    async def failing_credit(student_clean_id, amount):
-        return False, "gas_http_500"
-    monkeypatch.setattr(vlc, "_credit_video_library_points", failing_credit)
+    async def failing_credit(*a, **k):
+        raise RuntimeError("simulated ledger write failure")
+    monkeypatch.setattr(vlc.restricted_points, "credit", failing_credit)
     db = _DB()
     _seed_coupon(db)
     client = _make_client(db)
     body = _redeem(client, "VIDLIB20").json()
     assert body["ok"] is False
     assert body["state"] == "credit_failed"
-    assert "gas_http_500" not in body["message"]
+    assert "RuntimeError" not in body["message"]
     stored = db["coupons"].docs["VIDLIB20"]
     assert stored["uses_count"] == 1  # slot still reserved, retryable
     assert stored["redemptions"][0]["status"] == "credit_failed"
@@ -364,12 +393,13 @@ def test_credit_failure_does_not_burn_code_and_message_is_friendly(monkeypatch):
 
 def test_retry_after_credit_failure_retries_only_the_credit_step(monkeypatch):
     attempts = {"n": 0}
-    async def flaky_credit(student_clean_id, amount):
+    real_credit = vlc.restricted_points.credit
+    async def flaky_credit(*a, **k):
         attempts["n"] += 1
         if attempts["n"] == 1:
-            return False, "gas_http_500"
-        return True, ""
-    monkeypatch.setattr(vlc, "_credit_video_library_points", flaky_credit)
+            raise RuntimeError("simulated transient ledger failure")
+        return await real_credit(*a, **k)
+    monkeypatch.setattr(vlc.restricted_points, "credit", flaky_credit)
     db = _DB()
     _seed_coupon(db)
     client = _make_client(db)
@@ -418,4 +448,4 @@ def test_server_wires_registration_call_site_structurally():
     with open("server.py", encoding="utf-8") as f:
         src = f.read()
     assert "from video_library_coupon_tools import register_video_library_coupon_routes" in src
-    assert "register_video_library_coupon_routes(api, db, require_admin, require_student)" in src
+    assert "register_video_library_coupon_routes(api, db, require_admin, require_student, fan_out_push=_fan_out_push)" in src

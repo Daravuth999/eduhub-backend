@@ -7378,7 +7378,7 @@ except Exception as _sync_studio_load_err:  # noqa: BLE001
 try:
     from video_library_tools import register_video_library_routes, ensure_video_library_indexes
 
-    register_video_library_routes(api, db, require_admin, require_student)
+    register_video_library_routes(api, db, require_admin, require_student, fan_out_push=_fan_out_push)
 
     @app.on_event("startup")
     async def _video_library_startup():
@@ -7387,6 +7387,13 @@ try:
         except Exception as exc:  # noqa: BLE001
             logging.getLogger("eduhub").warning(
                 "video_library_tools: index ensure failed (non-fatal): %s", exc,
+            )
+        try:
+            import video_library_restricted_points as _vlrp
+            await _vlrp.ensure_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "video_library_restricted_points: index ensure failed (non-fatal): %s", exc,
             )
 except Exception as _video_library_load_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
@@ -7665,7 +7672,7 @@ except Exception as _edutalk_coupon_err:  # noqa: BLE001
 # coupon module above; never touches book-discount or EduTalk coupon code.
 try:
     from video_library_coupon_tools import register_video_library_coupon_routes
-    register_video_library_coupon_routes(api, db, require_admin, require_student)
+    register_video_library_coupon_routes(api, db, require_admin, require_student, fan_out_push=_fan_out_push)
 except Exception as _video_library_coupon_err:  # noqa: BLE001
     logging.getLogger("eduhub").warning(
         "video_library_coupon_tools: disabled (%s)", _video_library_coupon_err
