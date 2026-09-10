@@ -3262,16 +3262,23 @@ def register_edutalk_routes(api: APIRouter, db, require_admin, require_student) 
     msg_col = db[MONGO_MESSAGES_COLLECTION]
     usage_col = db[MONGO_USAGE_COLLECTION]
 
-    # v9.6 — fire-and-forget index creation for the audio cache + per-
-    # student entitlement collections. Failure here is non-fatal: the
-    # helpers themselves are wrapped in try/except, so an index miss
-    # just degrades lookups to full scans (rare in practice — both
-    # collections stay small thanks to content-hash deduplication).
-    if _AUDIO_CACHE_OK and _et_audio is not None:
-        try:
-            asyncio.get_event_loop().create_task(_et_audio.ensure_indexes(db))
-        except Exception as _idx_exc:  # noqa: BLE001
-            log.warning("edutalk: audio-cache index task spawn failed: %s", _idx_exc)
+    # 2026-09 (§3): index creation is intentionally NOT scheduled here.
+    # register_edutalk_routes runs at module-registration time, before
+    # Uvicorn's event loop exists — `asyncio.get_event_loop()` in that
+    # context raises "There is no current event loop in thread 'MainThread'"
+    # on every real boot (confirmed against this exact code, not assumed:
+    # the warning below is that exact exception's message, seen in every
+    # server startup log this project has). The try/except caught it and
+    # logged a warning, but the index-creation task was never actually
+    # scheduled anywhere else afterward — these audio-cache indexes were
+    # silently NEVER created, on any boot, ever (degrading to full scans
+    # permanently, not just "rarely" as the comment above assumed). Server
+    # .py now calls edutalk_audio_cache.ensure_indexes(db) directly from a
+    # proper `@app.on_event("startup")` handler, the same established
+    # pattern this codebase already uses correctly for question_bank/
+    # notification_packs/prize_pool/etc. — registered AFTER the real event
+    # loop exists, so it actually runs. _AUDIO_CACHE_OK/_et_audio stay
+    # exactly as they are for this module's own per-request lookups below.
 
     async def _load_config() -> dict:
         doc = await cfg_col.find_one({"_id": CONFIG_DOC_ID})
