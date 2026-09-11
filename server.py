@@ -6005,6 +6005,36 @@ except Exception as _question_bank_err:  # noqa: BLE001
         _question_bank_err,
     )
 
+# ── Speaking Lab Topic-Based Question Generation (Group Mode) ──────────
+# Additive, isolated module — gives Group Mode's "Discussion Topic" a
+# real group-chosen topic + a fresh Gemini-generated question, with a
+# pool-claim → inline-generate → static-bank fallback chain so a group is
+# never blocked. Failure is non-fatal: only the topic-questions routes
+# go away, Solo Mode and the rest of Speaking Lab are untouched.
+try:
+    from speaking_lab_topic_questions import (
+        register_topic_question_routes,
+        ensure_topic_question_indexes,
+    )
+    register_topic_question_routes(
+        api, db, require_admin,
+        current_user=current_user, is_super_admin=_is_super_admin,
+    )
+
+    @app.on_event("startup")
+    async def _topic_question_startup():
+        try:
+            await ensure_topic_question_indexes(db)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("eduhub").warning(
+                "speaking_lab_topic_questions: index ensure failed (non-fatal): %s", exc,
+            )
+except Exception as _topic_question_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "speaking_lab_topic_questions failed to load (Topic Questions API disabled): %s",
+        _topic_question_err,
+    )
+
 # ── Notification Packs (Architecture Reconstruction continuation,        ──
 # Author Studio's "Notification Packs" screen). An authoring layer only —
 # it renders reusable title/body/url templates but never sends anything
