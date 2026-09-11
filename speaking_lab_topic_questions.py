@@ -201,10 +201,32 @@ def _clean_json_text(raw: str) -> str:
     """Strip Markdown fences Gemini sometimes adds despite instructions —
     same helper as gemini_engine._clean_json_text (duplicated rather than
     imported: gemini_engine.py's helpers are private/module-internal, and
-    this module must stay self-contained per its own isolation contract)."""
+    this module must stay self-contained per its own isolation contract).
+
+    HOTFIX (observed in production): despite generationConfig's
+    responseMimeType="application/json" AND the system instruction's
+    explicit "Do not include explanations," Gemini sometimes still
+    prepends a conversational preamble before the JSON object — e.g. the
+    literal response `"Here is the JSON requested: {\"text\": ...}"`,
+    which failed json.loads on BOTH the original attempt and the retry
+    (same failure, not a transient glitch — see this module's own retry
+    logic). Since the model's own compliance isn't reliable here, the
+    fix is at the parsing layer: after fence-stripping, if the string
+    doesn't already start with "{", extract the substring between the
+    first "{" and the last "}" — recovers the real object regardless of
+    what surrounds it. A no-op for a response that's already bare JSON,
+    since those positions already bound the whole trimmed string."""
     cleaned = raw.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.strip()
+
+    if not cleaned.startswith("{"):
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start:end + 1]
+
     return cleaned.strip()
 
 
