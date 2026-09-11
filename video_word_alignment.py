@@ -265,6 +265,20 @@ class GeminiWordTimestampProvider:
                         continue
                     words.append({"word": text, "start": start, "end": end})
 
+        # Sort by the word's OWN reported start time immediately, before
+        # this raw response goes anywhere near matching/merging. Mirrors
+        # video_ai_provider.segments_to_sync's own "sort once, at the
+        # single point a document is built from raw provider data" fix —
+        # gemini-3.5-transcribe's own docs never promise `steps`/`content`/
+        # `annotations` are chronologically ordered by array position (a
+        # young, still-settling API surface per this module's own
+        # docstring), so nothing downstream should have to assume it. This
+        # does NOT fix every possible timing defect — a word whose own
+        # reported timestamp is simply wrong (not just out of position) is
+        # a different failure mode entirely, still guarded against
+        # separately by merge_real_word_timing's own ordering check below.
+        words.sort(key=lambda w: w["start"])
+
         return {"sync": {"paragraphs": [{"sentences": [{"words": words}]}]}}
 
 
