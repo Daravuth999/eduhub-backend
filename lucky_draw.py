@@ -970,6 +970,22 @@ def register_lucky_draw_routes(
                 db, session_id, resp.get("winners") or [],
                 actor=getattr(admin, "email", "admin"),
             )
+            # Additive, best-effort: auto-publish a PWA Home Dashboard
+            # showcase for this classroom draw, reusing event_engine.py's
+            # generalized _publish_winner_showcase (the SAME publish path
+            # Event Engine's own settlement uses) rather than a second
+            # showcase system. Never affects the response already being
+            # returned to the teacher's screen.
+            try:
+                from event_engine import _publish_winner_showcase
+                await _publish_winner_showcase(
+                    db, key=f"sl:{session_id}", event_name="Friday Speaking Lab",
+                    finalize_result=resp, actor=getattr(admin, "email", "admin"),
+                    source="speaking_lab_classroom_draw",
+                )
+            except Exception:  # noqa: BLE001
+                if log:
+                    log.exception("winner showcase publish failed for session=%s", session_id)
             return resp
 
         # ── FIX 9: safe retry of failed payouts (admin-only) ─────────────
@@ -1041,6 +1057,16 @@ def register_lucky_draw_routes(
                 push_notify=push_notify,
             )
             await _record_pool_distribution(db, session_id, resp.get("winners") or [], actor="dev")
+            try:
+                from event_engine import _publish_winner_showcase
+                await _publish_winner_showcase(
+                    db, key=f"sl:{session_id}", event_name="Friday Speaking Lab",
+                    finalize_result=resp, actor="dev",
+                    source="speaking_lab_classroom_draw",
+                )
+            except Exception:  # noqa: BLE001
+                if log:
+                    log.exception("winner showcase publish failed for session=%s", session_id)
             return resp
 
 

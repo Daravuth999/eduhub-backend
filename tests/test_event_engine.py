@@ -651,6 +651,43 @@ async def test_settling_auto_publishes_winner_showcase(monkeypatch):
     assert showcase["content"]["payoutStatus"] == "paid"
     assert showcase["content"]["celebrationBanner"] is True
     assert showcase["createdBy"] == "event_engine:teacher@test"
+    # Generalized-signature regression guard: the Event Engine call site
+    # must still resolve the template name itself and pass it through,
+    # and the new `source` field must default to "event_engine" here —
+    # everything else about this content shape is unchanged.
+    assert showcase["content"]["eventName"] == "A"
+    assert showcase["content"]["source"] == "event_engine"
+
+
+@pytest.mark.asyncio
+async def test_publish_winner_showcase_generalized_signature_direct(monkeypatch):
+    """Calling _publish_winner_showcase directly with the new keyword-only
+    signature (key/event_name/source, no `event` dict) produces the exact
+    same content shape the old event-dict-based call produced, plus the
+    new `source` field — proving the generalization is behavior-preserving
+    for any caller, not just transition_event's own."""
+    db = _FakeDB()
+    winners = _fake_winners(2)
+    finalize_result = {
+        "payout_status": "paid", "finalized_at": "2026-01-01T00:00:00+00:00",
+        "winners": winners,
+    }
+    await ee._publish_winner_showcase(
+        db, key="sl:sess-123", event_name="Friday Speaking Lab",
+        finalize_result=finalize_result, actor="teacher@test",
+        source="speaking_lab_classroom_draw",
+    )
+    showcase = await db["experience_configs"].find_one(
+        {"experienceType": "winner_showcase", "key": "sl:sess-123"},
+    )
+    assert showcase is not None
+    assert showcase["content"]["eventId"] == "sl:sess-123"
+    assert showcase["content"]["eventName"] == "Friday Speaking Lab"
+    assert showcase["content"]["champion"]["student_id"] == "stu0"
+    assert showcase["content"]["topWinners"] == winners
+    assert showcase["content"]["source"] == "speaking_lab_classroom_draw"
+    assert showcase["content"]["distributionCompleted"] is True
+    assert showcase["createdBy"] == "event_engine:teacher@test"
 
 
 @pytest.mark.asyncio

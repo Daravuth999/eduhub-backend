@@ -681,12 +681,22 @@ async def _finalize_lucky_draw(db, session_id: str, ctx: dict, *, actor: str = "
     return result
 
 
-async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, actor: str) -> None:
+async def _publish_winner_showcase(
+    db, *, key: str, event_name: str, finalize_result: dict, actor: str,
+    source: str = "event_engine",
+) -> None:
     """Auto-publish a Winner Showcase right after a lucky draw finalizes —
     architecture continuation's "no manual dashboard editing" requirement.
     Champion/top winners/payout status all come straight from
     lucky_draw.py's own finalize response (the SAME data the teacher
     console already shows); nothing here is guessed or duplicated.
+
+    Generalized (no longer takes a full ``event`` dict) so any caller with
+    a settlement result and a stable key can publish a showcase — the
+    classroom Speaking Lab finalize route (no Event Engine ``event``
+    document at all) reuses this the same way Event Engine itself does.
+    ``source`` is stamped onto the published content so readers can tell
+    showcases apart by origin without guessing from the key shape.
 
     Best-effort: a showcase-publish failure is logged and swallowed. The
     money has already moved by the time this runs — a display-layer
@@ -697,8 +707,6 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
     try:
         from experience_config_tools import auto_publish_experience_config
 
-        tmpl = await get_template(db, event.get("template_id"))
-        event_name = (tmpl or {}).get("name") or "Event"
         payout_status = finalize_result.get("payout_status") or ""
         distribution_completed = (
             payout_status in ("paid", "completed")
@@ -712,7 +720,7 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
         # weekly cadence still never leaves the PWA with no showcase at all.
         expires_at = (now + timedelta(days=7)).isoformat()
         content = {
-            "eventId": event["_id"],
+            "eventId": key,
             "eventName": event_name,
             "champion": winners[0],
             "topWinners": winners[:5],
@@ -722,9 +730,10 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
             "celebrationBanner": True,
             "settledAt": finalize_result.get("finalized_at") or now.isoformat(),
             "expiresAt": expires_at,
+            "source": source,
         }
         await auto_publish_experience_config(
-            db, experience_type="winner_showcase", key=event["_id"],
+            db, experience_type="winner_showcase", key=key,
             content=content, created_by=f"event_engine:{actor}",
             # Reuse the platform's OWN active-window expiry mechanism
             # (_is_active_now) rather than making every reader re-derive
@@ -733,7 +742,7 @@ async def _publish_winner_showcase(db, event: dict, finalize_result: dict, *, ac
         )
     except Exception:  # noqa: BLE001
         logger.exception(
-            "event_engine: winner showcase auto-publish failed for event=%s", event["_id"],
+            "event_engine: winner showcase auto-publish failed for key=%s", key,
         )
 
 
@@ -850,7 +859,13 @@ async def transition_event(
                     await _prepare_lucky_draw(db, linked_session_id, event, actor, lucky_draw_ctx)
                 elif to_state == "settling":
                     finalize_result = await _finalize_lucky_draw(db, linked_session_id, lucky_draw_ctx, actor=actor)
-                    await _publish_winner_showcase(db, event, finalize_result, actor=actor)
+                    tmpl_for_showcase = await get_template(db, event.get("template_id"))
+                    showcase_event_name = (tmpl_for_showcase or {}).get("name") or "Event"
+                    await _publish_winner_showcase(
+                        db, key=event["_id"], event_name=showcase_event_name,
+                        finalize_result=finalize_result, actor=actor,
+                        source="event_engine",
+                    )
 
     history_entry = {"state": to_state, "at": now, "by": actor}
     await db[EVENTS_COLL].update_one(
