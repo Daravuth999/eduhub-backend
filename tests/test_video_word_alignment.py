@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import sync_schema
 import video_word_alignment as vwa
 from sync_schema import build_confidence, build_paragraph, build_sentence, build_sync_document, build_word
 
@@ -144,6 +145,75 @@ def test_an_inverted_measured_span_is_rejected_not_persisted():
     assert words[0]["start"] == 1.0 and words[0]["end"] == 1.5  # untouched
     assert "measured" not in words[0]
     assert telemetry["matchedWords"] == 0
+
+
+# ── 2026-09 production incident: lesson vid_12473703734f4750 ("Sealing the
+#    Deal"). sync_schema.validate_sync_document rejected the resulting
+#    document with "words[13] out of chronological order: start=0.42
+#    precedes an earlier word's start=41.6". Root cause: difflib.
+#    SequenceMatcher.get_opcodes() only guarantees matched (i, j) index
+#    pairs are monotonic relative to EACH OTHER — it has no way to know,
+#    and does not claim, that gemini-3.5-transcribe's own raw word_info
+#    annotations came back in strict chronological order by array
+#    position (a young, still-settling API surface per this module's own
+#    docstring). A correctly content-matched word can still carry a
+#    wildly wrong, out-of-time-order measured timestamp. ──────────────────
+def test_an_out_of_order_measured_timestamp_is_rejected_not_persisted():
+    """The exact incident shape, reproduced directly: four words match
+    correctly by content (no repeated-token ambiguity at all), but the
+    THIRD word's own measured timestamp (0.42s — the real incident's own
+    value) is wildly earlier than the word immediately before it (already
+    accepted at ~40.4s). That one word must be rejected and left on
+    Gemini's own interpolated timing; its neighbors on either side must
+    still be merged normally — a single bad measured timestamp must never
+    take down the whole sentence's worth of real timing."""
+    gemini = _gemini_doc([
+        _gemini_word("remember", 40.0, 40.5),
+        _gemini_word("the", 40.5, 40.8),
+        _gemini_word("key", 40.8, 41.2),
+        _gemini_word("skills", 41.2, 41.6),
+    ])
+    measured = [
+        _measured_word("remember", 40.1, 40.4),
+        _measured_word("the", 40.4, 40.7),
+        _measured_word("key", 0.42, 0.9),  # the real incident's own value
+        _measured_word("skills", 41.55, 41.9),
+    ]
+
+    merged, telemetry = vwa.merge_real_word_timing(gemini, measured)
+    words = merged["paragraphs"][0]["sentences"][0]["words"]
+
+    assert words[0]["start"] == 40.1 and words[0]["measured"] is True  # remember — accepted
+    assert words[1]["start"] == 40.4 and words[1]["measured"] is True  # the — accepted
+    assert words[2]["start"] == 40.8 and words[2]["end"] == 41.2  # key — untouched interpolation
+    assert "measured" not in words[2]
+    assert words[3]["start"] == 41.55 and words[3]["measured"] is True  # skills — accepted
+    assert telemetry["matchedWords"] == 3  # 3 of 4 — only the bad one was rejected
+
+    is_valid, errors = sync_schema.validate_sync_document(merged)
+    assert is_valid, errors
+
+
+def test_rejecting_an_out_of_order_word_does_not_also_reject_its_correctly_ordered_successor():
+    """A word rejected for going backwards must not permanently lower the
+    bar for every later word too — the very next word's own, correctly
+    later measured timestamp must still be accepted."""
+    gemini = _gemini_doc([
+        _gemini_word("one", 10.0, 10.3),
+        _gemini_word("two", 10.3, 10.6),
+        _gemini_word("three", 10.6, 10.9),
+    ])
+    measured = [
+        _measured_word("one", 10.05, 10.28),
+        _measured_word("two", 1.0, 1.3),  # wrong — earlier than "one", rejected
+        _measured_word("three", 10.65, 10.95),  # correctly later than "one" — must still be accepted
+    ]
+    merged, telemetry = vwa.merge_real_word_timing(gemini, measured)
+    words = merged["paragraphs"][0]["sentences"][0]["words"]
+    assert words[0]["start"] == 10.05 and words[0]["measured"] is True
+    assert words[1]["start"] == 10.3 and "measured" not in words[1]  # rejected, kept interpolated
+    assert words[2]["start"] == 10.65 and words[2]["measured"] is True
+    assert telemetry["matchedWords"] == 2
 
 
 # ── GeminiWordTimestampProvider — real request/response shape, no network ──
