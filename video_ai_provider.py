@@ -279,14 +279,64 @@ def segments_to_sync(segments: list[dict], *, provider_category: str,
     )
 
 
-def _extract_json(text: str) -> Any:
+# 2026-09 production incident (lesson vid_12473703734f4750, "Sealing the
+# Deal"): despite _ASR_PROMPT explicitly instructing "start/end are SECONDS
+# ... never clock strings" and generationConfig.responseMimeType being
+# "application/json", Gemini emitted several segments with a BARE, UNQUOTED
+# clock-notation value once the transcript passed the one-minute mark —
+# e.g. `"start": 1:42.0,` instead of `"start": 102.0,` or even a quoted
+# `"start": "1:42.0",`. A bare colon sitting in a JSON value position is a
+# hard syntax error with no lenient fallback in Python's `json` module: the
+# WHOLE payload fails to parse, discarding every segment (including the
+# ones that were perfectly well-formed), not just the malformed one — this
+# is what actually produced the misleading "no parsable segments" error
+# while the raw response demonstrably contained real transcript content.
+#
+# parse_time_sec() below already correctly converts a QUOTED clock string
+# ("1:42.0") to seconds — it was never the problem. The problem is purely
+# that the malformed text never reaches it, because json.loads() rejects
+# the surrounding document first. This regex targets exactly that: a bare
+# numeric-clock-shaped token (one or two colons, optional decimal) sitting
+# directly after a JSON `: ` in a value position, followed by a JSON
+# delimiter. It is a no-op on well-formed JSON — ordinary decimal seconds
+# ("12.4") contain no colon and never match, and an already-quoted string
+# is untouched because the character right after "`: `" must be a digit,
+# never a `"`.
+_BARE_CLOCK_VALUE_RE = re.compile(
+    r'(:\s*)(\d{1,2}(?::\d{1,2}){1,2}(?:\.\d+)?)(\s*[,}\]])'
+)
+
+
+def _quote_bare_clock_values(text: str) -> str:
+    """Repair pass, applied only as a fallback after a direct json.loads()
+    fails — see _BARE_CLOCK_VALUE_RE's comment above for the real incident
+    this fixes. Quotes any bare clock-notation value so it becomes a valid
+    JSON string, which parse_time_sec() then converts to seconds exactly
+    as it already does for a QUOTED clock string."""
+    return _BARE_CLOCK_VALUE_RE.sub(lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}', text)
+
+
+def _json_like_block(text: str) -> str | None:
     if not isinstance(text, str):
         return None
     m = re.search(r"[\[{].*[\]}]", text, re.DOTALL)
-    if not m:
+    return m.group(0) if m else None
+
+
+def _extract_json(text: str) -> Any:
+    candidate = _json_like_block(text)
+    if candidate is None:
         return None
     try:
-        return json.loads(m.group(0))
+        return json.loads(candidate)
+    except Exception:  # noqa: BLE001
+        pass
+    # Fallback: only reached when the direct parse above failed. Repairs
+    # the one real, observed malformed-JSON pattern (bare clock-notation
+    # timestamps) and retries once. Never applied to already-valid JSON,
+    # so this cannot change behavior for the common, well-formed case.
+    try:
+        return json.loads(_quote_bare_clock_values(candidate))
     except Exception:  # noqa: BLE001
         return None
 
@@ -854,6 +904,31 @@ class GeminiVideoProvider:
             segments = None
         if segments is None:
             diag = _response_diagnostics(raw_payload)
+            # Distinguish a truly empty/blocked/garbage reply from one that
+            # demonstrably contained real content in a JSON-shaped block but
+            # still failed to parse (e.g. a malformed-JSON variant beyond
+            # what _quote_bare_clock_values repairs) — the 2026-09 incident
+            # above showed "no parsable segments" firing on a response whose
+            # raw text plainly contained real transcript sentences, which
+            # misled whoever read the failed run into assuming Gemini gave
+            # back nothing usable. `diag` being non-empty already means a
+            # safety block/truncation/no-candidates explanation exists and
+            # takes priority; only when the response otherwise looks normal
+            # (STOP, real candidates) do we check whether a JSON-shaped
+            # block was even present in the text.
+            had_json_block = not diag and _json_like_block(text) is not None
+            if had_json_block:
+                log.warning(
+                    "video-ai: ASR response had a JSON-shaped block with content but "
+                    "still failed to parse | model=%s mime=%s | text_tail=%r",
+                    self._model, content_type, text[-300:],
+                )
+                detail = (
+                    "Gemini's response included transcript content in a JSON-shaped block, "
+                    "but it could not be parsed as valid JSON (a response-formatting variance, "
+                    "not an empty or blocked reply)"
+                )
+                raise VideoAiError("bad_response_with_content", detail)
             log.warning("video-ai: ASR unparsable | model=%s mime=%s | %s | text_tail=%r",
                         self._model, content_type, diag or "no diagnostic", text[-300:])
             detail = "Gemini returned no parsable segments" + (f" ({diag})" if diag else "")

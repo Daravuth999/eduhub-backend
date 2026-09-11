@@ -132,6 +132,105 @@ async def test_align_bare_array_skips_non_dict_entries_honestly():
     assert result["transcriptText"] == "Real segment."
 
 
+# ── real 2026-09 production incident: lesson vid_12473703734f4750
+#    ("Sealing the Deal"). Despite _ASR_PROMPT explicitly telling Gemini
+#    "start/end are SECONDS ... never clock strings", the raw response
+#    contained several segments with a BARE, UNQUOTED clock-notation value
+#    once the transcript passed the one-minute mark — e.g. `"start":
+#    1:42.0,` — which is a hard JSON syntax error (a bare colon in a value
+#    position). json.loads() rejected the WHOLE document, discarding every
+#    segment even though the raw text plainly contained real transcript
+#    content, and the resulting "no parsable segments" error was actively
+#    misleading. These are the EXACT timestamp/text values from the real
+#    Render log's warning line. ───────────────────────────────────────────
+_INCIDENT_RAW_TEXT = (
+    '{"language": "en", "segments": [\n'
+    '  {"speaker": "S1", "start": 1:42.0, "end": 1:42.99, "text": "Let\'s get it signed."},\n'
+    '  {"speaker": "S3", "start": 1:48.0, "end": 1:49.0, "text": "Thanks for watching."},\n'
+    '  {"speaker": "S3", "start": 1:49.5, "end": 1:54.2, "text": '
+    '"Remember the key skills: compromise, concession, leverage, and commitment."}\n'
+    ']}'
+)
+
+
+@pytest.mark.asyncio
+async def test_align_repairs_bare_clock_notation_timestamps_from_the_real_incident():
+    """The exact malformed response from the vid_12473703734f4750 incident
+    must now parse successfully instead of being rejected outright."""
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": _INCIDENT_RAW_TEXT}]},
+                         "finishReason": "STOP"}],
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    result = await provider.align(b"fake-audio-bytes", "audio/mpeg")
+
+    assert result["transcriptText"] == (
+        "Let's get it signed. Thanks for watching. "
+        "Remember the key skills: compromise, concession, leverage, and commitment."
+    )
+    sentences = [s for p in result["sync"]["paragraphs"] for s in p["sentences"]]
+    assert len(sentences) == 3
+    # 1:42.0 -> 102.0s, 1:42.99 -> 102.99s: the real, correctly-converted
+    # values "1:42.0" would produce via the SAME parse_time_sec() clock-
+    # notation handling already used for a properly-quoted clock string —
+    # proving the fix is "make the malformed JSON parseable", not "invent
+    # a new timestamp semantic".
+    first_words = sentences[0]["words"]
+    assert first_words[0]["start"] == pytest.approx(102.0)
+    assert first_words[-1]["end"] == pytest.approx(102.99)
+    last_words = sentences[-1]["words"]
+    assert last_words[0]["start"] == pytest.approx(109.5)
+    assert last_words[-1]["end"] == pytest.approx(114.2)
+
+
+def test_quote_bare_clock_values_is_a_no_op_on_well_formed_json():
+    """The repair pass must never fire on already-valid JSON — ordinary
+    decimal seconds contain no colon, and it must be pure fallback."""
+    well_formed = '{"segments": [{"start": 12.4, "end": 15.0, "text": "fine"}]}'
+    assert vap._quote_bare_clock_values(well_formed) == well_formed
+    assert vap._extract_json(well_formed) == json.loads(well_formed)
+
+
+@pytest.mark.asyncio
+async def test_align_still_raises_the_plain_message_for_genuinely_empty_garbage_with_no_json_block():
+    """A response with no JSON-shaped block at all (a plain refusal/garbage
+    reply) must keep the original, unqualified message — there is no
+    content to honestly claim was present."""
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": "Sorry, I cannot help with that."}]},
+                         "finishReason": "STOP"}],
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert exc.value.code == "bad_response"
+    assert exc.value.message == "Gemini returned no parsable segments"
+
+
+@pytest.mark.asyncio
+async def test_align_distinguishes_content_present_but_unparseable_from_truly_empty():
+    """A response that unambiguously contains a JSON-shaped block with real
+    transcript text, but is broken in a way the clock-notation repair
+    doesn't cover, must say so honestly — never collapse back to the
+    generic, misleading "no parsable segments" wording that caused this
+    incident's own error to mislead whoever read it."""
+    broken_text = (
+        '{"language": "en", "segments": [\n'
+        '  {"speaker": "S1", "start": 10.0, "end": 12.0, "text": "Real content here",}\n'
+        ']}'
+    )  # trailing comma before "text" value's closing quote+brace — invalid
+    # JSON that the clock-notation repair does not (and should not) touch.
+    client = _RecordingGeminiClient(_FakeHttpResponse(200, {
+        "candidates": [{"content": {"parts": [{"text": broken_text}]}, "finishReason": "STOP"}],
+    }))
+    provider = vap.GeminiVideoProvider(http_client=client)
+    with pytest.raises(vap.VideoAiError) as exc:
+        await provider.align(b"fake-audio-bytes", "audio/mpeg")
+    assert exc.value.code == "bad_response_with_content"
+    assert "content" in exc.value.message.lower()
+    assert exc.value.message != "Gemini returned no parsable segments"
+
+
 @pytest.mark.asyncio
 async def test_align_raises_bad_response_with_no_extra_diagnostic_for_plain_garbage_text():
     """A normal-looking response (STOP finish reason, real candidates) that
