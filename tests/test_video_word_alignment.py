@@ -302,6 +302,73 @@ async def test_gemini_word_timestamp_provider_parses_the_real_documented_respons
     }
 
 
+# ── 2026-09 continued investigation: lesson vid_e734e740b0794a42 ("Sealing
+#    the Deal"), same shape as the incident PR #68 already fixed a REACTION
+#    to (merge_real_word_timing rejecting a backward-jumping candidate).
+#    This proves the SEPARATE, EARLIER defensive layer: gemini-3.5-
+#    transcribe's own Interactions API response is never guaranteed
+#    chronologically ordered by array position (a young, still-settling
+#    API surface per this module's own docstring) — sorting the raw word
+#    list by its own timestamp immediately, before it ever reaches
+#    difflib matching, removes that whole class of pure-ordering mistakes
+#    at the cheapest possible point, model-free. ───────────────────────────
+@pytest.mark.asyncio
+async def test_gemini_word_timestamp_provider_sorts_out_of_order_raw_annotations():
+    """Gemini's own docs never promise annotations come back in time order
+    by array position. A response with 'world' listed BEFORE 'hello' by
+    array position, despite 'hello' having the earlier real timestamp,
+    must come back sorted by actual start time."""
+    out_of_order_fixture = {
+        "steps": [{
+            "content": [{
+                "annotations": [
+                    {"type": "word_info", "text": "world", "start_offset": "0.500s", "end_offset": "0.850s"},
+                    {"type": "word_info", "text": "hello", "start_offset": "0.100s", "end_offset": "0.450s"},
+                ],
+            }],
+        }],
+    }
+    fake_client = _FakeHttpClient(
+        upload_response=_FakeResponse(200, {"file": {"uri": "files/abc123", "name": "files/abc123", "state": "ACTIVE"}}),
+        interactions_response=_FakeResponse(200, out_of_order_fixture),
+    )
+    provider = vwa.GeminiWordTimestampProvider(api_key="test-key", http_client=fake_client)
+
+    result = await provider.align(b"fake-audio-bytes", "audio/mpeg")
+
+    words = result["sync"]["paragraphs"][0]["sentences"][0]["words"]
+    assert [w["word"] for w in words] == ["hello", "world"]  # re-sorted by real start time
+    assert words[0]["start"] == 0.1 and words[1]["start"] == 0.5
+
+
+def test_sorting_the_raw_response_alone_does_not_fix_a_word_with_a_genuinely_wrong_value():
+    """Diagnostic distinction this task explicitly asked for: sorting fixes
+    words that are merely in the WRONG ARRAY POSITION relative to their own
+    (correct) timestamp. It cannot fix a word whose measured timestamp is
+    simply WRONG regardless of position — that is a substantively bad
+    measurement, not a formatting/ordering mistake, and sorting must not
+    silently mask it or make it look fixed. This is exactly the real
+    incident's own case: 'key' merely HAPPENS to sit in the correct array
+    position (matching 'remember','the','key','skills' in order) but its
+    own value (0.42s) is simply wrong — sorting this list by start would
+    only reorder which entry is 'first', it can never correct the value
+    itself, so merge_real_word_timing's own ordering guard (tested in
+    test_an_out_of_order_measured_timestamp_is_rejected_not_persisted) is
+    still required as a second, independent layer of defense."""
+    measured = [
+        _measured_word("remember", 40.1, 40.4),
+        _measured_word("the", 40.4, 40.7),
+        _measured_word("key", 0.42, 0.9),  # wrong VALUE, correct POSITION
+        _measured_word("skills", 41.55, 41.9),
+    ]
+    sorted_measured = sorted(measured, key=lambda w: w["start"])
+    # Sorting moves "key" to the FRONT of the array (its value is smallest)
+    # rather than correcting it — proving sorting is not a substitute for
+    # the value-level ordering guard merge_real_word_timing still applies.
+    assert [w["word"] for w in sorted_measured] == ["key", "remember", "the", "skills"]
+    assert sorted_measured[0]["word"] == "key" and sorted_measured[0]["start"] == 0.42
+
+
 @pytest.mark.asyncio
 async def test_gemini_word_timestamp_provider_raises_on_non_200():
     from video_ai_provider import VideoAiError
