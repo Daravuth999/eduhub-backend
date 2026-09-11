@@ -188,6 +188,40 @@ async def test_generate_question_strips_markdown_fences(monkeypatch):
     assert result["text"] == "What does your family usually do on weekends?"
 
 
+@pytest.mark.asyncio
+async def test_generate_question_strips_a_conversational_preamble(monkeypatch):
+    # Regression test for a real production failure: Gemini ignored both
+    # responseMimeType="application/json" and the system instruction's
+    # "Do not include explanations," on the SAME attempt on retry too —
+    # see Render logs for topic=Travel and topic=Family, both attempts
+    # failing identically with "Here is the JSON requested:" prefixed
+    # before the actual object.
+    monkeypatch.setattr(tq, "GEMINI_API_KEY", "fake-key")
+
+    async def fake_call(prompt):
+        return 'Here is the JSON requested: {"text": "Where would you like to travel and why?"}'
+
+    monkeypatch.setattr(tq, "_call_gemini", fake_call)
+    result = await tq.generate_question(topic="Travel")
+    assert result["text"] == "Where would you like to travel and why?"
+
+
+@pytest.mark.asyncio
+async def test_generate_question_strips_a_preamble_with_trailing_chatter_too(monkeypatch):
+    monkeypatch.setattr(tq, "GEMINI_API_KEY", "fake-key")
+
+    async def fake_call(prompt):
+        return (
+            'Sure, here you go:\n'
+            '{"text": "What do you usually do after school?"}\n'
+            'Let me know if you need another one!'
+        )
+
+    monkeypatch.setattr(tq, "_call_gemini", fake_call)
+    result = await tq.generate_question(topic="School")
+    assert result["text"] == "What do you usually do after school?"
+
+
 # ── Atomic pool claim: never the same row twice under concurrent calls ──
 
 @pytest.mark.asyncio
