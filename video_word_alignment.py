@@ -122,6 +122,13 @@ DEFAULT_WORD_TIMESTAMP_MODEL = "gemini-3.5-transcribe"
 # from a rejected request.
 MAX_ALIGNMENT_AUDIO_SECONDS = 30 * 60
 
+# Chronological-order guard for merge_real_word_timing (2026-09 production
+# incident, see that function's own docstring). Matches sync_schema.
+# validate_sync_document's own TOL for the same reason it exists there:
+# absorb float-rounding noise between two genuinely back-to-back words
+# without either module needing to agree on a shared import for one float.
+_MERGE_ORDER_TOL = 0.01
+
 
 def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -287,29 +294,69 @@ def merge_real_word_timing(gemini_sync: dict, measured_words: list[dict], *,
     measured_tokens = [_normalize_token(w.get("word", "")) for w in measured_words]
 
     matcher = difflib.SequenceMatcher(a=gemini_tokens, b=measured_tokens, autojunk=False)
-    matched = 0
+    # Candidate real (start, end) per gemini_words index, gathered from
+    # every token-matched ("equal") opcode block. Deliberately NOT applied
+    # here directly — see the sequential ordering pass below for why.
+    candidates: dict[int, tuple[float, float]] = {}
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "equal":
-            continue  # insert/delete/replace blocks are real ASR disagreements — leave interpolated
+            continue  # insert/delete/replace blocks are real ASR disagreements - leave interpolated
         for offset in range(i2 - i1):
             g_word = gemini_words[i1 + offset]
             m_word = measured_words[j1 + offset]
             real_start = float(m_word.get("start", g_word["start"]))
             real_end = float(m_word.get("end", g_word["end"]))
             if real_end < real_start:
-                continue  # never persist an inverted span — keep the interpolated one
-            g_word["start"] = round(real_start, 3)
-            g_word["end"] = round(real_end, 3)
-            g_word["confidence"] = build_confidence(
-                transcript=(g_word.get("confidence") or {}).get("transcript"),
-            )
-            # Provenance FACT, not a fabricated probability (see module
-            # docstring): two independent Gemini transcriptions of the same
-            # audio agreed on this exact word — that is real evidence this
-            # timing is measured, not interpolated, even with no numeric
-            # score to attach to it.
-            g_word["measured"] = True
-            matched += 1
+                continue  # never persist an inverted span - keep the interpolated one
+            candidates[i1 + offset] = (real_start, real_end)
+
+    # 2026-09 production incident (lesson vid_12473703734f4750, "Sealing
+    # the Deal"): sync_schema.validate_sync_document rejected the
+    # resulting document with "words[13] out of chronological order:
+    # start=0.42 precedes an earlier word's start=41.6". Root cause,
+    # confirmed by reading difflib's own contract: SequenceMatcher.
+    # get_opcodes() only guarantees matched (i, j) index pairs are
+    # monotonic within each sequence relative to each other - it has no
+    # way to know, and does not claim, that gemini-3.5-transcribe's own
+    # raw word_info annotations came back in strict chronological order (a
+    # young, still-settling API surface per this module's own docstring).
+    # One out-of-order measured word is enough for a token match deep into
+    # Gemini's own transcript to get overwritten with an EARLIER real
+    # timestamp than the word immediately before it - exactly this shape,
+    # reproduced twice in production. Fixed by applying candidates in a
+    # SECOND, strictly sequential pass (by Gemini's own word order, never
+    # matcher-opcode order) that only accepts a real timestamp if it does
+    # not move time backwards relative to whatever value - measured or
+    # still-interpolated - immediately precedes it. Same "when genuinely
+    # in doubt, keep the honest interpolated value" philosophy already
+    # used just above for an inverted (end < start) span; this is not a
+    # new kind of judgment call, just the same one applied to a second,
+    # newly-observed failure mode.
+    matched = 0
+    last_accepted_start = 0.0
+    for idx, g_word in enumerate(gemini_words):
+        candidate = candidates.get(idx)
+        if candidate is not None:
+            real_start, real_end = candidate
+            if real_start >= last_accepted_start - _MERGE_ORDER_TOL:
+                g_word["start"] = round(real_start, 3)
+                g_word["end"] = round(real_end, 3)
+                g_word["confidence"] = build_confidence(
+                    transcript=(g_word.get("confidence") or {}).get("transcript"),
+                )
+                # Provenance FACT, not a fabricated probability (see
+                # module docstring): two independent Gemini transcriptions
+                # of the same audio agreed on this exact word - that is
+                # real evidence this timing is measured, not interpolated,
+                # even with no numeric score to attach to it.
+                g_word["measured"] = True
+                matched += 1
+            # else: the candidate would move time backwards relative to
+            # the word immediately before it - a wrong-position token
+            # match, not a genuine re-occurrence at this point in the
+            # video. Left as Gemini's own interpolated timing, which is
+            # already internally consistent with its neighbors.
+        last_accepted_start = max(last_accepted_start, g_word["start"])
 
     total = len(gemini_words)
     telemetry = {
