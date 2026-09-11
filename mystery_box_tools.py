@@ -318,6 +318,12 @@ class _MBTRetryPushIn(BaseModel):
     claim_id: str = Field(..., min_length=1)
 
 
+class _ExtendToGroupIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    representative_student_id: str = Field(..., min_length=1)
+    member_student_ids: list[str] = Field(default_factory=list)
+
+
 def register_mystery_box_routes(
     api, db, require_admin, require_student,
     fan_out_push, push_subscriptions, login_reward_hooks,
@@ -1691,6 +1697,244 @@ def register_mystery_box_routes(
             "revealed_layout": public_layout,
         }
 
+    @api.post("/speaking-lab/mystery-box/rounds/{rid}/extend-to-group")
+    async def mbt_extend_to_group(
+        rid: str, payload: _ExtendToGroupIn, admin=Depends(require_admin),
+    ):
+        """Friday Speaking Labs Feature 2: clone an ALREADY-GRANTED Solo-Mode
+        prize onto the rest of a Group Mode representative's teammates.
+
+        This endpoint can never originate a prize — it only ever clones the
+        exact box/prize `mbt_reveal_round` already granted the representative,
+        reusing the SAME `_mbt_grant_prize`/idempotent-claim/notify machinery
+        (never a second reward system). Never re-rolls, never re-selects a
+        different box for any member. Safe to call more than once for the
+        same round: every member's grant is keyed on the same
+        `(round_id, student_id_norm)` claim-uniqueness `mbt_reveal_round`
+        itself uses, so a retry only ever fills in whatever is genuinely
+        still missing."""
+        row = await _mbt_rounds.find_one({"id": rid}, {"_id": 0})
+        if not row:
+            raise HTTPException(status_code=404, detail="round not found")
+        if (row.get("status") or "") == "open":
+            raise HTTPException(
+                status_code=400,
+                detail="Round has no granted prize yet — the representative must reveal first.",
+            )
+
+        rep_resolved = await _mbt_resolve_student(payload.representative_student_id)
+        rep_norm = rep_resolved["norm"] or _mbt_norm_id(payload.representative_student_id)
+        if not rep_norm:
+            raise HTTPException(status_code=400, detail="representative_student_id required")
+        rep_claim = await _mbt_claims.find_one(
+            {"round_id": rid, "student_id_norm": rep_norm}, {"_id": 0},
+        )
+        if not rep_claim or (rep_claim.get("granted_status") or "").lower() != "granted":
+            raise HTTPException(
+                status_code=400,
+                detail="Representative's own prize is not granted yet — cannot extend to the group.",
+            )
+
+        # Same box/prize the representative already won — read exactly as
+        # mbt_reveal_round does, never re-derived from the claim row itself,
+        # so this is provably the identical prize, not a re-lookup that
+        # could drift if the campaign layout ever changed underneath it.
+        box_index = row.get("selected_box_index")
+        if box_index is None:
+            raise HTTPException(status_code=500, detail="round has no selected box")
+        box_index = int(box_index)
+        layout = row.get("layout") or []
+        if box_index < 0 or box_index >= len(layout):
+            raise HTTPException(status_code=500, detail="box_index out of range")
+        chosen = layout[box_index]
+        prize = await _mbt_prize_templates.find_one({"id": chosen.get("prize_id")}, {"_id": 0})
+        if not prize:
+            raise HTTPException(status_code=500, detail="prize template missing")
+
+        # Dedup member ids, excluding the representative themself.
+        seen_norms = {rep_norm}
+        member_ids: list[str] = []
+        for raw_member_id in payload.member_student_ids:
+            candidate = (raw_member_id or "").strip()
+            if not candidate:
+                continue
+            candidate_norm = _mbt_norm_id(candidate)
+            if candidate_norm in seen_norms:
+                continue
+            seen_norms.add(candidate_norm)
+            member_ids.append(candidate)
+
+        outcomes: list[dict] = []
+        for raw_member_id in member_ids:
+            resolved = await _mbt_resolve_student(raw_member_id)
+            sid_clean = resolved["clean_id"] or raw_member_id
+            sid_norm = resolved["norm"] or _mbt_norm_id(raw_member_id)
+            sid_wallet = resolved.get("student_id") or ""
+            if not sid_norm:
+                outcomes.append({
+                    "student_id": raw_member_id, "outcome": "error",
+                    "error": "could not resolve student_id",
+                })
+                continue
+
+            existing = await _mbt_claims.find_one(
+                {"round_id": rid, "student_id_norm": sid_norm}, {"_id": 0},
+            )
+            if existing and (existing.get("granted_status") or "").lower() == "granted":
+                outcomes.append({
+                    "student_id": sid_clean, "outcome": "already_claimed",
+                    "claim": existing,
+                })
+                continue
+            if existing and (existing.get("granted_status") or "").lower() == "pending":
+                outcomes.append({
+                    "student_id": sid_clean, "outcome": "error",
+                    "error": "Grant already in progress for this student.",
+                })
+                continue
+
+            idem = _mbt_uuid.uuid4().hex
+            now = _mbt_iso(_mbt_now())
+            pending = {
+                "id": "clm_" + _mbt_secrets.token_hex(10),
+                "round_id": rid,
+                "campaign_id": row.get("campaign_id"),
+                "student_id": sid_clean,
+                "student_id_norm": sid_norm,
+                "student_id_raw": raw_member_id,
+                "student_wallet_id": sid_wallet,
+                "student_resolved": bool(resolved.get("ok")),
+                "student_name": resolved.get("display_name") or "",
+                "selected_box_index": box_index,
+                "prize_id": prize.get("id"),
+                "prize_type": prize.get("type"),
+                "prize_title": prize.get("title"),
+                "granted_status": "pending",
+                "retry_count": 0,
+                "idempotency_key": idem,
+                # Audit trail distinguishing a cloned Group Mode grant from
+                # a Solo Mode reveal — never read by _mbt_grant_prize/
+                # notify_mystery_box_prize, purely informational.
+                "granted_via": "group_extension",
+                "representative_student_id": rep_claim.get("student_id") or payload.representative_student_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                await _mbt_claims.insert_one(dict(pending))
+                pending_id = pending["id"]
+            except Exception:
+                # Unique-index race — another concurrent extend-to-group (or
+                # retry) already claimed this student for this round.
+                other = await _mbt_claims.find_one(
+                    {"round_id": rid, "student_id_norm": sid_norm}, {"_id": 0},
+                )
+                if other and (other.get("granted_status") or "").lower() == "granted":
+                    outcomes.append({
+                        "student_id": sid_clean, "outcome": "already_claimed",
+                        "claim": other,
+                    })
+                else:
+                    outcomes.append({
+                        "student_id": sid_clean, "outcome": "error",
+                        "error": "claim race — retry",
+                    })
+                continue
+
+            result = await _mbt_grant_prize(
+                prize=prize,
+                student_clean_id=sid_clean,
+                student_id_norm=sid_norm,
+                campaign_id=row.get("campaign_id") or "",
+                round_id=rid,
+            )
+            if not result.get("ok"):
+                await _mbt_claims.update_one(
+                    {"id": pending_id},
+                    {"$set": {
+                        "granted_status": "failed",
+                        "grant_error": (result.get("error") or "")[:200],
+                        "updated_at": _mbt_iso(_mbt_now()),
+                    }},
+                )
+                outcomes.append({
+                    "student_id": sid_clean, "outcome": "error",
+                    "error": result.get("error") or "grant failed",
+                })
+                continue
+
+            safe_display = result.get("safe_display") or _safe_display_for(prize, result.get("granted"))
+            await _mbt_claims.update_one(
+                {"id": pending_id},
+                {"$set": {
+                    "granted_status": "granted",
+                    "granted_at": _mbt_iso(_mbt_now()),
+                    "safe_display_payload": safe_display,
+                    "updated_at": _mbt_iso(_mbt_now()),
+                }},
+            )
+
+            # Same reward-success push Solo Mode uses, unmodified — only
+            # now that the grant is durably persisted as "granted" above.
+            try:
+                await notify_mystery_box_prize(
+                    student_id=sid_clean,
+                    grant_id=pending_id,
+                    prize_type=(prize.get("type") or "").strip().lower(),
+                    prize_payload=safe_display,
+                    source="speaking_lab_mystery_box",
+                )
+            except Exception as _notify_exc:  # noqa: BLE001
+                _MBT_LOG.warning(
+                    "mystery_box: group-extension notify raised (grant stays "
+                    "successful) claim=%s err=%s", pending_id, str(_notify_exc)[:200],
+                )
+
+            # Same points-ledger mirror mbt_reveal_round performs, so a
+            # cloned points grant is visible in My Portal exactly like a
+            # Solo Mode one.
+            try:
+                ptype_g = (prize.get("type") or "").strip().lower()
+                if ptype_g in ("points", "consolation"):
+                    granted_obj = result.get("granted") or {}
+                    credited = int(granted_obj.get("points_credited") or prize.get("points") or 0)
+                    if credited > 0:
+                        mirror = await _mbt_mirror_points_credit(
+                            clean_id=sid_clean,
+                            wallet_id=sid_wallet,
+                            amount=credited,
+                            claim_id=pending_id,
+                            source="speaking_lab_mystery_box",
+                        )
+                        await _mbt_claims.update_one(
+                            {"id": pending_id},
+                            {"$set": {
+                                "points_mirror_ok": bool(mirror.get("ok")),
+                                "points_mirror_status_ledger": mirror.get("ledger"),
+                                "points_mirror_status_wallet": mirror.get("wallet"),
+                                "points_mirror_ikey": mirror.get("ikey"),
+                                "points_mirror_error": mirror.get("error") or None,
+                            }},
+                        )
+            except Exception as _mirror_exc:  # noqa: BLE001
+                _MBT_LOG.warning(
+                    "mystery_box group-extension points mirror failed claim=%s err=%s",
+                    pending_id, str(_mirror_exc)[:200],
+                )
+
+            granted_row = await _mbt_claims.find_one({"id": pending_id}, {"_id": 0})
+            outcomes.append({
+                "student_id": sid_clean, "outcome": "granted", "claim": granted_row,
+            })
+
+        return {
+            "round_id": rid,
+            "representative_student_id": rep_claim.get("student_id") or payload.representative_student_id,
+            "prize_title": prize.get("title"),
+            "prize_type": prize.get("type"),
+            "members": outcomes,
+        }
+
     # ── STUDENT ROUTES (My Portal) ───────────────────────────────────────
     @api.get("/student/edutalk-passes")
     async def mbt_list_student_passes(student=Depends(require_student)):
@@ -2041,5 +2285,7 @@ def register_mystery_box_routes(
         "_SelectIn": _SelectIn,
         "_MBTReconcileIn": _MBTReconcileIn,
         "_MBTRetryPushIn": _MBTRetryPushIn,
+        "mbt_extend_to_group": mbt_extend_to_group,
+        "_ExtendToGroupIn": _ExtendToGroupIn,
     })
     return _ns
