@@ -3,7 +3,7 @@ Teacher Studio round: auto-anchor a genuinely NEW student's first tuition
 due date to their real registration timestamp.
 
 Confirmed against current code (tuition_tools.py, read directly, not
-assumed): tuition_records is created ONLY as a side effect of an actual
+assumed): tuition_records was created ONLY as a side effect of an actual
 payment (tuition_finalize_payment, called from payment_bridge.py) or a
 manual GAS-shadow-write (teacher_update_tuition) — teacher_create_student
 never touched it before this round. _ttn_advance_billing(current_ndd,
@@ -14,22 +14,28 @@ itself. The one genuinely optional piece of config that DOES exist —
 tuition_config's global_config.enabled — is respected: if explicitly
 disabled, no record is fabricated.
 
-teacher_create_student lives directly in server.py (not a separate
-*_tools.py module with its own register_*_routes(router, db, ...)
-factory), and — confirmed by grepping this whole test suite — no test
-here imports server.py directly; it requires full app/env setup at import
-time. This file therefore verifies the new wiring structurally against
-the real source text (same convention already used elsewhere in this
-suite for other hard-to-mount server.py logic), plus directly exercises
-the exact _ttn_advance_billing/_ttn_fmt_date call pattern the new code
-uses, to prove the computation itself is correct.
+tuition_tools.ensure_new_student_tuition_anchor(db, ...) is where the
+real work lives — a standalone, module-level, directly-testable function
+(deliberately NOT inlined into server.py's teacher_create_student, so
+that tuition_records/tuition_config stay touched only by their declared
+owner, tuition_tools.py — see tools/check_collection_ownership.py's
+--strict gate, which failed CI on an earlier version of this change that
+read/wrote those collections straight from server.py). This file tests
+that function directly against a fake db. teacher_create_student's own
+wiring (call it only on the brand-new branch, never reactivation) is
+verified structurally against the real server.py source, the same
+convention this suite already uses for other hard-to-mount server.py
+logic — but the actual anchoring BEHAVIOR is proven with real assertions
+against real inputs, not string matching.
 """
 from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
 
-from tuition_tools import _ttn_advance_billing, _ttn_fmt_date
+import pytest
+
+from tuition_tools import _ttn_advance_billing, _ttn_fmt_date, ensure_new_student_tuition_anchor
 
 
 def _teacher_create_student_source() -> str:
@@ -39,12 +45,8 @@ def _teacher_create_student_source() -> str:
     return src[start:end]
 
 
+# ── pure date-math sanity (the exact call pattern the accessor uses) ──────
 def test_tuition_anchor_computation_is_registration_date_plus_one_month():
-    """Directly proves the exact call pattern the new code uses:
-    _ttn_advance_billing(None, registration_date) — a brand-new student has
-    no prior due date, so the anchor point is their own registration day,
-    advanced by the SAME billing-cycle logic every subsequent due date
-    already uses (never new/invented date math)."""
     registration_date = date(2026, 9, 12)
     first_due = _ttn_advance_billing(None, registration_date)
     assert first_due == date(2026, 10, 12)
@@ -60,38 +62,124 @@ def test_tuition_anchor_clamps_to_month_end_exactly_like_every_other_advance():
     assert first_due == date(2026, 2, 28)
 
 
+# ── ensure_new_student_tuition_anchor — the real, now-directly-testable
+#    accessor function, exercised against a fake db ───────────────────────
+def _match(doc, query):
+    return all(doc.get(k) == v for k, v in query.items())
+
+
+class _Coll:
+    def __init__(self):
+        self.docs: dict = {}
+
+    async def find_one(self, query, projection=None):
+        for d in self.docs.values():
+            if _match(d, query):
+                out = dict(d)
+                if projection and projection.get("_id") == 0:
+                    out.pop("_id", None)
+                return out
+        return None
+
+    async def update_one(self, query, update, upsert=False):
+        for key, d in self.docs.items():
+            if _match(d, query):
+                if "$set" in update:
+                    d.update(update["$set"])
+                return
+        if upsert:
+            doc = dict(query)
+            if "$set" in update:
+                doc.update(update["$set"])
+            self.docs[doc.get("student_id", f"auto{len(self.docs)}")] = doc
+
+
+class _FakeDB:
+    def __init__(self):
+        self._c: dict = {}
+
+    def __getitem__(self, name):
+        return self._c.setdefault(name, _Coll())
+
+
+@pytest.mark.asyncio
+async def test_ensure_new_student_tuition_anchor_creates_an_honest_unpaid_record():
+    db = _FakeDB()
+    result = await ensure_new_student_tuition_anchor(
+        db, student_id="stu_new1", clean_id="stu100", registration_date=date(2026, 9, 12),
+    )
+    assert result == {"created": True, "next_due_date": "2026.10.12"}
+
+    doc = db["tuition_records"].docs["stu_new1"]
+    assert doc["student_id"] == "stu_new1"
+    assert doc["clean_id"] == "stu100"
+    assert doc["next_due_date"] == "2026.10.12"
+    # Never fabricated — the honest "nothing has happened yet" starting state.
+    assert doc["tuition_status"] == "Unpaid"
+    assert doc["last_payment_date"] is None
+    assert doc["payment_amount"] is None
+    assert doc["updated_by"] == "registration"
+
+
+@pytest.mark.asyncio
+async def test_ensure_new_student_tuition_anchor_respects_the_disabled_flag():
+    db = _FakeDB()
+    db["tuition_config"].docs["global_config"] = {"type": "global_config", "enabled": False}
+    result = await ensure_new_student_tuition_anchor(
+        db, student_id="stu_new2", clean_id="stu101", registration_date=date(2026, 9, 12),
+    )
+    assert result == {"created": False, "reason": "tuition tracking is disabled in global config"}
+    assert "stu_new2" not in db["tuition_records"].docs
+
+
+@pytest.mark.asyncio
+async def test_ensure_new_student_tuition_anchor_defaults_to_enabled_when_no_config_doc_exists():
+    """A deployment that has never touched tuition_config at all must not
+    be silently treated as disabled — the documented default is enabled."""
+    db = _FakeDB()
+    result = await ensure_new_student_tuition_anchor(
+        db, student_id="stu_new3", clean_id="stu102", registration_date=date(2026, 9, 12),
+    )
+    assert result["created"] is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_new_student_tuition_anchor_is_idempotent_via_upsert():
+    """Calling it twice for the same student_id (should never happen in
+    practice, since it only ever runs once per freshly-minted id) must not
+    create two documents."""
+    db = _FakeDB()
+    await ensure_new_student_tuition_anchor(
+        db, student_id="stu_new4", clean_id="stu103", registration_date=date(2026, 9, 12),
+    )
+    await ensure_new_student_tuition_anchor(
+        db, student_id="stu_new4", clean_id="stu103", registration_date=date(2026, 9, 12),
+    )
+    assert len(db["tuition_records"].docs) == 1
+
+
+# ── server.py wiring — structural, since it is not directly importable ───
+def test_server_calls_the_owner_accessor_not_the_raw_collections():
+    """Confirms the fix for the collection-ownership CI failure: server.py
+    must never reach into tuition_records/tuition_config directly — only
+    tuition_tools.py (the declared owner) may do that. server.py calls the
+    owner-exposed accessor instead."""
+    src = _teacher_create_student_source()
+    assert "ensure_new_student_tuition_anchor" in src
+    assert 'db["tuition_records"]' not in src
+    assert 'db["tuition_config"]' not in src
+    assert "db.tuition_records" not in src
+    assert "db.tuition_config" not in src
+
+
 def test_tuition_anchor_lives_only_on_the_brand_new_branch_not_reactivation():
     src = _teacher_create_student_source()
     reactivation_idx = src.index('action = "reactivated"')
     brand_new_idx = src.index('action = "created"')
-    anchor_idx = src.index("_ttn_advance_billing")
+    anchor_idx = src.index("ensure_new_student_tuition_anchor")
     assert brand_new_idx < anchor_idx, "tuition anchoring must be in the brand-new branch"
     assert not (reactivation_idx < anchor_idx < brand_new_idx), \
         "tuition anchoring must not run on the reactivation branch"
-
-
-def test_tuition_anchor_respects_the_global_enabled_flag_and_never_fabricates_amount():
-    src = _teacher_create_student_source()
-    assert 'tuition_cfg.get("enabled", True)' in src
-    # Never invents a payment_amount or tuition_status other than the
-    # honest "nothing paid yet" starting state.
-    assert '"payment_amount": None' in src
-    assert '"tuition_status": "Unpaid"' in src
-    assert '"last_payment_date": None' in src
-
-
-def test_tuition_anchor_never_overwrites_an_existing_tuition_record():
-    """The brand-new branch can only ever run for a student_id that was
-    JUST minted in this same request (uuid4()-based, freshly inserted) —
-    no pre-existing tuition_records document could possibly reference it
-    yet. Confirmed structurally: the upsert's filter is keyed on the
-    freshly-generated student_id, and no code path re-anchors an existing
-    record."""
-    src = _teacher_create_student_source()
-    anchor_section = src[src.index('action = "created"'):]
-    assert 'db["tuition_records"].update_one(\n                    {"student_id": student_id},' in anchor_section \
-        or '{"student_id": student_id},' in anchor_section
-    assert "upsert=True" in anchor_section
 
 
 def test_tuition_anchor_failure_never_blocks_student_creation():
