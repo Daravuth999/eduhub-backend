@@ -496,6 +496,119 @@ def test_admin_create_assessment_and_student_sees_only_published(monkeypatch):
     assert listed["assessments"][0]["mySubmission"] is None
 
 
+# ── item 2: Assessment Lab management controls (delete/edit/schedule) ──────
+def _student_with_group(group, sid="stu_alice", clean="stu094"):
+    s = _Student(sid=sid, clean=clean)
+    s.group = group
+    return s
+
+
+def test_admin_delete_assessment_removes_it_from_every_student_facing_query():
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+
+    listed = _call(router, "GET", "/student/assessments", student=_Student())
+    assert len(listed["assessments"]) == 1
+
+    deleted = _call(router, "DELETE", "/admin/assessments/{assessment_id}",
+                     assessment_id=asmt["assessmentId"], admin=_Admin())
+    assert deleted["ok"] is True
+
+    listed_after = _call(router, "GET", "/student/assessments", student=_Student())
+    assert listed_after["assessments"] == []
+
+    file = _UploadFile(b"fake-jpeg-bytes", "image/jpeg")
+    with pytest.raises(Exception) as exc:
+        _call(router, "POST", "/student/assessments/submit",
+              assessment_id=asmt["assessmentId"], file=file, student=_Student())
+    assert getattr(exc.value, "status_code", None) == 404
+
+
+def test_admin_delete_nonexistent_assessment_404s():
+    db, router, _ = _build()
+    with pytest.raises(Exception) as exc:
+        _call(router, "DELETE", "/admin/assessments/{assessment_id}",
+              assessment_id="asmt_does_not_exist", admin=_Admin())
+    assert getattr(exc.value, "status_code", None) == 404
+
+
+def test_deleting_an_assessment_never_touches_its_submissions():
+    """Real data decision, made and documented: a submission represents
+    completed student work (and for an awarded one, real wallet points
+    already credited) — deleting the parent assessment must never cascade-
+    delete that record."""
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+    db[at.COLL_SUBMISSIONS].docs["sub1"] = {
+        "_id": "sub1", "submissionId": "sub1", "assessmentId": asmt["assessmentId"],
+        "studentId": "stu_alice", "cleanId": "stu094", "status": "awarded",
+    }
+    _call(router, "DELETE", "/admin/assessments/{assessment_id}",
+          assessment_id=asmt["assessmentId"], admin=_Admin())
+    assert "sub1" in db[at.COLL_SUBMISSIONS].docs
+
+
+def test_admin_update_assessment_can_edit_subject_beyond_the_original_patch_fields():
+    db, router, _ = _build()
+    asmt = _seed_published_assessment(db)
+    updated = _call(router, "PATCH", "/admin/assessments/{assessment_id}",
+                     assessment_id=asmt["assessmentId"], payload={"subject": "Advanced Phonics"},
+                     admin=_Admin())
+    assert updated["assessment"]["subject"] == "Advanced Phonics"
+
+
+def test_schedule_targeted_assessment_only_reaches_matching_group_students():
+    db, router, _ = _build()
+    _seed_published_assessment(db)  # untargeted — group="" — reaches everyone
+    targeted = build_assessment_document(
+        "asmt_group_a", "Group A Only Quiz",
+        normalize_extracted_answer_key(REAL_ANSWER_KEY_ITEMS[:2]),
+        status="published", generated_at="2026-08-13T00:00:00Z", group="A",
+    )
+    db[at.COLL_ASSESSMENTS].docs[targeted["assessmentId"]] = dict(targeted)
+
+    listed_a = _call(router, "GET", "/student/assessments", student=_student_with_group("A"))
+    assert {a["assessmentId"] for a in listed_a["assessments"]} == {"asmt_fixed", "asmt_group_a"}
+
+    listed_b = _call(router, "GET", "/student/assessments", student=_student_with_group("B"))
+    assert {a["assessmentId"] for a in listed_b["assessments"]} == {"asmt_fixed"}
+
+    listed_none = _call(router, "GET", "/student/assessments", student=_student_with_group(""))
+    assert {a["assessmentId"] for a in listed_none["assessments"]} == {"asmt_fixed"}
+
+
+def test_schedule_targeted_assessment_submission_is_enforced_not_just_listing(monkeypatch):
+    """A student who already knows the assessmentId (a stale link, or one
+    shared by a student in the right schedule) must not be able to submit
+    against an assessment targeted at a DIFFERENT schedule just because
+    the list query happened to filter it out for them."""
+    _patch_media_storage(monkeypatch)
+    db, router, _ = _build()
+    targeted = build_assessment_document(
+        "asmt_group_a", "Group A Only Quiz",
+        normalize_extracted_answer_key(REAL_ANSWER_KEY_ITEMS[:2]),
+        status="published", generated_at="2026-08-13T00:00:00Z", group="A",
+    )
+    db[at.COLL_ASSESSMENTS].docs[targeted["assessmentId"]] = dict(targeted)
+
+    file = _UploadFile(b"fake-jpeg-bytes", "image/jpeg")
+    with pytest.raises(Exception) as exc:
+        _call(router, "POST", "/student/assessments/submit",
+              assessment_id="asmt_group_a", file=file, student=_student_with_group("B"))
+    assert getattr(exc.value, "status_code", None) == 403
+
+
+def test_untargeted_assessment_still_reaches_every_student_regardless_of_their_group():
+    """Backward compatibility: every assessment created before this field
+    existed (and any created with no explicit group) must keep reaching
+    every student exactly as it always has."""
+    db, router, _ = _build()
+    _seed_published_assessment(db)
+    for group in ("", "A", "B"):
+        listed = _call(router, "GET", "/student/assessments", student=_student_with_group(group))
+        assert len(listed["assessments"]) == 1
+
+
 def test_student_submit_scores_against_real_answer_key(monkeypatch):
     _patch_media_storage(monkeypatch)
     db, router, _ = _build()

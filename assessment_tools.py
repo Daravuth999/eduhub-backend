@@ -409,6 +409,7 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             source_ref=payload.get("sourceRef"),
             status="published" if payload.get("publish") else "draft",
             generated_at=_iso_now(),
+            group=payload.get("group") or "",
         )
         ok, errors = validate_assessment_document(doc)
         if not ok:
@@ -434,6 +435,8 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         existing = await _get_assessment_or_404(assessment_id)
         if "title" in payload:
             existing["title"] = str(payload["title"] or "").strip()[:200]
+        if "subject" in payload:
+            existing["subject"] = str(payload["subject"] or "").strip()[:80]
         if "questions" in payload and isinstance(payload["questions"], list):
             existing["questions"] = [
                 build_question(
@@ -449,11 +452,49 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
             existing["status"] = "archived"
         elif "status" in payload and payload["status"] in VALID_ASSESSMENT_STATUSES:
             existing["status"] = payload["status"]
+        # Schedule-targeted assignment (2026-09) — same "" | "A" | "B"
+        # convention as students.group; "" (or any other value) normalizes
+        # to "everyone", never silently rejected, matching build_assessment_
+        # document's own normalization so a round-trip through this route
+        # can never produce a value validate_assessment_document rejects.
+        if "group" in payload:
+            g = str(payload.get("group") or "").strip().upper()
+            existing["group"] = g if g in ("A", "B") else ""
         ok, errors = validate_assessment_document(existing)
         if not ok:
             raise HTTPException(400, "; ".join(errors))
         await assessments.update_one({"assessmentId": assessment_id}, {"$set": existing})
         return {"ok": True, "assessment": existing}
+
+    @api.delete("/admin/assessments/{assessment_id}")
+    async def admin_delete_assessment(assessment_id: str, admin=Depends(require_admin)):
+        """Genuine delete — removes the assessment document itself, so it
+        immediately stops matching every student-facing query (student_
+        list_assessments' find(), and _get_assessment_or_404 used by
+        student_submit_assessment — both simply find nothing once this
+        document is gone, no separate "excluded/deleted" flag needed).
+
+        Deliberately does NOT cascade-delete assessment_submissions for
+        this assessment: a submission represents real completed student
+        work, and for an already-awarded one, real wallet points already
+        credited via the existing award flow — the same "preserve the
+        record of what happened, even if the source it happened against
+        is gone" reasoning this codebase already applies to the account-
+        lifecycle data-purge (student_reuse_purge_tools.py archives, never
+        deletes, financial/award-adjacent records). A submission whose
+        assessmentId no longer resolves is still fully visible via GET
+        /admin/assessments/{id}/submissions... except that route 404s once
+        the assessment is gone too — so submissions remain in the database
+        for record-keeping, but their own dedicated by-assessment admin
+        view is a real, accepted limitation of this decision, not an
+        oversight: reviewing awarded/historical submissions this way is
+        the same trade-off already made for deleted assessments' own
+        `/admin/assessments/{assessment_id}` GET (also 404s)."""
+        result = await assessments.delete_one({"assessmentId": assessment_id})
+        if result.deleted_count == 0:
+            raise HTTPException(404, "Assessment not found.")
+        log.info("assessment: deleted %s by %s", assessment_id, getattr(admin, "email", "admin"))
+        return {"ok": True}
 
     # ── Teacher: submissions review ───────────────────────────────────────
     @api.post("/admin/assessments/{assessment_id}/extraction-check")
@@ -1236,7 +1277,21 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
     # ── Student: list, submit, own history ────────────────────────────────
     @api.get("/student/assessments")
     async def student_list_assessments(student=Depends(require_student)):
-        docs = await assessments.find({"status": "published"}, {"_id": 0}).sort("generatedAt", -1).to_list(200)
+        # Schedule-targeted assignment (2026-09): a document with no group
+        # (missing, or "") targets everyone — same convention as every
+        # other group-filtered query in this codebase (e.g. server.py's
+        # _build_target_query). $exists:False covers assessments created
+        # before this field existed, which must keep reaching every
+        # student exactly as they always have.
+        student_group = str(getattr(student, "group", "") or "")
+        allowed_groups = ["", student_group] if student_group else [""]
+        docs = await assessments.find(
+            {
+                "status": "published",
+                "$or": [{"group": {"$exists": False}}, {"group": {"$in": allowed_groups}}],
+            },
+            {"_id": 0},
+        ).sort("generatedAt", -1).to_list(200)
         clean_id = getattr(student, "clean_id", "")
         student_id = getattr(student, "student_id", "")
         for d in docs:
@@ -1254,6 +1309,17 @@ def register_assessment_routes(api: APIRouter, db, require_admin, require_studen
         asmt = await _get_assessment_or_404(assessment_id)
         if asmt.get("status") != "published":
             raise HTTPException(423, "This assessment is not open for submissions.")
+        # Schedule-targeted assignment enforcement — must be checked here
+        # too, not just in student_list_assessments' query: that route only
+        # controls what's LISTED, and a student who already knows an
+        # assessmentId (e.g. from a stale link, or another schedule's
+        # student sharing it) must not be able to submit against an
+        # assessment targeted at a different schedule just because the
+        # list happened to filter it out. Same "" == everyone convention.
+        asmt_group = str(asmt.get("group") or "")
+        student_group = str(getattr(student, "group", "") or "")
+        if asmt_group and asmt_group != student_group:
+            raise HTTPException(403, "This assessment is not assigned to your schedule.")
 
         raw = await file.read()
         if not raw:

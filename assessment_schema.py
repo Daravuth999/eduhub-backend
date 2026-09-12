@@ -118,7 +118,8 @@ def build_question(qid: str, prompt: str, correct_answer: str, *,
 def build_assessment_document(assessment_id: str, title: str, questions: list[dict], *,
                                subject: str = "", created_by: str = "",
                                source_ref: str | None = None,
-                               status: str = "draft", generated_at: str = "") -> dict:
+                               status: str = "draft", generated_at: str = "",
+                               group: str = "") -> dict:
     return {
         "assessmentId": assessment_id,
         "schemaVersion": ASSESSMENT_SCHEMA_VERSION,
@@ -130,6 +131,15 @@ def build_assessment_document(assessment_id: str, title: str, questions: list[di
         "sourceRef": source_ref,
         "status": status,
         "generatedAt": generated_at,
+        # Schedule-targeted assignment (2026-09): follows this codebase's
+        # existing students.group convention exactly ("A" | "B" | "" for
+        # everyone) — see server.py's Student model / teacher_admission.py's
+        # schedule-assignment routes. "" (the default) means every student
+        # sees it, matching today's existing behavior for every assessment
+        # created before this field existed (a missing/blank group has
+        # always meant "no restriction" everywhere else this convention is
+        # used, e.g. _build_target_query's "group" branch).
+        "group": str(group or "").strip().upper() if str(group or "").strip().upper() in ("A", "B") else "",
     }
 
 
@@ -147,6 +157,8 @@ def validate_assessment_document(doc: dict) -> tuple[bool, list[str]]:
         errors.append("title is required")
     if doc.get("status") not in VALID_ASSESSMENT_STATUSES:
         errors.append(f"status must be one of {VALID_ASSESSMENT_STATUSES}")
+    if doc.get("group", "") not in ("", "A", "B"):
+        errors.append('group must be "", "A", or "B"')
     questions = doc.get("questions")
     if not isinstance(questions, list) or not questions:
         errors.append("questions must be a non-empty list")
