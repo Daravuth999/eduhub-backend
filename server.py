@@ -3848,6 +3848,7 @@ async def teacher_create_student(
     existing = await db.students.find_one({"clean_id": clean_id}, {"_id": 0})
 
     purge_summary: dict | None = None
+    tuition_anchor: dict | None = None
 
     if existing:
         if existing.get("is_active"):
@@ -3907,6 +3908,49 @@ async def teacher_create_student(
         })
         action = "created"
 
+        # Item 4 (2026-09): auto-anchor this genuinely new student's first
+        # tuition due date to their real registration timestamp — forward-
+        # only, never touches an existing tuition_records document (this
+        # branch is provably brand-new; no such document can exist yet for
+        # this student_id). Confirmed by reading tuition_tools.py directly:
+        # _ttn_advance_billing needs only a prior-due-date (None here, since
+        # there is none yet) and "today" — the billing CYCLE LENGTH is a
+        # hardcoded constant of that function (always +1 calendar month),
+        # never external config that could be missing, so there is no
+        # "guessed cycle length" risk here. The one real, genuinely-optional
+        # piece of config — whether tuition tracking is enabled at all for
+        # this deployment — IS respected: if tuition_config's global_config
+        # doc explicitly disables it, no record is fabricated, and that gap
+        # is reported back plainly rather than silently skipped.
+        try:
+            from tuition_tools import _ttn_advance_billing, _ttn_fmt_date
+            tuition_cfg = await db["tuition_config"].find_one({"type": "global_config"}, {"_id": 0, "enabled": 1})
+            tuition_enabled = True if tuition_cfg is None else bool(tuition_cfg.get("enabled", True))
+            if tuition_enabled:
+                first_due = _ttn_advance_billing(None, now.date())
+                first_due_str = _ttn_fmt_date(first_due)
+                await db["tuition_records"].update_one(
+                    {"student_id": student_id},
+                    {"$set": {
+                        "student_id": student_id,
+                        "clean_id": clean_id,
+                        "tuition_status": "Unpaid",
+                        "last_payment_date": None,
+                        "next_due_date": first_due_str,
+                        "payment_amount": None,
+                        "data_source": "mongo_shadow",
+                        "updated_at": now.isoformat(),
+                        "updated_by": "registration",
+                    }},
+                    upsert=True,
+                )
+                tuition_anchor = {"created": True, "next_due_date": first_due_str}
+            else:
+                tuition_anchor = {"created": False, "reason": "tuition tracking is disabled in global config"}
+        except Exception as exc:  # noqa: BLE001 — never block student creation on this
+            log.warning("teacher: tuition auto-anchor failed for new student %s (non-fatal): %s", clean_id, exc)
+            tuition_anchor = {"created": False, "reason": f"error: {exc}"}
+
     log.info("teacher: student %s %s by %s", clean_id, action, admin.email)
     # Fire-and-forget GAS syncs â€” never block the credential card response.
     import asyncio as _asyncio_create
@@ -3926,6 +3970,7 @@ async def teacher_create_student(
         "password": plain_password,  # shown ONCE   never stored, never logged
         "login_url": "https://eduhub-studio-test.vercel.app",
         "purge_summary": purge_summary,
+        "tuition_anchor": tuition_anchor,
     }
 
 
