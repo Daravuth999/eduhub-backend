@@ -3826,6 +3826,15 @@ async def teacher_create_student(
     clean_id = (payload.get("clean_id") or "").strip().lower()
     display_name = (payload.get("display_name") or "").strip()
     group = (payload.get("group") or "").strip()
+    # Data-integrity fix (2026-09): reactivating a clean_id is used for TWO
+    # genuinely different admin intents that this single form previously
+    # conflated — "the SAME student is coming back" (their history should
+    # stay) vs. "this ID slot is now for a DIFFERENT, new person" (their
+    # history must NOT be inherited). Defaults to False so today's existing
+    # reactivation behavior is completely unchanged unless an admin
+    # explicitly opts in via the new UI checkbox — see student_reuse_purge_
+    # tools.py's own module docstring for the full inventory and rationale.
+    purge_previous_history = bool(payload.get("purge_previous_history") or False)
 
     if not clean_id or not display_name:
         raise HTTPException(
@@ -3837,6 +3846,8 @@ async def teacher_create_student(
     now = datetime.now(timezone.utc)
 
     existing = await db.students.find_one({"clean_id": clean_id}, {"_id": 0})
+
+    purge_summary: dict | None = None
 
     if existing:
         if existing.get("is_active"):
@@ -3867,6 +3878,16 @@ async def teacher_create_student(
         )
         student_id = existing["student_id"]
         action = "reactivated"
+
+        if purge_previous_history:
+            from student_reuse_purge_tools import purge_student_slot_for_reuse
+            purge_summary = await purge_student_slot_for_reuse(
+                db, student_id=student_id, clean_id=clean_id, admin_email=admin.email,
+            )
+            log.info(
+                "teacher: purged prior history for reused clean_id=%s student_id=%s by %s (purge_id=%s)",
+                clean_id, student_id, admin.email, purge_summary.get("purge_id"),
+            )
     else:
         student_id = f"stu_{uuid.uuid4().hex[:12]}"
         await db.students.insert_one({
@@ -3904,6 +3925,7 @@ async def teacher_create_student(
         "enrolled_at": now.isoformat(),
         "password": plain_password,  # shown ONCE   never stored, never logged
         "login_url": "https://eduhub-studio-test.vercel.app",
+        "purge_summary": purge_summary,
     }
 
 
