@@ -5923,6 +5923,22 @@ register_teacher_admission_routes(
     verify_pool_payment=_verify_pool_payment_evidence,
     find_recent_treasury_credits=_find_recent_treasury_credits,
 )
+
+# Schedule A/B admin-configurable time windows (2026-09, additive) --
+# purely additive metadata alongside the existing schedule identity/
+# eligibility system above, built on eduhub_platform.config's existing
+# generic three-tier resolver, never a new field on students.group.
+# Failure is non-fatal: if this module fails to load, the existing
+# schedule-assignment/eligibility system keeps working unchanged, it
+# just won't have configurable time windows.
+try:
+    from schedule_time_windows import register_schedule_time_window_routes
+
+    register_schedule_time_window_routes(api, db, require_admin, require_student)
+except Exception as _stw_load_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "schedule_time_windows: disabled (%s)", _stw_load_err,
+    )
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # ── Speaking Lab Direct Join (v1.0, DARK — speaking_lab_direct_join_enabled
