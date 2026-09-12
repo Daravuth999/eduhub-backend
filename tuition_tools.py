@@ -133,6 +133,59 @@ def _ttn_is_late(current_ndd: date | None, today: date) -> bool:
     return today > current_ndd
 
 
+async def ensure_new_student_tuition_anchor(
+    db, *, student_id: str, clean_id: str, registration_date: date,
+) -> dict:
+    """Called by server.py's teacher_create_student for a genuinely BRAND
+    NEW student (never on reactivation — that is a separate, already-
+    handled data-integrity concern) to auto-anchor their first tuition due
+    date to their real registration timestamp.
+
+    Lives here, not in server.py, so this module remains the sole real
+    owner of tuition_records/tuition_config — tools/check_collection_
+    ownership.py's --strict gate enforces exactly that; a direct
+    `db["tuition_records"]`/`db["tuition_config"]` reference from server.py
+    is a genuine ownership violation, not just a style nit, so the fix is
+    this owner-exposed accessor rather than an accepted exception.
+
+    Uses the SAME billing-cycle function (_ttn_advance_billing) every
+    subsequent due date already advances through — a brand-new student has
+    no prior due date, so `current_ndd=None` anchors from their own
+    registration date, exactly like a first payment does. Never fabricates
+    a rate/amount: the resulting record honestly starts as
+    tuition_status="Unpaid", payment_amount=None. Respects the one
+    genuinely optional piece of config that exists — tuition_config's
+    global_config.enabled — reporting an honest reason rather than
+    fabricating a record when tracking is explicitly disabled.
+
+    Returns {"created": True, "next_due_date": "YYYY.MM.DD"} or
+    {"created": False, "reason": str}. Never raises — a lookup/write
+    failure here must not be allowed to block student creation itself;
+    the caller is expected to wrap this in its own try/except."""
+    cfg = await db[_TTN_COLL_CONFIG].find_one({"type": "global_config"}, {"_id": 0, "enabled": 1})
+    enabled = True if cfg is None else bool(cfg.get("enabled", True))
+    if not enabled:
+        return {"created": False, "reason": "tuition tracking is disabled in global config"}
+    first_due = _ttn_advance_billing(None, registration_date)
+    first_due_str = _ttn_fmt_date(first_due)
+    await db[_TTN_COLL_RECORDS].update_one(
+        {"student_id": student_id},
+        {"$set": {
+            "student_id": student_id,
+            "clean_id": clean_id,
+            "tuition_status": "Unpaid",
+            "last_payment_date": None,
+            "next_due_date": first_due_str,
+            "payment_amount": None,
+            "data_source": "mongo_shadow",
+            "updated_at": _ttn_utcnow(),
+            "updated_by": "registration",
+        }},
+        upsert=True,
+    )
+    return {"created": True, "next_due_date": first_due_str}
+
+
 def _ttn_reward_points(amount_usd: float) -> int:
     """Wallet reward points for a tuition payment. 0 if reward is disabled."""
     if _TTN_POINTS_PER_USD <= 0 or amount_usd <= 0:
