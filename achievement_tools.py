@@ -322,6 +322,38 @@ def _public_trophy(trophy: dict, evaluation: dict, claim: dict | None) -> dict:
     }
 
 
+async def get_unlocked_trophy_for_student(db, student_ids: list[str], trophy_id: str) -> dict | None:
+    """Public, read-only re-verification of "has THIS student genuinely
+    unlocked THIS trophy", using the exact same evaluation this module's
+    own /achievements/me route uses — for a caller in another module
+    (messaging_tools.py's achievement share card) that must never trust
+    a client-supplied claim of ownership. Returns a plain snapshot dict
+    (trophy_id/name/artwork/claimed_at) on real success, or None
+    (not found, or genuinely not unlocked) — never raises, the caller
+    decides how to surface "no" as an HTTP error."""
+    trophy = await db[COLL_TROPHIES].find_one({"trophy_id": trophy_id}, {"_id": 0})
+    if not trophy:
+        return None
+    claim = await db[COLL_CLAIMS].find_one(
+        {"trophy_id": trophy_id, "student_id": {"$in": student_ids}}, {"_id": 0},
+    )
+    fake_student = type(
+        "_StudentIdShim", (),
+        {"clean_id": student_ids[0] if student_ids else "", "student_id": student_ids[0] if student_ids else ""},
+    )()
+    metrics = await compute_metrics(db, fake_student)
+    evaluation = _evaluate(trophy, metrics)
+    unlocked = evaluation["unlocked"] or bool(claim and claim.get("status") == "credited")
+    if not unlocked:
+        return None
+    return {
+        "trophy_id": trophy["trophy_id"],
+        "name": trophy.get("name") or trophy["trophy_id"],
+        "artwork": trophy.get("artwork") or "",
+        "claimed_at": (claim or {}).get("claimed_at"),
+    }
+
+
 def register_achievement_routes(api, db, require_student, require_admin, wallet=None):
     """Mount /api/achievements/* (student) and /api/admin/achievements/*
     (admin). `wallet` is a wallet_service.WalletService instance owned by

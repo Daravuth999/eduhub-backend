@@ -7750,6 +7750,37 @@ except Exception as _nc_err:  # noqa: BLE001
         "notification_center failed to load (Activity Center disabled): %s",
         _nc_err,
     )
+
+# ── IN-APP MESSAGING (messaging_tools.py + speaking_lab_group_chat.py,
+#    additive) — /api/messaging* (student), /api/admin/messaging*
+#    (admin/moderation), /api/speaking-lab/group-chats* (teacher-
+#    triggered group formation), realtime WS at /api/messaging/ws.
+#    Failure here must never take down the rest of the app — every
+#    other existing feature (including the deprecated-but-still-present
+#    Speaking Lab entry-fee/SSE machinery this deliberately does NOT
+#    touch) keeps working unchanged if this module fails to load. ──────
+try:
+    from messaging_tools import register_messaging_routes
+
+    register_messaging_routes(
+        api, app, db, require_student, require_admin, _fan_out_push,
+        current_user_dep=current_user, is_super_admin_fn=_is_super_admin, cron_secret=CRON_SECRET,
+    )
+    logging.getLogger("eduhub").info("messaging_tools: registered")
+except Exception as _msg_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "messaging_tools failed to load (in-app messaging disabled): %s", _msg_err,
+    )
+
+try:
+    from speaking_lab_group_chat import register_speaking_lab_group_chat_routes
+
+    register_speaking_lab_group_chat_routes(api, db, require_admin)
+    logging.getLogger("eduhub").info("speaking_lab_group_chat: registered")
+except Exception as _slgc_err:  # noqa: BLE001
+    logging.getLogger("eduhub").warning(
+        "speaking_lab_group_chat failed to load (Speaking Lab group chat disabled): %s", _slgc_err,
+    )
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── EXPERIENCE CONFIGURATION PLATFORM (isolated, additive) ────────────────
