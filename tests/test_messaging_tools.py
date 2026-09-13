@@ -846,6 +846,19 @@ class TestConfigToggle:
         assert await mt.messaging_enabled(db) is True
 
     @pytest.mark.asyncio
+    async def test_a_string_false_override_actually_disables_it(self, db):
+        """Regression test — messaging_enabled() previously did a raw
+        bool(value) instead of the shared resolve_bool_flag helper, so a
+        published override of the STRING "false" (exactly what Author
+        Studio's generic Platform Config text input saves) evaluated as
+        truthy in Python and silently left messaging turned on."""
+        from eduhub_platform.config import set_override
+        await set_override(db, "MESSAGING_ENABLED", "true", updated_by="admin@x")
+        assert await mt.messaging_enabled(db) is True
+        await set_override(db, "MESSAGING_ENABLED", "false", updated_by="admin@x")
+        assert await mt.messaging_enabled(db) is False
+
+    @pytest.mark.asyncio
     async def test_attachment_ttl_and_archive_hours_default_sensibly_and_are_overridable(self, db):
         assert await mt.attachment_ttl_days(db) == 30
         assert await mt.speaking_lab_archive_hours(db) == 24

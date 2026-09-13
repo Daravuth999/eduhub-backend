@@ -128,7 +128,7 @@ from fastapi import Body, Depends, File, Form, Header, HTTPException, Query, Upl
 from pymongo.errors import DuplicateKeyError
 
 import r2_object_store
-from eduhub_platform.config import resolve_flag
+from eduhub_platform.config import resolve_bool_flag, resolve_flag
 
 log = logging.getLogger("eduhub.messaging")
 
@@ -220,8 +220,8 @@ async def _assert_no_block_with_any(db, actor_id: str, other_ids: list[str]) -> 
 # other admin-toggleable setting in this codebase already uses.
 # ─────────────────────────────────────────────────────────────────────────────
 async def messaging_enabled(db) -> bool:
-    value, _source = await resolve_flag(db, "MESSAGING_ENABLED", default=False)
-    return bool(value)
+    value, _source = await resolve_bool_flag(db, "MESSAGING_ENABLED", default=False)
+    return value
 
 
 async def attachment_ttl_days(db) -> int:
