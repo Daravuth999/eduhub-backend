@@ -75,6 +75,26 @@ def _ttn_utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _ttn_iso(dt) -> str | None:
+    """A datetime read back from Mongo (this app's Motor client has no
+    tz_aware=True) is NAIVE even though every tuition timestamp here is
+    written as a real UTC instant — a bare `.isoformat()` on that naive
+    value omits the timezone suffix. TuitionPaymentModal.jsx computes a
+    live payment countdown as `new Date(intent.expires_at) - Date.now()`;
+    a suffix-less string is parsed as LOCAL browser time, so for a
+    Cambodia (UTC+7) student the countdown target lands ~7h in the past
+    on every resume/poll — clamping the diff to 0 and kicking the
+    student out of an in-progress payment that hasn't actually expired.
+    A naive value read back from these collections is always a real UTC
+    instant, so tagging it UTC before formatting is a fact, not a
+    guess."""
+    if not isinstance(dt, datetime):
+        return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _ttn_today_kh() -> date:
     return datetime.now(_TTN_KH_TZ).date()
 
@@ -648,7 +668,7 @@ def register_tuition_routes(
                 "status":     active_intent_doc.get("status"),
                 "amount_usd": active_intent_doc.get("amount_usd"),
                 "amount_khr": active_intent_doc.get("amount_khr"),
-                "expires_at": exp.isoformat() if isinstance(exp, datetime) else exp,
+                "expires_at": _ttn_iso(exp),
             }
 
         # Reward preview
@@ -661,7 +681,7 @@ def register_tuition_routes(
         reward_preview = max(0, round(payment_amount * per_usd)) if payment_amount > 0 else 0
 
         if isinstance(rec.get("updated_at"), datetime):
-            rec["updated_at"] = rec["updated_at"].isoformat()
+            rec["updated_at"] = _ttn_iso(rec["updated_at"])
 
         return {
             **rec,
@@ -980,7 +1000,7 @@ def register_tuition_routes(
             for k in ("created_at", "expires_at", "finalized_at"):
                 v = fresh.get(k)
                 if isinstance(v, datetime):
-                    fresh[k] = v.isoformat()
+                    fresh[k] = _ttn_iso(v)
             return fresh
 
         return {"intent_id": intent_id, "status": status}

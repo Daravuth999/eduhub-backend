@@ -318,7 +318,25 @@ async def _dispatch_realtime(student_ids: list[str], message: dict) -> None:
 # Serialization
 # ─────────────────────────────────────────────────────────────────────────────
 def _iso(dt: Optional[datetime]) -> Optional[str]:
-    return dt.isoformat() if isinstance(dt, datetime) else None
+    """Motor/PyMongo returns NAIVE datetimes on read (this app's client
+    has no tz_aware=True) even though every value here was written as a
+    proper UTC instant via datetime.now(timezone.utc) — BSON dates are
+    always UTC internally, PyMongo just doesn't reattach tzinfo unless
+    asked. A bare `.isoformat()` on that naive value omits the timezone
+    suffix (e.g. "2026-09-14T04:30:00" instead of "...+00:00"), and the
+    frontend's `new Date(...)` then parses a suffix-less string as LOCAL
+    browser time — for a student in Cambodia (UTC+7) this silently
+    turned a message sent seconds ago into "7h ago" the moment the
+    thread/inbox re-fetched over REST (the realtime WebSocket path was
+    unaffected, since it serializes the freshly-built aware value before
+    it ever round-trips through Mongo). A naive value read back from
+    this collection is always a real UTC instant, so tagging it UTC here
+    is a fact, not a guess."""
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _serialize_message(doc: dict) -> dict:
