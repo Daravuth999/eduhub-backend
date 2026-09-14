@@ -783,6 +783,26 @@ async def _assign_schedule_one(
         "changed_at":            utcnow().isoformat(),
     }
     await db[COLLECTION_SCHEDULE_AUDIT].insert_one(audit_doc)
+
+    # Attendance §2 — auto-roster assignment. Lazy import (not a top-level
+    # one) specifically so this module and attendance_tools.py never form
+    # a load-order-dependent circular import: attendance_tools.py imports
+    # THIS module's _normalize_schedule at its own top level (confirmed
+    # safe, since this module never imports attendance_tools.py anywhere
+    # at module scope), so the reverse direction here must stay lazy.
+    # ADD-ONLY per attendance_tools.sync_rosters_for_student_group's own
+    # documented decision — a student reassigned AWAY from a class's group
+    # is never auto-removed from its roster, only ever auto-added when
+    # newly eligible. Never blocks/fails the reassignment on an
+    # attendance-side error.
+    try:
+        from attendance_tools import sync_rosters_for_student_group
+        await sync_rosters_for_student_group(db, canonical_student_id, target_schedule)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "teacher_admission: attendance roster auto-sync failed for %s (non-fatal): %s",
+            canonical_student_id, exc,
+        )
     return UpdateStudentScheduleResult(
         student_id=norm_id, student_name=display_name,
         previous_schedule=previous, new_schedule=target_schedule,

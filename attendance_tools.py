@@ -40,6 +40,18 @@ import segno
 from pydantic import BaseModel, ConfigDict, Field
 
 from login_reward_tools import _lrc_campaign_status, lrc_get_campaign_public
+# Reused for auto-roster eligibility matching (§2) — same direct private-
+# helper import schedule_time_windows.py already established for this
+# exact function (its own docstring: "reuses _normalize_schedule ONLY as
+# the canonical way to turn a raw label into the same uppercase,
+# colon-stripped identity token every other consumer already treats as
+# canonical"). teacher_admission.py does not import attendance_tools.py
+# anywhere (confirmed), so this one-directional top-level import is safe;
+# the reverse call (teacher_admission.py -> attendance_tools.py, wired in
+# that module's own _assign_schedule_one) is a lazy, inside-function
+# import specifically so neither module needs to load before the other.
+from teacher_admission import _normalize_schedule
+
 log = logging.getLogger("eduhub.attendance")
 
 # Recurring weekly sessions (§1) are generated from a wall-clock HH:MM
@@ -748,6 +760,108 @@ class SettingsIn(BaseModel):
 # mirrors the file's own stated convention ("implemented as PURE
 # module-level functions so they are unit testable without a database").
 # ─────────────────────────────────────────────────────────────────────────────
+def _default_norm(v) -> str:
+    """Same shape as register_attendance_routes' closure-local `_norm`
+    default — module-level so functions below don't need the closure."""
+    return (str(v or "")).strip().lower()
+
+
+async def resolve_class_roster_ids(db, cls: dict, norm=_default_norm) -> set[str]:
+    """Module-level twin of the closure-local `_class_roster` (same exact
+    query shape: explicit roster ids first, else the class's own `group`
+    tag as a fallback filter) — extracted so it's usable outside
+    register_attendance_routes' closure. Returns just the set of
+    normalized ids actually enrolled, not the full display-name shape
+    `_class_roster` returns (callers here only need membership checks)."""
+    ids = [norm(x) for x in (cls.get("roster") or []) if x]
+    if ids:
+        query = {"$or": [{"clean_id": {"$in": ids}}, {"student_id": {"$in": ids}}]}
+    elif cls.get("group"):
+        query = {"group": cls.get("group")}
+    else:
+        return set()
+    out: set[str] = set()
+    async for s in db.students.find(query, {"_id": 0, "clean_id": 1, "student_id": 1}):
+        for v in (s.get("clean_id"), s.get("student_id")):
+            if v:
+                out.add(norm(v))
+    return out
+
+
+def class_matches_student_schedule(class_group_raw: str, student_group_raw: str) -> bool:
+    """§2 eligibility resolution (evidence, not a guess): a full-codebase
+    audit found NO structured per-student CEFR field anywhere — CEFR-style
+    labels like "A1"/"A2" exist only as free-text possibilities an admin
+    could type into ClassIn.title_en, and as entirely unrelated per-request
+    generation parameters in video/book-factory features never touched by
+    Attendance or Speaking Lab code. The ONLY real, structured, matchable
+    per-student attribute in this codebase is `students.group` (Schedule
+    A/B, normalized via teacher_admission._normalize_schedule). So
+    "eligible A/B" can only mean Schedule A/B — there is no CEFR data to
+    match a class's level-range label against.
+
+    Mirrors teacher_admission.session_schedule_eligibility's exact
+    permissive-AB semantics (inlined rather than imported back, to avoid
+    a two-way module dependency for one 3-line comparison): a class whose
+    own `group` tag normalizes to "AB" is eligible for ANY student with a
+    real assigned schedule; otherwise an exact A/B match is required. A
+    class whose `group` tag is empty or doesn't normalize to a real
+    Schedule value ("", "A1", "Beginner", etc.) never participates in
+    auto-assignment at all — this is also why AttendanceStudio.jsx's
+    "Group tag (e.g. A1)" placeholder is misleading given this field's
+    real wired behavior (flagged, not silently left for someone to
+    stumble on — see the accompanying frontend fix)."""
+    class_group = _normalize_schedule(class_group_raw)
+    if not class_group:
+        return False
+    if class_group == "AB":
+        return bool(_normalize_schedule(student_group_raw))
+    return _normalize_schedule(student_group_raw) == class_group
+
+
+async def sync_rosters_for_student_group(db, student_id: str, new_group: str, *, norm=_default_norm) -> dict:
+    """§2 auto-roster assignment — ADD-ONLY, deliberately never auto-
+    removes (§2.3's explicit, documented decision, not an accident): a
+    student whose schedule is reassigned AWAY from a class's group stays
+    on that class's roster until an admin explicitly removes them. Reasons:
+    (1) roster membership is also the historical record of who a class's
+    sessions were held for — silently severing that the moment a schedule
+    changes could orphan in-flight or recent attendance context an admin
+    may still need; (2) the existing manual-override guarantee (§2.4) is
+    unambiguous for ADDING (a student either belongs or doesn't, so
+    auto-add is safe and reversible by removing them manually) but
+    ambiguous for REMOVING (was this schedule change a correction, a
+    genuine reassignment, or a mistake about to be reverted?) — auto-
+    removal risks a real, hard-to-notice regression (a student silently
+    losing access to a class chat/session they were actively using) for a
+    case with no clearly-safe default. An admin can always remove a
+    student manually via the existing roster picker; this function never
+    does so on their behalf.
+
+    Called from every real write path for students.group (confirmed via
+    a full-codebase audit — there is no single choke point): server.py's
+    teacher_create_student (new registration) and teacher_update_student
+    (generic admin edit), and teacher_admission.py's _assign_schedule_one
+    (the Speaking-Lab-specific reassignment flow)."""
+    if not _normalize_schedule(new_group):
+        return {"added_to": []}
+    sid = norm(student_id)
+    if not sid:
+        return {"added_to": []}
+    added_to: list[str] = []
+    async for cls in db[COLL_CLASSES].find({}, {"_id": 0, "class_id": 1, "group": 1, "roster": 1}):
+        if not class_matches_student_schedule(cls.get("group") or "", new_group):
+            continue
+        roster = {norm(x) for x in (cls.get("roster") or [])}
+        if sid in roster:
+            continue
+        await db[COLL_CLASSES].update_one(
+            {"class_id": cls["class_id"]}, {"$addToSet": {"roster": sid}},
+        )
+        added_to.append(cls["class_id"])
+    return {"added_to": added_to}
+
+
 def _valid_hhmm(s: str) -> bool:
     if not isinstance(s, str) or ":" not in s:
         return False
