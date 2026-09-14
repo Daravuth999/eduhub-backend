@@ -98,6 +98,18 @@ class _Coll:
                 return type("R", (), {"matched_count": 1})()
         return type("R", (), {"matched_count": 0})()
 
+    async def replace_one(s, q, doc, upsert=False):
+        for k, d in s.docs.items():
+            if _match(d, q):
+                s.docs[k] = copy.deepcopy(doc)
+                return type("R", (), {"matched_count": 1})()
+        if upsert:
+            key = doc.get("_id") or f"auto{s._auto}"
+            s._auto += 1
+            s.docs[key] = copy.deepcopy(doc)
+            return type("R", (), {"matched_count": 0, "upserted_id": key})()
+        return type("R", (), {"matched_count": 0})()
+
     async def insert_one(s, doc):
         key = doc.get("_id") or f"auto{s._auto}"
         s._auto += 1
@@ -185,7 +197,7 @@ def _build(**extra):
     return db, router
 
 
-def _seed_class(db, *, cid="cls_x", weekdays=None, opens_time="19:00", closes_time="20:00", enabled=True):
+def _seed_class(db, *, cid="cls_x", weekdays=None, opens_time="19:00", closes_time="20:00", enabled=True, default_meet_url=""):
     db[att.COLL_CLASSES].docs[cid] = {
         "_id": cid, "class_id": cid, "title_en": "English A1", "title_kh": "",
         "roster": [], "group": "",
@@ -194,6 +206,7 @@ def _seed_class(db, *, cid="cls_x", weekdays=None, opens_time="19:00", closes_ti
             "weekdays": weekdays if weekdays is not None else [0, 2, 4],  # Mon/Wed/Fri
             "opens_time": opens_time, "closes_time": closes_time,
         },
+        "default_meet_url": default_meet_url,
     }
     return cid
 
@@ -208,6 +221,84 @@ def test_generates_a_session_for_every_matching_weekday_in_the_window():
     for date_str in result["created"]:
         d = datetime.fromisoformat(date_str).date()
         assert d.weekday() in {0, 2, 4}
+
+
+def test_regression_a_generated_session_inherits_the_classs_default_meet_url():
+    """§1.9 fix — generate_sessions_for_class always read
+    cls.get("default_meet_url"), but ClassIn never actually persisted
+    that field, so it was always None/empty in production: every
+    generated session got meet_url="" and an admin had to add the link
+    to each one by hand, defeating the point of auto-generation. Now
+    ClassIn.default_meet_url is a real, persisted field the Studio form
+    exposes, and every generated session inherits it automatically."""
+    db = _DB()
+    cid = _seed_class(db, weekdays=[0], default_meet_url="https://meet.google.com/abc-defg-hij")
+    cls = db[att.COLL_CLASSES].docs[cid]
+    run(att.generate_sessions_for_class(db, cls, days_ahead=7))
+    sessions = [s for s in db[att.COLL_SESSIONS].docs.values() if s["class_id"] == cid]
+    assert sessions, "expected at least one generated session"
+    for s in sessions:
+        assert s["meet_url"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_a_blackout_date_still_creates_a_session_but_pre_marked_as_a_holiday_exception():
+    """§1.8 — a date in settings["holiday_dates"] is not silently
+    skipped (no record at all); a real session is created for
+    traceability, with `exception` already set to "holiday" — reusing
+    the existing SessionException schema, not a new concept."""
+    db = _DB()
+    cid = _seed_class(db, weekdays=[0, 1, 2, 3, 4, 5, 6])  # every day, for a deterministic hit
+    cls = db[att.COLL_CLASSES].docs[cid]
+    today = datetime.now(att._KH_TZ).date()
+    holiday_date = (today + timedelta(days=1)).isoformat()
+    result = run(att.generate_sessions_for_class(
+        db, cls, days_ahead=3, settings={"holiday_dates": [holiday_date]},
+    ))
+    assert holiday_date in result["holidays_marked"]
+    assert holiday_date not in result["created"]
+    holiday_session = next(
+        s for s in db[att.COLL_SESSIONS].docs.values()
+        if s["class_id"] == cid and s["date"] == holiday_date
+    )
+    assert holiday_session["exception"] == "holiday"
+    assert holiday_session["exception_reason"]
+
+
+def test_regression_a_holiday_marked_generated_session_is_excluded_from_the_live_countdown():
+    """Cross-check with §3: next_upcoming_session_for_student already
+    excludes any session with `exception` set — a holiday date marked
+    during generation must be excluded exactly the same way, with zero
+    additional wiring, so a student's countdown correctly skips past it
+    to the next real session."""
+    db = _DB()
+    today = datetime.now(att._KH_TZ).date()
+    # Only the two target weekdays (tomorrow, day after) — deliberately
+    # excludes today's weekday so the test is deterministic regardless of
+    # what wall-clock time it happens to run at (today's own session, if
+    # generated, could otherwise still legitimately count as "upcoming").
+    target_weekdays = [(today.weekday() + 1) % 7, (today.weekday() + 2) % 7]
+    cid = _seed_class(db, weekdays=target_weekdays)
+    cls = db[att.COLL_CLASSES].docs[cid]
+    cls["roster"] = ["stu_alice"]
+    db.students.docs["stu_alice"] = {"_id": "s1", "clean_id": "stu_alice", "student_id": "stu_alice", "group": ""}
+    holiday_date = (today + timedelta(days=1)).isoformat()
+    real_date = (today + timedelta(days=2)).isoformat()
+    run(att.generate_sessions_for_class(
+        db, cls, days_ahead=3, settings={"holiday_dates": [holiday_date]},
+    ))
+    nxt = run(att.next_upcoming_session_for_student(db, "stu_alice"))
+    assert nxt is not None
+    assert real_date in nxt["opens_at"]
+    assert holiday_date not in nxt["opens_at"]
+
+
+def test_holidays_marked_key_present_in_every_return_shape_including_early_exits():
+    db = _DB()
+    disabled_id = _seed_class(db, cid="cls_disabled", enabled=False)
+    incomplete_id = _seed_class(db, cid="cls_incomplete", opens_time="", closes_time="")
+    for cid in (disabled_id, incomplete_id):
+        result = run(att.generate_sessions_for_class(db, db[att.COLL_CLASSES].docs[cid], days_ahead=7))
+        assert result["holidays_marked"] == []
 
 
 def test_generated_session_opens_and_closes_at_the_configured_wall_clock_time_in_utc():
@@ -339,3 +430,38 @@ def test_generate_due_route_accepts_the_correct_cron_secret_and_generates_for_ev
     assert res["ok"] is True
     assert cid1 in res["classes"]
     assert cid2 not in res["classes"]  # disabled template never participates
+
+
+# ── §1.8 — holiday_dates settings validation ─────────────────────────────────
+def test_settings_route_accepts_valid_holiday_dates_deduped_and_sorted():
+    db, router = _build()
+    res = _call(router, "PUT", "/admin/attendance/settings",
+                payload=att.SettingsIn(settings={"holiday_dates": ["2026-12-25", "2026-01-01", "2026-01-01"]}),
+                admin=_Admin())
+    assert res["settings"]["holiday_dates"] == ["2026-01-01", "2026-12-25"]
+
+
+def test_settings_route_rejects_a_malformed_holiday_date():
+    import fastapi
+    db, router = _build()
+    try:
+        _call(router, "PUT", "/admin/attendance/settings",
+              payload=att.SettingsIn(settings={"holiday_dates": ["25 Dec 2026"]}), admin=_Admin())
+        assert False, "expected 400"
+    except fastapi.HTTPException as e:
+        assert e.status_code == 400
+
+
+def test_settings_route_rejects_a_non_list_holiday_dates_value():
+    import fastapi
+    db, router = _build()
+    try:
+        _call(router, "PUT", "/admin/attendance/settings",
+              payload=att.SettingsIn(settings={"holiday_dates": "2026-12-25"}), admin=_Admin())
+        assert False, "expected 400"
+    except fastapi.HTTPException as e:
+        assert e.status_code == 400
+
+
+def test_default_settings_includes_an_empty_holiday_dates_list():
+    assert att.default_settings()["holiday_dates"] == []

@@ -482,6 +482,13 @@ def default_settings() -> dict:
         "attendance_cycle_start": None,
         "checkin_window_minutes": 90,
         "late_grace_minutes": 10,
+        # §1.8 — global blackout calendar (public holidays / no-class days),
+        # ISO "YYYY-MM-DD" strings. Applies across every class's weekly
+        # recurrence template (a public holiday closes the whole school, not
+        # one class) — checked by generate_sessions_for_class so an admin
+        # never has to generate-then-manually-except each affected date one
+        # at a time; see that function's own docstring for exactly how.
+        "holiday_dates": [],
         "mid_session_enabled": True,
         "mid_session_offset_minutes": 20,
         "shared_device_prompt_enabled": True,
@@ -701,6 +708,12 @@ class ClassIn(BaseModel):
     group: str = ""
     roster: list[str] = Field(default_factory=list)
     weekly_recurrence: WeeklyRecurrenceIn = Field(default_factory=WeeklyRecurrenceIn)
+    # §1.9 — every session generate_sessions_for_class materializes from
+    # this class's weekly template inherits this link automatically
+    # (SessionIn.meet_url below remains the per-session override for a
+    # manually-created or manually-edited session — this is only the
+    # default a fresh auto-generated one starts with).
+    default_meet_url: str = ""
 
 
 class SessionIn(BaseModel):
@@ -857,28 +870,36 @@ async def generate_sessions_for_class(db, cls: dict, *, days_ahead: int = 14, se
     (class_id, date) — whether it was created manually by an admin or by
     an earlier generation run, and regardless of whether it now carries a
     SessionException — this function skips that date entirely rather than
-    creating a second session or touching the existing one. This is also
-    exactly how an existing SessionException is respected (§1.4): a
-    cancelled/holiday date already has a real session document (that's
-    what setting an exception requires — see SessionExceptionIn's own
-    route), so it's already covered by the same "a session already
-    exists" skip, with no separate pre-generation exception calendar
-    needed. Known, documented limitation: an admin cannot pre-emptively
-    block a FUTURE date that has no session yet (the existing exception
-    mechanism only applies to an already-created session) — out of scope
-    for this pass; see the accompanying report."""
+    creating a second session or touching the existing one.
+
+    §1.8 — global blackout calendar (public holidays / no-class days,
+    settings["holiday_dates"], admin-configurable in Attendance Settings):
+    a date on this list is NOT silently skipped (that would leave a gap
+    with no record at all, and §3's countdown would have nothing telling
+    it why); instead a real Session document is still created for
+    traceability, but with `exception` PRE-SET to "holiday" at insert
+    time — reusing the exact existing SessionException schema/semantics
+    (SessionExceptionIn's own "holiday" literal), not a parallel concept.
+    This means next_upcoming_session_for_student (§3) already excludes it
+    automatically (it already filters on `exception: None`), so a
+    student's live countdown correctly skips straight past a holiday to
+    the next REAL session with zero additional wiring. Resolves the
+    "known, documented limitation" from the original §1 pass — an admin
+    can now pre-emptively block a future date that has no session yet."""
     tpl = cls.get("weekly_recurrence") or {}
     if not tpl.get("enabled"):
-        return {"created": [], "skipped_existing": [], "reason": "recurrence_disabled"}
+        return {"created": [], "skipped_existing": [], "holidays_marked": [], "reason": "recurrence_disabled"}
     weekdays = set(tpl.get("weekdays") or [])
     opens_time, closes_time = tpl.get("opens_time") or "", tpl.get("closes_time") or ""
     if not weekdays or not _valid_hhmm(opens_time) or not _valid_hhmm(closes_time):
-        return {"created": [], "skipped_existing": [], "reason": "template_incomplete"}
+        return {"created": [], "skipped_existing": [], "holidays_marked": [], "reason": "template_incomplete"}
 
     settings = settings or {}
+    holiday_dates = set(settings.get("holiday_dates") or [])
     today_local = datetime.now(_KH_TZ).date()
     created: list[str] = []
     skipped_existing: list[str] = []
+    holidays_marked: list[str] = []
     for date_obj in _next_n_dates(today_local, days_ahead):
         if date_obj.weekday() not in weekdays:
             continue
@@ -889,6 +910,7 @@ async def generate_sessions_for_class(db, cls: dict, *, days_ahead: int = 14, se
         if existing:
             skipped_existing.append(date_str)
             continue
+        is_holiday = date_str in holiday_dates
         opens_utc, closes_utc = _session_datetimes_for_date(date_obj, opens_time, closes_time)
         sid = "ses_" + secrets.token_hex(6)
         slug = secrets.token_urlsafe(7)
@@ -905,9 +927,14 @@ async def generate_sessions_for_class(db, cls: dict, *, days_ahead: int = 14, se
             "status": SESS_SCHEDULED,
             "created_at": _utcnow_iso(),
             "generated": True,  # distinguishes an auto-generated session from a manually-created one, for admin visibility only — never changes how it's treated
+            "exception": "holiday" if is_holiday else None,
+            "exception_reason": "Public holiday / no class (admin-configured blackout date)" if is_holiday else "",
         })
-        created.append(date_str)
-    return {"created": created, "skipped_existing": skipped_existing}
+        if is_holiday:
+            holidays_marked.append(date_str)
+        else:
+            created.append(date_str)
+    return {"created": created, "skipped_existing": skipped_existing, "holidays_marked": holidays_marked}
 
 
 async def next_upcoming_session_for_student(db, student_id: str, *, norm=_default_norm) -> dict | None:
@@ -1913,6 +1940,21 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                     status_code=400,
                     detail="base_attendance_points must be 1, 2, or 3",
                 )
+        if "holiday_dates" in payload.settings:
+            raw_dates = payload.settings["holiday_dates"]
+            if not isinstance(raw_dates, list):
+                raise HTTPException(status_code=400, detail="holiday_dates must be a list of YYYY-MM-DD strings")
+            clean_dates: list[str] = []
+            for d in raw_dates:
+                if not isinstance(d, str):
+                    raise HTTPException(status_code=400, detail=f"invalid holiday_dates entry: {d!r}")
+                try:
+                    datetime.strptime(d, "%Y-%m-%d")
+                except ValueError:
+                    raise HTTPException(status_code=400, detail=f"invalid holiday date (expected YYYY-MM-DD): {d!r}")
+                if d not in clean_dates:
+                    clean_dates.append(d)
+            payload.settings["holiday_dates"] = sorted(clean_dates)
         previous = await _load_settings()
         merged = _merge_settings(payload.settings)
         merged["_id"] = SETTINGS_ID
@@ -1948,6 +1990,7 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             # §1 — structured weekly template, additive alongside the
             # original free-text `recurrence` string above (unchanged).
             "weekly_recurrence": payload.weekly_recurrence.model_dump(),
+            "default_meet_url": payload.default_meet_url.strip(),
             "created_at": _utcnow_iso(),
         }
         await db[COLL_CLASSES].insert_one(doc)
@@ -1964,6 +2007,7 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "group": payload.group.strip(),
             "roster": [_norm(x) for x in payload.roster if x],
             "weekly_recurrence": payload.weekly_recurrence.model_dump(),
+            "default_meet_url": payload.default_meet_url.strip(),
             "updated_at": _utcnow_iso(),
         }
         res = await db[COLL_CLASSES].update_one({"class_id": class_id}, {"$set": upd})
