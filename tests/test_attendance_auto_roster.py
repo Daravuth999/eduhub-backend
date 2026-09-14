@@ -10,6 +10,21 @@ or as unrelated video/book-factory generation parameters). The only
 real, structured, matchable per-student attribute is `students.group`
 (Schedule A/B). These tests exercise exactly that resolution.
 
+§2.5 — union, not write-on-event. An earlier design wrote matching
+students into a class's `roster` array whenever their schedule changed
+(sync_rosters_for_student_group). That had a real bug: the very first
+write flipped a class's roster resolution from "match everyone by
+Schedule A/B" (the pre-existing fallback for an empty `roster` array)
+to "match ONLY the explicit ids now in `roster`" — silently dropping
+every other auto-matched student. Fixed by making resolution a live
+UNION (resolve_class_roster_ids / the closure-local `_class_roster`):
+explicit `roster` ids are manual additions/exceptions, ADDITIVE to,
+never a replacement for, the live Schedule A/B match. No roster write
+happens on a schedule change anymore — there is nothing to keep in
+sync, since the match is always computed fresh. These tests exercise
+resolve_class_roster_ids directly (the module-level, DB-driven half of
+that union) since that's the real behavior teachers/admins depend on.
+
 Same self-contained fake Mongo as the other attendance test files.
 """
 from __future__ import annotations
@@ -100,6 +115,10 @@ def _seed_class(db, cid, group, roster=None):
     }
 
 
+def _seed_student(db, sid, group):
+    db.students.docs[sid] = {"_id": sid, "clean_id": sid, "student_id": sid, "group": group}
+
+
 # ── class_matches_student_schedule — the resolved eligibility rule ──────────
 def test_a_class_labeled_A_matches_only_students_assigned_to_A():
     assert att.class_matches_student_schedule("A", "A") is True
@@ -126,96 +145,100 @@ def test_a_class_group_tag_that_is_not_a_real_schedule_value_never_participates(
     assert att.class_matches_student_schedule("", "A") is False
 
 
-# ── sync_rosters_for_student_group — add-only auto-assignment ───────────────
-def test_a_newly_assigned_student_is_auto_added_to_every_matching_class():
+# ── resolve_class_roster_ids — live, query-time auto-match ──────────────────
+def test_a_newly_assigned_student_is_immediately_matched_with_zero_admin_action():
+    """No sync/write step exists any more — a student's own `group` value
+    is enough. Adding the student to the students collection with a
+    matching schedule is the ONLY action; no roster array is touched."""
     db = _DB()
     _seed_class(db, "cls_a1", "A")
     _seed_class(db, "cls_a2", "A")
     _seed_class(db, "cls_b1", "B")
-    result = run(att.sync_rosters_for_student_group(db, "stu_alice", "A"))
-    assert set(result["added_to"]) == {"cls_a1", "cls_a2"}
-    assert "stu_alice" in db[att.COLL_CLASSES].docs["cls_a1"]["roster"]
-    assert "stu_alice" in db[att.COLL_CLASSES].docs["cls_a2"]["roster"]
-    assert "stu_alice" not in db[att.COLL_CLASSES].docs["cls_b1"]["roster"]
+    _seed_student(db, "stu_alice", "A")
+    assert run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"])) == {"stu_alice"}
+    assert run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a2"])) == {"stu_alice"}
+    assert run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_b1"])) == set()
+    # The class's own `roster` array was never written to.
+    assert db[att.COLL_CLASSES].docs["cls_a1"]["roster"] == []
 
 
 def test_an_ab_class_receives_students_from_either_schedule():
     db = _DB()
     _seed_class(db, "cls_ab", "AB")
-    run(att.sync_rosters_for_student_group(db, "stu_alice", "A"))
-    run(att.sync_rosters_for_student_group(db, "stu_bob", "B"))
-    roster = db[att.COLL_CLASSES].docs["cls_ab"]["roster"]
-    assert "stu_alice" in roster
-    assert "stu_bob" in roster
+    _seed_student(db, "stu_alice", "A")
+    _seed_student(db, "stu_bob", "B")
+    ids = run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_ab"]))
+    assert ids == {"stu_alice", "stu_bob"}
 
 
-def test_already_on_the_roster_is_not_duplicated():
-    db = _DB()
-    _seed_class(db, "cls_a1", "A", roster=["stu_alice"])
-    result = run(att.sync_rosters_for_student_group(db, "stu_alice", "A"))
-    assert result["added_to"] == []  # already there — nothing new
-    assert db[att.COLL_CLASSES].docs["cls_a1"]["roster"].count("stu_alice") == 1
-
-
-def test_an_empty_or_unassigned_group_never_triggers_any_roster_write():
+def test_an_empty_or_unassigned_group_never_matches_anything():
     db = _DB()
     _seed_class(db, "cls_a1", "A")
-    result = run(att.sync_rosters_for_student_group(db, "stu_alice", ""))
-    assert result["added_to"] == []
-    assert "stu_alice" not in db[att.COLL_CLASSES].docs["cls_a1"]["roster"]
+    _seed_student(db, "stu_alice", "")
+    assert run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"])) == set()
+
+
+def test_regression_a_manual_addition_never_drops_the_auto_matched_students():
+    """THE bug this fix targets: an earlier write-on-event design flipped
+    a class's resolution from "everyone matching Schedule A" to "only
+    this one explicit id" the instant any student's schedule changed.
+    Here an admin manually adds one extra (non-matching) student to a
+    class that ALSO has real Schedule A students — both must be
+    present, never either/or."""
+    db = _DB()
+    _seed_class(db, "cls_a1", "A", roster=["stu_manual"])  # admin-added exception, no Schedule A/B tag
+    _seed_student(db, "stu_manual", "")  # doesn't have Schedule A — that's exactly why they were added manually
+    _seed_student(db, "stu_alice", "A")
+    _seed_student(db, "stu_charlie", "A")
+    ids = run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"]))
+    assert ids == {"stu_manual", "stu_alice", "stu_charlie"}
+
+
+def test_regression_reverse_case_a_reassigned_student_leaves_the_live_match_immediately():
+    """§2.3's explicit, documented decision only concerns explicit manual
+    roster entries (an admin-added student stays until removed by hand —
+    see test_regression_manual_admin_add_and_remove_still_works_untouched
+    below). It was never meant to freeze the LIVE auto-match: a student
+    who is reassigned away from a class's Schedule A/B tag stops being
+    live-matched by that tag immediately, which is correct — they were
+    never explicitly rostered there, only ever included because their
+    schedule matched."""
+    db = _DB()
+    _seed_class(db, "cls_a1", "A")
+    _seed_student(db, "stu_alice", "A")
+    assert run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"])) == {"stu_alice"}
+    db.students.docs["stu_alice"]["group"] = "B"
+    assert run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"])) == set()
 
 
 def test_regression_manual_admin_add_and_remove_still_works_untouched_by_auto_assignment():
-    """§2.4 — the automation is purely additive; a class's roster can
-    still be manually edited directly (the existing RosterPicker /
-    admin_update_class flow), independent of this function."""
+    """§2.4 — the automation is purely additive; a class's explicit
+    `roster` array (manual additions/exceptions) can still be edited
+    directly via the existing RosterPicker / admin_update_class flow,
+    independent of the live Schedule A/B match."""
     db = _DB()
     _seed_class(db, "cls_a1", "A", roster=["stu_manual"])
-    run(att.sync_rosters_for_student_group(db, "stu_alice", "A"))
-    roster = db[att.COLL_CLASSES].docs["cls_a1"]["roster"]
-    assert "stu_manual" in roster  # untouched
-    assert "stu_alice" in roster  # newly auto-added
+    _seed_student(db, "stu_manual", "")
+    _seed_student(db, "stu_alice", "A")
+    ids = run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"]))
+    assert ids == {"stu_manual", "stu_alice"}
     # Manual removal (simulating the admin roster picker/update-class flow).
-    db[att.COLL_CLASSES].docs["cls_a1"]["roster"] = [r for r in roster if r != "stu_manual"]
-    assert "stu_manual" not in db[att.COLL_CLASSES].docs["cls_a1"]["roster"]
+    db[att.COLL_CLASSES].docs["cls_a1"]["roster"] = []
+    ids = run(att.resolve_class_roster_ids(db, db[att.COLL_CLASSES].docs["cls_a1"]))
+    assert ids == {"stu_alice"}  # manual entry gone, live Schedule A match untouched
 
 
-def test_regression_reverse_case_a_reassigned_student_is_NEVER_auto_removed_from_their_old_class():
-    """§2.3's explicit, documented decision: eligibility changing away
-    from a class's group does NOT auto-remove the student — only an
-    admin acting deliberately can do that. This is the actual behavior
-    under test, not just a comment."""
-    db = _DB()
-    _seed_class(db, "cls_a1", "A")
-    run(att.sync_rosters_for_student_group(db, "stu_alice", "A"))
-    assert "stu_alice" in db[att.COLL_CLASSES].docs["cls_a1"]["roster"]
-    # Reassign the student to Schedule B.
-    run(att.sync_rosters_for_student_group(db, "stu_alice", "B"))
-    # Still present on the A class's roster — no auto-removal happened.
-    assert "stu_alice" in db[att.COLL_CLASSES].docs["cls_a1"]["roster"]
-
-
-# ── source-level confirmation that all three real write paths are wired ─────
-def test_all_three_real_write_paths_for_students_group_call_the_sync_function():
-    """A full-codebase audit found THREE separate places that write
-    students.group with no single choke point: server.py's
-    teacher_create_student (registration) and teacher_update_student
-    (generic admin edit), and teacher_admission.py's
-    _assign_schedule_one (Speaking-Lab reassignment). Each must call
-    sync_rosters_for_student_group — verified here at the source level
-    since none of these three routes can be practically mounted in a
-    lightweight unit test (they live inside two very large, heavily-
-    dependency-injected modules)."""
+# ── source-level confirmation the write-on-event mechanism is gone ──────────
+def test_no_write_on_event_hook_remains_in_the_three_former_call_sites():
+    """The prior design wired an explicit sync call into every real write
+    path for students.group (server.py's teacher_create_student /
+    teacher_update_student, teacher_admission.py's _assign_schedule_one).
+    That mechanism is gone by design (§2.5) — resolve_class_roster_ids /
+    _class_roster already match live on every read, so there is nothing
+    left to keep in sync and no choke point to enforce."""
     import pathlib
     root = pathlib.Path(__file__).resolve().parent.parent
     server_src = (root / "server.py").read_text(encoding="utf-8")
     admission_src = (root / "teacher_admission.py").read_text(encoding="utf-8")
-
-    # teacher_create_student and teacher_update_student both live in
-    # server.py; both must reference the sync call somewhere after their
-    # own students.group write.
-    assert server_src.count("sync_rosters_for_student_group") >= 2, (
-        "expected both teacher_create_student and teacher_update_student "
-        "in server.py to call sync_rosters_for_student_group"
-    )
-    assert "sync_rosters_for_student_group" in admission_src
+    assert "sync_rosters_for_student_group" not in server_src
+    assert "sync_rosters_for_student_group" not in admission_src
