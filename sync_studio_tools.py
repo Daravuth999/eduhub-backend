@@ -982,6 +982,26 @@ def _apply_one_edit(doc: dict, op: dict) -> None:
         if start < 0 or end < start:
             raise SyncStudioError("bad_timing", "end must be >= start >= 0", 400)
         word["start"], word["end"] = start, end
+        # §3.2 — a reviewer manually placing this timestamp against the
+        # real media (by ear/eye) is at least as trustworthy as two
+        # independent Gemini transcriptions agreeing on it, so it earns
+        # the SAME `measured: True` flag gemini-3.5-transcribe's own
+        # matched words carry — this is what makes it render crisp (not
+        # the softer "interpolated" tier) in both Sync Review Studio and
+        # the student Teleprompter, and what makes apply_sync_edits'
+        # own wordAlignment recompute below count it as measured. A
+        # distinct `source: "reviewer"` provenance tag (never conflated
+        # with a model-measured word, even though both set measured=True)
+        # is kept alongside it — an honest fact about WHERE the
+        # confidence comes from, not a fabricated score.
+        word["measured"] = True
+        word["source"] = "reviewer"
+        # A human correction supersedes whatever the pipeline's own word-
+        # level transcript-confidence guess was for this word — keep the
+        # dict shape (never a raw None-valued key) but drop the stale
+        # signal rather than leave it contradicting the new measured flag.
+        if isinstance(word.get("confidence"), dict):
+            word["confidence"].pop("alignment", None)
 
     elif kind == "replace_sentence_text":
         s = _sentence(op.get("p"), op.get("s"))
@@ -1082,6 +1102,29 @@ async def apply_sync_edits(db, sync_id: str, operations: list[dict]) -> dict:
         "reviewStatus": "in_review",
         "approvedAt": None,
     }
+
+    # §3.2 — a manual set_word_timing correction (or a text replacement
+    # that regenerates a sentence's words from scratch, losing whatever
+    # measured flags those old words carried) changes how many of this
+    # document's words are ACTUALLY trustworthy right now. Recomputed
+    # from the real, current word list on every edit — never tracked
+    # per-op — so this stays correct regardless of which op(s) ran, and
+    # never invents a wordAlignment block for a document that never had
+    # one (a legacy/never-aligned document's shape is left untouched).
+    if working.get("wordAlignment") is not None:
+        all_words = [
+            w for p in working["paragraphs"]
+            for s in (p.get("sentences") or [])
+            for w in (s.get("words") or [])
+        ]
+        total = len(all_words)
+        matched = sum(1 for w in all_words if w.get("measured") is True)
+        updates["wordAlignment"] = {
+            **working["wordAlignment"],
+            "totalWords": total,
+            "matchedWords": matched,
+            "matchRatio": round(matched / total, 4) if total else working["wordAlignment"].get("matchRatio", 0.0),
+        }
     if "speakers" in working:
         updates["speakers"] = working["speakers"]
     if "originalParagraphs" not in doc:
