@@ -373,12 +373,31 @@ async def _dispatch_realtime(payload: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
+def _dt_to_iso_utc(dt: Any) -> str:
+    """Motor/PyMongo returns NAIVE datetimes on read (the client here has
+    no tz_aware=True) even though every value stored here was written as
+    a proper UTC instant via datetime.now(timezone.utc) — BSON dates are
+    always UTC internally, PyMongo just doesn't attach tzinfo back unless
+    asked. A bare `.isoformat()` on that naive value omits the timezone
+    suffix entirely (e.g. "2026-09-14T04:30:00" instead of "...+00:00"),
+    and the frontend's `new Date(...)` then parses a suffix-less string
+    as LOCAL browser time — silently adding the viewer's own UTC offset
+    on top of the real elapsed time. For a student in Cambodia (UTC+7)
+    this turned "just happened" into "7h ago". A value read back from
+    this collection is ALWAYS a real UTC instant, so treating a naive
+    one as UTC here is a fact, not a guess."""
+    if not isinstance(dt, datetime):
+        return str(dt or "")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _serialize(doc: dict, viewer_ids: Optional[set[str]] = None) -> dict:
     read = bool(doc.get("read"))
     if doc.get("studentId") == "*" and viewer_ids is not None:
         read_by = {_norm_id(x) for x in (doc.get("readBy") or [])}
         read = bool(read_by & viewer_ids)
-    created = doc.get("createdAt")
     return {
         "id": str(doc.get("_id", "")),
         "title": doc.get("title", ""),
@@ -388,7 +407,7 @@ def _serialize(doc: dict, viewer_ids: Optional[set[str]] = None) -> dict:
         "priority": doc.get("priority", "normal"),
         "broadcast": doc.get("studentId") == "*",
         "read": read,
-        "createdAt": created.isoformat() if isinstance(created, datetime) else str(created or ""),
+        "createdAt": _dt_to_iso_utc(doc.get("createdAt")),
     }
 
 

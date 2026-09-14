@@ -91,6 +91,7 @@ PROTECTED SYSTEMS
 
 from __future__ import annotations
 
+from datetime import timezone
 from typing import Any, Iterable, Mapping, Optional
 import logging
 
@@ -217,13 +218,30 @@ def _stringify_id(value: Any) -> str:
 
 
 def _coerce_iso(value: Any) -> Optional[str]:
-    """Return an ISO-8601 string for a datetime / str / None input."""
+    """Return an ISO-8601 string for a datetime / str / None input.
+
+    A datetime read back from Mongo (this app's Motor client has no
+    tz_aware=True) is NAIVE even though every ledger `created_at` is
+    written as a real UTC instant — a bare `.isoformat()` on that naive
+    value omits the timezone suffix, and the frontend's relative-time
+    math (transactionsApi.ts's ledgerRelativeTime) then parses it as
+    LOCAL browser time, silently adding the viewer's own UTC offset on
+    top of the real elapsed time (7h for Cambodia) — turning a points
+    credit that just happened into "7h ago" the moment the Points
+    Activity feed / Latest Reward card re-fetches. A naive value read
+    back from this collection is always a real UTC instant, so tagging
+    it UTC before formatting is a fact, not a guess."""
     if value is None:
         return None
     if isinstance(value, str):
         return value
     if hasattr(value, "isoformat"):
         try:
+            if getattr(value, "tzinfo", None) is None:
+                try:
+                    value = value.replace(tzinfo=timezone.utc)
+                except (AttributeError, TypeError):
+                    pass
             return value.isoformat()
         except Exception:
             return None
