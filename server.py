@@ -8238,6 +8238,13 @@ try:
         build_target_query=_build_target_query,
         norm_student_id=_norm_student_id,
         wallet=_attendance_wallet,
+        # §1 — POST /admin/attendance/sessions/generate-due's dual auth,
+        # the exact same current_user_dep/is_super_admin_fn/cron_secret
+        # injection points messaging_tools.py's own cron endpoint already
+        # uses (see register_messaging_routes' call site above).
+        current_user_dep=current_user,
+        is_super_admin_fn=_is_super_admin,
+        cron_secret=CRON_SECRET,
     )
 
     @app.on_event("startup")
