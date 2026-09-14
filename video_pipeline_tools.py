@@ -184,6 +184,49 @@ def build_pipeline_record(provider_version: str, run_id: str | None = None) -> d
     }
 
 
+def build_combined_provider_tag(segmentation_provider_version: str, word_alignment: dict | None) -> str:
+    """The previously-confirmed misleading-tag bug, fixed: `pipeline.
+    provider` and the pipeline's own log lines used to show ONLY the
+    segmentation provider's static version string (set once at pipeline
+    CLAIM time, before the real per-word alignment stage even runs) —
+    so it never reflected whether that second, real-alignment call
+    (video_word_alignment.run_word_alignment, gemini-3.5-transcribe)
+    actually ran for this specific execution. This has already caused
+    one real misdiagnosis ("still uses Gemini 2.5 Flash instead of
+    3.5") despite alignment genuinely running and contributing real
+    per-word timestamps — confirmed via a live end-to-end run against
+    the real Gemini API during this investigation.
+
+    Builds an honest, per-execution-accurate tag by appending the
+    alignment stage's REAL outcome (never a guess or a hardcoded
+    assumption) onto the segmentation provider's own existing version
+    string — called again after alignment actually completes/skips/
+    fails, not just once at pipeline start. `word_alignment` is the
+    same telemetry dict video_word_alignment.run_word_alignment already
+    returns and this module already stores at sync.wordAlignment — no
+    new tracking invented, just surfaced honestly where an admin
+    actually looks (pipeline status/logs)."""
+    if not word_alignment:
+        # Alignment hasn't run yet for this execution (e.g. this is the
+        # pipeline-claim-time value, before speech_recognition even
+        # starts, or a silent video with no audio to align at all) —
+        # honestly describes only what has actually happened so far.
+        return segmentation_provider_version
+    status = word_alignment.get("status")
+    align_provider = word_alignment.get("provider") or "word-alignment"
+    if status == "complete":
+        total = word_alignment.get("totalWords")
+        matched = word_alignment.get("matchedWords")
+        measured = f" [{matched}/{total} words measured]" if total else ""
+        return f"{segmentation_provider_version} + {align_provider}{measured}"
+    if status == "skipped":
+        reason = word_alignment.get("reason") or "unavailable this run"
+        return f"{segmentation_provider_version} (segmentation only — alignment skipped: {reason})"
+    if status == "failed":
+        return f"{segmentation_provider_version} (segmentation only — alignment failed, using interpolated timing)"
+    return segmentation_provider_version
+
+
 async def _set_step(db, lesson_id: str, run_id: str, step: str, status: str, error: str | None = None) -> None:
     # Fenced on runId (Directive 3 race fix): a poll-triggered self-heal in
     # get_pipeline_status can demote a STILL-genuinely-running pipeline to
@@ -328,6 +371,12 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
     sync_id = lesson["syncId"]
 
     async def _run_stages() -> None:
+        # Set only inside the has_audio branch below once the real
+        # per-word alignment stage actually runs — stays None for a
+        # silent video (nothing to align) so build_combined_provider_tag
+        # honestly reports segmentation-only in that case too.
+        word_alignment_meta: dict | None = None
+
         # 1 — media check + load
         await _set_step(db, lesson_id, run_id, "media_check", "running")
         raw, content_type = await load_media_bytes(db, media_bucket, lesson["mediaRef"])
@@ -566,8 +615,19 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
 
         # 5 — review ready
         await _set_step(db, lesson_id, run_id, "review_ready", "complete")
+        # Misleading-tag fix (see build_combined_provider_tag's own
+        # docstring): refresh pipeline.provider NOW, with the alignment
+        # stage's real outcome already known, instead of leaving the
+        # segmentation-only value build_pipeline_record wrote at claim
+        # time (before speech_recognition — let alone alignment — had
+        # even started) untouched for the rest of this run's lifetime.
+        combined_provider_tag = build_combined_provider_tag(provider.provider_version, word_alignment_meta)
+        await db[LESSONS_COLL].update_one(
+            {"lessonId": lesson_id, "pipeline.runId": run_id},
+            {"$set": {"pipeline.provider": combined_provider_tag}},
+        )
         await _finish(db, lesson_id, run_id, "complete")
-        logger.info("video_pipeline: complete lesson=%s provider=%s", lesson_id, provider.provider_version)
+        logger.info("video_pipeline: complete lesson=%s provider=%s", lesson_id, combined_provider_tag)
 
     logger.info("video_pipeline: START lesson=%s provider=%s", lesson_id, provider.provider_version)
     try:
