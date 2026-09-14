@@ -3939,6 +3939,17 @@ async def teacher_create_student(
     # (which may exist from a pre-MongoDB migration) shows the correct new name.
     _asyncio_create.create_task(_sync_name_to_gas(clean_id, display_name))
 
+    # Attendance §2 — auto-roster assignment. Covers both branches above
+    # (brand-new creation and ID-reuse reactivation both write `group`
+    # here); no-ops immediately if `group` is empty (most students have no
+    # schedule assigned yet at creation time). Never blocks/fails student
+    # creation on an attendance-side error.
+    try:
+        from attendance_tools import sync_rosters_for_student_group
+        await sync_rosters_for_student_group(db, student_id, group)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("teacher: attendance roster auto-sync failed for new student %s (non-fatal): %s", clean_id, exc)
+
     return {
         "action": action,
         "student_id": student_id,
@@ -4070,6 +4081,19 @@ async def teacher_update_student(
         _asyncio_patch.create_task(
             _sync_name_to_gas(doc["clean_id"], updates["display_name"])
         )
+
+    # Attendance §2 — auto-roster assignment when this generic admin edit
+    # is what changed `group` (a second real write path for students.group
+    # besides teacher_create_student and teacher_admission.py's own
+    # reassignment flow — confirmed via a full-codebase audit, there is no
+    # single choke point for this field). Never blocks/fails the edit on
+    # an attendance-side error.
+    if "group" in updates:
+        try:
+            from attendance_tools import sync_rosters_for_student_group
+            await sync_rosters_for_student_group(db, student_id, updates["group"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("teacher: attendance roster auto-sync failed for student %s (non-fatal): %s", student_id, exc)
 
     return {"ok": True}
 
@@ -8238,6 +8262,13 @@ try:
         build_target_query=_build_target_query,
         norm_student_id=_norm_student_id,
         wallet=_attendance_wallet,
+        # §1 — POST /admin/attendance/sessions/generate-due's dual auth,
+        # the exact same current_user_dep/is_super_admin_fn/cron_secret
+        # injection points messaging_tools.py's own cron endpoint already
+        # uses (see register_messaging_routes' call site above).
+        current_user_dep=current_user,
+        is_super_admin_fn=_is_super_admin,
+        cron_secret=CRON_SECRET,
     )
 
     @app.on_event("startup")

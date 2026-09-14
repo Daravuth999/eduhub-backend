@@ -40,8 +40,28 @@ import segno
 from pydantic import BaseModel, ConfigDict, Field
 
 from login_reward_tools import _lrc_campaign_status, lrc_get_campaign_public
+# Reused for auto-roster eligibility matching (§2) — same direct private-
+# helper import schedule_time_windows.py already established for this
+# exact function (its own docstring: "reuses _normalize_schedule ONLY as
+# the canonical way to turn a raw label into the same uppercase,
+# colon-stripped identity token every other consumer already treats as
+# canonical"). teacher_admission.py does not import attendance_tools.py
+# anywhere (confirmed), so this one-directional top-level import is safe;
+# the reverse call (teacher_admission.py -> attendance_tools.py, wired in
+# that module's own _assign_schedule_one) is a lazy, inside-function
+# import specifically so neither module needs to load before the other.
+from teacher_admission import _normalize_schedule
 
 log = logging.getLogger("eduhub.attendance")
+
+# Recurring weekly sessions (§1) are generated from a wall-clock HH:MM
+# template, converted to a real UTC instant. This platform has ONE
+# operating timezone — reusing the exact same fixed UTC+7 offset
+# convention tuition_tools.py's own _TTN_KH_TZ already established
+# ("Cambodia timezone... UTC+7 for local date semantics"), never a full
+# IANA zoneinfo pipeline, per schedule_time_windows.py's own documented
+# reasoning for why this codebase deliberately doesn't have one.
+_KH_TZ = timezone(timedelta(hours=7))
 
 # ── v2 rollout flag ──────────────────────────────────────────────────────
 # AND-gated, fail-closed: BOTH an explicit env var AND a settings-doc toggle
@@ -653,6 +673,26 @@ def _derive_campaign_status(camp: dict, now: datetime | None = None) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # pydantic payloads
 # ─────────────────────────────────────────────────────────────────────────────
+class WeeklyRecurrenceIn(BaseModel):
+    """Structured weekly template (§1) — EXTENDS ClassIn's original bare
+    `recurrence` string rather than replacing it (existing class documents
+    keep whatever free-text note an admin already typed there, e.g. as a
+    human-readable description; the two fields are independent and both
+    persist). `weekdays` uses Python's own Monday=0..Sunday=6 convention
+    (matching `datetime.weekday()`, which generate_sessions_for_class
+    below uses directly — no separate day-numbering scheme to keep in
+    sync). Times are plain "HH:MM" 24-hour wall-clock strings, mirroring
+    schedule_time_windows.py's exact storage shape for the same reason
+    that module documents: this platform has one operating timezone
+    (Cambodia, UTC+7 — see _KH_TZ above), so no IANA zone name is stored
+    per-class, only a fixed, shared offset applied at generation time."""
+    model_config = ConfigDict(extra="ignore")
+    enabled: bool = False
+    weekdays: list[int] = Field(default_factory=list)  # 0=Mon .. 6=Sun
+    opens_time: str = ""   # "HH:MM"
+    closes_time: str = ""  # "HH:MM"
+
+
 class ClassIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     title_en: str = "Untitled class"
@@ -661,6 +701,7 @@ class ClassIn(BaseModel):
     recurrence: str = ""
     group: str = ""
     roster: list[str] = Field(default_factory=list)
+    weekly_recurrence: WeeklyRecurrenceIn = Field(default_factory=WeeklyRecurrenceIn)
 
 
 class SessionIn(BaseModel):
@@ -712,6 +753,242 @@ class SettingsIn(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auto-roster assignment (§2) + recurring session generation (§1) — pure/
+# module-level functions, callable without register_attendance_routes'
+# closure, so OTHER modules (teacher_admission.py's schedule reassignment,
+# server.py's student create/update routes) can invoke them directly. This
+# mirrors the file's own stated convention ("implemented as PURE
+# module-level functions so they are unit testable without a database").
+# ─────────────────────────────────────────────────────────────────────────────
+def _default_norm(v) -> str:
+    """Same shape as register_attendance_routes' closure-local `_norm`
+    default — module-level so functions below don't need the closure."""
+    return (str(v or "")).strip().lower()
+
+
+async def resolve_class_roster_ids(db, cls: dict, norm=_default_norm) -> set[str]:
+    """Module-level twin of the closure-local `_class_roster` (same exact
+    query shape: explicit roster ids first, else the class's own `group`
+    tag as a fallback filter) — extracted so it's usable outside
+    register_attendance_routes' closure. Returns just the set of
+    normalized ids actually enrolled, not the full display-name shape
+    `_class_roster` returns (callers here only need membership checks)."""
+    ids = [norm(x) for x in (cls.get("roster") or []) if x]
+    if ids:
+        query = {"$or": [{"clean_id": {"$in": ids}}, {"student_id": {"$in": ids}}]}
+    elif cls.get("group"):
+        query = {"group": cls.get("group")}
+    else:
+        return set()
+    out: set[str] = set()
+    async for s in db.students.find(query, {"_id": 0, "clean_id": 1, "student_id": 1}):
+        for v in (s.get("clean_id"), s.get("student_id")):
+            if v:
+                out.add(norm(v))
+    return out
+
+
+def class_matches_student_schedule(class_group_raw: str, student_group_raw: str) -> bool:
+    """§2 eligibility resolution (evidence, not a guess): a full-codebase
+    audit found NO structured per-student CEFR field anywhere — CEFR-style
+    labels like "A1"/"A2" exist only as free-text possibilities an admin
+    could type into ClassIn.title_en, and as entirely unrelated per-request
+    generation parameters in video/book-factory features never touched by
+    Attendance or Speaking Lab code. The ONLY real, structured, matchable
+    per-student attribute in this codebase is `students.group` (Schedule
+    A/B, normalized via teacher_admission._normalize_schedule). So
+    "eligible A/B" can only mean Schedule A/B — there is no CEFR data to
+    match a class's level-range label against.
+
+    Mirrors teacher_admission.session_schedule_eligibility's exact
+    permissive-AB semantics (inlined rather than imported back, to avoid
+    a two-way module dependency for one 3-line comparison): a class whose
+    own `group` tag normalizes to "AB" is eligible for ANY student with a
+    real assigned schedule; otherwise an exact A/B match is required. A
+    class whose `group` tag is empty or doesn't normalize to a real
+    Schedule value ("", "A1", "Beginner", etc.) never participates in
+    auto-assignment at all — this is also why AttendanceStudio.jsx's
+    "Group tag (e.g. A1)" placeholder is misleading given this field's
+    real wired behavior (flagged, not silently left for someone to
+    stumble on — see the accompanying frontend fix)."""
+    class_group = _normalize_schedule(class_group_raw)
+    if not class_group:
+        return False
+    if class_group == "AB":
+        return bool(_normalize_schedule(student_group_raw))
+    return _normalize_schedule(student_group_raw) == class_group
+
+
+async def sync_rosters_for_student_group(db, student_id: str, new_group: str, *, norm=_default_norm) -> dict:
+    """§2 auto-roster assignment — ADD-ONLY, deliberately never auto-
+    removes (§2.3's explicit, documented decision, not an accident): a
+    student whose schedule is reassigned AWAY from a class's group stays
+    on that class's roster until an admin explicitly removes them. Reasons:
+    (1) roster membership is also the historical record of who a class's
+    sessions were held for — silently severing that the moment a schedule
+    changes could orphan in-flight or recent attendance context an admin
+    may still need; (2) the existing manual-override guarantee (§2.4) is
+    unambiguous for ADDING (a student either belongs or doesn't, so
+    auto-add is safe and reversible by removing them manually) but
+    ambiguous for REMOVING (was this schedule change a correction, a
+    genuine reassignment, or a mistake about to be reverted?) — auto-
+    removal risks a real, hard-to-notice regression (a student silently
+    losing access to a class chat/session they were actively using) for a
+    case with no clearly-safe default. An admin can always remove a
+    student manually via the existing roster picker; this function never
+    does so on their behalf.
+
+    Called from every real write path for students.group (confirmed via
+    a full-codebase audit — there is no single choke point): server.py's
+    teacher_create_student (new registration) and teacher_update_student
+    (generic admin edit), and teacher_admission.py's _assign_schedule_one
+    (the Speaking-Lab-specific reassignment flow)."""
+    if not _normalize_schedule(new_group):
+        return {"added_to": []}
+    sid = norm(student_id)
+    if not sid:
+        return {"added_to": []}
+    added_to: list[str] = []
+    async for cls in db[COLL_CLASSES].find({}, {"_id": 0, "class_id": 1, "group": 1, "roster": 1}):
+        if not class_matches_student_schedule(cls.get("group") or "", new_group):
+            continue
+        roster = {norm(x) for x in (cls.get("roster") or [])}
+        if sid in roster:
+            continue
+        await db[COLL_CLASSES].update_one(
+            {"class_id": cls["class_id"]}, {"$addToSet": {"roster": sid}},
+        )
+        added_to.append(cls["class_id"])
+    return {"added_to": added_to}
+
+
+def _valid_hhmm(s: str) -> bool:
+    if not isinstance(s, str) or ":" not in s:
+        return False
+    try:
+        h, m = s.split(":", 1)
+        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+    except (ValueError, TypeError):
+        return False
+
+
+def _next_n_dates(start_date, n_days: int):
+    for i in range(n_days):
+        yield start_date + timedelta(days=i)
+
+
+def _session_datetimes_for_date(date_obj, opens_time: str, closes_time: str) -> tuple[datetime, datetime]:
+    """Wall-clock HH:MM (Cambodia, fixed UTC+7 — see _KH_TZ) on a specific
+    calendar date -> real UTC instants, the same genuinely-dated-instant
+    shape attendance_sessions.opens_at/closes_at already use (as opposed
+    to schedule_time_windows.py's non-dated recurring wall-clock strings —
+    a real Session document needs an actual instant, this module's own
+    documented distinction)."""
+    oh, om = (int(x) for x in opens_time.split(":", 1))
+    ch, cm = (int(x) for x in closes_time.split(":", 1))
+    opens_local = datetime(date_obj.year, date_obj.month, date_obj.day, oh, om, tzinfo=_KH_TZ)
+    closes_local = datetime(date_obj.year, date_obj.month, date_obj.day, ch, cm, tzinfo=_KH_TZ)
+    if closes_local <= opens_local:
+        closes_local += timedelta(days=1)  # an overnight window, e.g. 23:30-00:30
+    return opens_local.astimezone(timezone.utc), closes_local.astimezone(timezone.utc)
+
+
+async def generate_sessions_for_class(db, cls: dict, *, days_ahead: int = 14, settings: dict | None = None) -> dict:
+    """§1 recurring session generation. Additive and non-destructive by
+    construction (§1.5/§1.6): for each (weekday, date) the template
+    covers, if ANY session document already exists for that
+    (class_id, date) — whether it was created manually by an admin or by
+    an earlier generation run, and regardless of whether it now carries a
+    SessionException — this function skips that date entirely rather than
+    creating a second session or touching the existing one. This is also
+    exactly how an existing SessionException is respected (§1.4): a
+    cancelled/holiday date already has a real session document (that's
+    what setting an exception requires — see SessionExceptionIn's own
+    route), so it's already covered by the same "a session already
+    exists" skip, with no separate pre-generation exception calendar
+    needed. Known, documented limitation: an admin cannot pre-emptively
+    block a FUTURE date that has no session yet (the existing exception
+    mechanism only applies to an already-created session) — out of scope
+    for this pass; see the accompanying report."""
+    tpl = cls.get("weekly_recurrence") or {}
+    if not tpl.get("enabled"):
+        return {"created": [], "skipped_existing": [], "reason": "recurrence_disabled"}
+    weekdays = set(tpl.get("weekdays") or [])
+    opens_time, closes_time = tpl.get("opens_time") or "", tpl.get("closes_time") or ""
+    if not weekdays or not _valid_hhmm(opens_time) or not _valid_hhmm(closes_time):
+        return {"created": [], "skipped_existing": [], "reason": "template_incomplete"}
+
+    settings = settings or {}
+    today_local = datetime.now(_KH_TZ).date()
+    created: list[str] = []
+    skipped_existing: list[str] = []
+    for date_obj in _next_n_dates(today_local, days_ahead):
+        if date_obj.weekday() not in weekdays:
+            continue
+        date_str = date_obj.isoformat()
+        existing = await db[COLL_SESSIONS].find_one(
+            {"class_id": cls["class_id"], "date": date_str}, {"_id": 0, "session_id": 1},
+        )
+        if existing:
+            skipped_existing.append(date_str)
+            continue
+        opens_utc, closes_utc = _session_datetimes_for_date(date_obj, opens_time, closes_time)
+        sid = "ses_" + secrets.token_hex(6)
+        slug = secrets.token_urlsafe(7)
+        await db[COLL_SESSIONS].insert_one({
+            "session_id": sid,
+            "class_id": cls["class_id"],
+            "date": date_str,
+            "meet_url": cls.get("default_meet_url") or "",
+            "join_slug": slug,
+            "opens_at": _iso(opens_utc),
+            "closes_at": _iso(closes_utc),
+            "grace_minutes": settings.get("late_grace_minutes", 10),
+            "mid_session_enabled": settings.get("mid_session_enabled", True),
+            "status": SESS_SCHEDULED,
+            "created_at": _utcnow_iso(),
+            "generated": True,  # distinguishes an auto-generated session from a manually-created one, for admin visibility only — never changes how it's treated
+        })
+        created.append(date_str)
+    return {"created": created, "skipped_existing": skipped_existing}
+
+
+async def next_upcoming_session_for_student(db, student_id: str, *, norm=_default_norm) -> dict | None:
+    """§3 countdown data — real, materialized sessions only (never an
+    estimate): the earliest not-yet-open session across every class this
+    student's roster (resolve_class_roster_ids, same resolution
+    _class_roster/attendance_live already use) includes them in. Returns
+    None (an honest "nothing scheduled" state, per §3.5) rather than a
+    placeholder when the student has no upcoming session at all."""
+    now = _utcnow()
+    sid = norm(student_id)
+    best: dict | None = None
+    async for cls in db[COLL_CLASSES].find({}, {"_id": 0}):
+        roster_ids = await resolve_class_roster_ids(db, cls, norm=norm)
+        if sid not in roster_ids:
+            continue
+        async for sess in db[COLL_SESSIONS].find(
+            {"class_id": cls["class_id"], "exception": None},
+            {"_id": 0, "opens_at": 1, "closes_at": 1, "class_id": 1},
+        ):
+            opens_dt = _parse_iso(sess.get("opens_at"))
+            if not opens_dt or opens_dt <= now:
+                continue
+            if best is None or opens_dt < best["_opens_dt"]:
+                best = {
+                    "_opens_dt": opens_dt,
+                    "opens_at": sess.get("opens_at"),
+                    "closes_at": sess.get("closes_at"),
+                    "class_id": cls["class_id"],
+                    "title_en": cls.get("title_en"),
+                    "title_kh": cls.get("title_kh"),
+                }
+    if best is not None:
+        best = {k: v for k, v in best.items() if k != "_opens_dt"}
+    return best
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # indexes (idempotent, best-effort)
 # ─────────────────────────────────────────────────────────────────────────────
 async def ensure_attendance_indexes(db) -> None:
@@ -745,8 +1022,9 @@ async def ensure_attendance_indexes(db) -> None:
 def register_attendance_routes(api, db, require_admin, require_student, *,
                                current_student=None, fan_out_push=None,
                                build_target_query=None, norm_student_id=None,
-                               wallet=None) -> None:
-    from fastapi import Depends, HTTPException
+                               wallet=None, current_user_dep=None,
+                               is_super_admin_fn=None, cron_secret="") -> None:
+    from fastapi import Depends, Header, HTTPException, Request
     from fastapi.responses import RedirectResponse
 
     _norm = norm_student_id or (lambda v: (str(v or "")).strip().lower())
@@ -1140,7 +1418,17 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     @api.get("/attendance/live")
     async def attendance_live(student=Depends(require_student)):
         """Currently-open session for any class the student is enrolled in —
-        powers the home-tile live state + in-app fallback Join Link."""
+        powers the home-tile live state + in-app fallback Join Link.
+
+        §3 extension — additive, existing `live`/`slug`/`session_id`/
+        `title_en`/`title_kh` fields and the `{"live": False}` shape for a
+        not-live student are completely unchanged for any existing
+        consumer that only reads those. When not live, the response now
+        ALSO carries a real `next_session` (or `null` if the student has
+        none scheduled at all — an honest state per §3.5, never a guessed
+        placeholder), sourced from actually-materialized Session documents
+        via next_upcoming_session_for_student, so the Dashboard tile's
+        countdown reflects real schedule data, not an estimate."""
         sid = _sid(student)
         now = _utcnow()
         cur = db[COLL_SESSIONS].find({"status": SESS_OPEN}, {"_id": 0})
@@ -1158,7 +1446,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                     "title_en": (cls or {}).get("title_en"),
                     "title_kh": (cls or {}).get("title_kh"),
                 }
-        return {"live": False}
+        next_session = await next_upcoming_session_for_student(db, sid, norm=_norm)
+        return {"live": False, "next_session": next_session}
 
     # ─────────────────────────────────────────────────────────────────────
     # STUDENT CLAIM ROUTES
@@ -1689,6 +1978,9 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "recurrence": payload.recurrence.strip(),
             "group": payload.group.strip(),
             "roster": [_norm(x) for x in payload.roster if x],
+            # §1 — structured weekly template, additive alongside the
+            # original free-text `recurrence` string above (unchanged).
+            "weekly_recurrence": payload.weekly_recurrence.model_dump(),
             "created_at": _utcnow_iso(),
         }
         await db[COLL_CLASSES].insert_one(doc)
@@ -1704,12 +1996,69 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
             "recurrence": payload.recurrence.strip(),
             "group": payload.group.strip(),
             "roster": [_norm(x) for x in payload.roster if x],
+            "weekly_recurrence": payload.weekly_recurrence.model_dump(),
             "updated_at": _utcnow_iso(),
         }
         res = await db[COLL_CLASSES].update_one({"class_id": class_id}, {"$set": upd})
         if res.matched_count == 0:
             raise HTTPException(status_code=404, detail="class_not_found")
         return {"ok": True}
+
+    @api.post("/admin/attendance/classes/{class_id}/generate-sessions")
+    async def admin_generate_class_sessions(
+        class_id: str, days_ahead: int = 14, admin=Depends(require_admin),
+    ):
+        """§1.7 — admin-triggered, on-demand generation for ONE class
+        (Attendance Studio's own "Generate sessions" action). Returns which
+        dates were newly created vs. skipped (§1.5's "detect and warn on
+        conflicts", surfaced here as an informational summary rather than a
+        blocking confirm-step, since generation is purely additive and
+        never overwrites — there is nothing destructive to confirm)."""
+        cls = await db[COLL_CLASSES].find_one({"class_id": class_id}, {"_id": 0})
+        if not cls:
+            raise HTTPException(status_code=404, detail="class_not_found")
+        settings = await _load_settings()
+        result = await generate_sessions_for_class(
+            db, cls, days_ahead=max(1, min(int(days_ahead), 90)), settings=settings,
+        )
+        return {"ok": True, "class_id": class_id, **result}
+
+    if current_user_dep is not None:
+        @api.post("/admin/attendance/sessions/generate-due")
+        async def admin_generate_due_sessions(
+            request: Request,
+            days_ahead: int = 14,
+            x_cron_secret: str | None = Header(default=None, alias="x-cron-secret"),
+            user=Depends(current_user_dep),
+        ):
+            """§1.3/§1.7 — external-cron entry point for ALL classes with an
+            enabled weekly template, following the EXACT dual-auth pattern
+            server.py's own POST /push/schedule/run-due already established
+            (x-cron-secret header OR super-admin), via the same optional
+            current_user_dep/is_super_admin_fn/cron_secret injection points
+            messaging_tools.py's own cron endpoint already established for
+            this exact situation — rather than an in-process scheduler,
+            confirmed this codebase has none anywhere and none is
+            introduced here."""
+            is_admin = bool(is_super_admin_fn(user)) if (user and is_super_admin_fn) else False
+            secret_ok = bool(cron_secret) and x_cron_secret == cron_secret
+            if not (is_admin or secret_ok):
+                raise HTTPException(status_code=403, detail="forbidden")
+            settings = await _load_settings()
+            days = max(1, min(int(days_ahead), 90))
+            results: dict[str, dict] = {}
+            # Filtered in Python, not via a dotted-path Mongo query — this
+            # module's own established convention elsewhere (e.g.
+            # attendance_live's own loop) is a broad top-level find()
+            # followed by a precise Python-side check, not a nested-field
+            # query filter.
+            async for cls in db[COLL_CLASSES].find({}, {"_id": 0}):
+                if not (cls.get("weekly_recurrence") or {}).get("enabled"):
+                    continue
+                results[cls["class_id"]] = await generate_sessions_for_class(
+                    db, cls, days_ahead=days, settings=settings,
+                )
+            return {"ok": True, "classes": results}
 
     @api.delete("/admin/attendance/classes/{class_id}")
     async def admin_delete_class(class_id: str, admin=Depends(require_admin)):
