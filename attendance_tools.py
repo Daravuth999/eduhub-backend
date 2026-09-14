@@ -953,6 +953,41 @@ async def generate_sessions_for_class(db, cls: dict, *, days_ahead: int = 14, se
     return {"created": created, "skipped_existing": skipped_existing}
 
 
+async def next_upcoming_session_for_student(db, student_id: str, *, norm=_default_norm) -> dict | None:
+    """§3 countdown data — real, materialized sessions only (never an
+    estimate): the earliest not-yet-open session across every class this
+    student's roster (resolve_class_roster_ids, same resolution
+    _class_roster/attendance_live already use) includes them in. Returns
+    None (an honest "nothing scheduled" state, per §3.5) rather than a
+    placeholder when the student has no upcoming session at all."""
+    now = _utcnow()
+    sid = norm(student_id)
+    best: dict | None = None
+    async for cls in db[COLL_CLASSES].find({}, {"_id": 0}):
+        roster_ids = await resolve_class_roster_ids(db, cls, norm=norm)
+        if sid not in roster_ids:
+            continue
+        async for sess in db[COLL_SESSIONS].find(
+            {"class_id": cls["class_id"], "exception": None},
+            {"_id": 0, "opens_at": 1, "closes_at": 1, "class_id": 1},
+        ):
+            opens_dt = _parse_iso(sess.get("opens_at"))
+            if not opens_dt or opens_dt <= now:
+                continue
+            if best is None or opens_dt < best["_opens_dt"]:
+                best = {
+                    "_opens_dt": opens_dt,
+                    "opens_at": sess.get("opens_at"),
+                    "closes_at": sess.get("closes_at"),
+                    "class_id": cls["class_id"],
+                    "title_en": cls.get("title_en"),
+                    "title_kh": cls.get("title_kh"),
+                }
+    if best is not None:
+        best = {k: v for k, v in best.items() if k != "_opens_dt"}
+    return best
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # indexes (idempotent, best-effort)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1383,7 +1418,17 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
     @api.get("/attendance/live")
     async def attendance_live(student=Depends(require_student)):
         """Currently-open session for any class the student is enrolled in —
-        powers the home-tile live state + in-app fallback Join Link."""
+        powers the home-tile live state + in-app fallback Join Link.
+
+        §3 extension — additive, existing `live`/`slug`/`session_id`/
+        `title_en`/`title_kh` fields and the `{"live": False}` shape for a
+        not-live student are completely unchanged for any existing
+        consumer that only reads those. When not live, the response now
+        ALSO carries a real `next_session` (or `null` if the student has
+        none scheduled at all — an honest state per §3.5, never a guessed
+        placeholder), sourced from actually-materialized Session documents
+        via next_upcoming_session_for_student, so the Dashboard tile's
+        countdown reflects real schedule data, not an estimate."""
         sid = _sid(student)
         now = _utcnow()
         cur = db[COLL_SESSIONS].find({"status": SESS_OPEN}, {"_id": 0})
@@ -1401,7 +1446,8 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
                     "title_en": (cls or {}).get("title_en"),
                     "title_kh": (cls or {}).get("title_kh"),
                 }
-        return {"live": False}
+        next_session = await next_upcoming_session_for_student(db, sid, norm=_norm)
+        return {"live": False, "next_session": next_session}
 
     # ─────────────────────────────────────────────────────────────────────
     # STUDENT CLAIM ROUTES
