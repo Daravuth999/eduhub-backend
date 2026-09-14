@@ -46,10 +46,9 @@ from login_reward_tools import _lrc_campaign_status, lrc_get_campaign_public
 # the canonical way to turn a raw label into the same uppercase,
 # colon-stripped identity token every other consumer already treats as
 # canonical"). teacher_admission.py does not import attendance_tools.py
-# anywhere (confirmed), so this one-directional top-level import is safe;
-# the reverse call (teacher_admission.py -> attendance_tools.py, wired in
-# that module's own _assign_schedule_one) is a lazy, inside-function
-# import specifically so neither module needs to load before the other.
+# anywhere (confirmed), so this one-directional top-level import is safe.
+# class_matches_student_schedule is the only consumer — roster resolution
+# is now a live query-time union (§2.5) with no reverse import needed.
 from teacher_admission import _normalize_schedule
 
 log = logging.getLogger("eduhub.attendance")
@@ -767,24 +766,25 @@ def _default_norm(v) -> str:
 
 
 async def resolve_class_roster_ids(db, cls: dict, norm=_default_norm) -> set[str]:
-    """Module-level twin of the closure-local `_class_roster` (same exact
-    query shape: explicit roster ids first, else the class's own `group`
-    tag as a fallback filter) — extracted so it's usable outside
-    register_attendance_routes' closure. Returns just the set of
-    normalized ids actually enrolled, not the full display-name shape
-    `_class_roster` returns (callers here only need membership checks)."""
-    ids = [norm(x) for x in (cls.get("roster") or []) if x]
-    if ids:
-        query = {"$or": [{"clean_id": {"$in": ids}}, {"student_id": {"$in": ids}}]}
-    elif cls.get("group"):
-        query = {"group": cls.get("group")}
-    else:
+    """Module-level twin of the closure-local `_class_roster` — same
+    union semantics (§2.5 fix, see that function's docstring for the bug
+    this replaced): every student is included if EITHER they're
+    explicitly listed in `roster` OR their own Schedule A/B tag matches
+    this class's group tag per class_matches_student_schedule, resolved
+    live on every call — never cached or written back — extracted so
+    it's usable outside register_attendance_routes' closure. Returns
+    just the set of normalized ids actually enrolled, not the full
+    display-name shape `_class_roster` returns (callers here only need
+    membership checks)."""
+    explicit_ids = {norm(x) for x in (cls.get("roster") or []) if x}
+    class_group = cls.get("group") or ""
+    if not explicit_ids and not class_group:
         return set()
     out: set[str] = set()
-    async for s in db.students.find(query, {"_id": 0, "clean_id": 1, "student_id": 1}):
-        for v in (s.get("clean_id"), s.get("student_id")):
-            if v:
-                out.add(norm(v))
+    async for s in db.students.find({}, {"_id": 0, "clean_id": 1, "student_id": 1, "group": 1}):
+        sid = norm(s.get("clean_id") or s.get("student_id"))
+        if sid in explicit_ids or class_matches_student_schedule(class_group, s.get("group") or ""):
+            out.add(sid)
     return out
 
 
@@ -817,49 +817,6 @@ def class_matches_student_schedule(class_group_raw: str, student_group_raw: str)
     if class_group == "AB":
         return bool(_normalize_schedule(student_group_raw))
     return _normalize_schedule(student_group_raw) == class_group
-
-
-async def sync_rosters_for_student_group(db, student_id: str, new_group: str, *, norm=_default_norm) -> dict:
-    """§2 auto-roster assignment — ADD-ONLY, deliberately never auto-
-    removes (§2.3's explicit, documented decision, not an accident): a
-    student whose schedule is reassigned AWAY from a class's group stays
-    on that class's roster until an admin explicitly removes them. Reasons:
-    (1) roster membership is also the historical record of who a class's
-    sessions were held for — silently severing that the moment a schedule
-    changes could orphan in-flight or recent attendance context an admin
-    may still need; (2) the existing manual-override guarantee (§2.4) is
-    unambiguous for ADDING (a student either belongs or doesn't, so
-    auto-add is safe and reversible by removing them manually) but
-    ambiguous for REMOVING (was this schedule change a correction, a
-    genuine reassignment, or a mistake about to be reverted?) — auto-
-    removal risks a real, hard-to-notice regression (a student silently
-    losing access to a class chat/session they were actively using) for a
-    case with no clearly-safe default. An admin can always remove a
-    student manually via the existing roster picker; this function never
-    does so on their behalf.
-
-    Called from every real write path for students.group (confirmed via
-    a full-codebase audit — there is no single choke point): server.py's
-    teacher_create_student (new registration) and teacher_update_student
-    (generic admin edit), and teacher_admission.py's _assign_schedule_one
-    (the Speaking-Lab-specific reassignment flow)."""
-    if not _normalize_schedule(new_group):
-        return {"added_to": []}
-    sid = norm(student_id)
-    if not sid:
-        return {"added_to": []}
-    added_to: list[str] = []
-    async for cls in db[COLL_CLASSES].find({}, {"_id": 0, "class_id": 1, "group": 1, "roster": 1}):
-        if not class_matches_student_schedule(cls.get("group") or "", new_group):
-            continue
-        roster = {norm(x) for x in (cls.get("roster") or [])}
-        if sid in roster:
-            continue
-        await db[COLL_CLASSES].update_one(
-            {"class_id": cls["class_id"]}, {"$addToSet": {"roster": sid}},
-        )
-        added_to.append(cls["class_id"])
-    return {"added_to": added_to}
 
 
 def _valid_hhmm(s: str) -> bool:
@@ -1062,22 +1019,32 @@ def register_attendance_routes(api, db, require_admin, require_student, *,
 
     async def _class_roster(cls: dict) -> list[dict]:
         """Roster scoped to a class's ACTUAL enrolled students — never inferred
-        from Telegram / Google. Resolves explicit roster ids first, else the
-        class group."""
-        ids = [_norm(x) for x in (cls.get("roster") or []) if x]
-        query: dict = {}
-        if ids:
-            query = {"$or": [
-                {"clean_id": {"$in": ids}},
-                {"student_id": {"$in": ids}},
-            ]}
-        elif cls.get("group"):
-            query = {"group": cls.get("group")}
-        else:
+        from Telegram / Google.
+
+        §2.5 fix — UNION, never either/or: a prior "explicit roster ids,
+        ELSE class group" design meant the very first manually-added
+        student silently dropped every auto-matched student, since a
+        single addToSet made `roster` non-empty and switched the whole
+        class from "match everyone by Schedule A/B" to "match ONLY this
+        one explicit id." Now every student is included if EITHER they
+        are explicitly listed in `roster` (a manual addition/exception —
+        e.g. a makeup student without a matching Schedule A/B tag) OR
+        their own Schedule A/B tag matches this class's group tag per
+        class_matches_student_schedule's permissive-AB semantics. The
+        schedule-match half is resolved live on every call — never
+        cached or written back to `roster` — so a brand-new registration
+        or a same-day reassignment is included immediately with zero
+        admin action and zero staleness."""
+        explicit_ids = {_norm(x) for x in (cls.get("roster") or []) if x}
+        class_group = cls.get("group") or ""
+        if not explicit_ids and not class_group:
             return []
         out = []
-        cur = db.students.find(query, {"_id": 0, "student_id": 1, "clean_id": 1, "display_name": 1})
+        cur = db.students.find({}, {"_id": 0, "student_id": 1, "clean_id": 1, "display_name": 1, "group": 1})
         async for s in cur:
+            sid = _norm(s.get("clean_id") or s.get("student_id"))
+            if not (sid in explicit_ids or class_matches_student_schedule(class_group, s.get("group") or "")):
+                continue
             # ``student_id`` here is the human-facing clean_id used for ALL of
             # attendance's internal bookkeeping (records / streaks / roster
             # matching) — intentionally unchanged. ``wallet_student_id`` is the
