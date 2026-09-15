@@ -949,7 +949,11 @@ def register_video_library_routes(api, db, require_admin, require_student, *, fa
         return {"ok": True, "lesson": doc}
 
     @api.post("/studio/video/lessons/{lesson_id}/media")
-    async def upload_lesson_media_route(lesson_id: str, file: UploadFile = File(...), admin=Depends(require_admin)):
+    async def upload_lesson_media_route(
+        lesson_id: str, file: UploadFile = File(...),
+        awaitTranscriptChoice: bool = Form(False),
+        admin=Depends(require_admin),
+    ):
         raw = await file.read()
         try:
             doc = await attach_lesson_media(
@@ -967,6 +971,18 @@ def register_video_library_routes(api, db, require_admin, require_student, *, fa
                 {"lessonId": lesson_id}, {"$set": {"contentType": content_type}},
             )
             doc["contentType"] = content_type
+        # Manual transcript import (additive — see transcript_import.py):
+        # `awaitTranscriptChoice` defaults False, so every EXISTING caller
+        # that doesn't know this parameter exists gets byte-for-byte the
+        # same behavior as before it existed — media lands, the Gemini
+        # pipeline starts immediately, full stop. Only when the NEW
+        # frontend choice UI explicitly opts in does this route hold off,
+        # leaving the lesson with media attached but no pipeline started
+        # until the admin's choice lands via either POST .../pipeline/run
+        # (auto-generate — the same existing manual-retry endpoint) or
+        # POST .../pipeline/import-transcript (import).
+        if awaitTranscriptChoice:
+            return {"ok": True, "lesson": doc, "pipelineScheduled": False}
         # Automatic AI processing — the product pipeline starts the moment
         # media lands; the Studio polls GET …/pipeline for progress. Lazy
         # import avoids a module cycle (pipeline imports this module's
