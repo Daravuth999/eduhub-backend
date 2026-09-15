@@ -37,6 +37,7 @@ import httpx
 from fastapi import Body, Depends, HTTPException
 
 import sync_studio_tools
+import transcript_import
 import video_ai_provider
 import video_render_tools
 import video_word_alignment
@@ -326,9 +327,21 @@ async def load_media_bytes(db, media_bucket, media_ref: str) -> tuple[bytes, str
         ) from exc
 
 
-async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
+async def run_pipeline(db, lesson_id: str, media_bucket, *, imported_transcript: dict | None = None) -> dict:
     """The complete automatic processing run. Atomic claim first — exactly
-    one concurrent run per lesson. Returns the final pipeline record."""
+    one concurrent run per lesson. Returns the final pipeline record.
+
+    `imported_transcript` (manual transcript import, additive — see
+    transcript_import.py): when provided, this is `{"format": "srt"|
+    "vtt", "segments": [{speaker, start, end, text}, ...]}` — already
+    parsed by the route below. ONLY the speech_recognition stage's
+    actual Gemini calls (segmentation + word-alignment) are bypassed;
+    every other stage (media_check, audio_extraction's own step-tracking,
+    synchronization, educational_analysis, review_ready) runs exactly as
+    it does for the Gemini-auto-generate path, reusing the SAME
+    downstream code with no branching beyond this one fork point. When
+    None (the default), behavior is byte-for-byte identical to before
+    this parameter existed."""
     lesson = await db[LESSONS_COLL].find_one({"lessonId": lesson_id}, {"_id": 0})
     if not lesson:
         raise RuntimeError(f"no lesson {lesson_id!r}")
@@ -404,7 +417,18 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         # docstring). Only a POSITIVELY CONFIRMED absent stream sets this
         # False; ambiguity must never cause real speech to be skipped.
         has_audio = True
-        if "video" in (stored_ct or "").lower():
+        if imported_transcript is not None:
+            # Manual transcript import — there is no Gemini call to
+            # prepare audio FOR, so extraction is genuinely unneeded work,
+            # not merely skipped for speed. Marked "skipped" (not
+            # "complete") with an honest reason, matching the existing
+            # silent-video convention just below rather than pretending
+            # this step ran.
+            await _set_step(
+                db, lesson_id, run_id, "audio_extraction", "skipped",
+                "transcript imported — audio extraction not needed",
+            )
+        elif "video" in (stored_ct or "").lower():
             audio_status = await video_render_tools.probe_audio_stream_status(raw, content_type=stored_ct)
             if audio_status == "absent":
                 # Root-cause fix for a real production incident: a genuinely
@@ -437,13 +461,57 @@ async def run_pipeline(db, lesson_id: str, media_bucket) -> dict:
         else:
             await _set_step(db, lesson_id, run_id, "audio_extraction", "complete", "media is already audio-only")
 
-        # 3 — speech recognition (Gemini / mock, provider-neutral surface).
-        # Skipped entirely — never "running" then "failed" — for a
-        # confirmed-silent video: there is nothing to transcribe, and this
-        # is an expected, valid production mode (a purely visual lesson),
-        # not an error condition (see Section 5/13 of the silent-video
-        # production spec this satisfies).
-        if has_audio:
+        # 3 — speech recognition (Gemini / mock, provider-neutral surface),
+        # OR manual transcript import (additive — see transcript_import.py
+        # and this function's own docstring). Skipped entirely for a
+        # confirmed-silent video — never "running" then "failed" — since
+        # there is nothing to transcribe, an expected, valid production
+        # mode (a purely visual lesson), not an error condition (see
+        # Section 5/13 of the silent-video production spec this
+        # satisfies).
+        if imported_transcript is not None:
+            # §1.1 hard requirement: parsed cues route straight through
+            # the SAME segments_to_sync consolidation every Gemini
+            # segmentation result already uses — no new interpolation, no
+            # new paragraph-grouping logic. Every word this produces is
+            # therefore honestly interpolated (segments_to_sync's own
+            # distribute_words call), never `measured` — identical
+            # honesty rule to Gemini's own lower-confidence output.
+            await _set_step(db, lesson_id, run_id, "speech_recognition", "running")
+            await sync_studio_tools.mark_alignment_processing(db, sync_id)
+            fmt = str(imported_transcript.get("format") or "unknown")
+            segments = imported_transcript.get("segments") or []
+            sync_fragment = video_ai_provider.segments_to_sync(
+                segments, provider_category="manual",
+                provider_version=f"manual-import-{fmt}",
+                generated_at=_now(),
+            )
+            transcript_text = " ".join(
+                w["word"]
+                for p in sync_fragment["paragraphs"]
+                for s in p["sentences"]
+                for w in s["words"]
+            )
+            result = {"sync": sync_fragment, "transcriptText": transcript_text}
+            await _set_step(
+                db, lesson_id, run_id, "speech_recognition", "complete",
+                f"transcript imported ({fmt}) — Gemini speech recognition and word-alignment skipped",
+            )
+
+            # Synchronization generation — the EXACT same call the Gemini
+            # path uses below; apply_alignment_result has no idea (and
+            # does not need to know) whether its input came from Gemini
+            # or an import.
+            await _set_step(db, lesson_id, run_id, "synchronization", "running")
+            sync_doc = await sync_studio_tools.apply_alignment_result(db, sync_id, result["sync"])
+            duration = float(sync_doc.get("durationSec") or 0.0)
+            if duration > 0:
+                await db[LESSONS_COLL].update_one(
+                    {"lessonId": lesson_id, "durationSec": {"$in": [0, 0.0, None]}},
+                    {"$set": {"durationSec": round(duration, 3)}},
+                )
+            await _set_step(db, lesson_id, run_id, "synchronization", "complete")
+        elif has_audio:
             await _set_step(db, lesson_id, run_id, "speech_recognition", "running")
             await sync_studio_tools.mark_alignment_processing(db, sync_id)
             result = await provider.align(transcribe_bytes, transcribe_ct)
@@ -716,12 +784,13 @@ async def get_pipeline_status(db, lesson_id: str) -> dict:
     return doc or {}
 
 
-def schedule_pipeline(db, lesson_id: str, media_bucket) -> None:
+def schedule_pipeline(db, lesson_id: str, media_bucket, *, imported_transcript: dict | None = None) -> None:
     """Fire-and-forget background run — the upload route returns immediately
-    and the Studio polls GET …/pipeline for progress."""
+    and the Studio polls GET …/pipeline for progress. `imported_transcript`
+    is threaded straight through to run_pipeline — see its docstring."""
     async def _run():
         try:
-            await run_pipeline(db, lesson_id, media_bucket)
+            await run_pipeline(db, lesson_id, media_bucket, imported_transcript=imported_transcript)
         except Exception as exc:  # noqa: BLE001
             logger.warning("video_pipeline: scheduled run refused lesson=%s (%s)", lesson_id, exc)
 
@@ -757,5 +826,37 @@ def register_video_pipeline_routes(api, db, require_admin) -> None:
             raise HTTPException(status_code=409, detail="pipeline already running")
         schedule_pipeline(db, lesson_id, sync_studio_tools.get_media_bucket(db))
         return {"ok": True, "scheduled": True, "aiEngine": "gemini" if video_ai_provider.ai_available() else "mock"}
+
+    @api.post("/studio/video/lessons/{lesson_id}/pipeline/import-transcript")
+    async def pipeline_import_transcript_route(
+        lesson_id: str, payload: dict = Body(...), _admin=Depends(require_admin),
+    ):
+        """Manual transcript import (additive alternative to Gemini-from-
+        scratch transcription — see transcript_import.py and run_pipeline's
+        own imported_transcript parameter). Body: {"format": "srt"|"vtt",
+        "content": "<raw file text>"}. Parses up front (a bad file fails
+        fast, synchronously, with a clear 400 — never scheduled as a
+        background run just to fail inside it), then schedules the SAME
+        run_pipeline background task the Gemini path uses, just with the
+        parsed segments already in hand instead of a Gemini call to make."""
+        fmt = str(payload.get("format") or "")
+        content = str(payload.get("content") or "")
+        lesson = await db[LESSONS_COLL].find_one({"lessonId": lesson_id}, {"_id": 0})
+        if not lesson:
+            raise HTTPException(status_code=404, detail="lesson not found")
+        if not lesson.get("mediaRef") or not lesson.get("syncId"):
+            raise HTTPException(status_code=409, detail="upload media before importing a transcript")
+        pipeline_doc = lesson.get("pipeline") or {}
+        if pipeline_doc.get("state") == "running" and not _pipeline_is_stale(pipeline_doc):
+            raise HTTPException(status_code=409, detail="pipeline already running")
+        try:
+            segments = transcript_import.parse_transcript_import(fmt, content)
+        except transcript_import.TranscriptImportError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        schedule_pipeline(
+            db, lesson_id, sync_studio_tools.get_media_bucket(db),
+            imported_transcript={"format": fmt.strip().lower(), "segments": segments},
+        )
+        return {"ok": True, "scheduled": True, "cueCount": len(segments)}
 
     logger.info("video_pipeline_tools: routes registered (/api/studio/video/*/pipeline)")
