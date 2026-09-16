@@ -372,6 +372,37 @@ def merge_real_word_timing(gemini_sync: dict, measured_words: list[dict], *,
             # already internally consistent with its neighbors.
         last_accepted_start = max(last_accepted_start, g_word["start"])
 
+    # 2026-09 production incident ("Apologies" lesson, sync_06f3e8d6118e43d5):
+    # confirmed via direct inspection of the RAW stored document (not the
+    # rendered Sync Review Studio UI) that a sentence's own `start`/`end`
+    # wrapper can go stale relative to its words after this point. Root
+    # cause: `build_sentence` sets a sentence's start/end from its words
+    # ONCE, at segmentation time (words[0].start, words[-1].end) — before
+    # this function ever runs. The loop above then legitimately replaces
+    # individual WORD timestamps with real gemini-3.5-transcribe
+    # measurements, but nothing propagates that correction back up to the
+    # sentence (or paragraph) wrapper, which keeps whatever value Gemini's
+    # OWN raw segmentation call originally reported — observed as a
+    # sentence showing "0:00.0-0:00.0" in the reviewer UI while its own
+    # words carry entirely correct, measured, non-zero timing. Recomputed
+    # here, mirroring build_sentence/build_paragraph's own construction
+    # logic exactly (first word's start, last word's end) — words within a
+    # sentence are already chronologically ordered by this point (the
+    # sequential merge pass above guarantees it), so this is a pure,
+    # honest recomputation from already-correct data, never a fabricated
+    # value. Left untouched (never invented) when a sentence/paragraph has
+    # no words/sentences at all.
+    for p in gemini_sync.get("paragraphs") or []:
+        for s in p.get("sentences") or []:
+            s_words = s.get("words") or []
+            if s_words:
+                s["start"] = s_words[0]["start"]
+                s["end"] = s_words[-1]["end"]
+        p_sentences = p.get("sentences") or []
+        if p_sentences:
+            p["start"] = p_sentences[0]["start"]
+            p["end"] = p_sentences[-1]["end"]
+
     total = len(gemini_words)
     telemetry = {
         "status": "complete",
