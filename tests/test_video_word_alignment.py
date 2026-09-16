@@ -135,6 +135,75 @@ def test_silence_gap_with_zero_measured_words_leaves_everything_interpolated():
     assert telemetry["meanAlignmentConfidence"] is None
 
 
+# ── §4 production incident: sentence/paragraph boundary staleness ─────────
+# Real data from lesson sync_06f3e8d6118e43d5 ("Apologies"), fetched
+# directly from the production database and confirmed (not assumed) to
+# reproduce the reported defect: Sync Review Studio showed sentence S1
+# ("I came to say I'm I'm sorry.") at 0:00.0-0:00.0 despite every one of
+# its words carrying entirely correct, measured, non-zero real timing
+# (0.5s-3.9s). Root cause confirmed by reading the RAW stored document,
+# not the rendered UI: build_sentence sets a sentence's start/end from its
+# words ONCE, before this function ever runs; nothing previously
+# propagated a later real-timing correction back up to that wrapper.
+def test_sentence_and_paragraph_boundaries_are_recomputed_from_corrected_words_apologies_lesson_regression():
+    # Gemini's OWN raw segmentation call reported this sentence's span as
+    # a degenerate ~0-width block (matching the real, confirmed pattern
+    # observed for this exact video's opening seconds) — build_sentence
+    # therefore starts with a stale 0.0/0.0-ish wrapper, exactly as
+    # persisted in production before this fix.
+    gemini = _gemini_doc([
+        _gemini_word("I", 0.0, 0.0), _gemini_word("came", 0.0, 0.0), _gemini_word("to", 0.0, 0.0),
+        _gemini_word("say", 0.0, 0.0), _gemini_word("I'm", 0.0, 0.0), _gemini_word("I'm", 0.0, 0.0),
+        _gemini_word("sorry.", 0.0, 0.0),
+    ])
+    assert gemini["paragraphs"][0]["sentences"][0]["start"] == 0.0
+    assert gemini["paragraphs"][0]["sentences"][0]["end"] == 0.0
+
+    # The real, independently-measured gemini-3.5-transcribe values for
+    # this exact sentence, copied verbatim from the production document.
+    measured = [
+        _measured_word("I", 0.5, 1.0), _measured_word("came", 1.4, 1.8), _measured_word("to", 1.8, 1.9),
+        _measured_word("say", 1.9, 2.3), _measured_word("I'm", 2.9, 3.1), _measured_word("I'm", 3.2, 3.4),
+        _measured_word("sorry.", 3.4, 3.9),
+    ]
+
+    merged, telemetry = vwa.merge_real_word_timing(gemini, measured)
+
+    words = merged["paragraphs"][0]["sentences"][0]["words"]
+    assert [w["start"] for w in words] == [0.5, 1.4, 1.8, 1.9, 2.9, 3.2, 3.4]
+    assert all(w["measured"] is True for w in words)
+    assert telemetry["matchedWords"] == 7  # confirms the merge itself worked, not just the boundary fix
+
+    # The actual regression: the SENTENCE wrapper must now match its own
+    # (corrected) words, not the stale value Gemini's raw segmentation
+    # originally reported.
+    sentence = merged["paragraphs"][0]["sentences"][0]
+    assert sentence["start"] == 0.5
+    assert sentence["end"] == 3.9
+    # And the enclosing PARAGRAPH, which has the same staleness exposure.
+    paragraph = merged["paragraphs"][0]
+    assert paragraph["start"] == 0.5
+    assert paragraph["end"] == 3.9
+
+
+def test_boundary_recompute_never_touches_a_sentence_with_no_words_or_a_paragraph_with_no_sentences():
+    """Honesty guard: an empty sentence/paragraph must never have a
+    boundary invented for it — left exactly as build_sentence/
+    build_paragraph's own defaults (0.0/0.0), matching those builders'
+    own documented behavior for an empty unit."""
+    empty_sentence = build_sentence("s1", [])
+    doc = build_sync_document(
+        media_ref="", provider_category="speech_recognition", provider_version="test",
+        paragraphs=[build_paragraph("p1", [empty_sentence])], generated_at="2026-01-01T00:00:00Z",
+        duration_sec=0.0,
+    )
+    merged, _telemetry = vwa.merge_real_word_timing(doc, [])
+    assert merged["paragraphs"][0]["sentences"][0]["start"] == 0.0
+    assert merged["paragraphs"][0]["sentences"][0]["end"] == 0.0
+    assert merged["paragraphs"][0]["start"] == 0.0
+    assert merged["paragraphs"][0]["end"] == 0.0
+
+
 def test_an_inverted_measured_span_is_rejected_not_persisted():
     """Defensive: a provider returning a genuinely malformed end<start span
     must never corrupt the document — the interpolated span is kept."""
